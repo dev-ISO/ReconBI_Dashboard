@@ -1,0 +1,32 @@
+# Node
+node_modules/
+dist/
+*.tsbuildinfo
+.npm/
+
+# .NET
+bin/
+obj/
+artifacts/
+*.user
+.vs/
+TestResults/
+
+# Python (legacy prototype)
+__pycache__/
+*.pyc
+.venv/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+appsettings.Development.json
+
+# Logs
+logs/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
