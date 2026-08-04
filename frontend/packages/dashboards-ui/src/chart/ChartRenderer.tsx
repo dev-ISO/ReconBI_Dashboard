@@ -1,15 +1,33 @@
+import type { ReactNode } from 'react';
 import {
+  Area,
+  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
+  Cell,
+  LabelList,
   Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
   ResponsiveContainer,
+  Scatter,
+  ScatterChart,
   Tooltip,
   XAxis,
   YAxis,
 } from 'recharts';
-import type { ChartSpec, QueryResult } from '@recon/dashboards-core';
-import { shapeChartData } from './chartData';
+import {
+  formatCellValue,
+  type CellValue,
+  type ChartFormat,
+  type ChartSpec,
+  type QueryColumn,
+  type QueryResult,
+} from '@recon/dashboards-core';
+import { shapeChartData, shapePieData, shapeScatterData } from './chartData';
 
 export interface ChartRendererProps {
   spec: ChartSpec;
@@ -18,38 +36,199 @@ export interface ChartRendererProps {
 
 const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-text-2)' } as const;
 
+const tooltipContentStyle = {
+  backgroundColor: 'var(--rcd-surface)',
+  border: '1px solid var(--rcd-border)',
+  borderRadius: 8,
+  color: 'var(--rcd-text)',
+  fontSize: 12,
+} as const;
+
+const legendWrapperStyle = { fontSize: 12, color: 'var(--rcd-text-2)' } as const;
+
+const TABLE_ROW_CAP = 500;
+
+/** Formats one measure value; seriesKey picks the column in measure-series mode. */
+type ValueFormatter = (value: unknown, seriesKey?: string) => string;
+
 /**
- * Loaded lazily (rcd-charts chunk). Column charts land with the vertical
- * slice; the full type set follows in the feature phase.
+ * Synthetic measure column carrying format.valueFormat as its hint, so
+ * formatCellValue's hint rules ("$" -> currency, "%" -> percent, else
+ * thousands) apply unchanged.
+ */
+const formatHintColumn = (formatHint: string): QueryColumn => ({
+  name: '__value',
+  label: '',
+  role: 'measure',
+  type: 'decimal',
+  source: null,
+  dateBucket: null,
+  formatHint,
+});
+
+function makeValueFormatter(format: ChartFormat, measureColumns: QueryColumn[]): ValueFormatter {
+  const overrideColumn = format.valueFormat ? formatHintColumn(format.valueFormat) : null;
+  return (value, seriesKey) => {
+    if (typeof value !== 'number') return value == null ? '' : String(value);
+    const column =
+      overrideColumn ??
+      (seriesKey ? measureColumns.find((c) => c.name === seriesKey) : undefined) ??
+      measureColumns[0];
+    return column ? formatCellValue(value, column) : String(value);
+  };
+}
+
+/** Legend placement from spec.format; bottom is the default. */
+function legendProps(format: ChartFormat) {
+  if (format.legendPosition === 'right') {
+    return {
+      layout: 'vertical',
+      align: 'right',
+      verticalAlign: 'middle',
+      wrapperStyle: legendWrapperStyle,
+    } as const;
+  }
+  return {
+    verticalAlign: format.legendPosition === 'top' ? 'top' : 'bottom',
+    wrapperStyle: legendWrapperStyle,
+  } as const;
+}
+
+const xAxisLabelProps = (text: string | undefined) =>
+  text
+    ? {
+        value: text,
+        position: 'insideBottom' as const,
+        offset: -4,
+        fontSize: 11,
+        fill: 'var(--rcd-text-2)',
+      }
+    : undefined;
+
+const yAxisLabelProps = (text: string | undefined) =>
+  text
+    ? {
+        value: text,
+        angle: -90,
+        position: 'insideLeft' as const,
+        offset: 8,
+        fontSize: 11,
+        fill: 'var(--rcd-text-2)',
+      }
+    : undefined;
+
+/** Base margins, widened when an axis title needs room. */
+const chartMargin = (format: ChartFormat, extras?: { bottom?: boolean; left?: boolean }) => ({
+  top: 8,
+  right: 12,
+  bottom: format.xAxisLabel || extras?.bottom ? 18 : 4,
+  left: format.yAxisLabel || extras?.left ? 8 : 4,
+});
+
+type TooltipCursor = 'fill' | 'line' | 'dashed' | 'none';
+
+/** Themed tooltip; formatEntry receives (value, dataKey of the hovered series). */
+function themedTooltip(
+  formatEntry: (value: unknown, dataKey: string | undefined) => string,
+  cursor: TooltipCursor,
+) {
+  const cursorProp =
+    cursor === 'fill'
+      ? { fill: 'var(--rcd-border)' }
+      : cursor === 'line'
+        ? { stroke: 'var(--rcd-axis)' }
+        : cursor === 'dashed'
+          ? { stroke: 'var(--rcd-axis)', strokeDasharray: '4 4' }
+          : false;
+  return (
+    <Tooltip
+      cursor={cursorProp}
+      contentStyle={tooltipContentStyle}
+      formatter={(value, _name, item) =>
+        formatEntry(value, typeof item.dataKey === 'string' ? item.dataKey : undefined)
+      }
+    />
+  );
+}
+
+function Placeholder({ children }: { children: ReactNode }) {
+  return (
+    <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Loaded lazily (rcd-charts chunk). All recharts marks render with
+ * isAnimationActive={false}: animation is rAF-driven and freezes at frame 0 in
+ * throttled background tabs; dashboards want instant, deterministic paint.
  */
 export default function ChartRenderer({ spec, result }: ChartRendererProps) {
-  const shaped = shapeChartData(result, spec);
-  const showLegend = spec.format.showLegend ?? shaped.series.length > 1;
+  const format = spec.format;
+  const measureColumns = result.columns.filter((c) => c.role === 'measure');
+  const formatValue = makeValueFormatter(format, measureColumns);
 
   switch (spec.type) {
     case 'column':
+    case 'bar':
+    case 'stackedColumn':
+    case 'stackedBar': {
+      const shaped = shapeChartData(result, spec);
+      const horizontal = spec.type === 'bar' || spec.type === 'stackedBar';
+      const stacked = spec.type === 'stackedColumn' || spec.type === 'stackedBar';
+      const showLegend = format.showLegend ?? shaped.series.length > 1;
+      const labelPosition = stacked ? 'center' : horizontal ? 'right' : 'top';
       return (
         <ResponsiveContainer width="100%" height="100%">
-          <BarChart data={shaped.data} margin={{ top: 8, right: 12, bottom: 4, left: 4 }}>
-            <CartesianGrid vertical={false} stroke="var(--rcd-grid-line)" />
-            <XAxis
-              dataKey={shaped.axisKey}
-              tick={axisTickStyle}
-              tickLine={false}
-              axisLine={{ stroke: 'var(--rcd-axis)' }}
+          <BarChart
+            data={shaped.data}
+            layout={horizontal ? 'vertical' : 'horizontal'}
+            margin={chartMargin(format)}
+          >
+            <CartesianGrid
+              vertical={horizontal}
+              horizontal={!horizontal}
+              stroke="var(--rcd-grid-line)"
             />
-            <YAxis tick={axisTickStyle} tickLine={false} axisLine={false} width={56} />
-            <Tooltip
-              cursor={{ fill: 'var(--rcd-border)' }}
-              contentStyle={{
-                backgroundColor: 'var(--rcd-surface)',
-                border: '1px solid var(--rcd-border)',
-                borderRadius: 8,
-                color: 'var(--rcd-text)',
-                fontSize: 12,
-              }}
-            />
-            {showLegend && <Legend wrapperStyle={{ fontSize: 12, color: 'var(--rcd-text-2)' }} />}
+            {horizontal ? (
+              <XAxis
+                type="number"
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={false}
+                label={xAxisLabelProps(format.xAxisLabel)}
+              />
+            ) : (
+              <XAxis
+                dataKey={shaped.axisKey}
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={{ stroke: 'var(--rcd-axis)' }}
+                label={xAxisLabelProps(format.xAxisLabel)}
+              />
+            )}
+            {horizontal ? (
+              <YAxis
+                type="category"
+                dataKey={shaped.axisKey}
+                width={110}
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={{ stroke: 'var(--rcd-axis)' }}
+                label={yAxisLabelProps(format.yAxisLabel)}
+              />
+            ) : (
+              <YAxis
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={false}
+                width={56}
+                label={yAxisLabelProps(format.yAxisLabel)}
+              />
+            )}
+            {themedTooltip(formatValue, 'fill')}
+            {showLegend && <Legend {...legendProps(format)} />}
             {shaped.series.map((series) => (
               <Bar
                 key={series.key}
@@ -57,22 +236,275 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 name={series.label}
                 fill={series.color}
                 stroke="var(--rcd-surface)"
-                strokeWidth={1}
-                radius={[2, 2, 0, 0]}
-                // Animation is rAF-driven and freezes at frame 0 in throttled
-                // background tabs; dashboards want instant, deterministic paint.
+                strokeWidth={stacked ? 2 : 1}
+                stackId={stacked ? 'stack' : undefined}
+                radius={stacked ? 0 : horizontal ? [0, 2, 2, 0] : [2, 2, 0, 0]}
                 isAnimationActive={false}
-              />
+              >
+                {format.showDataLabels && (
+                  <LabelList
+                    dataKey={series.key}
+                    position={labelPosition}
+                    fontSize={10}
+                    fill="var(--rcd-text-2)"
+                    formatter={(label) =>
+                      typeof label === 'number' ? formatValue(label, series.key) : label
+                    }
+                  />
+                )}
+              </Bar>
             ))}
           </BarChart>
         </ResponsiveContainer>
       );
+    }
 
-    default:
+    case 'line': {
+      const shaped = shapeChartData(result, spec);
+      const showLegend = format.showLegend ?? shaped.series.length > 1;
       return (
-        <div className="flex h-full items-center justify-center text-sm text-rcd-muted">
-          Chart type “{spec.type}” arrives with the full chart set.
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={shaped.data} margin={chartMargin(format)}>
+            <CartesianGrid vertical={false} stroke="var(--rcd-grid-line)" />
+            <XAxis
+              dataKey={shaped.axisKey}
+              tick={axisTickStyle}
+              tickLine={false}
+              axisLine={{ stroke: 'var(--rcd-axis)' }}
+              label={xAxisLabelProps(format.xAxisLabel)}
+            />
+            <YAxis
+              tick={axisTickStyle}
+              tickLine={false}
+              axisLine={false}
+              width={56}
+              label={yAxisLabelProps(format.yAxisLabel)}
+            />
+            {themedTooltip(formatValue, 'line')}
+            {showLegend && <Legend {...legendProps(format)} />}
+            {shaped.series.map((series) => (
+              <Line
+                key={series.key}
+                type="linear"
+                dataKey={series.key}
+                name={series.label}
+                stroke={series.color}
+                strokeWidth={2}
+                dot={false}
+                activeDot={{ r: 3 }}
+                isAnimationActive={false}
+              />
+            ))}
+          </LineChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    case 'area': {
+      const shaped = shapeChartData(result, spec);
+      const showLegend = format.showLegend ?? shaped.series.length > 1;
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={shaped.data} margin={chartMargin(format)}>
+            <CartesianGrid vertical={false} stroke="var(--rcd-grid-line)" />
+            <XAxis
+              dataKey={shaped.axisKey}
+              tick={axisTickStyle}
+              tickLine={false}
+              axisLine={{ stroke: 'var(--rcd-axis)' }}
+              label={xAxisLabelProps(format.xAxisLabel)}
+            />
+            <YAxis
+              tick={axisTickStyle}
+              tickLine={false}
+              axisLine={false}
+              width={56}
+              label={yAxisLabelProps(format.yAxisLabel)}
+            />
+            {themedTooltip(formatValue, 'line')}
+            {showLegend && <Legend {...legendProps(format)} />}
+            {shaped.series.map((series) => (
+              <Area
+                key={series.key}
+                type="linear"
+                dataKey={series.key}
+                name={series.label}
+                stroke={series.color}
+                strokeWidth={2}
+                fill={series.color}
+                fillOpacity={0.25}
+                dot={false}
+                isAnimationActive={false}
+              />
+            ))}
+          </AreaChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    case 'pie':
+    case 'donut': {
+      const { slices } = shapePieData(result, spec);
+      if (slices.length === 0) return <Placeholder>Pie needs a measure.</Placeholder>;
+      const showLegend = format.showLegend ?? slices.length > 1;
+      return (
+        <ResponsiveContainer width="100%" height="100%">
+          <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+            {themedTooltip(formatValue, 'none')}
+            {showLegend && <Legend {...legendProps(format)} />}
+            <Pie
+              data={slices}
+              dataKey="value"
+              nameKey="label"
+              innerRadius={spec.type === 'donut' ? '55%' : 0}
+              outerRadius="85%"
+              stroke="var(--rcd-surface)"
+              strokeWidth={2}
+              isAnimationActive={false}
+            >
+              {slices.map((slice, i) => (
+                <Cell key={`${i}-${slice.label}`} fill={slice.color} />
+              ))}
+            </Pie>
+          </PieChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    case 'scatter': {
+      const scatter = shapeScatterData(result, spec);
+      const xColumn = scatter.xColumn;
+      const yColumn = scatter.yColumn;
+      if (!xColumn || !yColumn) {
+        return <Placeholder>Scatter needs two measures (x and y).</Placeholder>;
+      }
+      const overrideColumn = format.valueFormat ? formatHintColumn(format.valueFormat) : null;
+      const formatPoint = (value: unknown, dataKey: string | undefined): string => {
+        if (typeof value !== 'number') return value == null ? '' : String(value);
+        return formatCellValue(value, overrideColumn ?? (dataKey === 'y' ? yColumn : xColumn));
+      };
+      const showLegend = format.showLegend ?? scatter.series.length > 1;
+      return (
+        <div className="relative h-full w-full">
+          <ResponsiveContainer width="100%" height="100%">
+            <ScatterChart margin={chartMargin(format, { bottom: true, left: true })}>
+              <CartesianGrid stroke="var(--rcd-grid-line)" />
+              <XAxis
+                type="number"
+                dataKey="x"
+                name={xColumn.label}
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={{ stroke: 'var(--rcd-axis)' }}
+                label={xAxisLabelProps(format.xAxisLabel ?? xColumn.label)}
+              />
+              <YAxis
+                type="number"
+                dataKey="y"
+                name={yColumn.label}
+                tick={axisTickStyle}
+                tickLine={false}
+                axisLine={false}
+                width={64}
+                label={yAxisLabelProps(format.yAxisLabel ?? yColumn.label)}
+              />
+              {themedTooltip(formatPoint, 'dashed')}
+              {showLegend && <Legend {...legendProps(format)} />}
+              {scatter.series.map((series) => (
+                <Scatter
+                  key={series.key}
+                  name={series.label}
+                  data={series.points}
+                  fill={series.color}
+                  isAnimationActive={false}
+                />
+              ))}
+            </ScatterChart>
+          </ResponsiveContainer>
+          {scatter.droppedSeries > 0 && (
+            <div className="absolute right-2 top-1 rounded border border-rcd-border bg-rcd-surface px-1.5 py-0.5 text-[10px] text-rcd-muted">
+              +{scatter.droppedSeries} more series not shown
+            </div>
+          )}
         </div>
       );
+    }
+
+    case 'kpi': {
+      const row = result.rows[0];
+      const primary = measureColumns[0];
+      if (!row || !primary) return <Placeholder>KPI needs a measure.</Placeholder>;
+
+      const kpiText = (value: CellValue, column: QueryColumn): string =>
+        typeof value === 'number' && format.valueFormat
+          ? formatCellValue(value, formatHintColumn(format.valueFormat))
+          : formatCellValue(value, column);
+
+      const primaryValue = row[result.columns.indexOf(primary)] ?? null;
+      const secondary = measureColumns[1];
+      const secondaryValue = secondary ? (row[result.columns.indexOf(secondary)] ?? null) : null;
+
+      return (
+        <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
+          <div className="text-4xl font-semibold tabular-nums text-rcd-text">
+            {kpiText(primaryValue, primary)}
+          </div>
+          <div className="text-sm text-rcd-text-2">{primary.label}</div>
+          {secondary && (
+            <div className="mt-1 text-sm tabular-nums text-rcd-muted">
+              {kpiText(secondaryValue, secondary)} {secondary.label}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    case 'table': {
+      const rows = result.rows.slice(0, TABLE_ROW_CAP);
+      return (
+        <div className="h-full w-full overflow-auto">
+          <table className="w-full border-separate border-spacing-0 text-sm">
+            <thead>
+              <tr>
+                {result.columns.map((column) => (
+                  <th
+                    key={column.name}
+                    className={`sticky top-0 border-b border-rcd-border bg-rcd-surface px-3 py-2 text-xs font-semibold text-rcd-text-2 ${
+                      column.role === 'measure' ? 'text-right' : 'text-left'
+                    }`}
+                  >
+                    {column.label}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, rowIndex) => (
+                <tr key={rowIndex} className="hover:bg-black/5 dark:hover:bg-white/10">
+                  {result.columns.map((column, columnIndex) => (
+                    <td
+                      key={column.name}
+                      className={`border-b border-rcd-border px-3 py-1.5 text-rcd-text ${
+                        column.role === 'measure' ? 'text-right tabular-nums' : 'text-left'
+                      }`}
+                    >
+                      {formatCellValue(row[columnIndex] ?? null, column)}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {result.rows.length > TABLE_ROW_CAP && (
+            <div className="px-3 py-2 text-xs text-rcd-muted">
+              Showing {TABLE_ROW_CAP} of {result.rows.length} rows
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    default:
+      return <Placeholder>Chart type “{spec.type}” isn’t supported.</Placeholder>;
   }
 }

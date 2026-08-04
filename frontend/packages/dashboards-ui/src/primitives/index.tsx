@@ -88,7 +88,16 @@ export function RcdDialog({ title, open, onClose, children, footer, wide }: RcdD
   useEffect(() => {
     if (!open) return;
     const previouslyFocused = document.activeElement as HTMLElement | null;
-    panelRef.current?.focus();
+    // Focus the first focusable element (not the panel), and never steal focus
+    // when it is already inside the panel (e.g. an autoFocus input) — stealing
+    // it dropped keystrokes from users clicking an input right after open.
+    const panel = panelRef.current;
+    if (panel && !panel.contains(document.activeElement)) {
+      const firstFocusable = panel.querySelector<HTMLElement>(
+        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+      );
+      (firstFocusable ?? panel).focus();
+    }
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {

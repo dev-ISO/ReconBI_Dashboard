@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Pencil, Plus, Share2 } from 'lucide-react';
+import { Pencil, Plus, Share2, SlidersHorizontal } from 'lucide-react';
 import { ConfirmDialog, RcdButton } from '../primitives';
 
 export interface DashboardToolbarProps {
@@ -13,6 +13,9 @@ export interface DashboardToolbarProps {
   readonly: boolean;
   onEnterEdit: () => void;
   onAddChart: () => void;
+  onAddSlicer: () => void;
+  /** Disables Add slicer (no model attached). */
+  addSlicerDisabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
 }
@@ -28,6 +31,8 @@ export function DashboardToolbar({
   readonly,
   onEnterEdit,
   onAddChart,
+  onAddSlicer,
+  addSlicerDisabled,
   onSave,
   onDiscard,
 }: DashboardToolbarProps) {
@@ -73,6 +78,14 @@ export function DashboardToolbar({
               <RcdButton onClick={onAddChart}>
                 <Plus size={14} />
                 Add chart
+              </RcdButton>
+              <RcdButton
+                onClick={onAddSlicer}
+                disabled={addSlicerDisabled}
+                title={addSlicerDisabled ? 'Attach a model to add slicers' : undefined}
+              >
+                <SlidersHorizontal size={14} />
+                Add slicer
               </RcdButton>
               <RcdButton onClick={handleDiscard} disabled={saving}>
                 Discard

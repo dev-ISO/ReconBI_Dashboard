@@ -1,15 +1,14 @@
 import { useDroppable } from '@dnd-kit/core';
-import { Sigma, X } from 'lucide-react';
+import { Filter, Sigma, X } from 'lucide-react';
 import {
   isTemporalType,
-  tableKey,
   type Aggregation,
   type Catalog,
   type ChartQuery,
   type ChartType,
-  type ColumnType,
   type DateBucket,
   type DimensionRef,
+  type FilterClause,
   type MeasureRef,
   type ModelDefinition,
 } from '@recon/dashboards-core';
@@ -17,6 +16,10 @@ import { RcdSelect } from '../primitives';
 import {
   aggregationOptionsFor,
   canAccept,
+  columnLabelOf,
+  columnTypeOf,
+  FILTERS_WELL,
+  filterSummary,
   wellsFor,
   type FieldDragData,
   type WellDef,
@@ -28,6 +31,8 @@ export interface WellsProps {
   model: ModelDefinition;
   catalog: Catalog | null;
   onChange: (query: ChartQuery) => void;
+  /** Opens the FilterEditor for an existing clause in query.filters. */
+  onEditFilter: (index: number) => void;
 }
 
 const DATE_BUCKETS: { value: DateBucket; label: string }[] = [
@@ -47,16 +52,8 @@ const AGG_LABELS: Record<Aggregation, string> = {
   countDistinct: 'Distinct count',
 };
 
-const columnTypeOf = (catalog: Catalog | null, table: string, column: string): ColumnType | null =>
-  catalog?.tables.find((t) => t.key === table)?.columns.find((c) => c.name === column)?.type ?? null;
-
-const columnLabelOf = (model: ModelDefinition, table: string, column: string): string => {
-  const modelTable = model.tables.find((t) => tableKey(t.schema, t.name) === table);
-  return modelTable?.columns?.find((c) => c.name === column)?.friendlyName ?? column;
-};
-
-/** Axis / Legend / Values drop targets with chip editing for the open query. */
-export function Wells({ chartType, query, model, catalog, onChange }: WellsProps) {
+/** Per-type wells (axis/legend/values) plus the universal Filters well. */
+export function Wells({ chartType, query, model, catalog, onChange, onEditFilter }: WellsProps) {
   const removeMeasure = (index: number) =>
     onChange({ ...query, measures: query.measures.filter((_, i) => i !== index) });
 
@@ -65,6 +62,9 @@ export function Wells({ chartType, query, model, catalog, onChange }: WellsProps
       ...query,
       measures: query.measures.map((m, i) => (i === index ? { ...m, aggregation } : m)),
     });
+
+  const removeFilter = (index: number) =>
+    onChange({ ...query, filters: query.filters.filter((_, i) => i !== index) });
 
   const renderWell = (def: WellDef) => {
     if (def.id === 'values') {
@@ -104,7 +104,23 @@ export function Wells({ chartType, query, model, catalog, onChange }: WellsProps
     );
   };
 
-  return <div className="flex flex-col gap-2.5">{wellsFor(chartType).map(renderWell)}</div>;
+  return (
+    <div className="flex flex-col gap-2.5">
+      {wellsFor(chartType).map(renderWell)}
+
+      <Well def={FILTERS_WELL} empty={query.filters.length === 0}>
+        {query.filters.map((clause, index) => (
+          <FilterChip
+            key={`${clause.table}.${clause.column}.${clause.operator}-${index}`}
+            clause={clause}
+            model={model}
+            onEdit={() => onEditFilter(index)}
+            onRemove={() => removeFilter(index)}
+          />
+        ))}
+      </Well>
+    </div>
+  );
 }
 
 function Well({ def, empty, children }: { def: WellDef; empty: boolean; children: React.ReactNode }) {
@@ -163,6 +179,42 @@ function Chip({
       <button
         type="button"
         aria-label={`Remove ${label}`}
+        onClick={onRemove}
+        className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
+function FilterChip({
+  clause,
+  model,
+  onEdit,
+  onRemove,
+}: {
+  clause: FilterClause;
+  model: ModelDefinition;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
+  const text = `${columnLabelOf(model, clause.table, clause.column)} · ${filterSummary(clause)}`;
+
+  return (
+    <div className="flex items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
+      <Filter size={12} className="shrink-0 text-rcd-muted" />
+      <button
+        type="button"
+        onClick={onEdit}
+        title={`Edit filter: ${text}`}
+        className="min-w-0 flex-1 truncate text-left font-medium hover:text-rcd-accent"
+      >
+        {text}
+      </button>
+      <button
+        type="button"
+        aria-label={`Remove filter ${text}`}
         onClick={onRemove}
         className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
       >

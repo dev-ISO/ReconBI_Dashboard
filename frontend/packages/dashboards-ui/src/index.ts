@@ -19,8 +19,18 @@ export type { ModelCanvasProps, CanvasNode, CanvasEdge } from './model-canvas/Mo
 
 export { ChartTile } from './chart/ChartTile';
 export type { ChartTileProps } from './chart/ChartTile';
-export { shapeChartData } from './chart/chartData';
-export type { ChartSeries, ShapedChartData } from './chart/chartData';
+export { shapeChartData, shapePieData, shapeScatterData, SCATTER_SERIES_CAP } from './chart/chartData';
+export type {
+  ChartSeries,
+  ShapedChartData,
+  PieSlice,
+  ShapedPieData,
+  ScatterPoint,
+  ScatterSeries,
+  ShapedScatterData,
+} from './chart/chartData';
+export { FormatPanel } from './chart/FormatPanel';
+export type { FormatPanelProps } from './chart/FormatPanel';
 
 export {
   RcdButton,

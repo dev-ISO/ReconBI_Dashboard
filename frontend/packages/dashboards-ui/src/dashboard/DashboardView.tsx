@@ -10,8 +10,10 @@ import { ChartBuilder } from '../chart-builder/ChartBuilder';
 import { ChartTile } from '../chart/ChartTile';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
+import { AddSlicerDialog } from './AddSlicerDialog';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardToolbar } from './DashboardToolbar';
+import { SlicerBar } from './SlicerBar';
 import { TileFrame } from './TileFrame';
 
 export interface DashboardViewProps {
@@ -41,6 +43,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [openError, setOpenError] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
   const [builder, setBuilder] = useState<{ tileId: string | null; spec: ChartSpec } | null>(null);
+  const [addSlicerOpen, setAddSlicerOpen] = useState(false);
 
   const openDashboard = useCallback(() => {
     setOpenError(null);
@@ -51,7 +54,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
   useEffect(() => {
     openDashboard();
-    return () => runtime.dashboards.close();
+    return () => {
+      // Never close() an active edit session: StrictMode remounts this effect
+      // (mount → cleanup → mount), and an unconditional close() here wiped the
+      // 'edit' state a fresh create() had just set — the remount's open() then
+      // re-fetched the dashboard into view mode. View-mode sessions still close
+      // so a later visit re-fetches fresh data.
+      if (runtime.dashboards.store.getState().mode !== 'edit') runtime.dashboards.close();
+    };
   }, [runtime, openDashboard]);
 
   const modelId = current?.id === dashboardId ? current.modelId : null;
@@ -204,9 +214,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         readonly={readonly}
         onEnterEdit={() => runtime.dashboards.enterEdit()}
         onAddChart={openAddChart}
+        onAddSlicer={() => setAddSlicerOpen(true)}
+        addSlicerDisabled={modelId === null}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
       />
+
+      {modelId !== null && <SlicerBar modelId={modelId} editable={editable} />}
 
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {tiles.length === 0 ? (
@@ -246,6 +260,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       >
         {builderBody}
       </RcdDialog>
+
+      {modelId !== null && (
+        <AddSlicerDialog
+          open={addSlicerOpen}
+          modelId={modelId}
+          onClose={() => setAddSlicerOpen(false)}
+        />
+      )}
     </div>
   );
 }

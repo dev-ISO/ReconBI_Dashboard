@@ -124,6 +124,11 @@ public sealed class QueryCompiler(ISqlDialect dialect)
 
     // ---------- Phase 2: emission ----------
 
+    /// <summary>
+    /// Emits the final parameterized statement. When <see cref="ChartQuerySpec.TopN"/>
+    /// is set, the ranking measure defines the row order and any explicit
+    /// <see cref="ChartQuerySpec.Sort"/> is ignored.
+    /// </summary>
     public CompiledQuery Emit(
         PreparedQuery prepared,
         ChartQuerySpec spec,
@@ -133,6 +138,7 @@ public sealed class QueryCompiler(ISqlDialect dialect)
     {
         var bag = new ParameterBag();
         var plan = prepared.Plan;
+        var warnings = CollectFanOutWarnings(prepared);
 
         var dimensionExprs = prepared.Dimensions
             .Select(d => DimensionExpression(d, plan))
@@ -160,25 +166,19 @@ public sealed class QueryCompiler(ISqlDialect dialect)
 
         AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
 
+        var effectiveLimit = EffectiveLimit(spec.Limit, limits, sourceOptions);
+
+        if (spec.TopN is { } topN)
+        {
+            return EmitTopN(
+                prepared, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings);
+        }
+
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
 
-        var effectiveLimit = EffectiveLimit(spec.Limit, limits, sourceOptions);
         var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
 
-        var sql = new StringBuilder();
-        sql.Append("SELECT ").Append(string.Join(",\n       ", selectItems));
-        sql.Append('\n').Append("FROM ").Append(FromClause(plan, prepared.Schema));
-        AppendJoins(sql, plan, prepared.Schema);
-
-        if (whereParts.Count > 0)
-        {
-            sql.Append('\n').Append("WHERE ").Append(string.Join("\n  AND ", whereParts));
-        }
-
-        if (prepared.Dimensions.Count > 0)
-        {
-            sql.Append('\n').Append("GROUP BY ").Append(string.Join(", ", dimensionExprs));
-        }
+        var sql = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
 
         if (orderParts.Count > 0)
         {
@@ -187,7 +187,127 @@ public sealed class QueryCompiler(ISqlDialect dialect)
 
         sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
-        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared), Warnings: []);
+        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared), warnings);
+    }
+
+    /// <summary>
+    /// Top-N emission. Without "Others" this is the normal aggregate ordered by
+    /// the ranking measure (descending, dimension as tie-breaker) limited to N.
+    /// With "Others" the aggregate becomes a CTE, rows are ranked with
+    /// ROW_NUMBER(), and an outer GROUP BY folds everything past rank N into a
+    /// single NULL-dimension bucket. Additive aggregations (Sum/Count/Min/Max)
+    /// re-aggregate for the Others row; Avg/CountDistinct cannot and yield NULL
+    /// there (with a QRY_OTHERS_UNSUPPORTED_AGG warning) while top rows keep
+    /// their exact values because each ranks as its own single-row group.
+    /// </summary>
+    private CompiledQuery EmitTopN(
+        PreparedQuery prepared,
+        TopNSpec topN,
+        IReadOnlyList<string> dimensionExprs,
+        IReadOnlyList<string> selectItems,
+        IReadOnlyList<string> measureExprs,
+        IReadOnlyList<string> whereParts,
+        int effectiveLimit,
+        ParameterBag bag,
+        List<EngineWarning> warnings)
+    {
+        if (prepared.Dimensions.Count != 1)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_TOPN",
+                $"Top N applies to a chart with exactly one dimension; this query has {prepared.Dimensions.Count}.");
+        }
+
+        if (topN.ByMeasureIndex < 0 || topN.ByMeasureIndex >= prepared.Measures.Count)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_SORT", $"Top N ranks by measure {topN.ByMeasureIndex}, which does not exist.");
+        }
+
+        var n = Math.Clamp(topN.N, 1, effectiveLimit);
+        var plan = prepared.Plan;
+        var rankAlias = dialect.QuoteIdentifier($"meas{topN.ByMeasureIndex}");
+
+        if (!topN.IncludeOthers)
+        {
+            var rankRef = dialect.SupportsSelectAliasInOrderBy ? rankAlias : measureExprs[topN.ByMeasureIndex];
+            var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(n + 1), NormalizedType.Integer));
+
+            var flat = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+            flat.Append('\n').Append("ORDER BY ")
+                .Append(rankRef).Append(" DESC").Append(dialect.NullsLastSuffix)
+                .Append(", ").Append(dimensionExprs[0]).Append(" ASC").Append(dialect.NullsLastSuffix);
+            flat.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+
+            return new CompiledQuery(flat.ToString(), bag.Parameters, BuildColumnPlans(prepared), warnings);
+        }
+
+        var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+
+        var nPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)n, NormalizedType.Integer));
+        var outerLimitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
+
+        var dimAlias = dialect.QuoteIdentifier("dim0");
+        var rnAlias = dialect.QuoteIdentifier("rn");
+        var isTopAlias = dialect.QuoteIdentifier("is_topn");
+
+        var outerItems = new List<string>
+        {
+            $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {dimAlias} END AS {dimAlias}",
+            $"({rnAlias} <= {nPlaceholder}) AS {isTopAlias}",
+        };
+
+        for (var i = 0; i < prepared.Measures.Count; i++)
+        {
+            var measure = prepared.Measures[i];
+            var measAlias = dialect.QuoteIdentifier($"meas{i}");
+            string expr;
+            switch (measure.Aggregation)
+            {
+                case Aggregation.Sum:
+                case Aggregation.Count:
+                    expr = dialect.Aggregate(Aggregation.Sum, measAlias);
+                    break;
+                case Aggregation.Min:
+                    expr = dialect.Aggregate(Aggregation.Min, measAlias);
+                    break;
+                case Aggregation.Max:
+                    expr = dialect.Aggregate(Aggregation.Max, measAlias);
+                    break;
+                default:
+                    // Avg / CountDistinct are not re-aggregatable. Top rows are
+                    // single-row groups, so SUM passes their exact value through;
+                    // the Others row sums only NULLs and stays NULL.
+                    expr = dialect.Aggregate(
+                        Aggregation.Sum, $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {measAlias} END");
+                    warnings.Add(new EngineWarning(
+                        "QRY_OTHERS_UNSUPPORTED_AGG",
+                        $"Measure '{measure.Label}' uses {measure.Aggregation}, which cannot be combined into an 'Others' bucket; the Others row has no value for it."));
+                    break;
+            }
+
+            outerItems.Add($"{expr} AS {measAlias}");
+        }
+
+        var sql = new StringBuilder();
+        sql.Append("WITH ").Append(dialect.QuoteIdentifier("base")).Append(" AS (\n");
+        sql.Append(inner);
+        sql.Append("\n),\n");
+        sql.Append(dialect.QuoteIdentifier("ranked")).Append(" AS (\n");
+        sql.Append("SELECT *, ROW_NUMBER() OVER (ORDER BY ")
+            .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix)
+            .Append(", ").Append(dimAlias).Append(" ASC").Append(dialect.NullsLastSuffix)
+            .Append(") AS ").Append(rnAlias);
+        sql.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("base"));
+        sql.Append("\n)\n");
+        sql.Append("SELECT ").Append(string.Join(",\n       ", outerItems));
+        sql.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("ranked"));
+        sql.Append('\n').Append("GROUP BY 1, 2");
+        sql.Append('\n').Append("ORDER BY ").Append(isTopAlias).Append(" DESC, ")
+            .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix);
+        sql.Append('\n').Append(dialect.LimitClause(outerLimitPlaceholder));
+
+        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings);
     }
 
     public CompiledQuery EmitDistinct(
@@ -454,6 +574,98 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         }
     }
 
+    /// <summary>SELECT ... FROM ... JOINs ... WHERE ... GROUP BY — no ORDER BY or LIMIT.</summary>
+    private StringBuilder BuildAggregateCore(
+        IReadOnlyList<string> selectItems,
+        JoinPlan plan,
+        DatabaseSchema schema,
+        IReadOnlyList<string> whereParts,
+        IReadOnlyList<string> groupByExprs)
+    {
+        var sql = new StringBuilder();
+        sql.Append("SELECT ").Append(string.Join(",\n       ", selectItems));
+        sql.Append('\n').Append("FROM ").Append(FromClause(plan, schema));
+        AppendJoins(sql, plan, schema);
+
+        if (whereParts.Count > 0)
+        {
+            sql.Append('\n').Append("WHERE ").Append(string.Join("\n  AND ", whereParts));
+        }
+
+        if (groupByExprs.Count > 0)
+        {
+            sql.Append('\n').Append("GROUP BY ").Append(string.Join(", ", groupByExprs));
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// A LEFT JOIN whose child table is the MANY side of its relationship
+    /// multiplies the rows of every table outside that child's subtree; any
+    /// aggregate over those tables may be over-counted. The standard star case
+    /// (base fact joins ONE-side dimension tables) never warns.
+    /// </summary>
+    private static List<EngineWarning> CollectFanOutWarnings(PreparedQuery prepared)
+    {
+        var warnings = new List<EngineWarning>();
+        if (prepared.Plan.Steps.Count == 0)
+        {
+            return warnings;
+        }
+
+        var parentOf = prepared.Plan.Steps.ToDictionary(
+            s => s.TableKey, s => s.ParentTableKey, StringComparer.Ordinal);
+        var seen = new HashSet<(int Measure, string Child)>();
+
+        foreach (var step in prepared.Plan.Steps)
+        {
+            // Fan-out needs a many-to-one edge entered from its ONE side: the
+            // joined child is the relationship's FromTable (the many side).
+            // One-to-one edges never multiply rows.
+            if (step.Via.Cardinality != Cardinality.ManyToOne
+                || !string.Equals(step.TableKey, step.Via.FromTable, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            for (var i = 0; i < prepared.Measures.Count; i++)
+            {
+                var measure = prepared.Measures[i];
+                if (IsInSubtree(measure.Table.Key, step.TableKey, parentOf) || !seen.Add((i, step.TableKey)))
+                {
+                    continue;
+                }
+
+                warnings.Add(new EngineWarning(
+                    "QRY_FANOUT",
+                    $"Measure '{measure.Label}' may be over-counted: joining '{step.TableKey}' multiplies rows of '{measure.Table.Key}' (relationship {step.Via.FromTable}->{step.Via.ToTable})."));
+            }
+        }
+
+        return warnings;
+    }
+
+    /// <summary>True when walking the join-plan parent chain from <paramref name="table"/> reaches <paramref name="root"/>.</summary>
+    private static bool IsInSubtree(string table, string root, IReadOnlyDictionary<string, string> parentOf)
+    {
+        var walk = table;
+        while (true)
+        {
+            if (string.Equals(walk, root, StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            if (!parentOf.TryGetValue(walk, out var parent))
+            {
+                return false; // reached the base table
+            }
+
+            walk = parent;
+        }
+    }
+
     private string DimensionExpression(ResolvedDimension dimension, JoinPlan plan)
     {
         var expr = QualifiedColumn(plan.AliasByTable[dimension.Table.Key], dimension.Column.Name);
@@ -629,7 +841,7 @@ public sealed class QueryCompiler(ISqlDialect dialect)
     private static string EscapeLikePattern(string value) =>
         value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
-    private static IReadOnlyList<ResultColumnPlan> BuildColumnPlans(PreparedQuery prepared)
+    private static IReadOnlyList<ResultColumnPlan> BuildColumnPlans(PreparedQuery prepared, bool includeIsTopN = false)
     {
         var columns = new List<ResultColumnPlan>();
         for (var i = 0; i < prepared.Dimensions.Count; i++)
@@ -638,6 +850,13 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             columns.Add(new ResultColumnPlan(
                 $"dim{i}", d.Label, ResultColumnRole.Dimension, d.Column.Type,
                 $"{d.Table.Key}.{d.Column.Name}", d.Spec.DateBucket, d.FormatHint));
+        }
+
+        if (includeIsTopN)
+        {
+            columns.Add(new ResultColumnPlan(
+                "is_topn", "Is Top N", ResultColumnRole.Dimension, NormalizedType.Boolean,
+                Source: null, DateBucket: null, FormatHint: null));
         }
 
         for (var i = 0; i < prepared.Measures.Count; i++)

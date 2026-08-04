@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { NavLink, Route, Routes } from 'react-router-dom';
 import { LayoutDashboard, Database, Network, FlaskConical, Moon, Sun } from 'lucide-react';
 import { DashboardsProvider } from '@recon/dashboards-ui';
@@ -21,15 +21,22 @@ const navItems = [
 export function App() {
   const { theme, toggle } = useTheme();
   const currentUser = useCurrentUser();
+  // Gate routed content until the auto-login settles so first fetches never
+  // fire tokenless 401s. 'idle' also gates (covers the pre-effect first paint).
+  const [autoLogin, setAutoLogin] = useState<'idle' | 'pending' | 'done'>('idle');
 
   // Default to carol so the portal works immediately after `docker compose up`.
   useEffect(() => {
-    if (!currentUser) {
-      loginAs('carol').catch(() => {
+    if (currentUser) return;
+    setAutoLogin('pending');
+    loginAs('carol')
+      .catch(() => {
         // demo API not up yet; the pages show their own error states
-      });
-    }
+      })
+      .finally(() => setAutoLogin('done'));
   }, [currentUser]);
+
+  const signingIn = !currentUser && autoLogin !== 'done';
 
   return (
     <div className="flex h-screen">
@@ -84,14 +91,23 @@ export function App() {
         </header>
         <main className="min-h-0 flex-1 overflow-auto">
           <DashboardsProvider baseUrl="/api/rcd/v1" fetcher={portalFetcher}>
-            <Routes>
-              <Route path="/" element={<DashboardListPage />} />
-              <Route path="/dashboards/:id" element={<DashboardPage />} />
-              <Route path="/models" element={<ModelListPage />} />
-              <Route path="/models/:id" element={<ModelEditorPage />} />
-              <Route path="/connections" element={<ConnectionsPage />} />
-              <Route path="/spike" element={<SpikePage />} />
-            </Routes>
+            {signingIn ? (
+              <div className="flex h-full items-center justify-center">
+                <div className="flex items-center gap-2 text-sm opacity-70" role="status">
+                  <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-black/20 border-t-[var(--color-accent)] dark:border-white/20" />
+                  Signing in…
+                </div>
+              </div>
+            ) : (
+              <Routes>
+                <Route path="/" element={<DashboardListPage />} />
+                <Route path="/dashboards/:id" element={<DashboardPage />} />
+                <Route path="/models" element={<ModelListPage />} />
+                <Route path="/models/:id" element={<ModelEditorPage />} />
+                <Route path="/connections" element={<ConnectionsPage />} />
+                <Route path="/spike" element={<SpikePage />} />
+              </Routes>
+            )}
           </DashboardsProvider>
         </main>
       </div>

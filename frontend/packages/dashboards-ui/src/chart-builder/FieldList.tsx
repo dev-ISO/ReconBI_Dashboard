@@ -2,6 +2,7 @@ import { useDraggable } from '@dnd-kit/core';
 import {
   Braces,
   CalendarDays,
+  Filter,
   Hash,
   KeyRound,
   Sigma,
@@ -24,6 +25,8 @@ export interface FieldListProps {
   catalog: Catalog | null;
   /** Click-to-add: the builder routes the entry to the most sensible well. */
   onAdd: (data: FieldDragData) => void;
+  /** Funnel affordance on column rows: adds the column as a chart filter. */
+  onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
 }
 
 const typeIcon = (type: ColumnType) => {
@@ -46,7 +49,7 @@ const typeIcon = (type: ColumnType) => {
 };
 
 /** Model-scoped field pane: one section per model table plus a Measures section. */
-export function FieldList({ model, catalog, onAdd }: FieldListProps) {
+export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps) {
   const tables = model.tables.filter((table) => !table.hidden);
 
   return (
@@ -58,7 +61,13 @@ export function FieldList({ model, catalog, onAdd }: FieldListProps) {
       )}
       {catalog !== null &&
         tables.map((table) => (
-          <TableSection key={tableKey(table.schema, table.name)} table={table} catalog={catalog} onAdd={onAdd} />
+          <TableSection
+            key={tableKey(table.schema, table.name)}
+            table={table}
+            catalog={catalog}
+            onAdd={onAdd}
+            onAddFilter={onAddFilter}
+          />
         ))}
 
       <SectionHeader icon={<Sigma size={12} />} label="Measures" />
@@ -84,10 +93,12 @@ function TableSection({
   table,
   catalog,
   onAdd,
+  onAddFilter,
 }: {
   table: ModelTable;
   catalog: Catalog;
   onAdd: (data: FieldDragData) => void;
+  onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
 }) {
   const key = tableKey(table.schema, table.name);
   const catalogTable = catalog.tables.find((t) => t.key === key);
@@ -105,16 +116,25 @@ function TableSection({
       ) : columns.length === 0 ? (
         <p className="px-3 py-1 text-xs text-rcd-muted">No queryable columns.</p>
       ) : (
-        columns.map((column) => (
-          <FieldEntry
-            key={column.name}
-            id={`column:${key}:${column.name}`}
-            data={{ kind: 'column', table: key, column: column.name, type: column.type }}
-            label={overrides.get(column.name)?.friendlyName ?? column.name}
-            icon={typeIcon(column.type)}
-            onAdd={onAdd}
-          />
-        ))
+        columns.map((column) => {
+          const data = {
+            kind: 'column',
+            table: key,
+            column: column.name,
+            type: column.type,
+          } as const;
+          return (
+            <FieldEntry
+              key={column.name}
+              id={`column:${key}:${column.name}`}
+              data={data}
+              label={overrides.get(column.name)?.friendlyName ?? column.name}
+              icon={typeIcon(column.type)}
+              onAdd={onAdd}
+              onFilter={onAddFilter ? () => onAddFilter(data) : undefined}
+            />
+          );
+        })
       )}
     </>
   );
@@ -137,29 +157,47 @@ function FieldEntry({
   label,
   icon,
   onAdd,
+  onFilter,
 }: {
   id: string;
   data: FieldDragData;
   label: string;
   icon: React.ReactNode;
   onAdd: (data: FieldDragData) => void;
+  /** When present, shows the funnel button that adds the field as a filter. */
+  onFilter?: () => void;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id, data });
 
   return (
-    <button
-      type="button"
-      ref={setNodeRef}
-      {...attributes}
-      {...listeners}
-      onClick={() => onAdd(data)}
-      title="Drag into a well, or click to add"
-      className={`mx-1 flex cursor-grab items-center gap-2 rounded-md px-2 py-1 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10 ${
+    <div
+      className={`group mx-1 flex items-center rounded-md hover:bg-black/5 dark:hover:bg-white/10 ${
         isDragging ? 'opacity-40' : ''
       }`}
     >
-      <span className="shrink-0 text-rcd-muted">{icon}</span>
-      <span className="truncate">{label}</span>
-    </button>
+      <button
+        type="button"
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
+        onClick={() => onAdd(data)}
+        title="Drag into a well, or click to add"
+        className="flex min-w-0 flex-1 cursor-grab items-center gap-2 px-2 py-1 text-left text-sm text-rcd-text"
+      >
+        <span className="shrink-0 text-rcd-muted">{icon}</span>
+        <span className="truncate">{label}</span>
+      </button>
+      {onFilter && (
+        <button
+          type="button"
+          aria-label={`Filter by ${label}`}
+          title={`Filter by ${label}`}
+          onClick={onFilter}
+          className="mr-1 shrink-0 rounded p-1 text-rcd-muted opacity-0 hover:bg-black/10 hover:text-rcd-text focus-visible:opacity-100 group-hover:opacity-100 dark:hover:bg-white/10"
+        >
+          <Filter size={12} />
+        </button>
+      )}
+    </div>
   );
 }
