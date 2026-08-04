@@ -60,6 +60,23 @@ builder.Services.AddControllers()
             ds.ConnectionString = demoDataConnection;
             ds.Description = "Seeded plant-maintenance demo database (read-only chart_reader role)";
         });
+
+        // Optional extra sources (e.g. other apps' LOCAL dev databases) from
+        // configuration that never gets committed (appsettings.Development.json
+        // is gitignored). Sessions are read-only by default; nothing in those
+        // databases is ever modified.
+        foreach (var section in builder.Configuration.GetSection("ExtraDataSources").GetChildren())
+        {
+            var extraConnection = section["ConnectionString"];
+            if (!string.IsNullOrWhiteSpace(extraConnection))
+            {
+                rcd.AddPostgresDataSource(section.Key, ds =>
+                {
+                    ds.ConnectionString = extraConnection;
+                    ds.Description = section["Description"] ?? "External database (read-only session)";
+                });
+            }
+        }
     });
 
 builder.Services.AddHttpContextAccessor();
