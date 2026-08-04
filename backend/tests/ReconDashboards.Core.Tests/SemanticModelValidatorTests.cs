@@ -331,6 +331,58 @@ public class SemanticModelValidatorTests
         Assert.Contains(result.Errors, e => e.Code == "MDL008" && e.Message.Contains("no source column"));
     }
 
+    [Theory]
+    [InlineData(Aggregation.StdDev)]
+    [InlineData(Aggregation.Variance)]
+    [InlineData(Aggregation.Median)]
+    public void StatisticalAggregationOverTextColumnReportsAggregationError(Aggregation aggregation)
+    {
+        var definition = CustomersAndOrders(
+            measures:
+            [
+                TestFixtures.BuildMeasure("Bad Stat", "public.orders", aggregation, "status"),
+            ]);
+
+        var result = Validate(definition);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Code == "MDL008");
+    }
+
+    [Fact]
+    public void MedianOverDateColumnReportsAggregationError()
+    {
+        var definition = CustomersAndOrders(
+            measures:
+            [
+                TestFixtures.BuildMeasure("Median Date", "public.orders", Aggregation.Median, "order_date"),
+            ]);
+
+        var result = Validate(definition);
+
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Errors, e => e.Code == "MDL008");
+    }
+
+    [Theory]
+    [InlineData(Aggregation.StdDev)]
+    [InlineData(Aggregation.Variance)]
+    [InlineData(Aggregation.Median)]
+    public void StatisticalAggregationOverNumericColumnIsAllowed(Aggregation aggregation)
+    {
+        var definition = CustomersAndOrders(
+            measures:
+            [
+                TestFixtures.BuildMeasure("Stat Total", "public.orders", aggregation, "order_total"),
+                TestFixtures.BuildMeasure("Stat Id", "public.orders", aggregation, "customer_id"),
+            ]);
+
+        var result = Validate(definition);
+
+        Assert.True(result.IsValid);
+        Assert.Empty(result.Issues);
+    }
+
     [Fact]
     public void MinOverDateColumnIsAllowed()
     {

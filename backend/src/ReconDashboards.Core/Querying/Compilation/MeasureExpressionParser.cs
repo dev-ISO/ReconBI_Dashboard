@@ -39,7 +39,8 @@ public sealed class MeasureExpressionParseException(string reason, int position)
 ///   term    := unary (('*' | '/') unary)*
 ///   unary   := '-' unary | primary
 ///   primary := number | '(' expr ')' | '[' measure name ']' | agg '(' arg ')'
-///   agg     := sum | avg | min | max | count | countDistinct   (case-insensitive)
+///   agg     := sum | avg | min | max | count | countDistinct
+///            | stdDev | variance | median                       (case-insensitive)
 ///   arg     := '*' (count only) | ident '.' ident '.' ident    (schema.table.column)
 ///
 /// Whitespace-insensitive. This is the SECURITY chokepoint for expressions:
@@ -309,10 +310,22 @@ public static class MeasureExpressionParser
             {
                 aggregation = Aggregation.CountDistinct;
             }
+            else if (string.Equals(name, "stddev", StringComparison.OrdinalIgnoreCase))
+            {
+                aggregation = Aggregation.StdDev;
+            }
+            else if (string.Equals(name, "variance", StringComparison.OrdinalIgnoreCase))
+            {
+                aggregation = Aggregation.Variance;
+            }
+            else if (string.Equals(name, "median", StringComparison.OrdinalIgnoreCase))
+            {
+                aggregation = Aggregation.Median;
+            }
             else
             {
                 _position = namePosition;
-                throw Error($"unknown function '{name}' (expected sum, avg, min, max, count, or countDistinct)");
+                throw Error($"unknown function '{name}' (expected sum, avg, min, max, count, countDistinct, stdDev, variance, or median)");
             }
 
             SkipWhitespace();

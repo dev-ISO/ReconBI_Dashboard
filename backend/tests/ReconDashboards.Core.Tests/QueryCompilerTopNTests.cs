@@ -177,6 +177,32 @@ LIMIT @p1
         Assert.Contains("Avg of order_total", warning.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(Aggregation.StdDev, "StdDev")]
+    [InlineData(Aggregation.Variance, "Variance")]
+    [InlineData(Aggregation.Median, "Median")]
+    public void StatisticalMeasuresInOthersPassTopValuesThroughAndWarn(
+        Aggregation aggregation, string expectedName)
+    {
+        // StdDev/Variance/Median are non-additive like Avg: top rows pass
+        // through via SUM over single-row groups, the Others row stays NULL.
+        var compiled = Compile(Spec(
+            new TopNSpec(3, 0, IncludeOthers: true),
+            measures:
+            [
+                SumOrderTotal(),
+                new MeasureSpec(null, "public.orders", "order_total", aggregation, null),
+            ]));
+
+        Assert.Contains(
+            "SUM(CASE WHEN \"rn\" <= @p0 THEN \"meas1\" END) AS \"meas1\"",
+            compiled.Sql, StringComparison.Ordinal);
+
+        var warning = Assert.Single(compiled.Warnings);
+        Assert.Equal("QRY_OTHERS_UNSUPPORTED_AGG", warning.Code);
+        Assert.Contains(expectedName, warning.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void MinAndMaxMeasuresReAggregateInTheOthersBucket()
     {

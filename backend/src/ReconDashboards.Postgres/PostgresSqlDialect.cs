@@ -36,6 +36,9 @@ public sealed class PostgresSqlDialect : ISqlDialect
         Aggregation.Avg => $"AVG({argumentExpression})",
         Aggregation.Min => $"MIN({argumentExpression})",
         Aggregation.Max => $"MAX({argumentExpression})",
+        Aggregation.StdDev => $"STDDEV_SAMP({argumentExpression})",
+        Aggregation.Variance => $"VAR_SAMP({argumentExpression})",
+        Aggregation.Median => $"PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY {argumentExpression})",
         _ => throw new ArgumentOutOfRangeException(nameof(aggregation)),
     };
 

@@ -487,7 +487,9 @@ public sealed class SemanticModelValidator
 
         return aggregation switch
         {
-            Aggregation.Sum or Aggregation.Avg => type is NormalizedType.Integer or NormalizedType.Decimal,
+            Aggregation.Sum or Aggregation.Avg
+                or Aggregation.StdDev or Aggregation.Variance or Aggregation.Median =>
+                type is NormalizedType.Integer or NormalizedType.Decimal,
             Aggregation.Min or Aggregation.Max => type is NormalizedType.Integer or NormalizedType.Decimal
                 or NormalizedType.Date or NormalizedType.Timestamp or NormalizedType.Text,
             Aggregation.Count or Aggregation.CountDistinct => true,

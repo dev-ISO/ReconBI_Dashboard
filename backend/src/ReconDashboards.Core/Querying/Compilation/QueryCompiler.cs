@@ -283,9 +283,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// With "Others" the aggregate becomes a CTE, rows are ranked with
     /// ROW_NUMBER(), and an outer GROUP BY folds everything past rank N into a
     /// single NULL-dimension bucket. Additive aggregations (Sum/Count/Min/Max)
-    /// re-aggregate for the Others row; Avg/CountDistinct cannot and yield NULL
-    /// there (with a QRY_OTHERS_UNSUPPORTED_AGG warning) while top rows keep
-    /// their exact values because each ranks as its own single-row group.
+    /// re-aggregate for the Others row; non-additive ones (Avg/CountDistinct/
+    /// StdDev/Variance/Median) cannot and yield NULL there (with a
+    /// QRY_OTHERS_UNSUPPORTED_AGG warning) while top rows keep their exact
+    /// values because each ranks as its own single-row group.
     /// </summary>
     private CompiledQuery EmitTopN(
         PreparedQuery prepared,
@@ -376,9 +377,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                         expr = dialect.Aggregate(Aggregation.Max, measAlias);
                         break;
                     default:
-                        // Avg / CountDistinct are not re-aggregatable. Top rows are
-                        // single-row groups, so SUM passes their exact value through;
-                        // the Others row sums only NULLs and stays NULL.
+                        // Avg / CountDistinct / StdDev / Variance / Median are not
+                        // re-aggregatable. Top rows are single-row groups, so SUM
+                        // passes their exact value through; the Others row sums
+                        // only NULLs and stays NULL.
                         expr = dialect.Aggregate(
                             Aggregation.Sum, $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {measAlias} END");
                         warnings.Add(new EngineWarning(
@@ -784,7 +786,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         return aggregation switch
         {
-            Aggregation.Sum or Aggregation.Avg => type is NormalizedType.Integer or NormalizedType.Decimal,
+            Aggregation.Sum or Aggregation.Avg
+                or Aggregation.StdDev or Aggregation.Variance or Aggregation.Median =>
+                type is NormalizedType.Integer or NormalizedType.Decimal,
             Aggregation.Min or Aggregation.Max => type is NormalizedType.Integer or NormalizedType.Decimal
                 or NormalizedType.Date or NormalizedType.Timestamp or NormalizedType.Text,
             Aggregation.Count or Aggregation.CountDistinct => true,
@@ -1183,7 +1187,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 ? NormalizedType.Decimal // arithmetic (esp. division) promotes
                 : m.Aggregation is Aggregation.Count or Aggregation.CountDistinct
                     ? NormalizedType.Integer
-                    : m.Aggregation == Aggregation.Avg
+                    : m.Aggregation is Aggregation.Avg
+                        or Aggregation.StdDev or Aggregation.Variance or Aggregation.Median
                         ? NormalizedType.Decimal
                         : m.Column?.Type ?? NormalizedType.Integer;
             columns.Add(new ResultColumnPlan(

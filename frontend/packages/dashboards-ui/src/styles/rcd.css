@@ -82,9 +82,17 @@ html[data-theme='dark'] .rcd-root {
 
 /* PDF export (DashboardPrintView). While the print preview overlay is open it
    adds `rcd-printing` to <body>; the overlay itself is portaled directly under
-   <body>, so hiding every OTHER body child leaves only the print sheet in the
-   output. The @page size/margin rule is injected at runtime from the chosen
-   paper + orientation (CSS alone cannot parameterize it). */
+   <body>, so hiding every OTHER body child leaves only the print sheets in the
+   output. The @page size/margin rule (explicit mm dimension pair) is injected
+   at runtime from the chosen paper + orientation (CSS alone cannot
+   parameterize it).
+
+   Pagination model: PrintSheets pre-slices the tiles into page-sized sheets
+   (.rcd-print-page > .rcd-print-sheet), each laid out at the EXACT printable
+   px size. In print every sheet becomes one page: fixed heights/padding are
+   stripped (the content fits by construction; @page applies the real margins)
+   while the inner content box keeps its exact inline pixel width, and each
+   sheet but the last forces a page break. */
 @media print {
   body.rcd-printing > :not(.rcd-print-view) {
     display: none !important;
@@ -100,28 +108,41 @@ html[data-theme='dark'] .rcd-root {
     print-color-adjust: exact;
   }
 
-  body.rcd-printing .rcd-print-toolbar {
+  body.rcd-printing .rcd-print-toolbar,
+  body.rcd-printing .rcd-print-pagenum {
     display: none !important;
   }
 
-  /* Drop the on-screen backdrop padding and the sheet's visual page margin —
-     the real margins come from @page. */
+  /* Drop the on-screen backdrop padding and inter-sheet gaps. */
   body.rcd-printing .rcd-print-stage {
     padding: 0 !important;
   }
 
+  /* One preview sheet = one printed page. */
+  body.rcd-printing .rcd-print-page {
+    margin: 0 !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  body.rcd-printing .rcd-print-page:not(:last-child) {
+    break-after: page;
+    page-break-after: always;
+  }
+
+  /* The sheet sheds its paper chrome: the visual 12mm padding is replaced by
+     the real @page margins, and the fixed paper height goes auto so nothing
+     ever spills onto a stray page. The inner content box KEEPS its exact
+     inline pixel width (the layout was computed at that width). */
   body.rcd-printing .rcd-print-sheet {
     width: auto !important;
+    height: auto !important;
     margin: 0 !important;
     padding: 0 !important;
     box-shadow: none !important;
   }
 
-  /* Pagination unit (grid band / sequential tile): never slice through one.
-     A band taller than a page still gets sliced — the browser ignores the
-     hint when the box cannot fit on any single page. */
-  body.rcd-printing .rcd-print-block {
-    break-inside: avoid;
-    page-break-inside: avoid;
+  body.rcd-printing .rcd-print-sheet-inner {
+    height: auto !important;
   }
 }

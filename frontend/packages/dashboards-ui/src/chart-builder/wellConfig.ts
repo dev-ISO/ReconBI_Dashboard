@@ -111,13 +111,25 @@ const toDimension = (data: Extract<FieldDragData, { kind: 'column' }>): Dimensio
   dateBucket: isTemporalType(data.type) ? 'month' : null,
 });
 
+/**
+ * Numeric columns that are really identifiers (ids, codes, keys) should not
+ * default to Sum — summing ids is never meaningful. Mirrors Power BI's smart
+ * default: such fields land in Values as Count instead.
+ */
+const looksLikeIdentifier = (column: string): boolean =>
+  /(^|_)(id|key|code|num|number|no)$/i.test(column) || /^id$/i.test(column);
+
 const toValueMeasure = (data: FieldDragData): MeasureRef =>
   data.kind === 'measure'
     ? { measureId: data.measureId }
     : {
         table: data.table,
         column: data.column,
-        aggregation: isNumericType(data.type) ? 'sum' : 'countDistinct',
+        aggregation: !isNumericType(data.type)
+          ? 'countDistinct'
+          : looksLikeIdentifier(data.column)
+            ? 'count'
+            : 'sum',
       };
 
 const sameMeasure = (a: MeasureRef, b: MeasureRef): boolean => {
@@ -188,7 +200,17 @@ export const normalizeQueryForType = (type: ChartType, query: ChartQuery): Chart
 /** Aggregations offered for an inline value chip; null type (no catalog) offers everything. */
 export const aggregationOptionsFor = (type: ColumnType | null): readonly Aggregation[] =>
   type === null || isNumericType(type)
-    ? (['sum', 'avg', 'min', 'max', 'count', 'countDistinct'] as const)
+    ? ([
+        'sum',
+        'avg',
+        'min',
+        'max',
+        'stdDev',
+        'variance',
+        'median',
+        'count',
+        'countDistinct',
+      ] as const)
     : (['count', 'countDistinct'] as const);
 
 // ---------------------------------------------------------------------------

@@ -120,6 +120,34 @@ LIMIT @p0
     }
 
     [Fact]
+    public void MedianCallInExpressionEmitsPercentileContWithinGroup()
+    {
+        var skew = ExpressionMeasure(
+            "Median Share", "MEDIAN(public.orders.order_total) / AVG(public.orders.order_total)");
+        var compiled = Compile(SpecFor(skew), ModelWith(skew));
+
+        AssertSql("""
+SELECT (PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "t0"."order_total") / NULLIF(AVG("t0"."order_total"), 0)) AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p0
+""", compiled);
+    }
+
+    [Fact]
+    public void StdDevAndVarianceCallsInExpressionEmitSampleAggregates()
+    {
+        var spread = ExpressionMeasure(
+            "Spread", "STDDEV(public.orders.order_total) + VARIANCE(public.orders.order_total)");
+        var compiled = Compile(SpecFor(spread), ModelWith(spread));
+
+        AssertSql("""
+SELECT (STDDEV_SAMP("t0"."order_total") + VAR_SAMP("t0"."order_total")) AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p0
+""", compiled);
+    }
+
+    [Fact]
     public void MeasureRefSubstitutesTheReferencedMeasuresFilteredAggregate()
     {
         var paid = TestFixtures.BuildMeasure(
@@ -215,6 +243,14 @@ LIMIT @p0
     [Fact]
     public void NonNumericColumnInSumIsRejected() =>
         AssertCompilationError("QRY_BAD_MEASURE", ExpressionMeasure("Bad", "sum(public.orders.status)"));
+
+    [Theory]
+    [InlineData("stdDev(public.orders.status)")]
+    [InlineData("variance(public.orders.status)")]
+    [InlineData("median(public.orders.status)")]
+    [InlineData("median(public.orders.order_date)")]
+    public void NonNumericColumnInStatisticalAggregateIsRejected(string expression) =>
+        AssertCompilationError("QRY_BAD_MEASURE", ExpressionMeasure("Bad", expression));
 
     [Fact]
     public void UnknownColumnIsRejected() =>

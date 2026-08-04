@@ -1,5 +1,17 @@
-import { useState } from 'react';
-import { Pencil, Plus, Printer, RefreshCw, Share2, SlidersHorizontal } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  BarChart3,
+  ChevronDown,
+  Filter,
+  Image as ImageIcon,
+  Pencil,
+  Plus,
+  Printer,
+  RefreshCw,
+  Share2,
+  SlidersHorizontal,
+  Type,
+} from 'lucide-react';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdSelect } from '../primitives';
 
 export interface DashboardToolbarProps {
@@ -13,8 +25,10 @@ export interface DashboardToolbarProps {
   readonly: boolean;
   onEnterEdit: () => void;
   onAddChart: () => void;
+  onAddText: () => void;
+  onAddImage: () => void;
   onAddSlicer: () => void;
-  /** Disables Add slicer (no model attached). */
+  /** Disables the Add > Slicer item (no model attached). */
   addSlicerDisabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
@@ -26,6 +40,12 @@ export interface DashboardToolbarProps {
   onRefresh?: () => void;
   /** Opens the PDF-export (print) configurator (both modes). */
   onExport?: () => void;
+  /** Toggles the Filters pane (both modes). */
+  onToggleFilters?: () => void;
+  /** Whether the Filters pane is open (button pressed state). */
+  filtersOpen?: boolean;
+  /** Enabled filter cards currently contributing clauses (badge count). */
+  activeFilterCount?: number;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -47,6 +67,8 @@ export function DashboardToolbar({
   readonly,
   onEnterEdit,
   onAddChart,
+  onAddText,
+  onAddImage,
   onAddSlicer,
   addSlicerDisabled,
   onSave,
@@ -55,6 +77,9 @@ export function DashboardToolbar({
   onChangeRefreshSeconds,
   onRefresh,
   onExport,
+  onToggleFilters,
+  filtersOpen = false,
+  activeFilterCount = 0,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -84,6 +109,28 @@ export function DashboardToolbar({
         <span className="truncate text-xs text-[var(--rcd-status-critical)]" title={error}>
           {error}
         </span>
+      )}
+
+      {onToggleFilters && (
+        <div className="relative shrink-0">
+          <RcdIconButton
+            aria-label={filtersOpen ? 'Hide filters pane' : 'Show filters pane'}
+            title="Filters"
+            aria-pressed={filtersOpen}
+            onClick={onToggleFilters}
+            className={filtersOpen ? 'bg-black/5 text-rcd-text dark:bg-white/10' : ''}
+          >
+            <Filter size={14} />
+          </RcdIconButton>
+          {activeFilterCount > 0 && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-rcd-accent px-1 text-[10px] font-semibold leading-none text-white"
+            >
+              {activeFilterCount}
+            </span>
+          )}
+        </div>
       )}
 
       {onExport && (
@@ -125,18 +172,13 @@ export function DashboardToolbar({
                   ))}
                 </RcdSelect>
               )}
-              <RcdButton onClick={onAddChart}>
-                <Plus size={14} />
-                Add chart
-              </RcdButton>
-              <RcdButton
-                onClick={onAddSlicer}
-                disabled={addSlicerDisabled}
-                title={addSlicerDisabled ? 'Attach a model to add slicers' : undefined}
-              >
-                <SlidersHorizontal size={14} />
-                Add slicer
-              </RcdButton>
+              <AddTileMenu
+                onAddChart={onAddChart}
+                onAddText={onAddText}
+                onAddImage={onAddImage}
+                onAddSlicer={onAddSlicer}
+                addSlicerDisabled={addSlicerDisabled ?? false}
+              />
               <RcdButton onClick={handleDiscard} disabled={saving}>
                 Discard
               </RcdButton>
@@ -159,5 +201,120 @@ export function DashboardToolbar({
         onCancel={() => setConfirmDiscard(false)}
       />
     </div>
+  );
+}
+
+/**
+ * The edit-mode add affordance: one "Add" button opening a small menu card
+ * (chart / text / image / slicer). A styled card, NOT a native menu; closed by
+ * outside click or Escape. The toolbar sits in normal (untransformed) flow, so
+ * the absolutely-positioned card needs no portal.
+ */
+function AddTileMenu({
+  onAddChart,
+  onAddText,
+  onAddImage,
+  onAddSlicer,
+  addSlicerDisabled,
+}: {
+  onAddChart: () => void;
+  onAddText: () => void;
+  onAddImage: () => void;
+  onAddSlicer: () => void;
+  addSlicerDisabled: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  const pick = (action: () => void) => {
+    setOpen(false);
+    action();
+  };
+
+  return (
+    <div className="relative" ref={rootRef}>
+      <RcdButton
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <Plus size={14} />
+        Add
+        <ChevronDown size={13} />
+      </RcdButton>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Add tile"
+          className="absolute right-0 top-full z-40 mt-1 w-40 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        >
+          <AddMenuItem onClick={() => pick(onAddChart)}>
+            <BarChart3 size={14} />
+            Chart
+          </AddMenuItem>
+          <AddMenuItem onClick={() => pick(onAddText)}>
+            <Type size={14} />
+            Text
+          </AddMenuItem>
+          <AddMenuItem onClick={() => pick(onAddImage)}>
+            <ImageIcon size={14} />
+            Image
+          </AddMenuItem>
+          <AddMenuItem
+            onClick={() => pick(onAddSlicer)}
+            disabled={addSlicerDisabled}
+            title={addSlicerDisabled ? 'Attach a model to add slicers' : undefined}
+          >
+            <SlidersHorizontal size={14} />
+            Slicer
+          </AddMenuItem>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddMenuItem({
+  onClick,
+  disabled,
+  title,
+  children,
+}: {
+  onClick: () => void;
+  disabled?: boolean;
+  title?: string;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      disabled={disabled}
+      title={title}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 disabled:opacity-40 dark:hover:bg-white/10"
+    >
+      {children}
+    </button>
   );
 }

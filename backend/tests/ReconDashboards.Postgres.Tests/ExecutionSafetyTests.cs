@@ -15,7 +15,8 @@ namespace ReconDashboards.Postgres.Tests;
 /// EnforceReadOnlySession into default_transaction_read_only=on plus a
 /// statement_timeout) resolved through a DataSourceRegistry. Covers parameter
 /// binding under hostile input, the read-only session guard, server-side
-/// timeouts, row caps, Top-N arithmetic, LIKE escaping, and row-level scoping.
+/// timeouts, row caps, Top-N arithmetic, LIKE escaping, median arithmetic,
+/// and row-level scoping.
 /// </summary>
 [Collection("postgres")]
 public sealed class ExecutionSafetyTests
@@ -302,7 +303,50 @@ public sealed class ExecutionSafetyTests
             normal.Rows.Select(r => Assert.IsType<string>(r[0])).ToArray());
     }
 
-    // ---------- 7. row-level scoping ----------
+    // ---------- 7. median vs direct PERCENTILE_CONT ----------
+
+    [Fact]
+    public async Task MedianMeasure_MatchesDirectPercentileContQuery()
+    {
+        var spec = Spec(
+            [Dim("public.customers", "region")],
+            [new MeasureSpec(null, "public.orders", "order_total", Aggregation.Median, null)]);
+
+        var compiled = Compile(spec);
+        Assert.Contains("PERCENTILE_CONT(0.5) WITHIN GROUP", compiled.Sql, StringComparison.Ordinal);
+
+        var result = await ExecuteAsync(compiled);
+
+        // Ground truth straight from the database; PERCENTILE_CONT over a
+        // numeric column returns double precision, ordered like the compiled
+        // query's default dimension sort.
+        var expected = new List<(string Region, double Median)>();
+        await using (var command = _fixture.DataSource.CreateCommand(
+            """
+            SELECT c.region, PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY o.order_total)
+            FROM orders o
+            JOIN customers c ON c.id = o.customer_id
+            GROUP BY c.region
+            ORDER BY c.region
+            """))
+        await using (var reader = await command.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                expected.Add((reader.GetString(0), reader.GetDouble(1)));
+            }
+        }
+
+        Assert.Equal(4, expected.Count);
+        Assert.Equal(expected.Count, result.Rows.Count);
+        for (var i = 0; i < expected.Count; i++)
+        {
+            Assert.Equal(expected[i].Region, result.Rows[i][0]);
+            Assert.Equal(expected[i].Median, Assert.IsType<double>(result.Rows[i][1]), 6);
+        }
+    }
+
+    // ---------- 8. row-level scoping ----------
 
     [Fact]
     public async Task RowFilters_ScopeResultsToTheContributedPredicate()

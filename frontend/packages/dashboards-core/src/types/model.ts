@@ -2,7 +2,22 @@
 import type { FilterClause } from './query';
 import type { ColumnType } from './schema';
 
-export type Aggregation = 'sum' | 'avg' | 'min' | 'max' | 'count' | 'countDistinct';
+/**
+ * Wire names are the backend Aggregation enum through its camelCase converter:
+ * StdDev -> 'stdDev' (STDDEV_SAMP), Variance -> 'variance' (VAR_SAMP),
+ * Median -> 'median' (PERCENTILE_CONT(0.5)). The statistical three are valid
+ * for numeric (integer/decimal) columns only.
+ */
+export type Aggregation =
+  | 'sum'
+  | 'avg'
+  | 'min'
+  | 'max'
+  | 'count'
+  | 'countDistinct'
+  | 'stdDev'
+  | 'variance'
+  | 'median';
 
 export type Cardinality = 'manyToOne' | 'oneToOne';
 

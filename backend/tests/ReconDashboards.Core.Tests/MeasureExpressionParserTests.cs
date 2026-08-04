@@ -38,6 +38,20 @@ public class MeasureExpressionParserTests
             Assert.IsType<AggregateCallNode>(MeasureExpressionParser.Parse("Avg(public.orders.order_total)")).Aggregation);
     }
 
+    [Theory]
+    [InlineData("STDDEV(public.orders.order_total)", Aggregation.StdDev)]
+    [InlineData("stdDev(public.orders.order_total)", Aggregation.StdDev)]
+    [InlineData("VARIANCE(public.orders.order_total)", Aggregation.Variance)]
+    [InlineData("MEDIAN(public.orders.order_total)", Aggregation.Median)]
+    [InlineData("median(public.orders.order_total)", Aggregation.Median)]
+    public void StatisticalFunctionNamesMapToTheirAggregations(string expression, Aggregation expected)
+    {
+        var call = Assert.IsType<AggregateCallNode>(MeasureExpressionParser.Parse(expression));
+        Assert.Equal(expected, call.Aggregation);
+        Assert.Equal("public.orders", call.TableKey);
+        Assert.Equal("order_total", call.Column);
+    }
+
     [Fact]
     public void CountStarHasNoTableOrColumn()
     {
@@ -143,6 +157,9 @@ public class MeasureExpressionParserTests
     [InlineData("sum(a.b.c.d)")]
     [InlineData("sum(*)")]
     [InlineData("countDistinct(*)")]
+    [InlineData("stdDev(*)")]
+    [InlineData("variance(*)")]
+    [InlineData("median(*)")]
     [InlineData("[Unterminated / count(*)")]
     [InlineData("[] + count(*)")]
     [InlineData("1.")]
@@ -161,9 +178,9 @@ public class MeasureExpressionParserTests
     [Fact]
     public void UnknownFunctionNameIsRejectedAtItsPosition()
     {
-        var ex = AssertParseError("median(public.orders.order_total)");
+        var ex = AssertParseError("mode(public.orders.order_total)");
         Assert.Equal(0, ex.Position);
-        Assert.Contains("median", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("mode", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

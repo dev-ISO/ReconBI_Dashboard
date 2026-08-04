@@ -21,7 +21,12 @@ public interface ISqlDialect
 
     string DateTrunc(DateBucket bucket, string expression);
 
-    /// <summary>SUM(x) / COUNT(*) / COUNT(DISTINCT x) / AVG / MIN / MAX. Null argument only for Count.</summary>
+    /// <summary>
+    /// SUM(x) / COUNT(*) / COUNT(DISTINCT x) / AVG / MIN / MAX / sample
+    /// stddev / sample variance / median. Null argument only for Count. The
+    /// whole aggregate shape is owned here — Median may render as an
+    /// ordered-set aggregate (e.g. PERCENTILE_CONT(0.5) WITHIN GROUP (...)).
+    /// </summary>
     string Aggregate(Aggregation aggregation, string? argumentExpression);
 
     /// <summary>Per-measure filtered aggregation, e.g. "agg FILTER (WHERE pred)".</summary>

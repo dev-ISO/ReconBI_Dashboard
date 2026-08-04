@@ -319,6 +319,85 @@ LIMIT @p0
         AssertParam(limitParam, "p0", 51L, NormalizedType.Integer); // min(100, 50) + 1
     }
 
+    // ---------- statistical aggregations ----------
+
+    [Fact]
+    public void StdDevEmitsStddevSamp()
+    {
+        var compiled = Compile(Spec(
+            measures: [new MeasureSpec(null, "public.orders", "order_total", Aggregation.StdDev, null)]));
+
+        AssertSql("""
+SELECT STDDEV_SAMP("t0"."order_total") AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p0
+""", compiled);
+    }
+
+    [Fact]
+    public void VarianceEmitsVarSamp()
+    {
+        var compiled = Compile(Spec(
+            measures: [new MeasureSpec(null, "public.orders", "order_total", Aggregation.Variance, null)]));
+
+        AssertSql("""
+SELECT VAR_SAMP("t0"."order_total") AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p0
+""", compiled);
+    }
+
+    [Fact]
+    public void GroupedMedianEmitsPercentileContWithinGroup()
+    {
+        var compiled = Compile(Spec(
+            dimensions: [CustomerRegion()],
+            measures: [new MeasureSpec(null, "public.orders", "order_total", Aggregation.Median, null)]));
+
+        AssertSql("""
+SELECT "t1"."region" AS "dim0",
+       PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "t0"."order_total") AS "meas0"
+FROM "public"."orders" AS "t0"
+LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
+GROUP BY "t1"."region"
+ORDER BY "t1"."region" ASC NULLS LAST
+LIMIT @p0
+""", compiled);
+    }
+
+    [Fact]
+    public void MedianMeasureFilterComposesFilterWhereAfterWithinGroup()
+    {
+        var measure = TestFixtures.BuildMeasure(
+            "Paid Median", "public.orders", Aggregation.Median, "order_total",
+            filters: [new FilterSpec("public.orders", "status", FilterOperator.Eq, [Json("paid")])]);
+        var model = TestFixtures.BuildValidDemoModel() with { Measures = [measure] };
+
+        var compiled = Compile(
+            Spec(measures: [new MeasureSpec(measure.Id, null, null, null, null)]),
+            model);
+
+        AssertSql("""
+SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "t0"."order_total") FILTER (WHERE "t0"."status" = @p0) AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p1
+""", compiled);
+    }
+
+    [Theory]
+    [InlineData(Aggregation.StdDev)]
+    [InlineData(Aggregation.Variance)]
+    [InlineData(Aggregation.Median)]
+    public void StatisticalAggregationColumnPlanIsDecimal(Aggregation aggregation)
+    {
+        var compiled = Compile(Spec(
+            measures: [new MeasureSpec(null, "public.orders", "order_total", aggregation, null)]));
+
+        var plan = Assert.Single(compiled.Columns);
+        Assert.Equal(ResultColumnRole.Measure, plan.Role);
+        Assert.Equal(NormalizedType.Decimal, plan.Type);
+    }
+
     // ---------- rejection ----------
 
     [Fact]
@@ -354,6 +433,21 @@ LIMIT @p0
         AssertCompilationError(
             "QRY_BAD_MEASURE",
             Spec(measures: [new MeasureSpec(null, "public.orders", "status", Aggregation.Sum, null)]));
+
+    [Theory]
+    [InlineData(Aggregation.StdDev)]
+    [InlineData(Aggregation.Variance)]
+    [InlineData(Aggregation.Median)]
+    public void StatisticalAggregationOverTextColumnIsRejected(Aggregation aggregation) =>
+        AssertCompilationError(
+            "QRY_BAD_MEASURE",
+            Spec(measures: [new MeasureSpec(null, "public.orders", "status", aggregation, null)]));
+
+    [Fact]
+    public void MedianOverDateColumnIsRejected() =>
+        AssertCompilationError(
+            "QRY_BAD_MEASURE",
+            Spec(measures: [new MeasureSpec(null, "public.orders", "order_date", Aggregation.Median, null)]));
 
     [Fact]
     public void TooManyInValuesIsRejected() =>

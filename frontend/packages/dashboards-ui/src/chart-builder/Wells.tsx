@@ -48,6 +48,9 @@ const AGG_LABELS: Record<Aggregation, string> = {
   avg: 'Average',
   min: 'Min',
   max: 'Max',
+  stdDev: 'Std. deviation',
+  variance: 'Variance',
+  median: 'Median',
   count: 'Count',
   countDistinct: 'Distinct count',
 };

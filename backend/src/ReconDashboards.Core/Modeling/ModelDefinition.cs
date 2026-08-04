@@ -4,6 +4,10 @@ using ReconDashboards.Core.Querying.Spec;
 
 namespace ReconDashboards.Core.Modeling;
 
+/// <summary>
+/// Wire names are camelCase via the converter: "sum", "avg", "min", "max",
+/// "count", "countDistinct", "stdDev", "variance", "median".
+/// </summary>
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<Aggregation>))]
 public enum Aggregation
 {
@@ -13,6 +17,9 @@ public enum Aggregation
     Max,
     Count,
     CountDistinct,
+    StdDev,
+    Variance,
+    Median,
 }
 
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<Cardinality>))]

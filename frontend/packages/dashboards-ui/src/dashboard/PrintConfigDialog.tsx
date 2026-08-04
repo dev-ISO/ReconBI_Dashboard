@@ -1,6 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Printer } from 'lucide-react';
+import { isChartTile, type FilterClause } from '@recon/dashboards-core';
+import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSelect } from '../primitives';
+import { PrintSheets } from './DashboardPrintView';
+import { computePrintLayout, filterSummaryFor } from './printLayout';
 
 /** Paper stock the print pipeline can size (valid CSS `@page size` keywords). */
 export type PrintPaper = 'letter' | 'a4' | 'legal' | 'tabloid';
@@ -64,6 +68,10 @@ const FLOW_OPTIONS: { value: PrintTileFlow; label: string }[] = [
   { value: 'sequential', label: 'Sequential (one tile per row)' },
 ];
 
+/** Thumbnail budget (px); the sheet is transform-scaled to fit inside it. */
+const THUMB_MAX_W = 460;
+const THUMB_MAX_H = 350;
+
 export interface PrintConfigDialogProps {
   open: boolean;
   onClose: () => void;
@@ -75,6 +83,11 @@ export interface PrintConfigDialogProps {
  * PDF-export configurator. The actual export uses the browser's print-to-PDF:
  * confirming mounts DashboardPrintView, which renders a print-quality copy of
  * the dashboard and calls window.print() on demand (no dependencies added).
+ *
+ * The right pane is a LIVE thumbnail of printed page 1: the same
+ * computePrintLayout + PrintSheets the full preview uses, transform-scaled
+ * down and non-interactive, re-rendering as settings change (charts come from
+ * the warm query cache, so this is cheap).
  */
 export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialogProps) {
   const [draft, setDraft] = useState<PrintOptions>(() => ({ ...sessionOptions }));
@@ -83,6 +96,52 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
   useEffect(() => {
     if (open) setDraft({ ...sessionOptions });
   }, [open]);
+
+  // The thumbnail mirrors what DashboardView will hand the print view: the
+  // ACTIVE page's tiles, the dashboard's model and the live per-tile filters.
+  const runtime = useRuntime();
+  const current = useDashboardState((state) => state.current);
+  const activePageId = useDashboardState((state) => state.activePageId);
+  const slicerValues = useDashboardState((state) => state.slicerValues);
+  const crossFilter = useDashboardState((state) => state.crossFilter);
+
+  const pages = current?.layout.pages ?? [];
+  const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
+  const tiles = useMemo(() => activePage?.tiles ?? [], [activePage]);
+  const modelId = current?.modelId ?? null;
+  const title =
+    current === null
+      ? 'Dashboard'
+      : pages.length > 1 && activePage
+        ? `${current.name} — ${activePage.name}`
+        : current.name;
+
+  // Same construction as DashboardView's filtersByTile: subscribed slices
+  // (tiles/slicerValues/crossFilter) drive recomputation, filtersForTile reads
+  // the exact same store state — never stale.
+  const filtersByTile = useMemo(() => {
+    const map = new Map<string, FilterClause[]>();
+    for (const tile of tiles) {
+      if (!isChartTile(tile)) continue;
+      map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
+    }
+    return map;
+  }, [runtime, tiles, slicerValues, crossFilter]);
+
+  // Page count + thumbnail scale from the SAME pure layout the preview uses.
+  const hasFilterSummary = useMemo(
+    () => filterSummaryFor(tiles, slicerValues, crossFilter).length > 0,
+    [tiles, slicerValues, crossFilter],
+  );
+  const layout = useMemo(
+    () => computePrintLayout(tiles, draft, hasFilterSummary),
+    [tiles, draft, hasFilterSummary],
+  );
+  const { geometry } = layout;
+  const thumbScale = Math.min(
+    THUMB_MAX_W / geometry.paperWidthPx,
+    THUMB_MAX_H / geometry.paperHeightPx,
+  );
 
   const patch = (partial: Partial<PrintOptions>) => setDraft((prev) => ({ ...prev, ...partial }));
 
@@ -96,6 +155,9 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
       title="Export to PDF"
       open={open}
       onClose={onClose}
+      wide
+      draggable
+      resizable
       footer={
         <>
           <RcdButton onClick={onClose}>Cancel</RcdButton>
@@ -106,90 +168,136 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
         </>
       }
     >
-      <div className="flex flex-col gap-4">
-        <p className="text-xs text-rcd-muted">
-          Opens a print preview of this dashboard. Use your browser&apos;s print dialog with
-          &ldquo;Save as PDF&rdquo; as the destination.
-        </p>
+      <div className="flex gap-5">
+        {/* Settings column */}
+        <div className="flex w-[17rem] shrink-0 flex-col gap-4">
+          <p className="text-xs text-rcd-muted">
+            Opens a print preview of this dashboard. Use your browser&apos;s print dialog with
+            &ldquo;Save as PDF&rdquo; as the destination.
+          </p>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Paper size">
-            <RcdSelect
-              aria-label="Paper size"
-              value={draft.paper}
-              onChange={(event) => patch({ paper: event.target.value as PrintPaper })}
-            >
-              {PAPER_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </RcdSelect>
-          </Field>
+          <div className="flex flex-col gap-3">
+            <Field label="Paper size">
+              <RcdSelect
+                aria-label="Paper size"
+                value={draft.paper}
+                onChange={(event) => patch({ paper: event.target.value as PrintPaper })}
+              >
+                {PAPER_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </Field>
 
-          <Field label="Orientation">
-            <RcdSelect
-              aria-label="Orientation"
-              value={draft.orientation}
-              onChange={(event) => patch({ orientation: event.target.value as PrintOrientation })}
-            >
-              {ORIENTATION_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </RcdSelect>
-          </Field>
+            <Field label="Orientation">
+              <RcdSelect
+                aria-label="Orientation"
+                value={draft.orientation}
+                onChange={(event) =>
+                  patch({ orientation: event.target.value as PrintOrientation })
+                }
+              >
+                {ORIENTATION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </Field>
 
-          <Field label="Scale">
-            <RcdSelect
-              aria-label="Scale"
-              value={draft.scale === 'fit' ? 'fit' : String(draft.scale)}
-              onChange={(event) =>
-                patch({ scale: event.target.value === 'fit' ? 'fit' : Number(event.target.value) })
-              }
-            >
-              {SCALE_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </RcdSelect>
-          </Field>
+            <Field label="Scale">
+              <RcdSelect
+                aria-label="Scale"
+                value={draft.scale === 'fit' ? 'fit' : String(draft.scale)}
+                onChange={(event) =>
+                  patch({
+                    scale: event.target.value === 'fit' ? 'fit' : Number(event.target.value),
+                  })
+                }
+              >
+                {SCALE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </Field>
 
-          <Field label="Tile flow">
-            <RcdSelect
-              aria-label="Tile flow"
-              value={draft.flow}
-              onChange={(event) => patch({ flow: event.target.value as PrintTileFlow })}
-            >
-              {FLOW_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </RcdSelect>
-          </Field>
+            <Field label="Tile flow">
+              <RcdSelect
+                aria-label="Tile flow"
+                value={draft.flow}
+                onChange={(event) => patch({ flow: event.target.value as PrintTileFlow })}
+              >
+                {FLOW_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </Field>
+          </div>
+
+          <fieldset className="flex flex-col gap-1.5">
+            <legend className="mb-1 text-xs text-rcd-text-2">Include</legend>
+            <IncludeToggle
+              label="Dashboard title"
+              checked={draft.includeTitle}
+              onChange={(next) => patch({ includeTitle: next })}
+            />
+            <IncludeToggle
+              label="Timestamp"
+              checked={draft.includeTimestamp}
+              onChange={(next) => patch({ includeTimestamp: next })}
+            />
+            <IncludeToggle
+              label="Active filters summary"
+              checked={draft.includeFilters}
+              onChange={(next) => patch({ includeFilters: next })}
+            />
+          </fieldset>
         </div>
 
-        <fieldset className="flex flex-col gap-1.5">
-          <legend className="mb-1 text-xs text-rcd-text-2">Include</legend>
-          <IncludeToggle
-            label="Dashboard title"
-            checked={draft.includeTitle}
-            onChange={(next) => patch({ includeTitle: next })}
-          />
-          <IncludeToggle
-            label="Timestamp"
-            checked={draft.includeTimestamp}
-            onChange={(next) => patch({ includeTimestamp: next })}
-          />
-          <IncludeToggle
-            label="Active filters summary"
-            checked={draft.includeFilters}
-            onChange={(next) => patch({ includeFilters: next })}
-          />
-        </fieldset>
+        {/* Live preview column */}
+        <div className="flex min-w-0 flex-1 flex-col gap-2">
+          <span className="text-xs text-rcd-text-2">
+            Preview — page 1 of {layout.pages.length}
+          </span>
+          <div className="flex flex-1 items-start justify-center overflow-auto rounded-md border border-rcd-border bg-[#26262a] p-3">
+            <div
+              aria-hidden
+              className="pointer-events-none select-none overflow-hidden"
+              style={{
+                width: geometry.paperWidthPx * thumbScale,
+                height: geometry.paperHeightPx * thumbScale,
+              }}
+            >
+              <div
+                style={{
+                  width: geometry.paperWidthPx,
+                  transform: `scale(${thumbScale})`,
+                  transformOrigin: 'top left',
+                }}
+              >
+                <PrintSheets
+                  title={title}
+                  tiles={tiles}
+                  modelId={modelId}
+                  filtersByTile={filtersByTile}
+                  options={draft}
+                  maxPages={1}
+                  showPageNumbers={false}
+                />
+              </div>
+            </div>
+          </div>
+          <p className="text-[11px] leading-4 text-rcd-muted">
+            The preview uses the exact printed page geometry — what you see here is page 1 of the
+            PDF.
+          </p>
+        </div>
       </div>
     </RcdDialog>
   );

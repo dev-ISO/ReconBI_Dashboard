@@ -28,6 +28,9 @@ const AGGREGATIONS: { value: Aggregation; label: string }[] = [
   { value: 'avg', label: 'Average' },
   { value: 'min', label: 'Min' },
   { value: 'max', label: 'Max' },
+  { value: 'stdDev', label: 'Std. deviation' },
+  { value: 'variance', label: 'Variance' },
+  { value: 'median', label: 'Median' },
   { value: 'count', label: 'Count' },
   { value: 'countDistinct', label: 'Count distinct' },
 ];
@@ -40,6 +43,9 @@ const compatibleColumns = (columns: CatalogColumn[], aggregation: Aggregation): 
   switch (aggregation) {
     case 'sum':
     case 'avg':
+    case 'stdDev':
+    case 'variance':
+    case 'median':
       return columns.filter((c) => isNumericType(c.type));
     case 'min':
     case 'max':
@@ -316,8 +322,8 @@ function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDia
             />
             <span className="text-xs text-rcd-muted">
               Arithmetic (+ − * / parentheses), numbers, SUM / AVG / MIN / MAX / COUNT /
-              COUNTDISTINCT over schema.table.column (COUNT(*) allowed), and [Measure Name]
-              references to plain measures. Division is guarded automatically. Examples:{' '}
+              COUNTDISTINCT / STDDEV / VARIANCE / MEDIAN over schema.table.column (COUNT(*)
+              allowed), and [Measure Name] references to plain measures. Division is guarded automatically. Examples:{' '}
               <code className="font-mono">SUM(public.orders.total) / COUNT(*)</code> ·{' '}
               <code className="font-mono">[Revenue] / [Order Count]</code>
             </span>

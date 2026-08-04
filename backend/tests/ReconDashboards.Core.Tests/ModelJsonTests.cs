@@ -95,6 +95,32 @@ public class ModelJsonTests
     }
 
     [Fact]
+    public void SerializedJsonUsesCamelCaseStringsForStatisticalAggregations()
+    {
+        // These exact wire names are mirrored by the frontend Aggregation union.
+        var definition = TestFixtures.BuildModel(
+            measures:
+            [
+                TestFixtures.BuildMeasure("Std", "public.orders", Aggregation.StdDev, "order_total"),
+                TestFixtures.BuildMeasure("Var", "public.orders", Aggregation.Variance, "order_total"),
+                TestFixtures.BuildMeasure("Med", "public.orders", Aggregation.Median, "order_total"),
+            ]);
+
+        var json = ModelJson.Serialize(definition);
+
+        Assert.Contains("\"aggregation\":\"stdDev\"", json);
+        Assert.Contains("\"aggregation\":\"variance\"", json);
+        Assert.Contains("\"aggregation\":\"median\"", json);
+
+        var reloaded = ModelJson.TryDeserialize(json, out var error);
+        Assert.Null(error);
+        Assert.NotNull(reloaded);
+        Assert.Equal(
+            [Aggregation.StdDev, Aggregation.Variance, Aggregation.Median],
+            reloaded.Measures.Select(m => m.Aggregation).ToArray());
+    }
+
+    [Fact]
     public void UnknownTopLevelPropertyIsRejectedWithError()
     {
         const string json = """{"version":1,"tables":[],"relationships":[],"measures":[],"surprise":true}""";

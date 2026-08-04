@@ -72,14 +72,8 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
       <ButtonsSlicer
         modelId={modelId}
         spec={spec}
-        selectedValue={clause?.operator === 'eq' ? clause.values[0] : undefined}
-        onPick={(value, isActive) =>
-          setClause(
-            isActive
-              ? null
-              : { table: spec.table, column: spec.column, operator: 'eq', values: [value] },
-          )
-        }
+        selected={inSelected}
+        onToggle={toggleInValue}
       />
     ) : (
       <DateRangeSlicer spec={spec} clause={clause} onChange={setClause} />
@@ -234,13 +228,14 @@ interface ButtonsFetchState {
 function ButtonsSlicer({
   modelId,
   spec,
-  selectedValue,
-  onPick,
+  selected,
+  onToggle,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
-  selectedValue: FilterValue | undefined;
-  onPick: (value: FilterValue, isActive: boolean) => void;
+  /** Multi-select: pills toggle membership of an 'in' clause. */
+  selected: readonly FilterValue[];
+  onToggle: (value: FilterValue) => void;
 }) {
   const runtime = useRuntime();
   const [retryToken, setRetryToken] = useState(0);
@@ -314,13 +309,13 @@ function ButtonsSlicer({
   return (
     <div className="flex flex-wrap content-start items-start gap-1.5 p-0.5">
       {state.values.slice(0, BUTTONS_CAP).map((value) => {
-        const isActive = selectedValue === value;
+        const isActive = selected.includes(value);
         return (
           <button
             key={`${typeof value}:${String(value)}`}
             type="button"
             aria-pressed={isActive}
-            onClick={() => onPick(value, isActive)}
+            onClick={() => onToggle(value)}
             title={String(value)}
             className={`max-w-full truncate rounded-full border px-2.5 py-1 text-sm transition-colors ${
               isActive

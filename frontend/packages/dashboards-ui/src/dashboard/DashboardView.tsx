@@ -2,8 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
 import {
   emptyChart,
+  filterCardIsActive,
   isChartTile,
+  isImageTile,
   isSlicerTile,
+  isTextTile,
   newId,
   type ChartSpec,
   type FilterClause,
@@ -17,8 +20,13 @@ import { AddSlicerDialog } from './AddSlicerDialog';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
+import { FiltersPane } from './FiltersPane';
+import { ImageTile } from './ImageTile';
+import { ImageTileDialog } from './ImageTileDialog';
+import { PageTabs } from './PageTabs';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
 import { SlicerTile } from './SlicerTile';
+import { TextTile } from './TextTile';
 import { TileFrame } from './TileFrame';
 
 export interface DashboardViewProps {
@@ -43,6 +51,10 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const storeError = useDashboardState((state) => state.error);
   const slicerValues = useDashboardState((state) => state.slicerValues);
   const crossFilter = useDashboardState((state) => state.crossFilter);
+  const activePageId = useDashboardState((state) => state.activePageId);
+  const selectedTileId = useDashboardState((state) => state.selectedTileId);
+  const filterCards = useDashboardState((state) => state.current?.layout.filterCards ?? null);
+  const filterCardOverrides = useDashboardState((state) => state.filterCardOverrides);
 
   const openModel = useModelState((state) => state.current);
   const catalog = useModelState((state) => state.catalog);
@@ -52,9 +64,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [modelError, setModelError] = useState<string | null>(null);
   const [builder, setBuilder] = useState<{ tileId: string | null; spec: ChartSpec } | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
+  const [addImageOpen, setAddImageOpen] = useState(false);
   const [printConfigOpen, setPrintConfigOpen] = useState(false);
   /** Non-null while the print preview overlay is mounted. */
   const [printOptions, setPrintOptions] = useState<PrintOptions | null>(null);
+  /** Filters pane visibility (collapsed by default, both modes). */
+  const [filtersPaneOpen, setFiltersPaneOpen] = useState(false);
 
   const openDashboard = useCallback(() => {
     setOpenError(null);
@@ -88,24 +103,40 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     loadModel();
   }, [loadModel]);
 
-  const tiles = current?.id === dashboardId ? current.layout.tiles : [];
+  // Pages are guaranteed non-empty after the store's open migration; the grid
+  // shows the ACTIVE page's tiles only.
+  const pages = current?.id === dashboardId ? (current.layout.pages ?? []) : [];
+  const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
+  const tiles = activePage?.tiles ?? [];
   const editable = mode === 'edit' && !readonly;
 
-  // Per-chart slicer + cross-filter clauses. The memo depends on the
-  // SUBSCRIBED tiles + slicerValues + crossFilter slices, so any change
-  // (value, targets, add/remove, datum click) re-renders this component and
-  // recomputes — filtersForTile reads the exact same store state the
-  // subscriptions delivered, so it can never be stale. ChartTile keys its
+  // Per-chart slicer + cross-filter + filter-card clauses. The memo depends on
+  // the SUBSCRIBED tiles + slicerValues + crossFilter + filterCards (+ their
+  // view-mode overrides) + activePageId slices, so any change (value, targets,
+  // add/remove, datum click, card edit/toggle, page switch) re-renders this
+  // component and recomputes — filtersForTile reads the exact same store state
+  // the subscriptions delivered, so it can never be stale. ChartTile keys its
   // fetch effect on the cache-key string, so the fresh (but often deep-equal)
   // arrays never re-trigger requests.
   const filtersByTile = useMemo(() => {
     const map = new Map<string, FilterClause[]>();
     for (const tile of tiles) {
-      if (isSlicerTile(tile)) continue;
+      // Only chart tiles consume filters (text/image/slicer tiles ignore them).
+      if (!isChartTile(tile)) continue;
       map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
     }
     return map;
-  }, [runtime, tiles, slicerValues, crossFilter]);
+  }, [runtime, tiles, slicerValues, crossFilter, filterCards, filterCardOverrides, activePageId]);
+
+  // Toolbar badge: enabled cards visible on this page currently contributing
+  // at least one clause (visual cards of ANY chart on the page count — they
+  // all filter, selected or not).
+  const activeFilterCount = useMemo(
+    () =>
+      runtime.dashboards.visibleFilterCards(activePage?.id ?? null).filter(filterCardIsActive)
+        .length,
+    [runtime, filterCards, filterCardOverrides, activePage],
+  );
 
   // Cross-filter: the renderer reports raw value + label; THIS layer knows the
   // tile's query, so it maps the click onto the chart's category dimension —
@@ -168,7 +199,10 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     (items: DashboardGridItem[]) => {
       const state = runtime.dashboards.store.getState();
       if (state.mode !== 'edit' || !state.current) return;
-      const layoutById = new Map(state.current.layout.tiles.map((tile) => [tile.id, tile.layout]));
+      const activeTiles =
+        (state.current.layout.pages ?? []).find((page) => page.id === state.activePageId)?.tiles ??
+        [];
+      const layoutById = new Map(activeTiles.map((tile) => [tile.id, tile.layout]));
       const changed = items.some((item) => {
         const layout = layoutById.get(item.id);
         return (
@@ -229,35 +263,55 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       );
     }
 
+    // Text/image tiles: frameless content in view mode, standard TileFrame
+    // chrome (title-bar dragging + config card) in edit mode — handled inside.
+    if (isTextTile(tile)) {
+      return <TextTile tileId={tile.id} spec={tile.text} editable={editable} />;
+    }
+
+    if (isImageTile(tile)) {
+      return <ImageTile tileId={tile.id} spec={tile.image} editable={editable} />;
+    }
+
     if (!isChartTile(tile)) return null;
     const chart = tile.chart;
+    // Edit-mode click selects the tile (drives the Filters pane's "On this
+    // visual" section). View mode never selects — datum clicks there belong to
+    // cross-filtering alone. The subtle accent ring marks the selection.
     return (
-      <TileFrame
-        title={chart.title}
-        editable={editable}
-        onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
-        onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
-        onDelete={() => runtime.dashboards.removeTile(tile.id)}
+      <div
+        className={`h-full rounded-lg ${
+          editable && selectedTileId === tile.id ? 'ring-2 ring-rcd-accent' : ''
+        }`}
+        onClick={editable ? () => runtime.dashboards.selectTile(tile.id) : undefined}
       >
-        {modelId === null ? (
-          <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
-            No model attached to this dashboard.
-          </div>
-        ) : (
-          <ChartTile
-            key={refreshToken}
-            spec={chart}
-            modelId={modelId}
-            filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
-            onDatumClick={(info) => handleDatumClick(tile.id, chart, info)}
-            activeCategory={
-              crossFilter && crossFilter.sourceTileId === tile.id
-                ? { label: crossFilter.categoryLabel }
-                : null
-            }
-          />
-        )}
-      </TileFrame>
+        <TileFrame
+          title={chart.title}
+          editable={editable}
+          onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
+          onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
+          onDelete={() => runtime.dashboards.removeTile(tile.id)}
+        >
+          {modelId === null ? (
+            <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
+              No model attached to this dashboard.
+            </div>
+          ) : (
+            <ChartTile
+              key={refreshToken}
+              spec={chart}
+              modelId={modelId}
+              filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
+              onDatumClick={(info) => handleDatumClick(tile.id, chart, info)}
+              activeCategory={
+                crossFilter && crossFilter.sourceTileId === tile.id
+                  ? { label: crossFilter.categoryLabel }
+                  : null
+              }
+            />
+          )}
+        </TileFrame>
+      </div>
     );
   };
 
@@ -318,6 +372,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         readonly={readonly}
         onEnterEdit={() => runtime.dashboards.enterEdit()}
         onAddChart={openAddChart}
+        onAddText={() => runtime.dashboards.addTextTile()}
+        onAddImage={() => setAddImageOpen(true)}
         onAddSlicer={() => setAddSlicerOpen(true)}
         addSlicerDisabled={modelId === null}
         onSave={() => void runtime.dashboards.save()}
@@ -326,9 +382,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         onChangeRefreshSeconds={(seconds) => runtime.dashboards.setRefreshSeconds(seconds)}
         onRefresh={refreshTiles}
         onExport={() => setPrintConfigOpen(true)}
+        onToggleFilters={() => setFiltersPaneOpen((open) => !open)}
+        filtersOpen={filtersPaneOpen}
+        activeFilterCount={activeFilterCount}
       />
 
-      <div className="relative min-h-0 flex-1">
+      {/* Flex row: grid area + (optional) right-docked Filters pane. */}
+      <div className="relative flex min-h-0 flex-1">
         {/* Cross-filter chip: floats under the toolbar in BOTH modes. */}
         {crossFilter && (
           <div className="absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
@@ -346,7 +406,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           </div>
         )}
 
-        <div className="h-full overflow-auto p-3">
+        <div className="h-full min-w-0 flex-1 overflow-auto p-3">
           {tiles.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <LayoutDashboard size={32} className="text-rcd-muted" />
@@ -375,7 +435,20 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             />
           )}
         </div>
+
+        {filtersPaneOpen && (
+          <FiltersPane
+            pageId={activePage?.id ?? null}
+            tiles={tiles}
+            modelId={modelId}
+            editable={editable}
+            onClose={() => setFiltersPaneOpen(false)}
+          />
+        )}
       </div>
+
+      {/* Excel-style page tabs, docked under the scroll area in BOTH modes. */}
+      <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={editable} />
 
       <RcdDialog
         title={builder?.tileId ? 'Edit chart' : 'Add chart'}
@@ -396,6 +469,17 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         />
       )}
 
+      <ImageTileDialog
+        open={addImageOpen}
+        title="Add image"
+        initial={null}
+        onClose={() => setAddImageOpen(false)}
+        onSave={(spec) => {
+          runtime.dashboards.addImageTile(spec);
+          setAddImageOpen(false);
+        }}
+      />
+
       <PrintConfigDialog
         open={printConfigOpen}
         onClose={() => setPrintConfigOpen(false)}
@@ -407,7 +491,11 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
       {printOptions !== null && (
         <DashboardPrintView
-          title={current.name}
+          // The ACTIVE page prints; its name joins the header title once the
+          // dashboard actually has multiple pages.
+          title={
+            pages.length > 1 && activePage ? `${current.name} — ${activePage.name}` : current.name
+          }
           tiles={tiles}
           modelId={modelId}
           filtersByTile={filtersByTile}
