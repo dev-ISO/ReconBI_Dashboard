@@ -10,6 +10,8 @@ import {
   Type,
 } from 'lucide-react';
 import {
+  DATE_TABLE_COLUMNS,
+  dateTableKey,
   isQueryableType,
   tableKey,
   type Catalog,
@@ -48,7 +50,7 @@ const typeIcon = (type: ColumnType) => {
   }
 };
 
-/** Model-scoped field pane: one section per model table plus a Measures section. */
+/** Model-scoped field pane: one section per model table and date table plus a Measures section. */
 export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps) {
   const tables = model.tables.filter((table) => !table.hidden);
 
@@ -70,6 +72,15 @@ export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps
           />
         ))}
 
+      {(model.dateTables ?? []).map((dateTable) => (
+        <DateTableSection
+          key={dateTableKey(dateTable.name)}
+          name={dateTable.name}
+          onAdd={onAdd}
+          onAddFilter={onAddFilter}
+        />
+      ))}
+
       <SectionHeader icon={<Sigma size={12} />} label="Measures" />
       {model.measures.length === 0 ? (
         <p className="px-3 py-1 text-xs text-rcd-muted">No measures defined in this model.</p>
@@ -81,6 +92,7 @@ export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps
             data={{ kind: 'measure', measureId: measure.id, name: measure.name }}
             label={measure.name}
             icon={<Sigma size={13} />}
+            badge={measure.expression ? <FxBadge /> : undefined}
             onAdd={onAdd}
           />
         ))
@@ -140,6 +152,61 @@ function TableSection({
   );
 }
 
+/**
+ * Engine date table: the 8 fixed columns rendered as normal column entries.
+ * Needs no catalog — the schema is fixed — so it renders even when the
+ * catalog failed to load. Drag payloads address the table by its
+ * '#date.{name}' key.
+ */
+function DateTableSection({
+  name,
+  onAdd,
+  onAddFilter,
+}: {
+  name: string;
+  onAdd: (data: FieldDragData) => void;
+  onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
+}) {
+  const key = dateTableKey(name);
+
+  return (
+    <>
+      <SectionHeader icon={<CalendarDays size={12} />} label={name} />
+      {DATE_TABLE_COLUMNS.map((column) => {
+        const data = {
+          kind: 'column',
+          table: key,
+          column: column.name,
+          type: column.type,
+        } as const;
+        return (
+          <FieldEntry
+            key={column.name}
+            id={`column:${key}:${column.name}`}
+            data={data}
+            label={column.name}
+            icon={typeIcon(column.type)}
+            onAdd={onAdd}
+            onFilter={onAddFilter ? () => onAddFilter(data) : undefined}
+          />
+        );
+      })}
+    </>
+  );
+}
+
+/** Cosmetic suffix marking a calculated (expression-backed) measure. */
+function FxBadge() {
+  return (
+    <span
+      title="Calculated measure"
+      className="ml-auto shrink-0 rounded bg-black/10 px-1 text-[10px] font-medium italic leading-4 text-rcd-muted dark:bg-white/10"
+    >
+      fx
+    </span>
+  );
+}
+
 function SectionHeader({ label, icon }: { label: string; icon?: React.ReactNode }) {
   return (
     <div className="flex items-center gap-1 px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
@@ -156,6 +223,7 @@ function FieldEntry({
   data,
   label,
   icon,
+  badge,
   onAdd,
   onFilter,
 }: {
@@ -163,6 +231,8 @@ function FieldEntry({
   data: FieldDragData;
   label: string;
   icon: React.ReactNode;
+  /** Cosmetic suffix (e.g. the "fx" marker); never part of the drag payload. */
+  badge?: React.ReactNode;
   onAdd: (data: FieldDragData) => void;
   /** When present, shows the funnel button that adds the field as a filter. */
   onFilter?: () => void;
@@ -186,6 +256,7 @@ function FieldEntry({
       >
         <span className="shrink-0 text-rcd-muted">{icon}</span>
         <span className="truncate">{label}</span>
+        {badge}
       </button>
       {onFilter && (
         <button

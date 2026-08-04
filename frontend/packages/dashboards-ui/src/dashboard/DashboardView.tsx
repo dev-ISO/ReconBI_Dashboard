@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, LayoutDashboard, Plus, RefreshCw } from 'lucide-react';
+import { AlertTriangle, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
 import {
   emptyChart,
   isChartTile,
@@ -10,11 +10,14 @@ import {
 } from '@recon/dashboards-core';
 import { ChartBuilder } from '../chart-builder/ChartBuilder';
 import { ChartTile } from '../chart/ChartTile';
+import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
 import { AddSlicerDialog } from './AddSlicerDialog';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
+import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
+import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
 import { SlicerTile } from './SlicerTile';
 import { TileFrame } from './TileFrame';
 
@@ -39,6 +42,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const saveStatus = useDashboardState((state) => state.saveStatus);
   const storeError = useDashboardState((state) => state.error);
   const slicerValues = useDashboardState((state) => state.slicerValues);
+  const crossFilter = useDashboardState((state) => state.crossFilter);
 
   const openModel = useModelState((state) => state.current);
   const catalog = useModelState((state) => state.catalog);
@@ -48,6 +52,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [modelError, setModelError] = useState<string | null>(null);
   const [builder, setBuilder] = useState<{ tileId: string | null; spec: ChartSpec } | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
+  const [printConfigOpen, setPrintConfigOpen] = useState(false);
+  /** Non-null while the print preview overlay is mounted. */
+  const [printOptions, setPrintOptions] = useState<PrintOptions | null>(null);
 
   const openDashboard = useCallback(() => {
     setOpenError(null);
@@ -84,12 +91,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const tiles = current?.id === dashboardId ? current.layout.tiles : [];
   const editable = mode === 'edit' && !readonly;
 
-  // Per-chart slicer filters. The memo depends on the SUBSCRIBED tiles +
-  // slicerValues slices, so any slicer change (value, targets, add/remove)
-  // re-renders this component and recomputes — filtersForTile reads the exact
-  // same store state the subscriptions delivered, so it can never be stale.
-  // ChartTile keys its fetch effect on the cache-key string, so the fresh
-  // (but often deep-equal) arrays never re-trigger requests.
+  // Per-chart slicer + cross-filter clauses. The memo depends on the
+  // SUBSCRIBED tiles + slicerValues + crossFilter slices, so any change
+  // (value, targets, add/remove, datum click) re-renders this component and
+  // recomputes — filtersForTile reads the exact same store state the
+  // subscriptions delivered, so it can never be stale. ChartTile keys its
+  // fetch effect on the cache-key string, so the fresh (but often deep-equal)
+  // arrays never re-trigger requests.
   const filtersByTile = useMemo(() => {
     const map = new Map<string, FilterClause[]>();
     for (const tile of tiles) {
@@ -97,7 +105,34 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
     }
     return map;
-  }, [runtime, tiles, slicerValues]);
+  }, [runtime, tiles, slicerValues, crossFilter]);
+
+  // Cross-filter: the renderer reports raw value + label; THIS layer knows the
+  // tile's query, so it maps the click onto the chart's category dimension —
+  // axis for cartesian/table charts, legend for pie/donut (RADIAL wells keep
+  // the slice dimension there; hand-built specs may still carry it in axis,
+  // hence the fallback). Null datum -> isNull clause. Same-datum clicks toggle
+  // off inside the store.
+  const handleDatumClick = useCallback(
+    (tileId: string, chart: ChartSpec, info: ChartDatumClickInfo) => {
+      const dimension =
+        chart.type === 'pie' || chart.type === 'donut'
+          ? (chart.query.legend ?? chart.query.axis ?? null)
+          : (chart.query.axis ?? null);
+      if (!dimension) return;
+      const clause: FilterClause =
+        info.value === null
+          ? { table: dimension.table, column: dimension.column, operator: 'isNull', values: [] }
+          : { table: dimension.table, column: dimension.column, operator: 'eq', values: [info.value] };
+      runtime.dashboards.setCrossFilter(
+        tileId,
+        clause,
+        `${dimension.column}: ${info.label}`,
+        info.label,
+      );
+    },
+    [runtime],
+  );
 
   /** Chart tiles by title for the slicer config menus' "Applies to" list. */
   const chartTileInfos = useMemo(
@@ -121,10 +156,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const refreshSeconds = current?.id === dashboardId ? (current.layout.refreshSeconds ?? null) : null;
 
   useEffect(() => {
-    if (mode !== 'view' || refreshSeconds == null || refreshSeconds <= 0) return;
+    // Auto-refresh is suspended while the print preview is open: a mid-print
+    // cache invalidation would flash every tile back to a skeleton.
+    if (mode !== 'view' || printOptions !== null || refreshSeconds == null || refreshSeconds <= 0)
+      return;
     const timer = setInterval(refreshTiles, refreshSeconds * 1000);
     return () => clearInterval(timer);
-  }, [mode, refreshSeconds, refreshTiles]);
+  }, [mode, refreshSeconds, refreshTiles, printOptions]);
 
   const handleLayoutChange = useCallback(
     (items: DashboardGridItem[]) => {
@@ -211,6 +249,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             spec={chart}
             modelId={modelId}
             filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
+            onDatumClick={(info) => handleDatumClick(tile.id, chart, info)}
+            activeCategory={
+              crossFilter && crossFilter.sourceTileId === tile.id
+                ? { label: crossFilter.categoryLabel }
+                : null
+            }
           />
         )}
       </TileFrame>
@@ -281,36 +325,56 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         refreshSeconds={refreshSeconds}
         onChangeRefreshSeconds={(seconds) => runtime.dashboards.setRefreshSeconds(seconds)}
         onRefresh={refreshTiles}
+        onExport={() => setPrintConfigOpen(true)}
       />
 
-      <div className="min-h-0 flex-1 overflow-auto p-3">
-        {tiles.length === 0 ? (
-          <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-            <LayoutDashboard size={32} className="text-rcd-muted" />
-            {editable ? (
-              <>
-                <p className="text-sm text-rcd-text-2">Nothing here yet.</p>
-                <RcdButton variant="primary" onClick={openAddChart}>
-                  <Plus size={14} />
-                  Add your first chart
-                </RcdButton>
-              </>
-            ) : (
-              <p className="text-sm text-rcd-muted">
-                This dashboard has no charts yet.
-                {!readonly && ' Click Edit to add one.'}
-              </p>
-            )}
+      <div className="relative min-h-0 flex-1">
+        {/* Cross-filter chip: floats under the toolbar in BOTH modes. */}
+        {crossFilter && (
+          <div className="absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
+            <span className="truncate">
+              Filtered by <span className="font-medium">{crossFilter.label}</span>
+            </span>
+            <button
+              type="button"
+              aria-label="Clear cross-filter"
+              onClick={() => runtime.dashboards.clearCrossFilter()}
+              className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+            >
+              <X size={12} />
+            </button>
           </div>
-        ) : (
-          <DashboardGrid
-            items={gridItems}
-            editable={editable}
-            onLayoutChange={handleLayoutChange}
-            renderItem={renderTile}
-            draggableHandle=".rcd-tile-drag-handle"
-          />
         )}
+
+        <div className="h-full overflow-auto p-3">
+          {tiles.length === 0 ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+              <LayoutDashboard size={32} className="text-rcd-muted" />
+              {editable ? (
+                <>
+                  <p className="text-sm text-rcd-text-2">Nothing here yet.</p>
+                  <RcdButton variant="primary" onClick={openAddChart}>
+                    <Plus size={14} />
+                    Add your first chart
+                  </RcdButton>
+                </>
+              ) : (
+                <p className="text-sm text-rcd-muted">
+                  This dashboard has no charts yet.
+                  {!readonly && ' Click Edit to add one.'}
+                </p>
+              )}
+            </div>
+          ) : (
+            <DashboardGrid
+              items={gridItems}
+              editable={editable}
+              onLayoutChange={handleLayoutChange}
+              renderItem={renderTile}
+              draggableHandle=".rcd-tile-drag-handle"
+            />
+          )}
+        </div>
       </div>
 
       <RcdDialog
@@ -329,6 +393,26 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           open={addSlicerOpen}
           modelId={modelId}
           onClose={() => setAddSlicerOpen(false)}
+        />
+      )}
+
+      <PrintConfigDialog
+        open={printConfigOpen}
+        onClose={() => setPrintConfigOpen(false)}
+        onConfirm={(options) => {
+          setPrintConfigOpen(false);
+          setPrintOptions(options);
+        }}
+      />
+
+      {printOptions !== null && (
+        <DashboardPrintView
+          title={current.name}
+          tiles={tiles}
+          modelId={modelId}
+          filtersByTile={filtersByTile}
+          options={printOptions}
+          onClose={() => setPrintOptions(null)}
         />
       )}
     </div>

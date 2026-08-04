@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Pencil, Plus, RefreshCw, Share2, SlidersHorizontal } from 'lucide-react';
+import { Pencil, Plus, Printer, RefreshCw, Share2, SlidersHorizontal } from 'lucide-react';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdSelect } from '../primitives';
 
 export interface DashboardToolbarProps {
@@ -24,6 +24,8 @@ export interface DashboardToolbarProps {
   onChangeRefreshSeconds?: (seconds: number | null) => void;
   /** Manual "refresh all tiles now" (both modes). */
   onRefresh?: () => void;
+  /** Opens the PDF-export (print) configurator (both modes). */
+  onExport?: () => void;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -52,6 +54,7 @@ export function DashboardToolbar({
   refreshSeconds = null,
   onChangeRefreshSeconds,
   onRefresh,
+  onExport,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -81,6 +84,12 @@ export function DashboardToolbar({
         <span className="truncate text-xs text-[var(--rcd-status-critical)]" title={error}>
           {error}
         </span>
+      )}
+
+      {onExport && (
+        <RcdIconButton aria-label="Export as PDF" title="Export as PDF (print)" onClick={onExport}>
+          <Printer size={14} />
+        </RcdIconButton>
       )}
 
       {onRefresh && (

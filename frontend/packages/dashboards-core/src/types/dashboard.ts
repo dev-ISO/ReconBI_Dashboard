@@ -85,6 +85,22 @@ export interface DashboardDetail {
 
 export const emptyLayout = (): DashboardLayoutDoc => ({ version: 1, tiles: [], slicers: [] });
 
+/**
+ * Transient cross-filter raised by clicking a datum on a chart tile
+ * (Power BI-style highlight). Runtime state only — it is NEVER serialized
+ * into the layout document and resets whenever a dashboard opens/closes.
+ */
+export interface CrossFilter {
+  /** Chart tile the click came from; that tile never filters itself. */
+  sourceTileId: string;
+  /** Clause every OTHER chart tile must include ('eq' raw value, or 'isNull'). */
+  clause: FilterClause;
+  /** Human chip text, e.g. "region: West". */
+  label: string;
+  /** Plain formatted category label — the source chart's dimming key. */
+  categoryLabel: string;
+}
+
 /** Slicer selections (null = no selection) keyed by slicer tile id. */
 export type SlicerValues = Record<string, FilterClause | null>;
 

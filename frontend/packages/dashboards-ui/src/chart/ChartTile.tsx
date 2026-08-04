@@ -9,16 +9,22 @@ import {
 } from '@recon/dashboards-core';
 import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
+// Type-only import: erased at compile time, so the lazy chunk split survives.
+import type { ChartDatumClickInfo } from './ChartRenderer';
 
 const ChartRenderer = lazy(() => import('./ChartRenderer'));
 
 export interface ChartTileProps {
   spec: ChartSpec;
   modelId: number;
-  /** Dashboard-level filters (slicers) merged into the chart's own. */
+  /** Dashboard-level filters (slicers + cross-filter) merged into the chart's own. */
   filters?: FilterClause[];
   /** Debounce before running (builder preview); 0 for tiles. */
   debounceMs?: number;
+  /** Cross-filter click pass-through (see ChartRendererProps.onDatumClick). */
+  onDatumClick?: (info: ChartDatumClickInfo) => void;
+  /** Set while this tile is the active cross-filter SOURCE (dims non-matches). */
+  activeCategory?: { label: string } | null;
 }
 
 const EMPTY_FILTERS: FilterClause[] = [];
@@ -32,7 +38,14 @@ const EMPTY_FILTERS: FilterClause[] = [];
  * identity-keyed effect here once produced an abort/retry loop that drained
  * the server's rate-limit bucket).
  */
-export function ChartTile({ spec, modelId, filters = EMPTY_FILTERS, debounceMs = 0 }: ChartTileProps) {
+export function ChartTile({
+  spec,
+  modelId,
+  filters = EMPTY_FILTERS,
+  debounceMs = 0,
+  onDatumClick,
+  activeCategory = null,
+}: ChartTileProps) {
   const runtime = useRuntime();
   const runnable = isRunnable(spec);
   const wireSpec = useMemo(
@@ -92,7 +105,12 @@ export function ChartTile({ spec, modelId, filters = EMPTY_FILTERS, debounceMs =
   return (
     <div className="h-full w-full min-w-0 overflow-hidden">
       <Suspense fallback={<div className="rcd-skeleton h-full w-full rounded-md" />}>
-        <ChartRenderer spec={spec} result={result} />
+        <ChartRenderer
+          spec={spec}
+          result={result}
+          onDatumClick={onDatumClick}
+          activeCategory={activeCategory}
+        />
       </Suspense>
     </div>
   );

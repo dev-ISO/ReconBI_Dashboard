@@ -4,12 +4,14 @@ import {
   isNumericType,
   isQueryableType,
   isTemporalType,
+  newId,
   tableKey,
   type Aggregation,
   type Catalog,
   type CatalogColumn,
   type Measure,
   type ModelTable,
+  type ValidationOutcome,
 } from '@recon/dashboards-core';
 import { useModelState, useRuntime } from '../provider/DashboardsProvider';
 import {
@@ -50,11 +52,19 @@ const compatibleColumns = (columns: CatalogColumn[], aggregation: Aggregation): 
   }
 };
 
+type MeasureMode = 'aggregation' | 'calculation';
+
+type ValidationIssue = ValidationOutcome['issues'][number];
+
+/** Server codes for calculated-measure problems (parse / unknown ref / shape). */
+const EXPRESSION_ISSUE_CODES = new Set(['MDL012', 'MDL013', 'MDL014']);
+
 interface MeasureDraft {
   name: string;
   table: string;
   aggregation: Aggregation;
   column: string | null;
+  expression: string | null;
 }
 
 interface MeasureDialogProps {
@@ -67,13 +77,21 @@ interface MeasureDialogProps {
 }
 
 function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDialogProps) {
+  const runtime = useRuntime();
+
   const firstTable = tables[0];
+  const [mode, setMode] = useState<MeasureMode>(
+    initial?.expression != null && initial.expression !== '' ? 'calculation' : 'aggregation',
+  );
   const [name, setName] = useState(initial?.name ?? '');
   const [table, setTable] = useState(
     initial?.table ?? (firstTable ? tableKey(firstTable.schema, firstTable.name) : ''),
   );
   const [aggregation, setAggregation] = useState<Aggregation>(initial?.aggregation ?? 'sum');
   const [column, setColumn] = useState(initial?.column ?? '');
+  const [expression, setExpression] = useState(initial?.expression ?? '');
+  const [issues, setIssues] = useState<ValidationIssue[]>([]);
+  const [checking, setChecking] = useState(false);
 
   const columnOptions = useMemo(() => {
     const catalogTable = catalog?.tables.find((t) => t.key === table) ?? null;
@@ -85,8 +103,80 @@ function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDia
     if (column !== '' && !columnOptions.some((c) => c.name === column)) setColumn('');
   }, [column, columnOptions]);
 
+  const clearIssues = () => {
+    if (issues.length > 0) setIssues([]);
+  };
+
   const canSave =
-    name.trim().length > 0 && table !== '' && (column !== '' || aggregation === 'count');
+    name.trim().length > 0 &&
+    table !== '' &&
+    !checking &&
+    (mode === 'aggregation'
+      ? column !== '' || aggregation === 'count'
+      : expression.trim().length > 0 && issues.length === 0);
+
+  const handleApply = () => {
+    if (mode === 'aggregation') {
+      onSave({
+        name: name.trim(),
+        table,
+        aggregation,
+        column: column === '' ? null : column,
+        expression: null,
+      });
+      return;
+    }
+    void applyCalculation();
+  };
+
+  /**
+   * Validate the WORKING definition (with this measure applied) server-side
+   * before committing; MDL012/013/014 issues surface inline and block Apply.
+   */
+  const applyCalculation = async () => {
+    const current = runtime.models.store.getState().current;
+    if (!current) return;
+
+    const draft: MeasureDraft = {
+      name: name.trim(),
+      table,
+      // Ignored by the engine for calculated measures but required by the wire shape.
+      aggregation: 'sum',
+      column: null,
+      expression: expression.trim(),
+    };
+
+    setChecking(true);
+    try {
+      const candidate: Measure = { ...draft, id: initial?.id ?? newId() };
+      const measures = initial
+        ? current.definition.measures.map((m) => (m.id === initial.id ? candidate : m))
+        : [...current.definition.measures, candidate];
+      const outcome = await runtime.api.validateModel(current.dataSourceName, {
+        ...current.definition,
+        measures,
+      });
+      const expressionIssues = outcome.issues.filter((issue) =>
+        EXPRESSION_ISSUE_CODES.has(issue.code),
+      );
+      if (expressionIssues.length > 0) {
+        setIssues(expressionIssues);
+        return;
+      }
+      onSave(draft);
+    } catch (error) {
+      setIssues([
+        {
+          code: 'requestFailed',
+          severity: 'error',
+          message: error instanceof Error ? error.message : String(error),
+          path: null,
+        },
+      ]);
+    } finally {
+      setChecking(false);
+    }
+  };
 
   return (
     <RcdDialog
@@ -96,19 +186,8 @@ function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDia
       footer={
         <>
           <RcdButton onClick={onClose}>Cancel</RcdButton>
-          <RcdButton
-            variant="primary"
-            disabled={!canSave}
-            onClick={() =>
-              onSave({
-                name: name.trim(),
-                table,
-                aggregation,
-                column: column === '' ? null : column,
-              })
-            }
-          >
-            {initial ? 'Save' : 'Add'}
+          <RcdButton variant="primary" disabled={!canSave} onClick={handleApply}>
+            {checking ? 'Checking…' : initial ? 'Save' : 'Add'}
           </RcdButton>
         </>
       }
@@ -124,11 +203,40 @@ function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDia
           />
         </label>
 
+        <fieldset className="flex items-center gap-4">
+          <legend className="sr-only">Measure type</legend>
+          {(
+            [
+              { value: 'aggregation', label: 'Aggregation' },
+              { value: 'calculation', label: 'Calculation' },
+            ] as { value: MeasureMode; label: string }[]
+          ).map((option) => (
+            <label key={option.value} className="flex items-center gap-1.5 text-sm text-rcd-text">
+              <input
+                type="radio"
+                name="rcd-measure-mode"
+                className="accent-[var(--rcd-accent)]"
+                checked={mode === option.value}
+                onChange={() => {
+                  setMode(option.value);
+                  clearIssues();
+                }}
+              />
+              {option.label}
+            </label>
+          ))}
+        </fieldset>
+
         <label className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-rcd-text-2">Table</span>
+          <span className="text-xs font-medium text-rcd-text-2">
+            {mode === 'calculation' ? 'Home table' : 'Table'}
+          </span>
           <RcdSelect
             value={table}
-            onChange={(event) => setTable(event.target.value)}
+            onChange={(event) => {
+              setTable(event.target.value);
+              clearIssues();
+            }}
             className="w-full"
           >
             {tables.length === 0 && <option value="">No tables in the model</option>}
@@ -141,49 +249,90 @@ function MeasureDialog({ initial, tables, catalog, onClose, onSave }: MeasureDia
               );
             })}
           </RcdSelect>
-        </label>
-
-        <label className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-rcd-text-2">Aggregation</span>
-          <RcdSelect
-            value={aggregation}
-            onChange={(event) => setAggregation(event.target.value as Aggregation)}
-            className="w-full"
-          >
-            {AGGREGATIONS.map((a) => (
-              <option key={a.value} value={a.value}>
-                {a.label}
-              </option>
-            ))}
-          </RcdSelect>
-        </label>
-
-        <label className="flex flex-col gap-1">
-          <span className="text-xs font-medium text-rcd-text-2">Column</span>
-          <RcdSelect
-            value={column}
-            onChange={(event) => setColumn(event.target.value)}
-            className="w-full"
-          >
-            {aggregation === 'count' ? (
-              <option value="">(all rows)</option>
-            ) : (
-              <option value="" disabled>
-                Select a column…
-              </option>
-            )}
-            {columnOptions.map((c) => (
-              <option key={c.name} value={c.name}>
-                {c.name}
-              </option>
-            ))}
-          </RcdSelect>
-          {columnOptions.length === 0 && aggregation !== 'count' && (
+          {mode === 'calculation' && (
             <span className="text-xs text-rcd-muted">
-              No compatible columns on this table for this aggregation.
+              Anchors join planning — pick the table whose columns dominate the expression.
             </span>
           )}
         </label>
+
+        {mode === 'aggregation' ? (
+          <>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-rcd-text-2">Aggregation</span>
+              <RcdSelect
+                value={aggregation}
+                onChange={(event) => setAggregation(event.target.value as Aggregation)}
+                className="w-full"
+              >
+                {AGGREGATIONS.map((a) => (
+                  <option key={a.value} value={a.value}>
+                    {a.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </label>
+
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-rcd-text-2">Column</span>
+              <RcdSelect
+                value={column}
+                onChange={(event) => setColumn(event.target.value)}
+                className="w-full"
+              >
+                {aggregation === 'count' ? (
+                  <option value="">(all rows)</option>
+                ) : (
+                  <option value="" disabled>
+                    Select a column…
+                  </option>
+                )}
+                {columnOptions.map((c) => (
+                  <option key={c.name} value={c.name}>
+                    {c.name}
+                  </option>
+                ))}
+              </RcdSelect>
+              {columnOptions.length === 0 && aggregation !== 'count' && (
+                <span className="text-xs text-rcd-muted">
+                  No compatible columns on this table for this aggregation.
+                </span>
+              )}
+            </label>
+          </>
+        ) : (
+          <label className="flex flex-col gap-1">
+            <span className="text-xs font-medium text-rcd-text-2">Expression</span>
+            <textarea
+              value={expression}
+              onChange={(event) => {
+                setExpression(event.target.value);
+                clearIssues();
+              }}
+              rows={4}
+              spellCheck={false}
+              placeholder="SUM(public.orders.total) / COUNT(*)"
+              className="w-full resize-y rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 font-mono text-sm text-rcd-text outline-none focus:border-rcd-accent"
+            />
+            <span className="text-xs text-rcd-muted">
+              Arithmetic (+ − * / parentheses), numbers, SUM / AVG / MIN / MAX / COUNT /
+              COUNTDISTINCT over schema.table.column (COUNT(*) allowed), and [Measure Name]
+              references to plain measures. Division is guarded automatically. Examples:{' '}
+              <code className="font-mono">SUM(public.orders.total) / COUNT(*)</code> ·{' '}
+              <code className="font-mono">[Revenue] / [Order Count]</code>
+            </span>
+            {issues.length > 0 && (
+              <ul className="flex flex-col gap-1">
+                {issues.map((issue, index) => (
+                  <li key={index} className="text-xs text-[var(--rcd-status-critical)]">
+                    <span className="font-semibold">{issue.code}</span> {issue.message}
+                    {issue.path && <span className="text-rcd-muted"> — {issue.path}</span>}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </label>
+        )}
       </div>
     </RcdDialog>
   );
@@ -200,10 +349,15 @@ export function MeasuresPanel() {
 
   if (!definition) return null;
 
-  const subtitle = (measure: Measure): string =>
-    measure.column
+  const isCalculated = (measure: Measure): boolean =>
+    measure.expression != null && measure.expression !== '';
+
+  const subtitle = (measure: Measure): string => {
+    if (isCalculated(measure)) return measure.expression ?? '';
+    return measure.column
       ? `${aggregationLabel(measure.aggregation)} of ${measure.table}.${measure.column}`
       : `${aggregationLabel(measure.aggregation)} of all rows in ${measure.table}`;
+  };
 
   const handleSave = (draft: MeasureDraft) => {
     if (editing !== null && editing !== 'new') models.updateMeasure(editing.id, draft);
@@ -238,8 +392,23 @@ export function MeasuresPanel() {
             >
               <Sigma size={14} className="shrink-0 text-rcd-accent" />
               <div className="min-w-0 flex-1">
-                <div className="truncate text-sm text-rcd-text">{measure.name}</div>
-                <div className="truncate text-xs text-rcd-muted">{subtitle(measure)}</div>
+                <div className="flex items-center gap-1.5">
+                  <span className="truncate text-sm text-rcd-text">{measure.name}</span>
+                  {isCalculated(measure) && (
+                    <span
+                      className="shrink-0 rounded border border-rcd-border px-1 font-mono text-[10px] font-semibold italic leading-4 text-rcd-accent"
+                      title="Calculated measure"
+                    >
+                      fx
+                    </span>
+                  )}
+                </div>
+                <div
+                  className={`truncate text-xs text-rcd-muted ${isCalculated(measure) ? 'font-mono' : ''}`}
+                  title={subtitle(measure)}
+                >
+                  {subtitle(measure)}
+                </div>
               </div>
               <RcdIconButton aria-label={`Edit ${measure.name}`} onClick={() => setEditing(measure)}>
                 <Pencil size={13} />

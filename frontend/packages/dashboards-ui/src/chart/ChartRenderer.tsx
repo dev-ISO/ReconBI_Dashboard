@@ -29,12 +29,35 @@ import {
   type QueryResult,
   type TextStyle,
 } from '@recon/dashboards-core';
-import { shapeChartData, shapePieData, shapeScatterData } from './chartData';
+import { RAW_AXIS_KEY, shapeChartData, shapePieData, shapeScatterData } from './chartData';
 import { textStyleToCss } from './textStyle';
+
+/** Payload of a cross-filter datum click. */
+export interface ChartDatumClickInfo {
+  /** RAW (pre-format) cell value of the clicked category; null = blank. */
+  value: CellValue;
+  /** Formatted display label of the clicked category. */
+  label: string;
+}
 
 export interface ChartRendererProps {
   spec: ChartSpec;
   result: QueryResult;
+  /**
+   * Cross-filter hook: fires with the clicked category's raw value + formatted
+   * label. Wired for column/bar/stacked bars, pie/donut slices, and table rows
+   * that have a dimension; line/area/scatter/kpi emit nothing (v1). The
+   * renderer stays query-agnostic — the CALLER maps the raw value onto its
+   * dimension (table/column) and builds the FilterClause.
+   */
+  onDatumClick?: (info: ChartDatumClickInfo) => void;
+  /**
+   * Set on the SOURCE chart while its cross-filter is active: categories whose
+   * formatted label differs render at fillOpacity 0.35. Implemented for
+   * single-series column/bar (the Cell path) and pie/donut; multi-series and
+   * stacked charts skip dimming (a category there spans several marks).
+   */
+  activeCategory?: { label: string } | null;
 }
 
 const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-text-2)' } as const;
@@ -174,7 +197,12 @@ function Placeholder({ children }: { children: ReactNode }) {
  * isAnimationActive={false}: animation is rAF-driven and freezes at frame 0 in
  * throttled background tabs; dashboards want instant, deterministic paint.
  */
-export default function ChartRenderer({ spec, result }: ChartRendererProps) {
+export default function ChartRenderer({
+  spec,
+  result,
+  onDatumClick,
+  activeCategory = null,
+}: ChartRendererProps) {
   const format = spec.format;
   const measureColumns = result.columns.filter((c) => c.role === 'measure');
   const formatValue = makeValueFormatter(format, measureColumns);
@@ -191,10 +219,26 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
       const labelPosition = stacked ? 'center' : horizontal ? 'right' : 'top';
       // Single-series column/bar only: each category gets its own palette
       // slot; in this mode colorOverrides keyed by the CATEGORY label win.
-      const colorByCategory =
-        Boolean(format.colorByCategory) &&
-        shaped.series.length === 1 &&
-        (spec.type === 'column' || spec.type === 'bar');
+      const singleSeriesBar =
+        shaped.series.length === 1 && (spec.type === 'column' || spec.type === 'bar');
+      const colorByCategory = Boolean(format.colorByCategory) && singleSeriesBar;
+      // Cross-filter source dimming rides the same per-category Cell path, so
+      // it too is single-series column/bar only; stacked/legend charts keep
+      // full opacity (a category there spans several marks — skipped in v1).
+      const dimming = activeCategory !== null && singleSeriesBar;
+      const renderCells = colorByCategory || dimming;
+      // Recharts hands (barItem, index) — index addresses shaped.data directly,
+      // which is sturdier across recharts versions than digging into payload.
+      const handleBarClick = onDatumClick
+        ? (_: unknown, index: number) => {
+            const row = shaped.data[index];
+            if (!row) return;
+            onDatumClick({
+              value: row[RAW_AXIS_KEY] ?? null,
+              label: String(row[shaped.axisKey] ?? ''),
+            });
+          }
+        : undefined;
       return (
         <ResponsiveContainer width="100%" height="100%">
           <BarChart
@@ -256,18 +300,28 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 stackId={stacked ? 'stack' : undefined}
                 radius={stacked ? 0 : horizontal ? [0, 2, 2, 0] : [2, 2, 0, 0]}
                 isAnimationActive={false}
+                cursor={handleBarClick ? 'pointer' : undefined}
+                onClick={handleBarClick}
               >
-                {colorByCategory &&
-                  shaped.data.map((row, dataIndex) => (
-                    <Cell
-                      key={dataIndex}
-                      fill={seriesColor(
-                        dataIndex,
-                        String(row[shaped.axisKey] ?? ''),
-                        format.colorOverrides,
-                      )}
-                    />
-                  ))}
+                {renderCells &&
+                  shaped.data.map((row, dataIndex) => {
+                    const categoryLabel = String(row[shaped.axisKey] ?? '');
+                    return (
+                      <Cell
+                        key={dataIndex}
+                        fill={
+                          colorByCategory
+                            ? seriesColor(dataIndex, categoryLabel, format.colorOverrides)
+                            : series.color
+                        }
+                        fillOpacity={
+                          dimming && activeCategory && categoryLabel !== activeCategory.label
+                            ? 0.35
+                            : undefined
+                        }
+                      />
+                    );
+                  })}
                 {format.showDataLabels && (
                   <LabelList
                     dataKey={series.key}
@@ -374,6 +428,13 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
       const { slices } = shapePieData(result, spec);
       if (slices.length === 0) return <Placeholder>Pie needs a measure.</Placeholder>;
       const showLegend = format.showLegend ?? slices.length > 1;
+      // Sector index addresses our own slices array (data order === sector order).
+      const handleSliceClick = onDatumClick
+        ? (_: unknown, index: number) => {
+            const slice = slices[index];
+            if (slice) onDatumClick({ value: slice.raw, label: slice.label });
+          }
+        : undefined;
       return (
         <ResponsiveContainer width="100%" height="100%">
           <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
@@ -388,9 +449,17 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
               stroke="var(--rcd-surface)"
               strokeWidth={2}
               isAnimationActive={false}
+              cursor={handleSliceClick ? 'pointer' : undefined}
+              onClick={handleSliceClick}
             >
               {slices.map((slice, i) => (
-                <Cell key={`${i}-${slice.label}`} fill={slice.color} />
+                <Cell
+                  key={`${i}-${slice.label}`}
+                  fill={slice.color}
+                  fillOpacity={
+                    activeCategory && slice.label !== activeCategory.label ? 0.35 : undefined
+                  }
+                />
               ))}
             </Pie>
           </PieChart>
@@ -494,6 +563,18 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
       const rows = result.rows.slice(0, TABLE_ROW_CAP);
       // Header text follows legendStyle; measure headers honor seriesLabels.
       const headerStyle = textStyleToCss(format.legendStyle);
+      // Row click cross-filters by the FIRST dimension column (when present).
+      // No dimming for tables (v1) — the active row isn't visually marked.
+      const clickColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
+      const clickIndex = clickColumn ? result.columns.indexOf(clickColumn) : -1;
+      const handleRowClick =
+        onDatumClick && clickColumn
+          ? (row: CellValue[]) =>
+              onDatumClick({
+                value: row[clickIndex] ?? null,
+                label: formatCellValue(row[clickIndex] ?? null, clickColumn),
+              })
+          : null;
       return (
         <div className="h-full w-full overflow-auto">
           <table className="w-full border-separate border-spacing-0 text-sm">
@@ -516,7 +597,15 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
             </thead>
             <tbody>
               {rows.map((row, rowIndex) => (
-                <tr key={rowIndex} className="hover:bg-black/5 dark:hover:bg-white/10">
+                <tr
+                  key={rowIndex}
+                  onClick={handleRowClick ? () => handleRowClick(row) : undefined}
+                  className={
+                    handleRowClick
+                      ? 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/10'
+                      : 'hover:bg-black/5 dark:hover:bg-white/10'
+                  }
+                >
                   {result.columns.map((column, columnIndex) => (
                     <td
                       key={column.name}

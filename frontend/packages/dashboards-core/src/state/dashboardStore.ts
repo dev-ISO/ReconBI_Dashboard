@@ -5,6 +5,7 @@ import {
   emptyLayout,
   isSlicerTile,
   mergedSlicerFilters,
+  type CrossFilter,
   type DashboardDetail,
   type DashboardLayoutDoc,
   type DashboardSummary,
@@ -14,6 +15,7 @@ import {
   type SlicerVariant,
 } from '../types/dashboard';
 import type { FilterClause } from '../types/query';
+import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
 import type { AsyncStatus } from './modelStore';
 
@@ -38,6 +40,8 @@ export interface DashboardStoreState {
   draftBackup: OpenDashboard | null;
   selectedTileId: string | null;
   slicerValues: SlicerValues;
+  /** Transient click-to-highlight filter; NOT persisted with the layout. */
+  crossFilter: CrossFilter | null;
   saveStatus: AsyncStatus;
   error: string | null;
 }
@@ -51,6 +55,7 @@ const initialState: DashboardStoreState = {
   draftBackup: null,
   selectedTileId: null,
   slicerValues: {},
+  crossFilter: null,
   saveStatus: 'idle',
   error: null,
 };
@@ -95,6 +100,7 @@ export class DashboardStore {
       draftBackup: null,
       selectedTileId: null,
       slicerValues: {},
+      crossFilter: null,
       saveStatus: 'idle',
       error: null,
     });
@@ -130,6 +136,7 @@ export class DashboardStore {
       dirty: false,
       draftBackup: null,
       selectedTileId: null,
+      crossFilter: null,
       ...(backup ? { current: backup } : {}),
     });
   }
@@ -194,6 +201,10 @@ export class DashboardStore {
     if (tileId in this.state.slicerValues) {
       const { [tileId]: _removed, ...rest } = this.state.slicerValues;
       this.set({ slicerValues: rest });
+    }
+    // Same for a removed cross-filter source chart.
+    if (this.state.crossFilter?.sourceTileId === tileId) {
+      this.set({ crossFilter: null });
     }
   }
 
@@ -287,6 +298,34 @@ export class DashboardStore {
     this.set({ slicerValues: { ...this.state.slicerValues, [slicerId]: clause } });
   }
 
+  /**
+   * Activates the click-to-highlight cross-filter emitted by a chart tile.
+   * Clicking the SAME datum on the same source again (same source tile +
+   * structurally identical clause, compared via stableStringify) toggles it
+   * off; any other click replaces the active filter (one at a time, v1).
+   */
+  setCrossFilter(
+    sourceTileId: string,
+    clause: FilterClause,
+    label: string,
+    categoryLabel: string,
+  ): void {
+    const active = this.state.crossFilter;
+    if (
+      active &&
+      active.sourceTileId === sourceTileId &&
+      stableStringify(active.clause) === stableStringify(clause)
+    ) {
+      this.set({ crossFilter: null });
+      return;
+    }
+    this.set({ crossFilter: { sourceTileId, clause, label, categoryLabel } });
+  }
+
+  clearCrossFilter(): void {
+    if (this.state.crossFilter !== null) this.set({ crossFilter: null });
+  }
+
   /** Filters every tile query must include (all slicer selections). */
   activeFilters(): FilterClause[] {
     return mergedSlicerFilters(this.state.slicerValues);
@@ -294,7 +333,11 @@ export class DashboardStore {
 
   /**
    * Filters a specific chart tile must include: the union of selections from
-   * slicer tiles whose targets are null/absent (all charts) or include tileId.
+   * slicer tiles whose targets are null/absent (all charts) or include tileId,
+   * plus the active cross-filter when this tile is not its source. The source
+   * chart never filters itself, and slicer targeting does NOT constrain
+   * cross-filters — a datum click highlights every other chart regardless of
+   * any slicer's "applies to" list.
    */
   filtersForTile(tileId: string): FilterClause[] {
     const layout = this.state.current?.layout;
@@ -307,6 +350,8 @@ export class DashboardStore {
       const clause = this.state.slicerValues[tile.id];
       if (clause != null) clauses.push(clause);
     }
+    const cross = this.state.crossFilter;
+    if (cross && cross.sourceTileId !== tileId) clauses.push(cross.clause);
     return clauses;
   }
 

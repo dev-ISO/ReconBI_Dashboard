@@ -79,3 +79,49 @@ html[data-theme='dark'] .rcd-root {
   );
   background-size: 800px 100%;
 }
+
+/* PDF export (DashboardPrintView). While the print preview overlay is open it
+   adds `rcd-printing` to <body>; the overlay itself is portaled directly under
+   <body>, so hiding every OTHER body child leaves only the print sheet in the
+   output. The @page size/margin rule is injected at runtime from the chosen
+   paper + orientation (CSS alone cannot parameterize it). */
+@media print {
+  body.rcd-printing > :not(.rcd-print-view) {
+    display: none !important;
+  }
+
+  /* Overlay leaves fixed/scroll mode and becomes the document flow. */
+  body.rcd-printing .rcd-print-view {
+    position: static !important;
+    inset: auto !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body.rcd-printing .rcd-print-toolbar {
+    display: none !important;
+  }
+
+  /* Drop the on-screen backdrop padding and the sheet's visual page margin —
+     the real margins come from @page. */
+  body.rcd-printing .rcd-print-stage {
+    padding: 0 !important;
+  }
+
+  body.rcd-printing .rcd-print-sheet {
+    width: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+
+  /* Pagination unit (grid band / sequential tile): never slice through one.
+     A band taller than a page still gets sliced — the browser ignores the
+     hint when the box cannot fit on any single page. */
+  body.rcd-printing .rcd-print-block {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+}

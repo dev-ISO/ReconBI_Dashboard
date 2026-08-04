@@ -14,13 +14,20 @@ export interface ChartSeries {
 }
 
 export interface ShapedChartData {
-  /** One object per axis value: { axisLabel, [seriesKey]: number }. */
-  data: Record<string, string | number | null>[];
+  /** One object per axis value: { axisLabel, rawAxis, [seriesKey]: number }. */
+  data: Record<string, CellValue>[];
   series: ChartSeries[];
   axisKey: string;
 }
 
 const AXIS_KEY = '__axis';
+
+/**
+ * Hidden row field carrying the RAW axis cell (pre-format CellValue) so click
+ * handlers can build exact filter clauses; the formatted label under axisKey
+ * stays display-only. Never rendered — recharts only reads declared dataKeys.
+ */
+export const RAW_AXIS_KEY = '__rawAxis';
 
 /**
  * Display name for a series: format.seriesLabels override (keyed by the
@@ -52,8 +59,9 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
     }));
 
     const data = result.rows.map((row) => {
-      const item: Record<string, string | number | null> = {
+      const item: Record<string, CellValue> = {
         [AXIS_KEY]: axisColumn ? formatCellValue(row[axisIndex] ?? null, axisColumn) : '',
+        [RAW_AXIS_KEY]: axisColumn ? (row[axisIndex] ?? null) : null,
       };
       for (const column of measureColumns) {
         item[column.name] = toNumber(row[result.columns.indexOf(column)] ?? null);
@@ -70,7 +78,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   const measureColumn = measureColumns[0];
   const measureIndex = measureColumn ? result.columns.indexOf(measureColumn) : -1;
 
-  const byAxis = new Map<string, Record<string, string | number | null>>();
+  const byAxis = new Map<string, Record<string, CellValue>>();
   const legendValues: string[] = [];
 
   for (const row of result.rows) {
@@ -80,7 +88,10 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
 
     let item = byAxis.get(axisLabel);
     if (!item) {
-      item = { [AXIS_KEY]: axisLabel };
+      item = {
+        [AXIS_KEY]: axisLabel,
+        [RAW_AXIS_KEY]: axisColumn ? (row[axisIndex] ?? null) : null,
+      };
       byAxis.set(axisLabel, item);
     }
     item[legendLabel] = measureIndex >= 0 ? toNumber(row[measureIndex] ?? null) : null;
@@ -99,6 +110,8 @@ export interface PieSlice {
   label: string;
   value: number;
   color: string;
+  /** Raw (pre-format) label cell for click-to-filter; null when unlabeled. */
+  raw: CellValue;
 }
 
 export interface ShapedPieData {
@@ -129,6 +142,7 @@ export function shapePieData(result: QueryResult, spec: ChartSpec): ShapedPieDat
       label: displayLabel(label, spec),
       value,
       color: seriesColor(slices.length, label, spec.format.colorOverrides),
+      raw: labelColumn ? (row[labelIndex] ?? null) : null,
     });
   }
   return { slices };

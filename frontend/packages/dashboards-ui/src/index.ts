@@ -31,6 +31,7 @@ export type {
 } from './chart/chartData';
 export { FormatPanel } from './chart/FormatPanel';
 export type { FormatPanelProps } from './chart/FormatPanel';
+export { textStyleToCss } from './chart/textStyle';
 
 export {
   RcdButton,

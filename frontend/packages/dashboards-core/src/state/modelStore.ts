@@ -3,9 +3,11 @@ import type { DashboardsApi } from '../api/DashboardsApi';
 import { RcdApiError } from '../api/fetcher';
 import type { Catalog, CatalogTable, ConnectionInfo, RelationshipSuggestion } from '../types/schema';
 import {
+  dateTableKey,
   emptyDefinition,
   tableKey,
   type Cardinality,
+  type DateTableDef,
   type Measure,
   type ModelDefinition,
   type ModelDetail,
@@ -254,6 +256,46 @@ export class ModelStore {
     this.mutateDefinition((definition) => ({
       ...definition,
       measures: definition.measures.filter((m) => m.id !== id),
+    }));
+  }
+
+  addDateTable(def: DateTableDef): void {
+    this.mutateDefinition((definition) => {
+      const existing = definition.dateTables ?? [];
+      if (existing.some((d) => d.name === def.name)) return definition;
+      return { ...definition, dateTables: [...existing, def] };
+    });
+  }
+
+  updateDateTable(name: string, patch: Partial<DateTableDef>): void {
+    this.mutateDefinition((definition) => {
+      const existing = definition.dateTables ?? [];
+      if (!existing.some((d) => d.name === name)) return definition;
+      const nextName = patch.name ?? name;
+      // A rename re-points relationships at the new canonical key.
+      const oldKey = dateTableKey(name);
+      const newKey = dateTableKey(nextName);
+      return {
+        ...definition,
+        dateTables: existing.map((d) => (d.name === name ? { ...d, ...patch } : d)),
+        relationships:
+          oldKey === newKey
+            ? definition.relationships
+            : definition.relationships.map((r) =>
+                r.toTable === oldKey ? { ...r, toTable: newKey } : r,
+              ),
+      };
+    });
+  }
+
+  removeDateTable(name: string): void {
+    const key = dateTableKey(name);
+    this.mutateDefinition((definition) => ({
+      ...definition,
+      dateTables: (definition.dateTables ?? []).filter((d) => d.name !== name),
+      relationships: definition.relationships.filter(
+        (r) => r.fromTable !== key && r.toTable !== key,
+      ),
     }));
   }
 

@@ -12,6 +12,7 @@ import { SchemaExplorer } from '../data-pane/SchemaExplorer';
 import { ModelCanvas, type ModelCanvasConnectInput } from '../model-canvas/ModelCanvas';
 import { RelationshipDialog } from '../model-canvas/RelationshipDialog';
 import { MeasuresPanel } from './MeasuresPanel';
+import { DateTablesPanel } from './DateTablesPanel';
 
 export interface ModelEditorProps {
   /** Existing model id, or 'new' with a data source to start from. */
@@ -271,8 +272,13 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
           />
         </div>
 
-        <aside className="w-72 shrink-0 border-l border-rcd-border bg-rcd-surface">
-          <MeasuresPanel />
+        <aside className="flex w-72 shrink-0 flex-col border-l border-rcd-border bg-rcd-surface">
+          <div className="min-h-0 flex-1">
+            <MeasuresPanel />
+          </div>
+          <div className="flex max-h-[45%] min-h-0 shrink-0 flex-col border-t border-rcd-border">
+            <DateTablesPanel />
+          </div>
         </aside>
       </div>
 
