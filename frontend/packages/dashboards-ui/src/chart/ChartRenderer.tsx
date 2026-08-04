@@ -59,6 +59,9 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 stroke="var(--rcd-surface)"
                 strokeWidth={1}
                 radius={[2, 2, 0, 0]}
+                // Animation is rAF-driven and freezes at frame 0 in throttled
+                // background tabs; dashboards want instant, deterministic paint.
+                isAnimationActive={false}
               />
             ))}
           </BarChart>

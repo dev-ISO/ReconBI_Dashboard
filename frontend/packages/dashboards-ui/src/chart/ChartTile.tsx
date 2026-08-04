@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, BarChart3, RefreshCw } from 'lucide-react';
 import {
   isRunnable,
@@ -21,11 +21,18 @@ export interface ChartTileProps {
   debounceMs?: number;
 }
 
+const EMPTY_FILTERS: FilterClause[] = [];
+
 /**
  * Runs a chart spec through the shared query cache and renders exactly one of:
  * configure hint / skeleton / error+retry / empty / the chart.
+ *
+ * The fetch effect is keyed on the CACHE KEY STRING, not object identities —
+ * fresh-but-equal spec/filters arrays must never re-trigger requests (an
+ * identity-keyed effect here once produced an abort/retry loop that drained
+ * the server's rate-limit bucket).
  */
-export function ChartTile({ spec, modelId, filters = [], debounceMs = 0 }: ChartTileProps) {
+export function ChartTile({ spec, modelId, filters = EMPTY_FILTERS, debounceMs = 0 }: ChartTileProps) {
   const runtime = useRuntime();
   const runnable = isRunnable(spec);
   const wireSpec = useMemo(
@@ -35,12 +42,16 @@ export function ChartTile({ spec, modelId, filters = [], debounceMs = 0 }: Chart
   const cacheKey = wireSpec ? runtime.queries.keyFor(wireSpec) : null;
   const entry = useQueryCacheState((state) => (cacheKey ? state.entries[cacheKey] : undefined));
   const [retryToken, setRetryToken] = useState(0);
+  const wireSpecRef = useRef(wireSpec);
+  wireSpecRef.current = wireSpec;
 
   useEffect(() => {
-    if (!wireSpec) return;
+    if (!cacheKey) return;
     const controller = new AbortController();
     const timer = setTimeout(() => {
-      runtime.queries.run(wireSpec, controller.signal).catch(() => {
+      const current = wireSpecRef.current;
+      if (!current) return;
+      runtime.queries.run(current, controller.signal).catch(() => {
         // surfaced via the cache entry
       });
     }, debounceMs);
@@ -48,7 +59,7 @@ export function ChartTile({ spec, modelId, filters = [], debounceMs = 0 }: Chart
       clearTimeout(timer);
       controller.abort();
     };
-  }, [runtime, wireSpec, debounceMs, retryToken]);
+  }, [runtime, cacheKey, debounceMs, retryToken]);
 
   if (!runnable) {
     return (
@@ -79,7 +90,7 @@ export function ChartTile({ spec, modelId, filters = [], debounceMs = 0 }: Chart
   }
 
   return (
-    <div className="h-full w-full">
+    <div className="h-full w-full min-w-0 overflow-hidden">
       <Suspense fallback={<div className="rcd-skeleton h-full w-full rounded-md" />}>
         <ChartRenderer spec={spec} result={result} />
       </Suspense>
