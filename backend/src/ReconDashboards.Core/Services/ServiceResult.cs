@@ -10,6 +10,9 @@ public enum ServiceErrorKind
     Conflict,
     Validation,
     LimitExceeded,
+
+    /// <summary>The downstream database failed or was unreachable (maps to 502).</summary>
+    Upstream,
 }
 
 /// <summary>

@@ -9,7 +9,9 @@ public sealed record RegisteredDataSource(
     string Name,
     string ProviderName,
     DataSourceOptions Options,
-    ISchemaIntrospector Introspector);
+    ISchemaIntrospector Introspector,
+    IQueryExecutor? Executor = null,
+    ISqlDialect? Dialect = null);
 
 /// <summary>Runtime lookup of registered data sources (introspectors created lazily, once per source).</summary>
 public interface IDataSourceRegistry
@@ -50,7 +52,9 @@ public sealed class DataSourceRegistry(ReconDashboardsOptions options, IServiceP
                 registration.Name,
                 registration.ProviderName,
                 registration.Options,
-                registration.IntrospectorFactory(services)));
+                registration.IntrospectorFactory(services),
+                registration.ExecutorFactory?.Invoke(services),
+                registration.Dialect));
         return true;
     }
 }

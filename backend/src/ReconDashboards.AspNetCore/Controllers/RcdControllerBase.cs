@@ -1,3 +1,4 @@
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using ReconDashboards.Core.Services;
 
@@ -21,6 +22,7 @@ public abstract class RcdControllerBase : ControllerBase
             ServiceErrorKind.Conflict => StatusCodes.Status409Conflict,
             ServiceErrorKind.Validation => StatusCodes.Status422UnprocessableEntity,
             ServiceErrorKind.LimitExceeded => StatusCodes.Status422UnprocessableEntity,
+            ServiceErrorKind.Upstream => StatusCodes.Status502BadGateway,
             _ => StatusCodes.Status500InternalServerError,
         };
 

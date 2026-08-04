@@ -1,6 +1,8 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ReconDashboards.Core.Modeling;
+using ReconDashboards.Core.Querying.Compilation;
+using ReconDashboards.Core.Querying.Execution;
 using ReconDashboards.Core.Schema;
 using ReconDashboards.Core.Services;
 
@@ -128,6 +130,29 @@ public sealed record SaveDashboardRequest(
     bool IsShared = false,
     DateTime? ExpectedUpdatedAtUtc = null);
 
+public sealed record QueryColumnDto(
+    string Name,
+    string Label,
+    string Role,
+    string Type,
+    string? Source,
+    string? DateBucket,
+    string? FormatHint);
+
+public sealed record QueryWarningDto(string Code, string Message);
+
+public sealed record QueryMetaDto(
+    int RowCount,
+    bool Truncated,
+    int ElapsedMs,
+    IReadOnlyList<QueryWarningDto> Warnings,
+    string? Sql);
+
+public sealed record QueryResponse(
+    IReadOnlyList<QueryColumnDto> Columns,
+    IReadOnlyList<object?[]> Rows,
+    QueryMetaDto Meta);
+
 public static class DtoMapping
 {
     private static string Camel(string value) => JsonNamingPolicy.CamelCase.ConvertName(value);
@@ -169,4 +194,32 @@ public static class DtoMapping
 
     public static ValidationIssueDto ToIssueDto(ValidationIssue issue) =>
         new(issue.Code, issue.Severity.ToString().ToLowerInvariant(), issue.Message, issue.Path);
+
+    public static QueryResponse ToQueryResponse(QueryOutcome outcome, bool includeSql)
+    {
+        var columns = outcome.Compiled.Columns
+            .Select(c => new QueryColumnDto(
+                c.Name,
+                c.Label,
+                Camel(c.Role.ToString()),
+                Camel(c.Type.ToString()),
+                c.Source,
+                c.DateBucket is { } bucket ? Camel(bucket.ToString()) : null,
+                c.FormatHint))
+            .ToArray();
+
+        var warnings = outcome.Compiled.Warnings
+            .Select(w => new QueryWarningDto(w.Code, w.Message))
+            .ToArray();
+
+        return new QueryResponse(
+            columns,
+            outcome.Rows,
+            new QueryMetaDto(
+                outcome.Rows.Count,
+                outcome.Truncated,
+                outcome.ElapsedMs,
+                warnings,
+                includeSql ? outcome.Compiled.Sql : null));
+    }
 }

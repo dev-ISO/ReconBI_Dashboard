@@ -35,7 +35,9 @@ public static class PostgresReconDashboardsOptionsExtensions
             name,
             ProviderName: "postgres",
             dataSourceOptions,
-            IntrospectorFactory: _ => new PostgresSchemaIntrospector(lazyDataSource.Value, name)));
+            IntrospectorFactory: _ => new PostgresSchemaIntrospector(lazyDataSource.Value, name),
+            ExecutorFactory: _ => new PostgresQueryExecutor(lazyDataSource.Value),
+            Dialect: new PostgresSqlDialect()));
 
         return options;
     }

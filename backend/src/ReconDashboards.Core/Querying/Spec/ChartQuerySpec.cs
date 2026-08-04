@@ -1,8 +1,11 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
+using ReconDashboards.Core.Json;
 using ReconDashboards.Core.Modeling;
 
 namespace ReconDashboards.Core.Querying.Spec;
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<DateBucket>))]
 public enum DateBucket
 {
     Year,
@@ -12,6 +15,7 @@ public enum DateBucket
     Day,
 }
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<FilterOperator>))]
 public enum FilterOperator
 {
     Eq,
@@ -29,12 +33,14 @@ public enum FilterOperator
     NotNull,
 }
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SortDirection>))]
 public enum SortDirection
 {
     Asc,
     Desc,
 }
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SortTargetKind>))]
 public enum SortTargetKind
 {
     Dimension,

@@ -1,12 +1,18 @@
+using System.Security.Claims;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using ReconDashboards.AspNetCore.Controllers;
 using ReconDashboards.AspNetCore.Conventions;
 using ReconDashboards.Core.Abstractions;
 using ReconDashboards.Core.Caching;
 using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
+using ReconDashboards.Core.Querying.Execution;
 using ReconDashboards.Core.Services;
 
 namespace ReconDashboards.AspNetCore.DependencyInjection;
@@ -64,6 +70,25 @@ public static class AddReconDashboardsExtensions
         services.TryAddSingleton(TimeProvider.System);
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
+        services.AddScoped<ChartQueryService>();
+
+        // Per-user token bucket for query endpoints. Takes effect when the host
+        // pipeline calls UseRateLimiter() (both production hosts already do).
+        var queriesPerMinute = Math.Max(1, options.Limits.QueriesPerMinutePerUser);
+        services.AddRateLimiter(rateLimiter => rateLimiter.AddPolicy(
+            RcdRateLimiting.QueryPolicyName,
+            httpContext => RateLimitPartition.GetTokenBucketLimiter(
+                httpContext.User.FindFirst(ClaimTypes.NameIdentifier)?.Value
+                    ?? httpContext.Connection.RemoteIpAddress?.ToString()
+                    ?? "anonymous",
+                _ => new TokenBucketRateLimiterOptions
+                {
+                    TokenLimit = queriesPerMinute,
+                    TokensPerPeriod = queriesPerMinute,
+                    ReplenishmentPeriod = TimeSpan.FromMinutes(1),
+                    QueueLimit = 0,
+                    AutoReplenishment = true,
+                })));
 
         mvc.AddApplicationPart(typeof(AddReconDashboardsExtensions).Assembly);
 

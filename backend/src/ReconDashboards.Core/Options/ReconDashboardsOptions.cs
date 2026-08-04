@@ -13,7 +13,9 @@ public sealed record DataSourceRegistration(
     string Name,
     string ProviderName,
     DataSourceOptions Options,
-    Func<IServiceProvider, ISchemaIntrospector> IntrospectorFactory);
+    Func<IServiceProvider, ISchemaIntrospector> IntrospectorFactory,
+    Func<IServiceProvider, IQueryExecutor>? ExecutorFactory = null,
+    ISqlDialect? Dialect = null);
 
 public sealed class ReconDashboardsOptions
 {

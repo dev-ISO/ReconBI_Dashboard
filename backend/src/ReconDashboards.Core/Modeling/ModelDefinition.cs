@@ -1,7 +1,10 @@
+using System.Text.Json.Serialization;
+using ReconDashboards.Core.Json;
 using ReconDashboards.Core.Querying.Spec;
 
 namespace ReconDashboards.Core.Modeling;
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<Aggregation>))]
 public enum Aggregation
 {
     Sum,
@@ -12,12 +15,14 @@ public enum Aggregation
     CountDistinct,
 }
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<Cardinality>))]
 public enum Cardinality
 {
     ManyToOne,
     OneToOne,
 }
 
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<RelationshipSource>))]
 public enum RelationshipSource
 {
     Fk,
