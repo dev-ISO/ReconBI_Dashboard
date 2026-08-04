@@ -38,6 +38,17 @@ public interface ISqlDialect
     /// <summary>Case-insensitive LIKE with backslash escaping (pattern is pre-escaped by the compiler).</summary>
     string CaseInsensitiveLike(string expression, string parameterPlaceholder);
 
+    /// <summary>CAST(expr AS date) or equivalent; joins timestamp columns onto virtual date tables.</summary>
+    string CastToDate(string expression);
+
+    /// <summary>
+    /// The SELECT body of a virtual calendar CTE: columns date_key (date),
+    /// year/quarter/month/week/day (int), month_name/day_name (text), one row
+    /// per day from start to end inclusive. Both placeholders are bound as
+    /// date parameters by the compiler.
+    /// </summary>
+    string CalendarTableSql(string startPlaceholder, string endPlaceholder);
+
     /// <summary>" NULLS LAST" or an equivalent wrapping for engines without it.</summary>
     string NullsLastSuffix { get; }
 

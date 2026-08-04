@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Copy, GripVertical, MoreVertical, Pencil, Trash2, type LucideIcon } from 'lucide-react';
 import { ConfirmDialog, RcdIconButton } from '../primitives';
@@ -7,9 +7,18 @@ export interface TileFrameProps {
   title: string;
   /** Shows the drag handle + kebab actions (dashboard edit mode). */
   editable: boolean;
-  onEdit: () => void;
-  onDuplicate: () => void;
-  onDelete: () => void;
+  onEdit?: () => void;
+  onDuplicate?: () => void;
+  onDelete?: () => void;
+  /**
+   * Replaces the built-in kebab menu: the kebab reports its screen position and
+   * the caller renders its own menu (slicer tiles' config menu).
+   */
+  onMenu?: (position: { x: number; y: number }) => void;
+  /** Right-click hook on the whole tile (caller must preventDefault). */
+  onContextMenu?: (event: ReactMouseEvent<HTMLDivElement>) => void;
+  /** Extra header content rendered before the kebab (e.g. a clear-filter x). */
+  headerExtra?: ReactNode;
   children: ReactNode;
 }
 
@@ -18,7 +27,17 @@ export interface TileFrameProps {
  * bar carries the `rcd-tile-drag-handle` class that DashboardGrid targets, so
  * the kebab and tile content stay clickable while dragging is title-bar only.
  */
-export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, children }: TileFrameProps) {
+export function TileFrame({
+  title,
+  editable,
+  onEdit,
+  onDuplicate,
+  onDelete,
+  onMenu,
+  onContextMenu,
+  headerExtra,
+  children,
+}: TileFrameProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -58,6 +77,7 @@ export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, chil
   return (
     <div
       ref={rootRef}
+      onContextMenu={onContextMenu}
       className="flex h-full flex-col rounded-lg border border-rcd-border bg-rcd-surface shadow-sm"
     >
       <div className="flex items-center border-b border-rcd-border py-1 pl-2 pr-1">
@@ -72,17 +92,26 @@ export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, chil
           </span>
         </div>
 
+        {headerExtra}
+
         {editable && (
           <div className="relative" ref={menuRef}>
             <RcdIconButton
               aria-label={`Actions for ${title}`}
               aria-haspopup="menu"
               aria-expanded={menuOpen}
-              onClick={() => setMenuOpen((open) => !open)}
+              onClick={(event) => {
+                if (onMenu) {
+                  const rect = event.currentTarget.getBoundingClientRect();
+                  onMenu({ x: rect.left, y: rect.bottom + 4 });
+                } else {
+                  setMenuOpen((open) => !open);
+                }
+              }}
             >
               <MoreVertical size={15} />
             </RcdIconButton>
-            {menuOpen && (
+            {menuOpen && !onMenu && (
               <div
                 role="menu"
                 className="absolute right-0 top-full z-30 mt-1 w-36 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
@@ -92,7 +121,7 @@ export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, chil
                   label="Edit"
                   onClick={() => {
                     setMenuOpen(false);
-                    onEdit();
+                    onEdit?.();
                   }}
                 />
                 <MenuItem
@@ -100,7 +129,7 @@ export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, chil
                   label="Duplicate"
                   onClick={() => {
                     setMenuOpen(false);
-                    onDuplicate();
+                    onDuplicate?.();
                   }}
                 />
                 <MenuItem
@@ -133,7 +162,7 @@ export function TileFrame({ title, editable, onEdit, onDuplicate, onDelete, chil
               open
               onConfirm={() => {
                 setConfirmDelete(false);
-                onDelete();
+                onDelete?.();
               }}
               onCancel={() => setConfirmDelete(false)}
             />

@@ -1,3 +1,4 @@
+using ReconDashboards.Core.Querying.Compilation;
 using ReconDashboards.Core.Schema;
 
 namespace ReconDashboards.Core.Modeling;
@@ -7,12 +8,15 @@ namespace ReconDashboards.Core.Modeling;
 /// (store rejects on errors) and again at query time, so schema drift degrades
 /// to a clear error — never to bad SQL.
 ///
-/// Codes: MDL001 table existence/duplicates · MDL002 column/endpoint existence ·
-/// MDL003 join type compatibility · MDL004 one active relationship per pair ·
-/// MDL005 no self-relationships · MDL006 duplicate relationship (warning) ·
-/// MDL007 active-graph cycle · MDL008 aggregation/type compatibility ·
-/// MDL009 many-side cardinality unproven (warning) · MDL010 name collisions
-/// (warning) · MDL011 unusable endpoint type.
+/// Codes: MDL001 table existence/duplicates (incl. date tables) · MDL002
+/// column/endpoint existence · MDL003 join type compatibility (incl. date-table
+/// endpoint rules) · MDL004 one active relationship per pair · MDL005 no
+/// self-relationships · MDL006 duplicate relationship (warning) · MDL007
+/// active-graph cycle · MDL008 aggregation/type compatibility · MDL009
+/// many-side cardinality unproven (warning) · MDL010 name collisions (warning) ·
+/// MDL011 unusable endpoint type · MDL012 measure expression parse error ·
+/// MDL013 measure expression reference invalid · MDL014 expression measure also
+/// sets a column · MDL015 date-table range invalid.
 /// </summary>
 public sealed class SemanticModelValidator
 {
@@ -21,11 +25,55 @@ public sealed class SemanticModelValidator
         var result = new ValidationResult();
 
         var catalogTables = ValidateTables(definition, schema, result);
+        ValidateDateTables(definition, catalogTables, result);
         ValidateRelationships(definition, catalogTables, result);
         ValidateMeasures(definition, catalogTables, result);
         ValidateNameCollisions(definition, result);
 
         return result;
+    }
+
+    /// <summary>
+    /// Date tables are virtual — nothing to check against the catalog — but
+    /// their names must be usable and their ranges non-empty. Valid ones join
+    /// the resolved-table map so relationship/endpoint checks treat them like
+    /// any other table.
+    /// </summary>
+    private static void ValidateDateTables(
+        ModelDefinition definition,
+        Dictionary<string, TableSchema> catalogTables,
+        ValidationResult result)
+    {
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < definition.DateTableDefs.Count; i++)
+        {
+            var dateTable = definition.DateTableDefs[i];
+            var path = $"dateTables[{i}]";
+
+            if (string.IsNullOrWhiteSpace(dateTable.Name))
+            {
+                result.AddError("MDL001", "A date table needs a non-empty name.", path);
+                continue;
+            }
+
+            if (!seen.Add(dateTable.Name))
+            {
+                result.AddError("MDL001", $"Date table '{dateTable.Name}' appears more than once in the model.", path);
+                continue;
+            }
+
+            if (dateTable is { RangeStart: { } start, RangeEnd: { } end } && start > end)
+            {
+                result.AddError(
+                    "MDL015",
+                    $"Date table '{dateTable.Name}' has an empty range: rangeStart {start:yyyy-MM-dd} is after rangeEnd {end:yyyy-MM-dd}.",
+                    path);
+                continue;
+            }
+
+            catalogTables[dateTable.Key] = DateTableSchema.Build(dateTable);
+        }
     }
 
     private static Dictionary<string, TableSchema> ValidateTables(
@@ -94,6 +142,17 @@ public sealed class SemanticModelValidator
                 continue;
             }
 
+            if (DateTableSchema.IsDateTableKey(rel.FromTable))
+            {
+                result.AddError(
+                    "MDL003",
+                    $"A date table can only be the \"to\" (one) side of a relationship; '{rel.FromTable}' is on the from side.",
+                    path);
+                continue;
+            }
+
+            var toDateTable = DateTableSchema.IsDateTableKey(rel.ToTable);
+
             var fromColumn = ResolveEndpoint(rel.FromTable, rel.FromColumn, catalogTables, result, path, definition);
             var toColumn = ResolveEndpoint(rel.ToTable, rel.ToColumn, catalogTables, result, path, definition);
             if (fromColumn is null || toColumn is null)
@@ -119,7 +178,29 @@ public sealed class SemanticModelValidator
                 continue;
             }
 
-            if (!AreJoinCompatible(fromColumn.Type, toColumn.Type))
+            if (toDateTable)
+            {
+                // Date tables join on date_key from a Date column (equality) or
+                // a Timestamp column (the compiler casts the from side to date).
+                if (!string.Equals(rel.ToColumn, DateTableSchema.DateKeyColumn, StringComparison.Ordinal))
+                {
+                    result.AddError(
+                        "MDL003",
+                        $"Relationships to a date table must join its '{DateTableSchema.DateKeyColumn}' column, not '{rel.ToColumn}'.",
+                        path);
+                    continue;
+                }
+
+                if (fromColumn.Type is not (NormalizedType.Date or NormalizedType.Timestamp))
+                {
+                    result.AddError(
+                        "MDL003",
+                        $"'{rel.FromTable}.{rel.FromColumn}' is {fromColumn.Type}; joining a date table needs a date or timestamp column.",
+                        path);
+                    continue;
+                }
+            }
+            else if (!AreJoinCompatible(fromColumn.Type, toColumn.Type))
             {
                 result.AddError(
                     "MDL003",
@@ -181,7 +262,7 @@ public sealed class SemanticModelValidator
         string path,
         ModelDefinition definition)
     {
-        if (definition.FindTable(tableKey) is null)
+        if (!definition.ContainsTable(tableKey))
         {
             result.AddError("MDL002", $"Relationship references table '{tableKey}', which is not part of the model.", path);
             return null;
@@ -224,7 +305,19 @@ public sealed class SemanticModelValidator
                 continue; // Catalog absence already reported as MDL001.
             }
 
-            if (measure.Column is null)
+            if (measure.Expression is not null)
+            {
+                if (measure.Column is not null)
+                {
+                    result.AddError(
+                        "MDL014",
+                        $"Measure '{measure.Name}' is expression-based and may not also set a source column.",
+                        $"{path}.column");
+                }
+
+                ValidateMeasureExpression(definition, measure, catalogTables, result, path);
+            }
+            else if (measure.Column is null)
             {
                 if (measure.Aggregation != Aggregation.Count)
                 {
@@ -263,6 +356,97 @@ public sealed class SemanticModelValidator
                 {
                     result.AddError("MDL002", $"Column '{filter.Column}' does not exist on table '{filter.Table}'.", filterPath);
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// MDL012: expression does not parse. MDL013: a reference does not resolve —
+    /// unknown/non-model table, unknown column, non-numeric column for sum/avg,
+    /// unknown or ambiguous [measure], or a [measure] that is itself
+    /// expression-based (nesting/cycles are rejected outright).
+    /// </summary>
+    private static void ValidateMeasureExpression(
+        ModelDefinition definition,
+        Measure measure,
+        Dictionary<string, TableSchema> catalogTables,
+        ValidationResult result,
+        string path)
+    {
+        MeasureExprNode root;
+        try
+        {
+            root = MeasureExpressionParser.Parse(measure.Expression!);
+        }
+        catch (MeasureExpressionParseException ex)
+        {
+            result.AddError("MDL012", $"Measure '{measure.Name}': {ex.Message}", $"{path}.expression");
+            return;
+        }
+
+        var expressionPath = $"{path}.expression";
+        foreach (var node in MeasureExpressionParser.Flatten(root))
+        {
+            switch (node)
+            {
+                case AggregateCallNode { TableKey: { } tableKey } call:
+                    if (definition.FindTable(tableKey) is null)
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression references table '{tableKey}', which is not part of the model.",
+                            expressionPath);
+                        break;
+                    }
+
+                    if (!catalogTables.TryGetValue(tableKey, out var callTable))
+                    {
+                        break; // Catalog absence already reported as MDL001.
+                    }
+
+                    var callColumn = callTable.FindColumn(call.Column!);
+                    if (callColumn is null)
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression references column '{call.Column}', which does not exist on '{tableKey}'.",
+                            expressionPath);
+                    }
+                    else if (!IsAggregationCompatible(call.Aggregation, callColumn.Type))
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression: {call.Aggregation} is not valid for column '{call.Column}' of type {callColumn.Type}.",
+                            expressionPath);
+                    }
+
+                    break;
+
+                case MeasureRefNode reference:
+                    var (target, ambiguous) = MeasureExpressionParser.ResolveMeasureRef(definition, reference.Name);
+                    if (ambiguous)
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression reference '[{reference.Name}]' matches more than one measure; rename them so the reference is unambiguous.",
+                            expressionPath);
+                    }
+                    else if (target is null)
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression references measure '[{reference.Name}]', which does not exist.",
+                            expressionPath);
+                    }
+                    else if (target.Expression is not null)
+                    {
+                        result.AddError(
+                            "MDL013",
+                            $"Measure '{measure.Name}' expression references '[{reference.Name}]', which is itself expression-based; expression measures may only reference plain aggregation measures.",
+                            expressionPath);
+                    }
+
+                    break;
             }
         }
     }

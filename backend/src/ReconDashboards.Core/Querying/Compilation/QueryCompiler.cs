@@ -10,7 +10,18 @@ namespace ReconDashboards.Core.Querying.Compilation;
 
 public sealed record ResolvedDimension(DimensionSpec Spec, TableSchema Table, ColumnSchema Column, string Label, string? FormatHint);
 
-public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint);
+/// <summary>
+/// A calculated measure's parsed expression with its references resolved:
+/// the distinct table keys used by direct aggregate calls, and each [reference]
+/// mapped to the (plain) model measure it names.
+/// </summary>
+public sealed record ResolvedMeasureExpression(
+    MeasureExprNode Root,
+    IReadOnlyList<string> AggregateTableKeys,
+    IReadOnlyDictionary<string, ResolvedMeasure> References);
+
+/// <summary>Expression is non-null for calculated measures; Aggregation/Column are then unused.</summary>
+public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null);
 
 public sealed record ResolvedFilter(TableSchema Table, ColumnSchema Column, FilterOperator Operator, IReadOnlyList<JsonElement> Values);
 
@@ -20,7 +31,12 @@ public sealed record PreparedQuery(
     IReadOnlyList<ResolvedMeasure> Measures,
     IReadOnlyList<ResolvedFilter> Filters,
     JoinPlan Plan,
-    DatabaseSchema Schema);
+    DatabaseSchema Schema,
+    IReadOnlyList<DateTableDef>? DateTables = null)
+{
+    /// <summary>Date tables the join plan touches, in emission order.</summary>
+    public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+}
 
 public sealed record PreparedDistinctQuery(
     TableSchema Table,
@@ -29,16 +45,24 @@ public sealed record PreparedDistinctQuery(
     IReadOnlyList<ResolvedFilter> Filters,
     int Limit,
     JoinPlan Plan,
-    DatabaseSchema Schema);
+    DatabaseSchema Schema,
+    IReadOnlyList<DateTableDef>? DateTables = null)
+{
+    /// <summary>Date tables the join plan touches, in emission order.</summary>
+    public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+}
 
 /// <summary>
 /// Spec + model + catalog snapshot -> parameterized single-statement SELECT.
 /// Every identifier in the output is resolved from the snapshot then
 /// dialect-quoted; every value is a parameter. No client string ever reaches
-/// SQL text.
+/// SQL text. The clock only feeds default date-table ranges (which are always
+/// bound as parameters, so statements stay deterministic for a fixed clock).
 /// </summary>
-public sealed class QueryCompiler(ISqlDialect dialect)
+public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvider = null)
 {
+    private readonly TimeProvider _clock = timeProvider ?? TimeProvider.System;
+
     // ---------- Phase 1: resolution ----------
 
     public PreparedQuery Prepare(ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
@@ -63,6 +87,8 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             throw new QueryCompilationException("QRY_TOO_MANY_FILTERS", $"At most {limits.MaxFilters} filters are allowed.");
         }
 
+        schema = AugmentWithDateTables(model, schema);
+
         var dimensions = spec.Dimensions.Select(d => ResolveDimension(d, model, schema)).ToArray();
         var measures = spec.Measures.Select(m => ResolveMeasure(m, model, schema)).ToArray();
         var filters = spec.Filters.Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)).ToArray();
@@ -80,6 +106,19 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             {
                 involved.Add(f.Table.Key);
             }
+
+            if (m.Expression is { } expression)
+            {
+                involved.UnionWith(expression.AggregateTableKeys);
+                foreach (var reference in expression.References.Values)
+                {
+                    involved.Add(reference.Table.Key);
+                    foreach (var f in reference.Filters)
+                    {
+                        involved.Add(f.Table.Key);
+                    }
+                }
+            }
         }
 
         foreach (var f in filters)
@@ -91,12 +130,14 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         var active = model.Relationships.Where(r => r.IsActive).ToArray();
         var plan = JoinPathResolver.Resolve(baseTable, involved, active, limits.MaxJoins);
 
-        return new PreparedQuery(dimensions, measures, filters, plan, schema);
+        return new PreparedQuery(dimensions, measures, filters, plan, schema, CollectDateTables(model, plan));
     }
 
     public PreparedDistinctQuery PrepareDistinct(
         DistinctValuesSpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
     {
+        schema = AugmentWithDateTables(model, schema);
+
         var (table, column) = ResolveColumn(spec.Table, spec.Column, model, schema);
         EnsureUsable(column, $"Column '{spec.Table}.{spec.Column}'");
 
@@ -119,7 +160,51 @@ public sealed class QueryCompiler(ISqlDialect dialect)
 
         var limit = Math.Clamp(spec.Limit ?? 100, 1, limits.MaxDistinctValues);
 
-        return new PreparedDistinctQuery(table, column, spec.Search, filters, limit, plan, schema);
+        return new PreparedDistinctQuery(
+            table, column, spec.Search, filters, limit, plan, schema, CollectDateTables(model, plan));
+    }
+
+    /// <summary>
+    /// Date tables become resolvable exactly like catalog tables by appending
+    /// their synthesized schemas to the snapshot. Nothing is introspected; the
+    /// "#date." key prefix guarantees no collision with real tables.
+    /// </summary>
+    private static DatabaseSchema AugmentWithDateTables(ModelDefinition model, DatabaseSchema schema)
+    {
+        if (model.DateTableDefs.Count == 0)
+        {
+            return schema;
+        }
+
+        var synthesized = model.DateTableDefs
+            .Where(d => !string.IsNullOrWhiteSpace(d.Name))
+            .Select(DateTableSchema.Build);
+        return schema with { Tables = [.. schema.Tables, .. synthesized] };
+    }
+
+    /// <summary>The date tables the join plan touches, base table first then join order.</summary>
+    private static IReadOnlyList<DateTableDef> CollectDateTables(ModelDefinition model, JoinPlan plan)
+    {
+        if (model.DateTableDefs.Count == 0)
+        {
+            return [];
+        }
+
+        var result = new List<DateTableDef>();
+        if (model.FindDateTable(plan.BaseTable) is { } baseDateTable)
+        {
+            result.Add(baseDateTable);
+        }
+
+        foreach (var step in plan.Steps)
+        {
+            if (model.FindDateTable(step.TableKey) is { } dateTable)
+            {
+                result.Add(dateTable);
+            }
+        }
+
+        return result;
     }
 
     // ---------- Phase 2: emission ----------
@@ -139,6 +224,7 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         var bag = new ParameterBag();
         var plan = prepared.Plan;
         var warnings = CollectFanOutWarnings(prepared);
+        var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
 
         var dimensionExprs = prepared.Dimensions
             .Select(d => DimensionExpression(d, plan))
@@ -171,7 +257,7 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         if (spec.TopN is { } topN)
         {
             return EmitTopN(
-                prepared, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings);
+                prepared, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings, calendarCtes);
         }
 
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
@@ -187,7 +273,8 @@ public sealed class QueryCompiler(ISqlDialect dialect)
 
         sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
-        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared), warnings);
+        return new CompiledQuery(
+            CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, BuildColumnPlans(prepared), warnings);
     }
 
     /// <summary>
@@ -209,7 +296,8 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         IReadOnlyList<string> whereParts,
         int effectiveLimit,
         ParameterBag bag,
-        List<EngineWarning> warnings)
+        List<EngineWarning> warnings,
+        IReadOnlyList<string> calendarCtes)
     {
         if (prepared.Dimensions.Count != 1)
         {
@@ -239,7 +327,8 @@ public sealed class QueryCompiler(ISqlDialect dialect)
                 .Append(", ").Append(dimensionExprs[0]).Append(" ASC").Append(dialect.NullsLastSuffix);
             flat.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
-            return new CompiledQuery(flat.ToString(), bag.Parameters, BuildColumnPlans(prepared), warnings);
+            return new CompiledQuery(
+                CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings);
         }
 
         var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
@@ -262,35 +351,54 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             var measure = prepared.Measures[i];
             var measAlias = dialect.QuoteIdentifier($"meas{i}");
             string expr;
-            switch (measure.Aggregation)
+            if (measure.Expression is not null)
             {
-                case Aggregation.Sum:
-                case Aggregation.Count:
-                    expr = dialect.Aggregate(Aggregation.Sum, measAlias);
-                    break;
-                case Aggregation.Min:
-                    expr = dialect.Aggregate(Aggregation.Min, measAlias);
-                    break;
-                case Aggregation.Max:
-                    expr = dialect.Aggregate(Aggregation.Max, measAlias);
-                    break;
-                default:
-                    // Avg / CountDistinct are not re-aggregatable. Top rows are
-                    // single-row groups, so SUM passes their exact value through;
-                    // the Others row sums only NULLs and stays NULL.
-                    expr = dialect.Aggregate(
-                        Aggregation.Sum, $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {measAlias} END");
-                    warnings.Add(new EngineWarning(
-                        "QRY_OTHERS_UNSUPPORTED_AGG",
-                        $"Measure '{measure.Label}' uses {measure.Aggregation}, which cannot be combined into an 'Others' bucket; the Others row has no value for it."));
-                    break;
+                // Calculated measures compose aggregates and are never
+                // re-aggregatable: pass top rows through, leave Others NULL.
+                expr = dialect.Aggregate(
+                    Aggregation.Sum, $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {measAlias} END");
+                warnings.Add(new EngineWarning(
+                    "QRY_OTHERS_UNSUPPORTED_AGG",
+                    $"Measure '{measure.Label}' is a calculated expression, which cannot be combined into an 'Others' bucket; the Others row has no value for it."));
+            }
+            else
+            {
+                switch (measure.Aggregation)
+                {
+                    case Aggregation.Sum:
+                    case Aggregation.Count:
+                        expr = dialect.Aggregate(Aggregation.Sum, measAlias);
+                        break;
+                    case Aggregation.Min:
+                        expr = dialect.Aggregate(Aggregation.Min, measAlias);
+                        break;
+                    case Aggregation.Max:
+                        expr = dialect.Aggregate(Aggregation.Max, measAlias);
+                        break;
+                    default:
+                        // Avg / CountDistinct are not re-aggregatable. Top rows are
+                        // single-row groups, so SUM passes their exact value through;
+                        // the Others row sums only NULLs and stays NULL.
+                        expr = dialect.Aggregate(
+                            Aggregation.Sum, $"CASE WHEN {rnAlias} <= {nPlaceholder} THEN {measAlias} END");
+                        warnings.Add(new EngineWarning(
+                            "QRY_OTHERS_UNSUPPORTED_AGG",
+                            $"Measure '{measure.Label}' uses {measure.Aggregation}, which cannot be combined into an 'Others' bucket; the Others row has no value for it."));
+                        break;
+                }
             }
 
             outerItems.Add($"{expr} AS {measAlias}");
         }
 
         var sql = new StringBuilder();
-        sql.Append("WITH ").Append(dialect.QuoteIdentifier("base")).Append(" AS (\n");
+        sql.Append("WITH ");
+        foreach (var calendarCte in calendarCtes)
+        {
+            sql.Append(calendarCte).Append(",\n");
+        }
+
+        sql.Append(dialect.QuoteIdentifier("base")).Append(" AS (\n");
         sql.Append(inner);
         sql.Append("\n),\n");
         sql.Append(dialect.QuoteIdentifier("ranked")).Append(" AS (\n");
@@ -316,6 +424,7 @@ public sealed class QueryCompiler(ISqlDialect dialect)
     {
         var bag = new ParameterBag();
         var plan = prepared.Plan;
+        var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
         var expr = QualifiedColumn(plan.AliasByTable[prepared.Table.Key], prepared.Column.Name);
 
         var whereParts = new List<string>();
@@ -354,15 +463,41 @@ public sealed class QueryCompiler(ISqlDialect dialect)
                 prepared.Column.Type, $"{prepared.Table.Key}.{prepared.Column.Name}", null, null),
         };
 
-        return new CompiledQuery(sql.ToString(), bag.Parameters, columns, Warnings: []);
+        return new CompiledQuery(CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, columns, Warnings: []);
     }
+
+    // ---------- date-table emission ----------
+
+    /// <summary>
+    /// One rendered CTE per referenced date table ("dt_{name}" AS (SELECT ...)).
+    /// Both range ends are ALWAYS parameters — defaults are computed here from
+    /// the injected clock, so statement text stays constant.
+    /// </summary>
+    private List<string> BuildCalendarCtes(IReadOnlyList<DateTableDef> dateTables, ParameterBag bag)
+    {
+        var ctes = new List<string>(dateTables.Count);
+        foreach (var dateTable in dateTables)
+        {
+            var start = dateTable.RangeStart ?? DateTableSchema.DefaultRangeStart;
+            var end = dateTable.RangeEnd ?? DateTableSchema.DefaultRangeEnd(_clock);
+            var startPlaceholder = dialect.ParameterPlaceholder(bag.Add(start, NormalizedType.Date));
+            var endPlaceholder = dialect.ParameterPlaceholder(bag.Add(end, NormalizedType.Date));
+            ctes.Add(
+                $"{dialect.QuoteIdentifier(DateTableSchema.CteName(dateTable))} AS (\n{dialect.CalendarTableSql(startPlaceholder, endPlaceholder)}\n)");
+        }
+
+        return ctes;
+    }
+
+    private static string CalendarWithPrefix(IReadOnlyList<string> calendarCtes) =>
+        calendarCtes.Count == 0 ? "" : $"WITH {string.Join(",\n", calendarCtes)}\n";
 
     // ---------- resolution helpers ----------
 
     private static (TableSchema Table, ColumnSchema Column) ResolveColumn(
         string tableKey, string columnName, ModelDefinition model, DatabaseSchema schema)
     {
-        if (model.FindTable(tableKey) is null)
+        if (!model.ContainsTable(tableKey))
         {
             throw new QueryCompilationException("QRY_UNKNOWN_TABLE", $"Table '{tableKey}' is not part of the model.");
         }
@@ -417,6 +552,11 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             var measure = model.Measures.FirstOrDefault(m => m.Id == measureId)
                 ?? throw new QueryCompilationException(
                     "QRY_UNKNOWN_MEASURE", $"The model has no measure with id {measureId}.");
+            if (measure.Expression is not null)
+            {
+                return ResolveExpressionMeasure(measure, model, schema);
+            }
+
             return ResolveMeasureCore(
                 measure.Name, measure.Table, measure.Aggregation, measure.Column,
                 measure.MeasureFilters, measure.FormatHint, model, schema);
@@ -431,6 +571,114 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         var label = spec.Alias
             ?? (spec.Column is null ? $"{spec.Aggregation}" : $"{spec.Aggregation} of {spec.Column}");
         return ResolveMeasureCore(label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, model, schema);
+    }
+
+    /// <summary>
+    /// Resolves a calculated measure: parse (QRY_BAD_MEASURE on failure), then
+    /// resolve every aggregate call against the catalog and every [reference]
+    /// against the model's plain measures. Nothing unresolved survives — that
+    /// is the security bar for expressions.
+    /// </summary>
+    private ResolvedMeasure ResolveExpressionMeasure(Measure measure, ModelDefinition model, DatabaseSchema schema)
+    {
+        if (measure.Column is not null)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_MEASURE", $"Measure '{measure.Name}' is expression-based and may not also set a source column.");
+        }
+
+        if (model.FindTable(measure.Table) is null)
+        {
+            throw new QueryCompilationException("QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' is not part of the model.");
+        }
+
+        var table = schema.FindTable(measure.Table)
+            ?? throw new QueryCompilationException(
+                "QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' no longer exists in the data source.");
+
+        MeasureExprNode root;
+        try
+        {
+            root = MeasureExpressionParser.Parse(measure.Expression!);
+        }
+        catch (MeasureExpressionParseException ex)
+        {
+            throw new QueryCompilationException("QRY_BAD_MEASURE", $"Measure '{measure.Name}': {ex.Message}");
+        }
+
+        var aggregateTables = new List<string>();
+        var references = new Dictionary<string, ResolvedMeasure>(StringComparer.Ordinal);
+
+        foreach (var node in MeasureExpressionParser.Flatten(root))
+        {
+            switch (node)
+            {
+                case AggregateCallNode { TableKey: { } tableKey } call:
+                    if (model.FindTable(tableKey) is null)
+                    {
+                        throw new QueryCompilationException(
+                            "QRY_UNKNOWN_TABLE",
+                            $"Measure '{measure.Name}' expression references table '{tableKey}', which is not part of the model.");
+                    }
+
+                    var callTable = schema.FindTable(tableKey)
+                        ?? throw new QueryCompilationException(
+                            "QRY_UNKNOWN_TABLE", $"Table '{tableKey}' no longer exists in the data source.");
+                    var callColumn = callTable.FindColumn(call.Column!)
+                        ?? throw new QueryCompilationException(
+                            "QRY_UNKNOWN_COLUMN",
+                            $"Measure '{measure.Name}' expression references column '{call.Column}', which does not exist on '{tableKey}'.");
+                    if (!IsAggregationCompatible(call.Aggregation, callColumn.Type))
+                    {
+                        throw new QueryCompilationException(
+                            "QRY_BAD_MEASURE",
+                            $"Measure '{measure.Name}' expression: {call.Aggregation} is not valid for column '{call.Column}' of type {callColumn.Type}.");
+                    }
+
+                    if (!aggregateTables.Contains(tableKey))
+                    {
+                        aggregateTables.Add(tableKey);
+                    }
+
+                    break;
+
+                case MeasureRefNode reference when !references.ContainsKey(reference.Name):
+                    var (target, ambiguous) = MeasureExpressionParser.ResolveMeasureRef(model, reference.Name);
+                    if (ambiguous)
+                    {
+                        throw new QueryCompilationException(
+                            "QRY_BAD_MEASURE",
+                            $"Measure '{measure.Name}' expression reference '[{reference.Name}]' matches more than one model measure.");
+                    }
+
+                    if (target is null)
+                    {
+                        throw new QueryCompilationException(
+                            "QRY_BAD_MEASURE",
+                            $"Measure '{measure.Name}' expression references measure '[{reference.Name}]', which does not exist.");
+                    }
+
+                    if (target.Expression is not null)
+                    {
+                        throw new QueryCompilationException(
+                            "QRY_BAD_MEASURE",
+                            $"Measure '{measure.Name}' expression references '[{reference.Name}]', which is itself expression-based; expression measures may only reference plain aggregation measures.");
+                    }
+
+                    references[reference.Name] = ResolveMeasureCore(
+                        target.Name, target.Table, target.Aggregation, target.Column,
+                        target.MeasureFilters, target.FormatHint, model, schema);
+                    break;
+            }
+        }
+
+        var resolvedFilters = measure.MeasureFilters
+            .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
+            .ToArray();
+
+        return new ResolvedMeasure(
+            measure.Name, table, measure.Aggregation, Column: null, resolvedFilters, measure.FormatHint,
+            new ResolvedMeasureExpression(root, aggregateTables, references));
     }
 
     private ResolvedMeasure ResolveMeasureCore(
@@ -552,10 +800,16 @@ public sealed class QueryCompiler(ISqlDialect dialect)
     private string QualifiedTable(TableSchema table) =>
         $"{dialect.QuoteIdentifier(table.Schema)}.{dialect.QuoteIdentifier(table.Name)}";
 
+    /// <summary>Real tables are schema-qualified; virtual date tables reference their calendar CTE.</summary>
+    private string TableSource(TableSchema table) =>
+        string.Equals(table.Schema, DateTableSchema.SchemaName, StringComparison.Ordinal)
+            ? dialect.QuoteIdentifier("dt_" + table.Name)
+            : QualifiedTable(table);
+
     private string FromClause(JoinPlan plan, DatabaseSchema schema)
     {
         var baseTable = schema.FindTable(plan.BaseTable)!;
-        return $"{QualifiedTable(baseTable)} AS {dialect.QuoteIdentifier("t0")}";
+        return $"{TableSource(baseTable)} AS {dialect.QuoteIdentifier("t0")}";
     }
 
     private void AppendJoins(StringBuilder sql, JoinPlan plan, DatabaseSchema schema)
@@ -567,8 +821,15 @@ public sealed class QueryCompiler(ISqlDialect dialect)
             var fromSide = QualifiedColumn(plan.AliasByTable[step.Via.FromTable], step.Via.FromColumn);
             var toSide = QualifiedColumn(plan.AliasByTable[step.Via.ToTable], step.Via.ToColumn);
 
+            // Timestamp columns join a date table's date_key at day grain.
+            if (DateTableSchema.IsDateTableKey(step.Via.ToTable)
+                && schema.FindTable(step.Via.FromTable)?.FindColumn(step.Via.FromColumn)?.Type == NormalizedType.Timestamp)
+            {
+                fromSide = dialect.CastToDate(fromSide);
+            }
+
             sql.Append('\n')
-                .Append("LEFT JOIN ").Append(QualifiedTable(child))
+                .Append("LEFT JOIN ").Append(TableSource(child))
                 .Append(" AS ").Append(dialect.QuoteIdentifier(childAlias))
                 .Append(" ON ").Append(fromSide).Append(" = ").Append(toSide);
         }
@@ -672,20 +933,76 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         return dimension.Spec.DateBucket is { } bucket ? dialect.DateTrunc(bucket, expr) : expr;
     }
 
-    private string MeasureExpression(ResolvedMeasure measure, JoinPlan plan, ParameterBag bag)
-    {
-        var argument = measure.Column is null
+    private string MeasureExpression(ResolvedMeasure measure, JoinPlan plan, ParameterBag bag) =>
+        measure.Expression is { } expression
+            ? ExpressionSql(expression.Root, expression, measure.Filters, plan, bag)
+            : AggregateWithFilters(
+                dialect.Aggregate(measure.Aggregation, AggregateArgument(measure, plan)),
+                measure.Filters, plan, bag);
+
+    private string? AggregateArgument(ResolvedMeasure measure, JoinPlan plan) =>
+        measure.Column is null
             ? null
             : QualifiedColumn(plan.AliasByTable[measure.Table.Key], measure.Column.Name);
-        var aggregate = dialect.Aggregate(measure.Aggregation, argument);
 
-        if (measure.Filters.Count == 0)
+    private string AggregateWithFilters(
+        string aggregate, IReadOnlyList<ResolvedFilter> filters, JoinPlan plan, ParameterBag bag)
+    {
+        if (filters.Count == 0)
         {
             return aggregate;
         }
 
-        var predicate = string.Join(" AND ", measure.Filters.Select(f => BuildPredicate(f, plan, bag)));
+        var predicate = string.Join(" AND ", filters.Select(f => BuildPredicate(f, plan, bag)));
         return dialect.AggregateFilter(aggregate, predicate);
+    }
+
+    /// <summary>
+    /// Renders a calculated measure's AST. Arithmetic is parenthesized per
+    /// node, division is NULLIF-guarded, aggregate calls render through the
+    /// dialect with plan aliases, and [references] substitute the referenced
+    /// measure's aggregate SQL. The expression measure's own filters apply to
+    /// every aggregate it renders (combined with a reference's own filters).
+    /// </summary>
+    private string ExpressionSql(
+        MeasureExprNode node,
+        ResolvedMeasureExpression expression,
+        IReadOnlyList<ResolvedFilter> outerFilters,
+        JoinPlan plan,
+        ParameterBag bag)
+    {
+        switch (node)
+        {
+            case NumberLiteralNode number:
+                return number.Literal;
+
+            case UnaryMinusNode unary:
+                return $"(-{ExpressionSql(unary.Operand, expression, outerFilters, plan, bag)})";
+
+            case BinaryNode binary:
+                var left = ExpressionSql(binary.Left, expression, outerFilters, plan, bag);
+                var right = ExpressionSql(binary.Right, expression, outerFilters, plan, bag);
+                return binary.Operator == '/'
+                    ? $"({left} / NULLIF({right}, 0))"
+                    : $"({left} {binary.Operator} {right})";
+
+            case AggregateCallNode call:
+                var argument = call.Column is null
+                    ? null
+                    : QualifiedColumn(plan.AliasByTable[call.TableKey!], call.Column);
+                return AggregateWithFilters(dialect.Aggregate(call.Aggregation, argument), outerFilters, plan, bag);
+
+            case MeasureRefNode reference:
+                var target = expression.References[reference.Name];
+                IReadOnlyList<ResolvedFilter> combined = outerFilters.Count == 0
+                    ? target.Filters
+                    : [.. target.Filters, .. outerFilters];
+                return AggregateWithFilters(
+                    dialect.Aggregate(target.Aggregation, AggregateArgument(target, plan)), combined, plan, bag);
+
+            default:
+                throw new InvalidOperationException($"Unknown expression node {node.GetType().Name}.");
+        }
     }
 
     private string BuildPredicate(ResolvedFilter filter, JoinPlan plan, ParameterBag bag)
@@ -862,11 +1179,13 @@ public sealed class QueryCompiler(ISqlDialect dialect)
         for (var i = 0; i < prepared.Measures.Count; i++)
         {
             var m = prepared.Measures[i];
-            var type = m.Aggregation is Aggregation.Count or Aggregation.CountDistinct
-                ? NormalizedType.Integer
-                : m.Aggregation == Aggregation.Avg
-                    ? NormalizedType.Decimal
-                    : m.Column?.Type ?? NormalizedType.Integer;
+            var type = m.Expression is not null
+                ? NormalizedType.Decimal // arithmetic (esp. division) promotes
+                : m.Aggregation is Aggregation.Count or Aggregation.CountDistinct
+                    ? NormalizedType.Integer
+                    : m.Aggregation == Aggregation.Avg
+                        ? NormalizedType.Decimal
+                        : m.Column?.Type ?? NormalizedType.Integer;
             columns.Add(new ResultColumnPlan(
                 $"meas{i}", m.Label, ResultColumnRole.Measure, type,
                 m.Column is null ? null : $"{m.Table.Key}.{m.Column.Name}", null, m.FormatHint));

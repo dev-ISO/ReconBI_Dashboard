@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { AlertTriangle, LayoutDashboard, Plus, RefreshCw } from 'lucide-react';
 import {
   emptyChart,
-  mergedSlicerFilters,
+  isChartTile,
+  isSlicerTile,
   newId,
   type ChartSpec,
+  type FilterClause,
 } from '@recon/dashboards-core';
 import { ChartBuilder } from '../chart-builder/ChartBuilder';
 import { ChartTile } from '../chart/ChartTile';
@@ -13,7 +15,7 @@ import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
 import { AddSlicerDialog } from './AddSlicerDialog';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardToolbar } from './DashboardToolbar';
-import { SlicerBar } from './SlicerBar';
+import { SlicerTile } from './SlicerTile';
 import { TileFrame } from './TileFrame';
 
 export interface DashboardViewProps {
@@ -24,6 +26,8 @@ export interface DashboardViewProps {
 
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+const NO_FILTERS: FilterClause[] = [];
 
 /** The embeddable entry point: toolbar + tile grid, view/edit modes. */
 export function DashboardView({ dashboardId, readonly = false }: DashboardViewProps) {
@@ -79,12 +83,48 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
   const tiles = current?.id === dashboardId ? current.layout.tiles : [];
   const editable = mode === 'edit' && !readonly;
-  const slicerFilters = useMemo(() => mergedSlicerFilters(slicerValues), [slicerValues]);
+
+  // Per-chart slicer filters. The memo depends on the SUBSCRIBED tiles +
+  // slicerValues slices, so any slicer change (value, targets, add/remove)
+  // re-renders this component and recomputes — filtersForTile reads the exact
+  // same store state the subscriptions delivered, so it can never be stale.
+  // ChartTile keys its fetch effect on the cache-key string, so the fresh
+  // (but often deep-equal) arrays never re-trigger requests.
+  const filtersByTile = useMemo(() => {
+    const map = new Map<string, FilterClause[]>();
+    for (const tile of tiles) {
+      if (isSlicerTile(tile)) continue;
+      map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
+    }
+    return map;
+  }, [runtime, tiles, slicerValues]);
+
+  /** Chart tiles by title for the slicer config menus' "Applies to" list. */
+  const chartTileInfos = useMemo(
+    () => tiles.filter(isChartTile).map((tile) => ({ id: tile.id, title: tile.chart.title })),
+    [tiles],
+  );
 
   const gridItems = useMemo<DashboardGridItem[]>(
     () => tiles.map((tile) => ({ id: tile.id, ...tile.layout })),
     [tiles],
   );
+
+  // Auto-refresh: invalidate the shared query cache, then bump a token that
+  // keys ChartTile — remounting refetches (brief skeleton) with fresh data.
+  const [refreshToken, setRefreshToken] = useState(0);
+  const refreshTiles = useCallback(() => {
+    runtime.queries.invalidateAll();
+    setRefreshToken((token) => token + 1);
+  }, [runtime]);
+
+  const refreshSeconds = current?.id === dashboardId ? (current.layout.refreshSeconds ?? null) : null;
+
+  useEffect(() => {
+    if (mode !== 'view' || refreshSeconds == null || refreshSeconds <= 0) return;
+    const timer = setInterval(refreshTiles, refreshSeconds * 1000);
+    return () => clearInterval(timer);
+  }, [mode, refreshSeconds, refreshTiles]);
 
   const handleLayoutChange = useCallback(
     (items: DashboardGridItem[]) => {
@@ -138,11 +178,26 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const renderTile = (id: string) => {
     const tile = tiles.find((t) => t.id === id);
     if (!tile) return null;
+
+    if (isSlicerTile(tile)) {
+      return (
+        <SlicerTile
+          tileId={tile.id}
+          spec={tile.slicer}
+          modelId={modelId}
+          editable={editable}
+          chartTiles={chartTileInfos}
+        />
+      );
+    }
+
+    if (!isChartTile(tile)) return null;
+    const chart = tile.chart;
     return (
       <TileFrame
-        title={tile.chart.title}
+        title={chart.title}
         editable={editable}
-        onEdit={() => setBuilder({ tileId: tile.id, spec: tile.chart })}
+        onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
         onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
         onDelete={() => runtime.dashboards.removeTile(tile.id)}
       >
@@ -151,7 +206,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             No model attached to this dashboard.
           </div>
         ) : (
-          <ChartTile spec={tile.chart} modelId={modelId} filters={slicerFilters} />
+          <ChartTile
+            key={refreshToken}
+            spec={chart}
+            modelId={modelId}
+            filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
+          />
         )}
       </TileFrame>
     );
@@ -218,9 +278,10 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         addSlicerDisabled={modelId === null}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
+        refreshSeconds={refreshSeconds}
+        onChangeRefreshSeconds={(seconds) => runtime.dashboards.setRefreshSeconds(seconds)}
+        onRefresh={refreshTiles}
       />
-
-      {modelId !== null && <SlicerBar modelId={modelId} editable={editable} />}
 
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {tiles.length === 0 ? (
@@ -257,6 +318,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         open={builder !== null}
         onClose={() => setBuilder(null)}
         wide
+        draggable
+        resizable
       >
         {builderBody}
       </RcdDialog>

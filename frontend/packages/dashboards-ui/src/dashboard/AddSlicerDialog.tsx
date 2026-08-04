@@ -1,5 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { isQueryableType, tableKey } from '@recon/dashboards-core';
+import {
+  isQueryableType,
+  isTemporalType,
+  tableKey,
+  type SlicerVariant,
+} from '@recon/dashboards-core';
 import { useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 
@@ -10,10 +15,18 @@ export interface AddSlicerDialogProps {
   onClose: () => void;
 }
 
+const VARIANT_OPTIONS: { value: SlicerVariant; label: string }[] = [
+  { value: 'checklist', label: 'Checklist' },
+  { value: 'dropdown', label: 'Dropdown' },
+  { value: 'buttons', label: 'Buttons' },
+  { value: 'dateRange', label: 'Date range' },
+];
+
 /**
- * Table + text-column + label picker for a new dashboard slicer. Tables come
- * from the open model definition, columns from the catalog (queryable text
- * columns only — slicers are 'in' filters over distinct values).
+ * Table + column + label + variant picker for a new slicer TILE. Tables come
+ * from the open model definition, columns from the catalog. Value-pick
+ * variants (checklist/dropdown/buttons) list text columns; the date-range
+ * variant lists date/timestamp columns instead.
  */
 export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps) {
   const runtime = useRuntime();
@@ -25,6 +38,7 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
   const [column, setColumn] = useState('');
   const [label, setLabel] = useState('');
   const [labelTouched, setLabelTouched] = useState(false);
+  const [variant, setVariant] = useState<SlicerVariant>('checklist');
 
   useEffect(() => {
     if (!open) return;
@@ -32,6 +46,7 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     setColumn('');
     setLabel('');
     setLabelTouched(false);
+    setVariant('checklist');
   }, [open]);
 
   const modelReady = openModel !== null && openModel.id === modelId;
@@ -45,16 +60,21 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     [modelReady, openModel],
   );
 
+  const wantTemporal = variant === 'dateRange';
+
   const columns = useMemo(() => {
     if (!usableCatalog || !table) return [];
     const modelTable = tables.find((t) => tableKey(t.schema, t.name) === table);
     const overrides = new Map((modelTable?.columns ?? []).map((c) => [c.name, c]));
     return (usableCatalog.tables.find((t) => t.key === table)?.columns ?? [])
       .filter(
-        (c) => c.type === 'text' && isQueryableType(c.type) && !overrides.get(c.name)?.hidden,
+        (c) =>
+          (wantTemporal ? isTemporalType(c.type) : c.type === 'text') &&
+          isQueryableType(c.type) &&
+          !overrides.get(c.name)?.hidden,
       )
       .map((c) => ({ name: c.name, label: overrides.get(c.name)?.friendlyName ?? c.name }));
-  }, [usableCatalog, table, tables]);
+  }, [usableCatalog, table, tables, wantTemporal]);
 
   const handleTable = (next: string) => {
     setTable(next);
@@ -69,11 +89,22 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     }
   };
 
+  const handleVariant = (next: SlicerVariant) => {
+    const temporalChanged = (next === 'dateRange') !== wantTemporal;
+    setVariant(next);
+    // The column list switches between text and date/timestamp columns; a
+    // previously chosen column of the other kind is no longer valid.
+    if (temporalChanged) {
+      setColumn('');
+      if (!labelTouched) setLabel('');
+    }
+  };
+
   const canAdd = table !== '' && column !== '' && label.trim() !== '';
 
   const handleAdd = () => {
     if (!canAdd) return;
-    runtime.dashboards.addSlicer({ table, column, label: label.trim() });
+    runtime.dashboards.addSlicer({ table, column, label: label.trim(), variant });
     onClose();
   };
 
@@ -96,6 +127,20 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
           <p className="text-sm text-rcd-text-2">Loading the dashboard&apos;s model…</p>
         ) : (
           <>
+            <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+              Style
+              <RcdSelect
+                value={variant}
+                onChange={(event) => handleVariant(event.target.value as SlicerVariant)}
+              >
+                {VARIANT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </label>
+
             <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
               Table
               <RcdSelect value={table} onChange={(event) => handleTable(event.target.value)}>
@@ -134,7 +179,9 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
               )}
               {table !== '' && usableCatalog !== null && columns.length === 0 && (
                 <span className="text-xs text-rcd-muted">
-                  This table has no text columns to slice by.
+                  {wantTemporal
+                    ? 'This table has no date columns for a date-range slicer.'
+                    : 'This table has no text columns to slice by.'}
                 </span>
               )}
             </label>
@@ -147,7 +194,7 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
                   setLabel(event.target.value);
                   setLabelTouched(true);
                 }}
-                placeholder="Shown on the slicer chip"
+                placeholder="Shown on the slicer tile"
               />
             </label>
           </>

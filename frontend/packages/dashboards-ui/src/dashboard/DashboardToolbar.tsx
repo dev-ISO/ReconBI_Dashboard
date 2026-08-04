@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Pencil, Plus, Share2, SlidersHorizontal } from 'lucide-react';
-import { ConfirmDialog, RcdButton } from '../primitives';
+import { Pencil, Plus, RefreshCw, Share2, SlidersHorizontal } from 'lucide-react';
+import { ConfirmDialog, RcdButton, RcdIconButton, RcdSelect } from '../primitives';
 
 export interface DashboardToolbarProps {
   name: string;
@@ -18,7 +18,21 @@ export interface DashboardToolbarProps {
   addSlicerDisabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
+  /** View-mode auto-refresh interval (persisted with the layout); null = off. */
+  refreshSeconds?: number | null;
+  /** Edit-mode change of the auto-refresh interval. */
+  onChangeRefreshSeconds?: (seconds: number | null) => void;
+  /** Manual "refresh all tiles now" (both modes). */
+  onRefresh?: () => void;
 }
+
+const REFRESH_OPTIONS: { value: string; label: string }[] = [
+  { value: '', label: 'Auto refresh: off' },
+  { value: '30', label: 'Every 30s' },
+  { value: '60', label: 'Every 1m' },
+  { value: '300', label: 'Every 5m' },
+  { value: '900', label: 'Every 15m' },
+];
 
 /** Dashboard header: name + badges on the left, mode-dependent actions on the right. */
 export function DashboardToolbar({
@@ -35,6 +49,9 @@ export function DashboardToolbar({
   addSlicerDisabled,
   onSave,
   onDiscard,
+  refreshSeconds = null,
+  onChangeRefreshSeconds,
+  onRefresh,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -66,6 +83,12 @@ export function DashboardToolbar({
         </span>
       )}
 
+      {onRefresh && (
+        <RcdIconButton aria-label="Refresh tiles" title="Refresh tiles" onClick={onRefresh}>
+          <RefreshCw size={14} />
+        </RcdIconButton>
+      )}
+
       {mode === 'view'
         ? !readonly && (
             <RcdButton onClick={onEnterEdit}>
@@ -75,6 +98,24 @@ export function DashboardToolbar({
           )
         : !readonly && (
             <>
+              {onChangeRefreshSeconds && (
+                <RcdSelect
+                  aria-label="Auto refresh interval"
+                  title="Auto refresh (view mode)"
+                  value={refreshSeconds == null ? '' : String(refreshSeconds)}
+                  onChange={(event) =>
+                    onChangeRefreshSeconds(
+                      event.target.value === '' ? null : Number(event.target.value),
+                    )
+                  }
+                >
+                  {REFRESH_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              )}
               <RcdButton onClick={onAddChart}>
                 <Plus size={14} />
                 Add chart

@@ -26,8 +26,10 @@ export type TableNodeType = Node<TableNodeData, 'rcdTable'>;
 
 /**
  * Canvas node for one model table: header (name + schema + remove) and column
- * rows, each queryable column exposing a target handle (left) and a source
- * handle (right) keyed by the column name.
+ * rows. Each queryable column exposes source + target handles on BOTH sides
+ * (ids `${column}::l-src` / `::r-src` / `::l-tgt` / `::r-tgt`) so ModelCanvas
+ * can attach every edge to the side facing the other node — lines never wrap
+ * behind nodes. Each side's pair overlaps visually as a single dot.
  */
 export function TableNode({ data, selected }: NodeProps<TableNodeType>) {
   return (
@@ -66,8 +68,12 @@ export function TableNode({ data, selected }: NodeProps<TableNodeType>) {
           <div key={column.name} className="relative flex items-center px-2.5 py-0.5">
             {column.queryable && (
               <>
-                <Handle type="target" position={Position.Left} id={column.name} />
-                <Handle type="source" position={Position.Right} id={column.name} />
+                {/* Targets first so the source handle sits on top and starts drags;
+                    drops still land on targets via React Flow's closest-handle logic. */}
+                <Handle type="target" position={Position.Left} id={`${column.name}::l-tgt`} />
+                <Handle type="source" position={Position.Left} id={`${column.name}::l-src`} />
+                <Handle type="target" position={Position.Right} id={`${column.name}::r-tgt`} />
+                <Handle type="source" position={Position.Right} id={`${column.name}::r-src`} />
               </>
             )}
             <span

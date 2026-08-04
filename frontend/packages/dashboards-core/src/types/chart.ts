@@ -16,8 +16,26 @@ export type ChartType =
   | 'kpi'
   | 'table';
 
+/**
+ * Optional styling for a piece of chart text (title, axis titles, legend).
+ * Every field is optional; an undefined field keeps the theme default
+ * (fontSize 11-12, color var(--rcd-text-2), regular weight/style).
+ */
+export interface TextStyle {
+  /** Font size in px. */
+  fontSize?: number;
+  bold?: boolean;
+  italic?: boolean;
+  /** Hex color (e.g. "#6b7280"); undefined -> theme default var(--rcd-text-2). */
+  color?: string;
+}
+
 export interface ChartFormat {
-  /** Per-series hex overrides keyed by series name; default palette otherwise. */
+  /**
+   * Per-series hex overrides keyed by series name; default palette otherwise.
+   * When colorByCategory is active (single-series column/bar) the keys are
+   * CATEGORY labels instead and take precedence over the palette slot.
+   */
   colorOverrides?: Record<string, string>;
   showLegend?: boolean;
   legendPosition?: 'top' | 'right' | 'bottom';
@@ -26,6 +44,29 @@ export interface ChartFormat {
   valueFormat?: string;
   xAxisLabel?: string;
   yAxisLabel?: string;
+  /**
+   * Styling for the chart title. The tile frame that renders the title applies
+   * it (via the UI package's textStyleToCss helper); the KPI label line also
+   * respects it.
+   */
+  titleStyle?: TextStyle;
+  /** Styling for the x/y axis title labels (xAxisLabel / yAxisLabel). */
+  axisTitleStyle?: TextStyle;
+  /** Styling for legend text; the table chart's header row uses it too. */
+  legendStyle?: TextStyle;
+  /**
+   * Display-name overrides keyed by the series' DEFAULT display name (measure
+   * label, legend value, or pie slice label — the same keys colorOverrides
+   * uses). Renames legend entries, tooltip series names, KPI labels and table
+   * measure headers; colors and data keys stay bound to the original name.
+   */
+  seriesLabels?: Record<string, string>;
+  /**
+   * Column/bar only, and only when exactly one series renders: color each
+   * category (each bar) from the categorical palette by slot index instead of
+   * one color per series. colorOverrides keyed by category label win.
+   */
+  colorByCategory?: boolean;
 }
 
 export interface ChartQuery {

@@ -23,6 +23,15 @@ export interface ShapedChartData {
 const AXIS_KEY = '__axis';
 
 /**
+ * Display name for a series: format.seriesLabels override (keyed by the
+ * DEFAULT name — the same key colorOverrides uses) or the default itself.
+ * Colors and data keys always stay bound to the default name so renaming a
+ * series never re-shuffles its color or breaks existing overrides.
+ */
+const displayLabel = (defaultLabel: string, spec: ChartSpec): string =>
+  spec.format.seriesLabels?.[defaultLabel] ?? defaultLabel;
+
+/**
  * Pivots the engine's columnar result into recharts-friendly rows.
  * With a legend dimension: one series per legend value (first measure).
  * Without: one series per measure.
@@ -38,7 +47,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   if (!hasLegend) {
     const series: ChartSeries[] = measureColumns.map((column, i) => ({
       key: column.name,
-      label: column.label,
+      label: displayLabel(column.label, spec),
       color: seriesColor(i, column.label, spec.format.colorOverrides),
     }));
 
@@ -79,7 +88,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
 
   const series: ChartSeries[] = legendValues.map((value, i) => ({
     key: value,
-    label: value,
+    label: displayLabel(value, spec),
     color: seriesColor(i, value, spec.format.colorOverrides),
   }));
 
@@ -117,7 +126,7 @@ export function shapePieData(result: QueryResult, spec: ChartSpec): ShapedPieDat
       ? formatCellValue(row[labelIndex] ?? null, labelColumn)
       : valueColumn.label;
     slices.push({
-      label,
+      label: displayLabel(label, spec),
       value,
       color: seriesColor(slices.length, label, spec.format.colorOverrides),
     });
@@ -189,7 +198,7 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
 
   const series: ScatterSeries[] = [...bySeries.entries()].map(([key, points], i) => ({
     key,
-    label: splitColumn ? key : 'All points',
+    label: displayLabel(splitColumn ? key : 'All points', spec),
     color: seriesColor(i, key, spec.format.colorOverrides),
     points,
   }));

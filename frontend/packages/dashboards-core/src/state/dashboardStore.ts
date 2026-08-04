@@ -3,12 +3,15 @@ import type { DashboardsApi } from '../api/DashboardsApi';
 import type { ChartSpec } from '../types/chart';
 import {
   emptyLayout,
+  isSlicerTile,
   mergedSlicerFilters,
   type DashboardDetail,
   type DashboardLayoutDoc,
   type DashboardSummary,
   type DashboardTile,
+  type SlicerTileSpec,
   type SlicerValues,
+  type SlicerVariant,
 } from '../types/dashboard';
 import type { FilterClause } from '../types/query';
 import { newId } from '../util/ids';
@@ -187,16 +190,36 @@ export class DashboardStore {
     if (this.state.selectedTileId === tileId) {
       this.set({ selectedTileId: null });
     }
+    // Defensive: a removed slicer tile must not keep filtering charts.
+    if (tileId in this.state.slicerValues) {
+      const { [tileId]: _removed, ...rest } = this.state.slicerValues;
+      this.set({ slicerValues: rest });
+    }
   }
 
   duplicateTile(tileId: string): void {
     this.mutateLayout((layout) => {
       const source = layout.tiles.find((t) => t.id === tileId);
       if (!source) return layout;
+      // Free placement (no auto-compaction): drop the copy below ALL content
+      // so it can never overlap an existing tile.
+      const maxY = layout.tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
       const copy: DashboardTile = {
         id: newId(),
-        layout: { ...source.layout, y: source.layout.y + source.layout.h },
-        chart: structuredClone({ ...source.chart, id: newId(), title: `${source.chart.title} (copy)` }),
+        layout: { ...source.layout, x: source.layout.x, y: maxY },
+        ...(source.kind ? { kind: source.kind } : {}),
+        ...(source.chart
+          ? {
+              chart: structuredClone({
+                ...source.chart,
+                id: newId(),
+                title: `${source.chart.title} (copy)`,
+              }),
+            }
+          : {}),
+        ...(source.slicer
+          ? { slicer: structuredClone({ ...source.slicer, label: `${source.slicer.label} (copy)` }) }
+          : {}),
       };
       return { ...layout, tiles: [...layout.tiles, copy] };
     });
@@ -226,29 +249,70 @@ export class DashboardStore {
     this.set({ selectedTileId: tileId });
   }
 
-  addSlicer(def: { table: string; column: string; label: string }): void {
+  /** Adds a slicer TILE (grid citizen like charts); variant defaults to checklist. */
+  addSlicer(def: { table: string; column: string; label: string; variant?: SlicerVariant }): void {
+    this.mutateLayout((layout) => {
+      const maxY = layout.tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+      const tile: DashboardTile = {
+        id: newId(),
+        kind: 'slicer',
+        layout: { x: 0, y: maxY, w: 6, h: 5, minW: 3, minH: 3 },
+        slicer: {
+          table: def.table,
+          column: def.column,
+          label: def.label,
+          variant: def.variant ?? 'checklist',
+        },
+      };
+      return { ...layout, tiles: [...layout.tiles, tile] };
+    });
+  }
+
+  /** Patches a slicer tile's spec (variant, label, targets, showClear). */
+  updateSlicer(tileId: string, patch: Partial<SlicerTileSpec>): void {
     this.mutateLayout((layout) => ({
       ...layout,
-      slicers: [...layout.slicers, { ...def, id: newId() }],
+      tiles: layout.tiles.map((t) =>
+        t.id === tileId && t.slicer ? { ...t, slicer: { ...t.slicer, ...patch } } : t,
+      ),
     }));
   }
 
-  removeSlicer(slicerId: string): void {
-    this.mutateLayout((layout) => ({
-      ...layout,
-      slicers: layout.slicers.filter((s) => s.id !== slicerId),
-    }));
-    const { [slicerId]: _removed, ...rest } = this.state.slicerValues;
-    this.set({ slicerValues: rest });
+  /** Removes a slicer tile and its selection. */
+  removeSlicer(tileId: string): void {
+    this.removeTile(tileId);
   }
 
   setSlicerValue(slicerId: string, clause: FilterClause | null): void {
     this.set({ slicerValues: { ...this.state.slicerValues, [slicerId]: clause } });
   }
 
-  /** Filters every tile query must include (slicer selections). */
+  /** Filters every tile query must include (all slicer selections). */
   activeFilters(): FilterClause[] {
     return mergedSlicerFilters(this.state.slicerValues);
+  }
+
+  /**
+   * Filters a specific chart tile must include: the union of selections from
+   * slicer tiles whose targets are null/absent (all charts) or include tileId.
+   */
+  filtersForTile(tileId: string): FilterClause[] {
+    const layout = this.state.current?.layout;
+    if (!layout) return [];
+    const clauses: FilterClause[] = [];
+    for (const tile of layout.tiles) {
+      if (!isSlicerTile(tile)) continue;
+      const targets = tile.slicer.targets;
+      if (targets != null && !targets.includes(tileId)) continue;
+      const clause = this.state.slicerValues[tile.id];
+      if (clause != null) clauses.push(clause);
+    }
+    return clauses;
+  }
+
+  /** View-mode auto-refresh interval (persisted with the layout on save). */
+  setRefreshSeconds(seconds: number | null): void {
+    this.mutateLayout((layout) => ({ ...layout, refreshSeconds: seconds }));
   }
 }
 
@@ -260,8 +324,34 @@ const toOpen = (detail: DashboardDetail): OpenDashboard => ({
   isShared: detail.isShared,
   ownerIsMe: detail.ownerIsMe,
   expectedUpdatedAtUtc: detail.updatedAtUtc,
-  layout: detail.layout?.tiles ? detail.layout : emptyLayout(),
+  layout: migrateSlicers(detail.layout?.tiles ? detail.layout : emptyLayout()),
 });
+
+/**
+ * Migrates legacy top-bar slicers (layout.slicers[]) into checklist slicer
+ * TILES appended below all content (free canvas, no pushing — they can never
+ * overlap), then empties slicers[]. Idempotent: migrated docs re-open clean.
+ * The migration is in-memory only until the user saves.
+ */
+const migrateSlicers = (layout: DashboardLayoutDoc): DashboardLayoutDoc => {
+  const legacy = layout.slicers ?? [];
+  if (legacy.length === 0) return layout.slicers ? layout : { ...layout, slicers: [] };
+  const maxY = layout.tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+  const migrated: DashboardTile[] = legacy.map((def, index) => ({
+    id: def.id,
+    kind: 'slicer',
+    layout: {
+      x: (index % 4) * 6,
+      y: maxY + Math.floor(index / 4) * 4,
+      w: 6,
+      h: 4,
+      minW: 3,
+      minH: 3,
+    },
+    slicer: { table: def.table, column: def.column, label: def.label, variant: 'checklist' },
+  }));
+  return { ...layout, tiles: [...layout.tiles, ...migrated], slicers: [] };
+};
 
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);

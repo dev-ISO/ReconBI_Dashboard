@@ -63,6 +63,12 @@ const fallbackPosition = (index: number): CanvasPosition => ({
 const endpointKey = (fromTable: string, fromColumn: string, toTable: string, toColumn: string): string =>
   `${fromTable}|${fromColumn}|${toTable}|${toColumn}`;
 
+/** Width fallback until React Flow measures the node (TableNode renders at Tailwind w-52 = 208px). */
+const NODE_WIDTH_FALLBACK = 208;
+
+/** TableNode handle ids are `${column}::<l|r>-<src|tgt>`; this recovers the column name. */
+const handleColumn = (handleId: string): string => handleId.replace(/::[lr]-(src|tgt)$/, '');
+
 const buildNodes = (
   definition: ModelDefinition,
   catalog: Catalog | null,
@@ -168,14 +174,32 @@ export function ModelCanvas({
   const edges = useMemo<ModelCanvasEdge[]>(() => {
     if (!catalog) return [];
 
+    // Attach each edge to the sides facing the other node so lines never wrap
+    // behind nodes. Reads CURRENT positions from local `nodes` state (a memo
+    // dep), so sides flip live while dragging.
+    const nodeById = new Map(nodes.map((node) => [node.id, node]));
+    const centerX = (id: string): number => {
+      const node = nodeById.get(id);
+      if (!node) return 0;
+      return node.position.x + (node.measured?.width ?? NODE_WIDTH_FALLBACK) / 2;
+    };
+    const sideHandles = (
+      sourceId: string,
+      sourceColumn: string,
+      targetId: string,
+      targetColumn: string,
+    ): { sourceHandle: string; targetHandle: string } =>
+      centerX(sourceId) <= centerX(targetId)
+        ? { sourceHandle: `${sourceColumn}::r-src`, targetHandle: `${targetColumn}::l-tgt` }
+        : { sourceHandle: `${sourceColumn}::l-src`, targetHandle: `${targetColumn}::r-tgt` };
+
     const relationshipEdges: ModelCanvasEdge[] = definition.relationships
       .filter((r) => tableKeys.has(r.fromTable) && tableKeys.has(r.toTable))
       .map((r) => ({
         id: r.id,
         source: r.fromTable,
-        sourceHandle: r.fromColumn,
         target: r.toTable,
-        targetHandle: r.toColumn,
+        ...sideHandles(r.fromTable, r.fromColumn, r.toTable, r.toColumn),
         label: r.cardinality === 'manyToOne' ? '* — 1' : '1 — 1',
         style: r.isActive
           ? { stroke: 'var(--rcd-accent)', strokeWidth: 1.5, opacity: 0.7 }
@@ -190,15 +214,14 @@ export function ModelCanvas({
       id: `suggestion:${endpointKey(s.fromTable, s.fromColumn, s.toTable, s.toColumn)}`,
       type: 'rcdSuggestion' as const,
       source: s.fromTable,
-      sourceHandle: s.fromColumn,
       target: s.toTable,
-      targetHandle: s.toColumn,
+      ...sideHandles(s.fromTable, s.fromColumn, s.toTable, s.toColumn),
       selectable: false,
       data: { suggestion: s, onAccept: onAcceptSuggestion },
     }));
 
     return [...relationshipEdges, ...suggestionEdges];
-  }, [catalog, definition.relationships, tableKeys, visibleSuggestions, onAcceptSuggestion]);
+  }, [catalog, definition.relationships, tableKeys, visibleSuggestions, onAcceptSuggestion, nodes]);
 
   const handleNodesChange = useCallback((changes: NodeChange<TableNodeType>[]) => {
     setNodes((current) => applyNodeChanges(changes, current));
@@ -208,12 +231,15 @@ export function ModelCanvas({
     (connection: Connection) => {
       const { source, target, sourceHandle, targetHandle } = connection;
       if (!source || !target || !sourceHandle || !targetHandle) return;
-      if (source === target && sourceHandle === targetHandle) return;
+      // Handles carry side/role suffixes; strip them back to column names.
+      const fromColumn = handleColumn(sourceHandle);
+      const toColumn = handleColumn(targetHandle);
+      if (source === target && fromColumn === toColumn) return;
       onConnect({
         fromTable: source,
-        fromColumn: sourceHandle,
+        fromColumn,
         toTable: target,
-        toColumn: targetHandle,
+        toColumn,
       });
     },
     [onConnect],

@@ -49,8 +49,9 @@ public sealed class ChartQueryService(
         }
 
         var (model, source, schema) = context.Value!;
-        var compiler = new QueryCompiler(source.Dialect
-            ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."));
+        var compiler = new QueryCompiler(
+            source.Dialect ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."),
+            timeProvider);
 
         CompiledQuery compiled;
         try
@@ -83,8 +84,9 @@ public sealed class ChartQueryService(
         }
 
         var (model, source, schema) = context.Value!;
-        var compiler = new QueryCompiler(source.Dialect
-            ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."));
+        var compiler = new QueryCompiler(
+            source.Dialect ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."),
+            timeProvider);
 
         CompiledQuery compiled;
         int limit;

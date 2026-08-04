@@ -70,7 +70,13 @@ public sealed record Relationship(
     bool IsActive = true,
     RelationshipSource Source = RelationshipSource.Manual);
 
-/// <summary>Column is null only for Count (COUNT(*)).</summary>
+/// <summary>
+/// Column is null only for Count (COUNT(*)) and for calculated measures. When
+/// <see cref="Expression"/> is set the measure is calculated: Aggregation and
+/// Column are ignored (Column must stay null — MDL014) and the expression
+/// composes aggregate calls / [references] to plain measures. Table remains the
+/// measure's home table (it anchors join planning).
+/// </summary>
 public sealed record Measure(
     Guid Id,
     string Name,
@@ -78,9 +84,20 @@ public sealed record Measure(
     Aggregation Aggregation,
     string? Column = null,
     string? FormatHint = null,
-    IReadOnlyList<FilterSpec>? Filters = null)
+    IReadOnlyList<FilterSpec>? Filters = null,
+    string? Expression = null)
 {
     public IReadOnlyList<FilterSpec> MeasureFilters => Filters ?? [];
+}
+
+/// <summary>
+/// A model-declared VIRTUAL calendar table (see <see cref="DateTableSchema"/>).
+/// Null range bounds default at compile time to 2015-01-01 and Dec 31 of next
+/// year; both ends are always bound as parameters.
+/// </summary>
+public sealed record DateTableDef(string Name, DateOnly? RangeStart = null, DateOnly? RangeEnd = null)
+{
+    public string Key => $"{DateTableSchema.KeyPrefix}{Name}";
 }
 
 /// <summary>
@@ -92,12 +109,21 @@ public sealed record ModelDefinition(
     int Version,
     IReadOnlyList<ModelTable> Tables,
     IReadOnlyList<Relationship> Relationships,
-    IReadOnlyList<Measure> Measures)
+    IReadOnlyList<Measure> Measures,
+    IReadOnlyList<DateTableDef>? DateTables = null)
 {
     public const int CurrentVersion = 1;
 
+    public IReadOnlyList<DateTableDef> DateTableDefs => DateTables ?? [];
+
     public ModelTable? FindTable(string key) =>
         Tables.FirstOrDefault(t => string.Equals(t.Key, key, StringComparison.Ordinal));
+
+    public DateTableDef? FindDateTable(string key) =>
+        DateTableDefs.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.Ordinal));
+
+    /// <summary>True when the key names a model table or a declared date table.</summary>
+    public bool ContainsTable(string key) => FindTable(key) is not null || FindDateTable(key) is not null;
 }
 
 /// <summary>A materialized model: database row identity plus its parsed definition.</summary>

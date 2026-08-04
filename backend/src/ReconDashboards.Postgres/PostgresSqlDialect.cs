@@ -59,6 +59,18 @@ public sealed class PostgresSqlDialect : ISqlDialect
     public string CaseInsensitiveLike(string expression, string parameterPlaceholder) =>
         $"{expression} ILIKE {parameterPlaceholder} ESCAPE '\\'";
 
+    public string CastToDate(string expression) => $"CAST({expression} AS date)";
+
+    /// <summary>
+    /// generate_series over timestamps (the ::timestamp casts pin overload
+    /// resolution and keep the series timezone-free), one row per day.
+    /// </summary>
+    public string CalendarTableSql(string startPlaceholder, string endPlaceholder) =>
+        $"""
+         SELECT d::date AS "date_key", EXTRACT(YEAR FROM d)::int AS "year", EXTRACT(QUARTER FROM d)::int AS "quarter", EXTRACT(MONTH FROM d)::int AS "month", TO_CHAR(d, 'Mon') AS "month_name", EXTRACT(WEEK FROM d)::int AS "week", EXTRACT(DAY FROM d)::int AS "day", TO_CHAR(d, 'Dy') AS "day_name"
+         FROM generate_series({startPlaceholder}::timestamp, {endPlaceholder}::timestamp, interval '1 day') AS d
+         """;
+
     public string NullsLastSuffix => " NULLS LAST";
 
     public bool SupportsSelectAliasInOrderBy => true;

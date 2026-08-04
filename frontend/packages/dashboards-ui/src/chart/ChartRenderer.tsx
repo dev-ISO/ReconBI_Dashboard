@@ -21,13 +21,16 @@ import {
 } from 'recharts';
 import {
   formatCellValue,
+  seriesColor,
   type CellValue,
   type ChartFormat,
   type ChartSpec,
   type QueryColumn,
   type QueryResult,
+  type TextStyle,
 } from '@recon/dashboards-core';
 import { shapeChartData, shapePieData, shapeScatterData } from './chartData';
+import { textStyleToCss } from './textStyle';
 
 export interface ChartRendererProps {
   spec: ChartSpec;
@@ -78,42 +81,49 @@ function makeValueFormatter(format: ChartFormat, measureColumns: QueryColumn[]):
   };
 }
 
-/** Legend placement from spec.format; bottom is the default. */
+/** Legend placement + text style from spec.format; bottom is the default. */
 function legendProps(format: ChartFormat) {
+  const wrapperStyle = { ...legendWrapperStyle, ...textStyleToCss(format.legendStyle) };
   if (format.legendPosition === 'right') {
     return {
       layout: 'vertical',
       align: 'right',
       verticalAlign: 'middle',
-      wrapperStyle: legendWrapperStyle,
+      wrapperStyle,
     } as const;
   }
   return {
     verticalAlign: format.legendPosition === 'top' ? 'top' : 'bottom',
-    wrapperStyle: legendWrapperStyle,
+    wrapperStyle,
   } as const;
 }
 
-const xAxisLabelProps = (text: string | undefined) =>
+/** SVG text attributes for an axis title; theme defaults unless styled. */
+const axisTitleTextProps = (style: TextStyle | undefined) => ({
+  fontSize: style?.fontSize ?? 11,
+  fill: style?.color ?? 'var(--rcd-text-2)',
+  fontWeight: style?.bold ? 600 : undefined,
+  fontStyle: style?.italic ? ('italic' as const) : undefined,
+});
+
+const xAxisLabelProps = (text: string | undefined, style?: TextStyle) =>
   text
     ? {
         value: text,
         position: 'insideBottom' as const,
         offset: -4,
-        fontSize: 11,
-        fill: 'var(--rcd-text-2)',
+        ...axisTitleTextProps(style),
       }
     : undefined;
 
-const yAxisLabelProps = (text: string | undefined) =>
+const yAxisLabelProps = (text: string | undefined, style?: TextStyle) =>
   text
     ? {
         value: text,
         angle: -90,
         position: 'insideLeft' as const,
         offset: 8,
-        fontSize: 11,
-        fill: 'var(--rcd-text-2)',
+        ...axisTitleTextProps(style),
       }
     : undefined;
 
@@ -179,6 +189,12 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
       const stacked = spec.type === 'stackedColumn' || spec.type === 'stackedBar';
       const showLegend = format.showLegend ?? shaped.series.length > 1;
       const labelPosition = stacked ? 'center' : horizontal ? 'right' : 'top';
+      // Single-series column/bar only: each category gets its own palette
+      // slot; in this mode colorOverrides keyed by the CATEGORY label win.
+      const colorByCategory =
+        Boolean(format.colorByCategory) &&
+        shaped.series.length === 1 &&
+        (spec.type === 'column' || spec.type === 'bar');
       return (
         <ResponsiveContainer width="100%" height="100%">
           <BarChart
@@ -197,7 +213,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={false}
-                label={xAxisLabelProps(format.xAxisLabel)}
+                label={xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
               />
             ) : (
               <XAxis
@@ -205,7 +221,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={{ stroke: 'var(--rcd-axis)' }}
-                label={xAxisLabelProps(format.xAxisLabel)}
+                label={xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
               />
             )}
             {horizontal ? (
@@ -216,7 +232,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={{ stroke: 'var(--rcd-axis)' }}
-                label={yAxisLabelProps(format.yAxisLabel)}
+                label={yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
               />
             ) : (
               <YAxis
@@ -224,7 +240,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tickLine={false}
                 axisLine={false}
                 width={56}
-                label={yAxisLabelProps(format.yAxisLabel)}
+                label={yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
               />
             )}
             {themedTooltip(formatValue, 'fill')}
@@ -241,6 +257,17 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 radius={stacked ? 0 : horizontal ? [0, 2, 2, 0] : [2, 2, 0, 0]}
                 isAnimationActive={false}
               >
+                {colorByCategory &&
+                  shaped.data.map((row, dataIndex) => (
+                    <Cell
+                      key={dataIndex}
+                      fill={seriesColor(
+                        dataIndex,
+                        String(row[shaped.axisKey] ?? ''),
+                        format.colorOverrides,
+                      )}
+                    />
+                  ))}
                 {format.showDataLabels && (
                   <LabelList
                     dataKey={series.key}
@@ -271,14 +298,14 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
               tick={axisTickStyle}
               tickLine={false}
               axisLine={{ stroke: 'var(--rcd-axis)' }}
-              label={xAxisLabelProps(format.xAxisLabel)}
+              label={xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
             />
             <YAxis
               tick={axisTickStyle}
               tickLine={false}
               axisLine={false}
               width={56}
-              label={yAxisLabelProps(format.yAxisLabel)}
+              label={yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
             />
             {themedTooltip(formatValue, 'line')}
             {showLegend && <Legend {...legendProps(format)} />}
@@ -312,14 +339,14 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
               tick={axisTickStyle}
               tickLine={false}
               axisLine={{ stroke: 'var(--rcd-axis)' }}
-              label={xAxisLabelProps(format.xAxisLabel)}
+              label={xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
             />
             <YAxis
               tick={axisTickStyle}
               tickLine={false}
               axisLine={false}
               width={56}
-              label={yAxisLabelProps(format.yAxisLabel)}
+              label={yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
             />
             {themedTooltip(formatValue, 'line')}
             {showLegend && <Legend {...legendProps(format)} />}
@@ -396,7 +423,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={{ stroke: 'var(--rcd-axis)' }}
-                label={xAxisLabelProps(format.xAxisLabel ?? xColumn.label)}
+                label={xAxisLabelProps(format.xAxisLabel ?? xColumn.label, format.axisTitleStyle)}
               />
               <YAxis
                 type="number"
@@ -406,7 +433,7 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 tickLine={false}
                 axisLine={false}
                 width={64}
-                label={yAxisLabelProps(format.yAxisLabel ?? yColumn.label)}
+                label={yAxisLabelProps(format.yAxisLabel ?? yColumn.label, format.axisTitleStyle)}
               />
               {themedTooltip(formatPoint, 'dashed')}
               {showLegend && <Legend {...legendProps(format)} />}
@@ -443,16 +470,20 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
       const primaryValue = row[result.columns.indexOf(primary)] ?? null;
       const secondary = measureColumns[1];
       const secondaryValue = secondary ? (row[result.columns.indexOf(secondary)] ?? null) : null;
+      const kpiLabel = (column: QueryColumn): string =>
+        format.seriesLabels?.[column.label] ?? column.label;
 
       return (
         <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
           <div className="text-4xl font-semibold tabular-nums text-rcd-text">
             {kpiText(primaryValue, primary)}
           </div>
-          <div className="text-sm text-rcd-text-2">{primary.label}</div>
+          <div className="text-sm text-rcd-text-2" style={textStyleToCss(format.titleStyle)}>
+            {kpiLabel(primary)}
+          </div>
           {secondary && (
             <div className="mt-1 text-sm tabular-nums text-rcd-muted">
-              {kpiText(secondaryValue, secondary)} {secondary.label}
+              {kpiText(secondaryValue, secondary)} {kpiLabel(secondary)}
             </div>
           )}
         </div>
@@ -461,6 +492,8 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
 
     case 'table': {
       const rows = result.rows.slice(0, TABLE_ROW_CAP);
+      // Header text follows legendStyle; measure headers honor seriesLabels.
+      const headerStyle = textStyleToCss(format.legendStyle);
       return (
         <div className="h-full w-full overflow-auto">
           <table className="w-full border-separate border-spacing-0 text-sm">
@@ -469,11 +502,14 @@ export default function ChartRenderer({ spec, result }: ChartRendererProps) {
                 {result.columns.map((column) => (
                   <th
                     key={column.name}
+                    style={headerStyle}
                     className={`sticky top-0 border-b border-rcd-border bg-rcd-surface px-3 py-2 text-xs font-semibold text-rcd-text-2 ${
                       column.role === 'measure' ? 'text-right' : 'text-left'
                     }`}
                   >
-                    {column.label}
+                    {column.role === 'measure'
+                      ? (format.seriesLabels?.[column.label] ?? column.label)
+                      : column.label}
                   </th>
                 ))}
               </tr>
