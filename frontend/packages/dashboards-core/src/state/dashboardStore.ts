@@ -226,6 +226,22 @@ export class DashboardStore {
     this.set({ selectedTileId: tileId });
   }
 
+  addSlicer(def: { table: string; column: string; label: string }): void {
+    this.mutateLayout((layout) => ({
+      ...layout,
+      slicers: [...layout.slicers, { ...def, id: newId() }],
+    }));
+  }
+
+  removeSlicer(slicerId: string): void {
+    this.mutateLayout((layout) => ({
+      ...layout,
+      slicers: layout.slicers.filter((s) => s.id !== slicerId),
+    }));
+    const { [slicerId]: _removed, ...rest } = this.state.slicerValues;
+    this.set({ slicerValues: rest });
+  }
+
   setSlicerValue(slicerId: string, clause: FilterClause | null): void {
     this.set({ slicerValues: { ...this.state.slicerValues, [slicerId]: clause } });
   }
