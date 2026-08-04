@@ -36,7 +36,8 @@ EXPOSE 8080
 USER $APP_UID
 ENTRYPOINT ["dotnet", "ReconDashboards.DemoHost.dll"]
 
-FROM mcr.microsoft.com/dotnet/runtime-deps:10.0 AS migrator
+# Full runtime: the EF bundle is framework-dependent.
+FROM mcr.microsoft.com/dotnet/runtime:10.0 AS migrator
 WORKDIR /app
 COPY --from=build /app/efbundle-rcd .
 # RCD_MIGRATIONS_CONNECTION is read by the bundle via --connection.

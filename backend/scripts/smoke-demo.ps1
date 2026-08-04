@@ -70,6 +70,7 @@ $modelBody = @{
     name = "Smoke Model $([guid]::NewGuid().ToString('N').Substring(0, 8))"
     dataSourceName = 'demo'
     definition = $definition
+    isShared = $true   # carol is admin; shared so alice/bob can query it
 } | ConvertTo-Json -Depth 12
 
 $model = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/models" `

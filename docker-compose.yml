@@ -21,6 +21,7 @@ services:
     build:
       context: ./backend
       dockerfile: demo/ReconDashboards.DemoHost/Dockerfile
+      target: final
     container_name: rcd-demo-api
     depends_on:
       postgres:
