@@ -32,6 +32,11 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
   const clause = useDashboardState((state) => state.slicerValues[tileId] ?? null);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
 
+  /** Frameless mode: no header bar; the label becomes an inline body caption. */
+  const hideHeader = spec.style?.hideHeader === true;
+  /** Compact mode: tighter paddings + smaller text on every variant. */
+  const compact = spec.style?.compact === true;
+
   const hasSelection = clause !== null && clause.values.length > 0;
   const setClause = (next: FilterClause | null) => runtime.dashboards.setSlicerValue(tileId, next);
 
@@ -53,17 +58,26 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         No model attached to this dashboard.
       </div>
     ) : spec.variant === 'checklist' ? (
-      <DistinctValueList
-        modelId={modelId}
-        table={spec.table}
-        column={spec.column}
-        selected={inSelected}
-        onToggle={toggleInValue}
-      />
+      // Compact overrides reach INTO DistinctValueList via arbitrary variants
+      // (its rows are labels): tighter rows + smaller text. Literal classes.
+      <div
+        className={
+          compact ? '[&_label]:gap-1.5 [&_label]:py-0.5 [&_label]:text-xs' : ''
+        }
+      >
+        <DistinctValueList
+          modelId={modelId}
+          table={spec.table}
+          column={spec.column}
+          selected={inSelected}
+          onToggle={toggleInValue}
+        />
+      </div>
     ) : spec.variant === 'dropdown' ? (
       <DropdownSlicer
         modelId={modelId}
         spec={spec}
+        compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
         onClear={() => setClause(null)}
@@ -72,17 +86,21 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
       <ButtonsSlicer
         modelId={modelId}
         spec={spec}
+        compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
       />
     ) : (
-      <DateRangeSlicer spec={spec} clause={clause} onChange={setClause} />
+      <DateRangeSlicer spec={spec} compact={compact} clause={clause} onChange={setClause} />
     );
+
+  const showClear = hasSelection && spec.showClear !== false;
 
   return (
     <TileFrame
       title={spec.label}
       editable={editable}
+      container={hideHeader ? { hideHeader: true } : null}
       onMenu={(position) => setMenuPos(position)}
       onContextMenu={(event) => {
         // Config card instead of the native browser menu (both modes).
@@ -91,7 +109,7 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         setMenuPos({ x: event.clientX, y: event.clientY });
       }}
       headerExtra={
-        hasSelection && spec.showClear !== false ? (
+        !hideHeader && showClear ? (
           <RcdIconButton
             aria-label={`Clear ${spec.label} selection`}
             title="Clear selection"
@@ -102,9 +120,41 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         ) : null
       }
     >
-      {/* The dropdown's popover must escape the tile — no scroll container
-          around it (overflow-y would clip the absolutely-positioned panel). */}
-      <div className={spec.variant === 'dropdown' ? 'h-full' : 'h-full overflow-y-auto'}>{body}</div>
+      <div className="flex h-full flex-col">
+        {hideHeader && (
+          // Frameless mode: the label shrinks to an inline caption (the clear x
+          // moves next to it, since there is no header bar to host it).
+          <div className="flex shrink-0 items-center gap-1 pb-1">
+            <span
+              className={`min-w-0 truncate font-medium text-rcd-text-2 ${
+                compact ? 'text-[11px]' : 'text-xs'
+              }`}
+              title={spec.label}
+            >
+              {spec.label}
+            </span>
+            {showClear && (
+              <RcdIconButton
+                aria-label={`Clear ${spec.label} selection`}
+                title="Clear selection"
+                className="!p-0.5"
+                onClick={() => setClause(null)}
+              >
+                <X size={11} />
+              </RcdIconButton>
+            )}
+          </div>
+        )}
+        {/* The dropdown's popover must escape the tile — no scroll container
+            around it (overflow-y would clip the absolutely-positioned panel). */}
+        <div
+          className={
+            spec.variant === 'dropdown' ? 'min-h-0 flex-1' : 'min-h-0 flex-1 overflow-y-auto'
+          }
+        >
+          {body}
+        </div>
+      </div>
 
       {menuPos &&
         // Portal past the transformed grid item: position:fixed inside a
@@ -131,12 +181,14 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
 function DropdownSlicer({
   modelId,
   spec,
+  compact,
   selected,
   onToggle,
   onClear,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
+  compact: boolean;
   selected: FilterValue[];
   onToggle: (value: FilterValue) => void;
   onClear: () => void;
@@ -185,9 +237,9 @@ function DropdownSlicer({
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className={`flex w-full items-center justify-between gap-1.5 rounded-md border bg-rcd-bg px-2.5 py-1.5 text-sm text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
-          active ? 'border-rcd-accent' : 'border-rcd-border'
-        }`}
+        className={`flex w-full items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
+          compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
+        } ${active ? 'border-rcd-accent' : 'border-rcd-border'}`}
       >
         <span className="min-w-0 truncate">
           {active ? `${selected.length} selected` : 'All values'}
@@ -228,11 +280,13 @@ interface ButtonsFetchState {
 function ButtonsSlicer({
   modelId,
   spec,
+  compact,
   selected,
   onToggle,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
+  compact: boolean;
   /** Multi-select: pills toggle membership of an 'in' clause. */
   selected: readonly FilterValue[];
   onToggle: (value: FilterValue) => void;
@@ -317,7 +371,9 @@ function ButtonsSlicer({
             aria-pressed={isActive}
             onClick={() => onToggle(value)}
             title={String(value)}
-            className={`max-w-full truncate rounded-full border px-2.5 py-1 text-sm transition-colors ${
+            className={`max-w-full truncate rounded-full border transition-colors ${
+              compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1 text-sm'
+            } ${
               isActive
                 ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] font-medium text-rcd-accent'
                 : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
@@ -342,10 +398,12 @@ function ButtonsSlicer({
 /** Two date inputs: both = between, one-sided = gte/lte ('YYYY-MM-DD' values). */
 function DateRangeSlicer({
   spec,
+  compact,
   clause,
   onChange,
 }: {
   spec: SlicerTileSpec;
+  compact: boolean;
   clause: FilterClause | null;
   onChange: (clause: FilterClause | null) => void;
 }) {
@@ -372,9 +430,14 @@ function DateRangeSlicer({
     }
   };
 
+  const labelClasses = compact
+    ? 'flex flex-col gap-0.5 text-[11px] text-rcd-text-2'
+    : 'flex flex-col gap-1 text-xs text-rcd-text-2';
+  const inputClasses = compact ? 'h-7 text-xs' : '';
+
   return (
-    <div className="flex flex-col gap-2 p-0.5">
-      <label className="flex flex-col gap-1 text-xs text-rcd-text-2">
+    <div className={compact ? 'flex flex-col gap-1 p-0.5' : 'flex flex-col gap-2 p-0.5'}>
+      <label className={labelClasses}>
         From
         <RcdInput
           type="date"
@@ -382,9 +445,10 @@ function DateRangeSlicer({
           max={to || undefined}
           onChange={(event) => update(event.target.value, to)}
           aria-label={`${spec.label} from date`}
+          className={inputClasses}
         />
       </label>
-      <label className="flex flex-col gap-1 text-xs text-rcd-text-2">
+      <label className={labelClasses}>
         To
         <RcdInput
           type="date"
@@ -392,6 +456,7 @@ function DateRangeSlicer({
           min={from || undefined}
           onChange={(event) => update(from, event.target.value)}
           aria-label={`${spec.label} to date`}
+          className={inputClasses}
         />
       </label>
     </div>

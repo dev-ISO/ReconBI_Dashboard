@@ -30,7 +30,81 @@ export interface TextStyle {
   color?: string;
 }
 
+/** Predefined chart color themes (8 categorical slots each; see util/palette THEMES). */
+export type ChartThemeName = 'default' | 'ocean' | 'sunset' | 'forest' | 'berry' | 'mono';
+
+/** Tile container customization; undefined fields keep the standard look. */
+export interface ContainerStyle {
+  /** No header bar; the tile is frameless (edit mode shows a hover drag strip). */
+  hideHeader?: boolean;
+  /** Hex background; null/undefined = theme surface. */
+  background?: string | null;
+  borderColor?: string | null;
+  /** Border width px (default 1 when a color is set). */
+  borderWidth?: number;
+  /** Corner radius px (default 8). */
+  borderRadius?: number;
+  shadow?: 'none' | 'sm' | 'md' | 'lg';
+  /**
+   * Rich title rendered INSIDE the tile body above the chart (sanitized HTML —
+   * util/richText allowlist). Independent of the header-bar title.
+   */
+  innerTitleHtml?: string | null;
+}
+
+/** Numeric axis label formatting. */
+export interface AxisValueFormat {
+  kind?: 'auto' | 'number' | 'currency' | 'percent' | 'compact';
+  /** Fraction digits (compact/number/currency/percent). */
+  decimals?: number;
+}
+
+/** Date axis label presets for bucketed dimensions. */
+export type DateFormatPreset =
+  | 'auto'
+  | 'monthShort' // Jan
+  | 'monthLong' // January
+  | 'monthNum' // 1..12
+  | 'monthYear' // Jan 2026
+  | 'dayShort' // Mon
+  | 'dayLong' // Monday
+  | 'dayOfMonth' // 1..31
+  | 'quarter' // Q1 2026
+  | 'year' // 2026
+  | 'isoDate'; // 2026-08-04
+
+export interface SeriesLineStyle {
+  dash?: 'solid' | 'dashed' | 'dotted';
+  /** Stroke width px (default 2). */
+  width?: number;
+}
+
+export interface TooltipStyle {
+  enabled?: boolean;
+  background?: string | null;
+  textColor?: string | null;
+  /** Colored per-series accent bar in the tooltip rows (default true). */
+  accentBorder?: boolean;
+  /** Append share-of-total percent (pie/donut/stacked). */
+  showPercent?: boolean;
+}
+
 export interface ChartFormat {
+  /** Predefined palette; per-series colorOverrides still win. */
+  theme?: ChartThemeName;
+  container?: ContainerStyle;
+  /** Numeric axis formats (value axis; x for horizontal bars/scatter-x). */
+  xAxisFormat?: AxisValueFormat;
+  yAxisFormat?: AxisValueFormat;
+  /** Date label preset for bucketed date dimensions on the axis. */
+  dateFormat?: DateFormatPreset;
+  /** Per-series line style, keyed like colorOverrides (line/area charts). */
+  lineStyles?: Record<string, SeriesLineStyle>;
+  tooltip?: TooltipStyle;
+  /** Legend items toggle series visibility on click (default true). */
+  legendInteractive?: boolean;
+  /** Per-tile live refresh in seconds (overrides dashboard refresh; null = off). */
+  refreshSeconds?: number | null;
   /**
    * Per-series hex overrides keyed by series name; default palette otherwise.
    * When colorByCategory is active (single-series column/bar) the keys are

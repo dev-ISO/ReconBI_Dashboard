@@ -1,5 +1,6 @@
 import {
   formatCellValue,
+  formatDateLabel,
   seriesColor,
   type CellValue,
   type ChartSpec,
@@ -11,6 +12,12 @@ export interface ChartSeries {
   key: string;
   label: string;
   color: string;
+  /**
+   * The series' DEFAULT display name (measure label / legend value) — the key
+   * format.colorOverrides, lineStyles and seriesLabels all use. `key` is the
+   * recharts dataKey (column NAME in measure mode) and can differ from it.
+   */
+  styleKey: string;
 }
 
 export interface ShapedChartData {
@@ -39,6 +46,17 @@ const displayLabel = (defaultLabel: string, spec: ChartSpec): string =>
   spec.format.seriesLabels?.[defaultLabel] ?? defaultLabel;
 
 /**
+ * Category label for an axis (or pie-label) cell. Date-BUCKETED columns honor
+ * format.dateFormat via formatDateLabel — which falls back to the bucket-aware
+ * formatCellValue default on 'auto'/unset — so shape-time labels are already
+ * the final tick text.
+ */
+const categoryLabel = (value: CellValue, column: QueryColumn, spec: ChartSpec): string =>
+  column.dateBucket !== null
+    ? formatDateLabel(value, column, spec.format.dateFormat)
+    : formatCellValue(value, column);
+
+/**
  * Pivots the engine's columnar result into recharts-friendly rows.
  * With a legend dimension: one series per legend value (first measure).
  * Without: one series per measure.
@@ -55,12 +73,13 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
     const series: ChartSeries[] = measureColumns.map((column, i) => ({
       key: column.name,
       label: displayLabel(column.label, spec),
-      color: seriesColor(i, column.label, spec.format.colorOverrides),
+      color: seriesColor(i, column.label, spec.format.colorOverrides, spec.format.theme),
+      styleKey: column.label,
     }));
 
     const data = result.rows.map((row) => {
       const item: Record<string, CellValue> = {
-        [AXIS_KEY]: axisColumn ? formatCellValue(row[axisIndex] ?? null, axisColumn) : '',
+        [AXIS_KEY]: axisColumn ? categoryLabel(row[axisIndex] ?? null, axisColumn, spec) : '',
         [RAW_AXIS_KEY]: axisColumn ? (row[axisIndex] ?? null) : null,
       };
       for (const column of measureColumns) {
@@ -82,7 +101,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   const legendValues: string[] = [];
 
   for (const row of result.rows) {
-    const axisLabel = axisColumn ? formatCellValue(row[axisIndex] ?? null, axisColumn) : '';
+    const axisLabel = axisColumn ? categoryLabel(row[axisIndex] ?? null, axisColumn, spec) : '';
     const legendLabel = formatCellValue(row[legendIndex] ?? null, legendColumn);
     if (!legendValues.includes(legendLabel)) legendValues.push(legendLabel);
 
@@ -100,7 +119,8 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   const series: ChartSeries[] = legendValues.map((value, i) => ({
     key: value,
     label: displayLabel(value, spec),
-    color: seriesColor(i, value, spec.format.colorOverrides),
+    color: seriesColor(i, value, spec.format.colorOverrides, spec.format.theme),
+    styleKey: value,
   }));
 
   return { data: [...byAxis.values()], series, axisKey: AXIS_KEY };
@@ -120,8 +140,8 @@ export interface ShapedPieData {
 
 /**
  * First dimension = slice label, first measure = slice value. Rows whose
- * measure is null/non-numeric are skipped; colors come from the categorical
- * slots with overrides keyed by slice label.
+ * measure is null/non-numeric are skipped; colors come from the theme palette
+ * (or categorical slots) with overrides keyed by slice label.
  */
 export function shapePieData(result: QueryResult, spec: ChartSpec): ShapedPieData {
   const labelColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
@@ -136,12 +156,12 @@ export function shapePieData(result: QueryResult, spec: ChartSpec): ShapedPieDat
     const value = toNumber(row[valueIndex] ?? null);
     if (value === null) continue;
     const label = labelColumn
-      ? formatCellValue(row[labelIndex] ?? null, labelColumn)
+      ? categoryLabel(row[labelIndex] ?? null, labelColumn, spec)
       : valueColumn.label;
     slices.push({
       label: displayLabel(label, spec),
       value,
-      color: seriesColor(slices.length, label, spec.format.colorOverrides),
+      color: seriesColor(slices.length, label, spec.format.colorOverrides, spec.format.theme),
       raw: labelColumn ? (row[labelIndex] ?? null) : null,
     });
   }
@@ -213,7 +233,7 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
   const series: ScatterSeries[] = [...bySeries.entries()].map(([key, points], i) => ({
     key,
     label: displayLabel(splitColumn ? key : 'All points', spec),
-    color: seriesColor(i, key, spec.format.colorOverrides),
+    color: seriesColor(i, key, spec.format.colorOverrides, spec.format.theme),
     points,
   }));
 

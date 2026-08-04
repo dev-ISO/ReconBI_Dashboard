@@ -59,6 +59,43 @@ html[data-theme='dark'] .rcd-root {
   --rcd-cat-8: #e66767;
 }
 
+/* Slim, token-colored scrollbars on every scroll container inside the library
+   (scoped to .rcd-root; host chrome outside stays untouched). WebKit/Blink use
+   the pseudo-elements; Firefox uses scrollbar-width/color, which INHERIT from
+   .rcd-root down. Recent Chromium also honors scrollbar-color and then ignores
+   the pseudo-elements — both paths give the same slim thumb-on-transparent. */
+.rcd-root::-webkit-scrollbar,
+.rcd-root ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.rcd-root::-webkit-scrollbar-thumb,
+.rcd-root ::-webkit-scrollbar-thumb {
+  border-radius: 9999px;
+  background-color: var(--rcd-border);
+}
+
+.rcd-root::-webkit-scrollbar-thumb:hover,
+.rcd-root ::-webkit-scrollbar-thumb:hover {
+  background-color: var(--rcd-muted);
+}
+
+.rcd-root::-webkit-scrollbar-track,
+.rcd-root ::-webkit-scrollbar-track {
+  background-color: transparent;
+}
+
+.rcd-root::-webkit-scrollbar-corner,
+.rcd-root ::-webkit-scrollbar-corner {
+  background-color: transparent;
+}
+
+.rcd-root {
+  scrollbar-width: thin;
+  scrollbar-color: var(--rcd-border) transparent;
+}
+
 /* Skeleton shimmer for loading tiles. */
 @keyframes rcd-shimmer {
   0% {

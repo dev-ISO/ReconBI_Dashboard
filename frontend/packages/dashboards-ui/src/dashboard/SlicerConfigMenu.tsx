@@ -111,6 +111,15 @@ export function SlicerConfigMenu({
     onClose();
   };
 
+  const style = spec.style ?? {};
+
+  /** Flips one visual-mode flag, preserving the other (style patches whole). */
+  const toggleStyleFlag = (flag: 'hideHeader' | 'compact') => {
+    runtime.dashboards.updateSlicer(tileId, {
+      style: { ...style, [flag]: !(style[flag] === true) },
+    });
+  };
+
   const appliesToSummary = allCharts
     ? 'All charts'
     : targets.length === 0
@@ -163,6 +172,27 @@ export function SlicerConfigMenu({
                 className="w-full"
               />
             </div>
+
+            <Divider />
+            <SectionLabel>Appearance</SectionLabel>
+            <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+              <input
+                type="checkbox"
+                className="accent-[var(--rcd-accent)]"
+                checked={style.hideHeader === true}
+                onChange={() => toggleStyleFlag('hideHeader')}
+              />
+              Frameless
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+              <input
+                type="checkbox"
+                className="accent-[var(--rcd-accent)]"
+                checked={style.compact === true}
+                onChange={() => toggleStyleFlag('compact')}
+              />
+              Compact
+            </label>
 
             <Divider />
             <SectionLabel>Applies to</SectionLabel>

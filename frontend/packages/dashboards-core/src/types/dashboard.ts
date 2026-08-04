@@ -14,6 +14,14 @@ export interface TileLayout {
 /** How a slicer tile renders its value picker. */
 export type SlicerVariant = 'checklist' | 'dropdown' | 'buttons' | 'dateRange';
 
+/** Visual tweaks for a slicer tile; absent fields keep the standard look. */
+export interface SlicerTileStyle {
+  /** No header bar; the label renders as a small caption inside the body. */
+  hideHeader?: boolean;
+  /** Tighter paddings + smaller text (dense dashboards). */
+  compact?: boolean;
+}
+
 export interface SlicerTileSpec {
   table: string;
   column: string;
@@ -23,6 +31,8 @@ export interface SlicerTileSpec {
   showClear?: boolean;
   /** Chart tile ids this slicer filters; null/absent = all charts. */
   targets?: string[] | null;
+  /** Visual mode tweaks (frameless / compact); absent = standard look. */
+  style?: SlicerTileStyle;
 }
 
 /** Static rich-text tile content. `html` is ALWAYS a sanitized subset — every

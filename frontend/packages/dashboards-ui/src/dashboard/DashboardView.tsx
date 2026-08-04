@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { AlertTriangle, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
 import {
   emptyChart,
   filterCardIsActive,
   isChartTile,
   isImageTile,
+  isRunnable,
   isSlicerTile,
   isTextTile,
   newId,
+  toWireSpec,
   type ChartSpec,
+  type DashboardTile,
   type FilterClause,
 } from '@recon/dashboards-core';
 import { ChartBuilder } from '../chart-builder/ChartBuilder';
@@ -17,6 +21,7 @@ import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
 import { AddSlicerDialog } from './AddSlicerDialog';
+import { ChartContextMenu } from './ChartContextMenu';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
@@ -62,7 +67,16 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
   const [openError, setOpenError] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
-  const [builder, setBuilder] = useState<{ tileId: string | null; spec: ChartSpec } | null>(null);
+  const [builder, setBuilder] = useState<{
+    tileId: string | null;
+    spec: ChartSpec;
+    initialTab?: 'fields' | 'format';
+  } | null>(null);
+  /** Right-click context card on a CHART tile (edit mode only). */
+  const [chartMenu, setChartMenu] = useState<{
+    tileId: string;
+    position: { x: number; y: number };
+  } | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
   const [addImageOpen, setAddImageOpen] = useState(false);
   const [printConfigOpen, setPrintConfigOpen] = useState(false);
@@ -195,6 +209,82 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     return () => clearInterval(timer);
   }, [mode, refreshSeconds, refreshTiles, printOptions]);
 
+  // Per-tile live refresh: charts whose format.refreshSeconds is set tick on
+  // their own intervals (one interval per distinct seconds value), independent
+  // of the dashboard-level refresh above. View mode only, print closed.
+  const [tileRefreshTokens, setTileRefreshTokens] = useState<Record<string, number>>({});
+
+  /** Chart tile ids grouped by their per-tile refresh interval (seconds). */
+  const tileRefreshGroups = useMemo(() => {
+    const groups = new Map<number, string[]>();
+    if (modelId === null) return groups;
+    for (const tile of tiles) {
+      if (!isChartTile(tile)) continue;
+      const seconds = tile.chart.format.refreshSeconds ?? null;
+      if (seconds == null || seconds <= 0) continue;
+      const ids = groups.get(seconds) ?? [];
+      ids.push(tile.id);
+      groups.set(seconds, ids);
+    }
+    return groups;
+  }, [tiles, modelId]);
+
+  // Ticks read the CURRENT tiles/filters through a ref so slicer/cross-filter
+  // changes never reset the running intervals (and keys never go stale).
+  const tickInputs = useRef<{
+    tiles: DashboardTile[];
+    filtersByTile: Map<string, FilterClause[]>;
+    modelId: number | null;
+  }>({ tiles, filtersByTile, modelId });
+  tickInputs.current = { tiles, filtersByTile, modelId };
+
+  const refreshTileGroup = useCallback(
+    (tileIds: string[]) => {
+      const inputs = tickInputs.current;
+      if (inputs.modelId === null) return;
+      // Targeted invalidation: recompute exactly the cache key ChartTile uses
+      // (same spec + same filters array -> same stableStringify key) and drop
+      // ONLY those entries from the shared query cache. Other mounted tiles
+      // keep their entries — and their rendered data — untouched.
+      const keys: string[] = [];
+      for (const id of tileIds) {
+        const tile = inputs.tiles.find((t) => t.id === id);
+        if (!tile || !isChartTile(tile) || !isRunnable(tile.chart)) continue;
+        keys.push(
+          runtime.queries.keyFor(
+            toWireSpec(tile.chart, inputs.modelId, inputs.filtersByTile.get(id) ?? NO_FILTERS),
+          ),
+        );
+      }
+      if (keys.length > 0) {
+        runtime.queries.store.setState((state) => {
+          const entries = { ...state.entries };
+          for (const key of keys) delete entries[key];
+          return { entries };
+        });
+      }
+      // Remount just these tiles (key bump): each remount re-runs ChartTile's
+      // fetch effect, which now misses the cache and refetches fresh data.
+      setTileRefreshTokens((tokens) => {
+        const next = { ...tokens };
+        for (const id of tileIds) next[id] = (next[id] ?? 0) + 1;
+        return next;
+      });
+    },
+    [runtime],
+  );
+
+  useEffect(() => {
+    if (mode !== 'view' || printOptions !== null || tileRefreshGroups.size === 0) return;
+    const timers: number[] = [];
+    for (const [seconds, tileIds] of tileRefreshGroups) {
+      timers.push(window.setInterval(() => refreshTileGroup(tileIds), seconds * 1000));
+    }
+    return () => {
+      for (const timer of timers) window.clearInterval(timer);
+    };
+  }, [mode, printOptions, tileRefreshGroups, refreshTileGroup]);
+
   const handleLayoutChange = useCallback(
     (items: DashboardGridItem[]) => {
       const state = runtime.dashboards.store.getState();
@@ -288,9 +378,21 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         <TileFrame
           title={chart.title}
           editable={editable}
+          container={chart.format.container ?? null}
           onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
           onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
           onDelete={() => runtime.dashboards.removeTile(tile.id)}
+          onContextMenu={
+            // Context card replaces the native menu in EDIT mode only; view
+            // mode keeps the browser's own right-click menu.
+            editable
+              ? (event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  setChartMenu({ tileId: tile.id, position: { x: event.clientX, y: event.clientY } });
+                }
+              : undefined
+          }
         >
           {modelId === null ? (
             <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
@@ -298,7 +400,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             </div>
           ) : (
             <ChartTile
-              key={refreshToken}
+              key={`${refreshToken}:${tileRefreshTokens[tile.id] ?? 0}`}
               spec={chart}
               modelId={modelId}
               filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
@@ -354,11 +456,15 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         model={openModel.definition}
         catalog={builderCatalog}
         initial={builder.spec}
+        initialTab={builder.initialTab}
         onSave={handleBuilderSave}
         onCancel={() => setBuilder(null)}
       />
     );
   })();
+
+  /** Chart tile the context card targets (undefined once the tile is gone). */
+  const chartMenuTile = chartMenu ? tiles.find((t) => t.id === chartMenu.tileId) : undefined;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-rcd-bg">
@@ -449,6 +555,39 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
       {/* Excel-style page tabs, docked under the scroll area in BOTH modes. */}
       <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={editable} />
+
+      {chartMenu &&
+        editable &&
+        chartMenuTile &&
+        isChartTile(chartMenuTile) &&
+        // Portal past the transformed grid items: position:fixed inside a
+        // transformed ancestor would resolve against the tile, not the viewport.
+        createPortal(
+          <div className="rcd-root bg-transparent">
+            <ChartContextMenu
+              title={chartMenuTile.chart.title}
+              position={chartMenu.position}
+              onFormat={() =>
+                setBuilder({
+                  tileId: chartMenuTile.id,
+                  spec: chartMenuTile.chart,
+                  initialTab: 'format',
+                })
+              }
+              onEditFields={() =>
+                setBuilder({
+                  tileId: chartMenuTile.id,
+                  spec: chartMenuTile.chart,
+                  initialTab: 'fields',
+                })
+              }
+              onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
+              onDelete={() => runtime.dashboards.removeTile(chartMenuTile.id)}
+              onClose={() => setChartMenu(null)}
+            />
+          </div>,
+          document.body,
+        )}
 
       <RcdDialog
         title={builder?.tileId ? 'Edit chart' : 'Add chart'}

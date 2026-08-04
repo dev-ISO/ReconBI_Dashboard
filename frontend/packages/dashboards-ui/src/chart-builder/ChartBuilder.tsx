@@ -47,6 +47,8 @@ export interface ChartBuilderProps {
   onCancel: () => void;
   /** Column metadata for the model's data source; FieldList falls back to measures when null. */
   catalog?: Catalog | null;
+  /** Tab shown when the builder opens (a dashboard-side "Format chart" flow passes 'format'). */
+  initialTab?: 'fields' | 'format';
 }
 
 /** Target of the FilterEditor dialog: an existing clause (index) or a new one. */
@@ -59,10 +61,18 @@ interface FilterEditorTarget {
 type BuilderTab = 'fields' | 'format';
 
 /** Field list | tabs (title + type + wells / format panel) | live preview. */
-export function ChartBuilder({ modelId, model, initial, onSave, onCancel, catalog }: ChartBuilderProps) {
+export function ChartBuilder({
+  modelId,
+  model,
+  initial,
+  onSave,
+  onCancel,
+  catalog,
+  initialTab = 'fields',
+}: ChartBuilderProps) {
   const runtime = useRuntime();
   const [draft, setDraft] = useState<ChartSpec>(() => structuredClone(initial));
-  const [tab, setTab] = useState<BuilderTab>('fields');
+  const [tab, setTab] = useState<BuilderTab>(initialTab);
   const [activeDrag, setActiveDrag] = useState<FieldDragData | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [filterTarget, setFilterTarget] = useState<FilterEditorTarget | null>(null);

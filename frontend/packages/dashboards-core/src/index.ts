@@ -23,5 +23,5 @@ export type { DashboardsRuntime } from './state/createRuntime';
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
 export { sanitizeRichHtml } from './util/richText';
-export { formatCellValue } from './util/format';
-export { seriesColor, CATEGORICAL_SLOTS } from './util/palette';
+export { formatCellValue, formatAxisValue, formatDateLabel } from './util/format';
+export { seriesColor, CATEGORICAL_SLOTS, CHART_THEMES } from './util/palette';
