@@ -1,0 +1,52 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: rcd-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rcd_dev_password}
+      POSTGRES_DB: demo_app
+    ports:
+      - "5445:5432"
+    volumes:
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+      - rcd-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d demo_app"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: demo/ReconDashboards.DemoHost/Dockerfile
+    container_name: rcd-demo-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Development
+      ASPNETCORE_URLS: http://+:8080
+      ConnectionStrings__Storage: Host=postgres;Port=5432;Database=demo_dashboards;Username=postgres;Password=${POSTGRES_PASSWORD:-rcd_dev_password}
+      ConnectionStrings__DemoData: Host=postgres;Port=5432;Database=demo_app;Username=chart_reader;Password=${CHART_READER_PASSWORD:-chart_reader_password}
+      TokenKey: ${DEMO_TOKEN_KEY:-dev-only-demo-signing-key-at-least-64-characters-long-0123456789abcdef}
+    ports:
+      - "5040:8080"
+
+  # Applies the rcd_ EF migrations bundle (never auto-migrate at startup):
+  #   docker compose --profile migrate run --rm migrator
+  migrator:
+    profiles: ["migrate"]
+    build:
+      context: ./backend
+      dockerfile: demo/ReconDashboards.DemoHost/Dockerfile
+      target: migrator
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      RCD_MIGRATIONS_CONNECTION: Host=postgres;Port=5432;Database=demo_dashboards;Username=postgres;Password=${POSTGRES_PASSWORD:-rcd_dev_password}
+
+volumes:
+  rcd-pgdata:
