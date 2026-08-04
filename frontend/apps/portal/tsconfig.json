@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": ["vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@recon/dashboards-ui": ["../../packages/dashboards-ui/src/index.ts"],
+      "@recon/dashboards-core": ["../../packages/dashboards-core/src/index.ts"]
+    }
+  },
+  "include": ["src"]
+}

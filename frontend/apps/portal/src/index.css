@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Portal defines the same host-variable contract the production SPAs use, so
+   the library's fallback chain (--rcd-* -> --color-* -> defaults) is exercised
+   here exactly as it will be when embedded. */
+:root {
+  --color-bg: #f9f9f7;
+  --color-surface: #fcfcfb;
+  --color-text: #0b0b0b;
+  --color-accent: #2a78d6;
+}
+
+html[data-theme='dark'] {
+  --color-bg: #0d0d0d;
+  --color-surface: #1a1a19;
+  --color-text: #ffffff;
+  --color-accent: #3987e5;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-text);
+  font-family:
+    Inter,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}

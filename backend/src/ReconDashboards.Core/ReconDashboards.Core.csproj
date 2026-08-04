@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>Engine core for ReconDashboards: semantic model, validation, join resolution, SQL compilation (dialect-agnostic), dashboard persistence, options. No ASP.NET, no Npgsql.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Floor at 10.0.0 so host apps' exact pins (10.0.0 / 10.0.3 / 10.0.8) win resolution. -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" Version="[10.0.0,11.0.0)" />
+    <PackageReference Include="Microsoft.Extensions.Caching.Memory" Version="[10.0.0,11.0.0)" />
+  </ItemGroup>
+
+</Project>

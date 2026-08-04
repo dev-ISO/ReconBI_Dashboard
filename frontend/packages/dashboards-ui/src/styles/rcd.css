@@ -1,0 +1,81 @@
+/* Third-party CSS the library depends on, bundled into dist/style.css so hosts
+   import exactly one stylesheet. */
+@import 'react-grid-layout/css/styles.css';
+@import 'react-resizable/css/styles.css';
+@import '@xyflow/react/dist/style.css';
+
+/* ReconDashboards theme contract.
+   Every library surface renders inside .rcd-root. Tokens fall back through the
+   hosts' CSS variables (--color-*) to standalone defaults, so the library is
+   correctly styled both embedded and in the portal.
+   Categorical palette: validated 8-slot set (CVD-checked); dark values are
+   re-stepped for dark surfaces, not auto-flipped. */
+.rcd-root {
+  --rcd-bg: var(--color-bg, #f9f9f7);
+  --rcd-surface: var(--color-surface, #fcfcfb);
+  --rcd-text: var(--color-text, #0b0b0b);
+  --rcd-accent: var(--color-accent, #2a78d6);
+  --rcd-text-2: #52514e;
+  --rcd-muted: #898781;
+  --rcd-border: rgba(11, 11, 11, 0.1);
+  --rcd-grid-line: #e1e0d9;
+  --rcd-axis: #c3c2b7;
+
+  --rcd-cat-1: #2a78d6;
+  --rcd-cat-2: #eb6834;
+  --rcd-cat-3: #1baf7a;
+  --rcd-cat-4: #eda100;
+  --rcd-cat-5: #e87ba4;
+  --rcd-cat-6: #008300;
+  --rcd-cat-7: #4a3aa7;
+  --rcd-cat-8: #e34948;
+
+  --rcd-status-good: #0ca30c;
+  --rcd-status-warn: #fab219;
+  --rcd-status-serious: #ec835a;
+  --rcd-status-critical: #d03b3b;
+
+  color: var(--rcd-text);
+  background-color: var(--rcd-bg);
+}
+
+html[data-theme='dark'] .rcd-root {
+  --rcd-bg: var(--color-bg, #0d0d0d);
+  --rcd-surface: var(--color-surface, #1a1a19);
+  --rcd-text: var(--color-text, #ffffff);
+  --rcd-text-2: #c3c2b7;
+  --rcd-muted: #898781;
+  --rcd-border: rgba(255, 255, 255, 0.1);
+  --rcd-grid-line: #2c2c2a;
+  --rcd-axis: #383835;
+
+  --rcd-cat-1: #3987e5;
+  --rcd-cat-2: #d95926;
+  --rcd-cat-3: #199e70;
+  --rcd-cat-4: #c98500;
+  --rcd-cat-5: #d55181;
+  --rcd-cat-6: #008300;
+  --rcd-cat-7: #9085e9;
+  --rcd-cat-8: #e66767;
+}
+
+/* Skeleton shimmer for loading tiles. */
+@keyframes rcd-shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+.rcd-skeleton {
+  animation: rcd-shimmer 1.4s ease-in-out infinite;
+  background: linear-gradient(
+    90deg,
+    var(--rcd-border) 25%,
+    var(--rcd-surface) 50%,
+    var(--rcd-border) 75%
+  );
+  background-size: 800px 100%;
+}

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>PostgreSQL provider for ReconDashboards: pg_catalog schema introspection, SQL dialect, read-only query executor, EF Core migrations for the rcd_ tables.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Floor at 10.0.0: Unanet pins 10.0.0 exactly, PSV pins 10.0.3 exactly; their direct pins must win. -->
+    <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="[10.0.0,11.0.0)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ReconDashboards.Core\ReconDashboards.Core.csproj" />
+  </ItemGroup>
+
+</Project>

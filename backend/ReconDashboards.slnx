@@ -1,0 +1,15 @@
+<Solution>
+  <Folder Name="/demo/">
+    <Project Path="demo/ReconDashboards.DemoHost/ReconDashboards.DemoHost.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/ReconDashboards.AspNetCore/ReconDashboards.AspNetCore.csproj" />
+    <Project Path="src/ReconDashboards.Core/ReconDashboards.Core.csproj" />
+    <Project Path="src/ReconDashboards.Postgres/ReconDashboards.Postgres.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ReconDashboards.Api.Tests/ReconDashboards.Api.Tests.csproj" />
+    <Project Path="tests/ReconDashboards.Core.Tests/ReconDashboards.Core.Tests.csproj" />
+    <Project Path="tests/ReconDashboards.Postgres.Tests/ReconDashboards.Postgres.Tests.csproj" />
+  </Folder>
+</Solution>

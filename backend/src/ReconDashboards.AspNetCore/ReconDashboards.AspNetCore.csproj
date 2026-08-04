@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <Description>ASP.NET Core surface for ReconDashboards: controllers under a configurable route prefix, authorization policy slots, DI integration (AddReconDashboards).</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- FrameworkReference only: no Microsoft.AspNetCore.* or Microsoft.OpenApi package refs,
+         so host apps' CVE-pinned OpenApi versions are never perturbed. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ReconDashboards.Core\ReconDashboards.Core.csproj" />
+  </ItemGroup>
+
+</Project>

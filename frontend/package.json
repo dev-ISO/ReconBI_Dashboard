@@ -1,0 +1,13 @@
+{
+  "name": "recon-dashboards-frontend",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @recon/dashboards-core && npm run build -w @recon/dashboards-ui && npm run build -w recon-dashboards-portal",
+    "dev": "npm run dev -w recon-dashboards-portal",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  }
+}

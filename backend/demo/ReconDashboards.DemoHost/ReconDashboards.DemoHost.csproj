@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <Description>Demo host for ReconDashboards: thin API mirroring the production hosts' conventions (JWT, fallback-deny auth), wired to the seeded demo database.</Description>
+    <IsPackable>false</IsPackable>
+    <UserSecretsId>recondashboards-demohost</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="[10.0.0,11.0.0)" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="[10.0.0,11.0.0)">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ReconDashboards.AspNetCore\ReconDashboards.AspNetCore.csproj" />
+    <ProjectReference Include="..\..\src\ReconDashboards.Postgres\ReconDashboards.Postgres.csproj" />
+  </ItemGroup>
+
+</Project>
