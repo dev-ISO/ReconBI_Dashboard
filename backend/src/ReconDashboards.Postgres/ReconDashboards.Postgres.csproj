@@ -7,6 +7,12 @@
   <ItemGroup>
     <!-- Floor at 10.0.0: Unanet pins 10.0.0 exactly, PSV pins 10.0.3 exactly; their direct pins must win. -->
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="[10.0.0,11.0.0)" />
+    <!-- Design-time only (migrations authoring in this repo); PrivateAssets keeps it out of the package,
+         so a higher floor here never reaches hosts (10.0.0 pulled a vulnerable System.Security.Cryptography.Xml). -->
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Design" Version="[10.0.8,11.0.0)">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
   </ItemGroup>
 
   <ItemGroup>
