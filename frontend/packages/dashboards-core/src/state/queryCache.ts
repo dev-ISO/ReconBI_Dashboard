@@ -41,7 +41,7 @@ export class QueryCache {
     return this.store.getState().entries[key];
   }
 
-  async run(spec: ChartQuerySpec, signal?: AbortSignal): Promise<QueryResult> {
+  async run(spec: ChartQuerySpec, _signal?: AbortSignal): Promise<QueryResult> {
     const key = this.keyFor(spec);
     const existing = this.entryFor(key);
     if (existing?.status === 'ok' && Date.now() - existing.fetchedAt < QUERY_TTL_MS) {
@@ -52,8 +52,12 @@ export class QueryCache {
     if (inFlight) return inFlight;
 
     this.setEntry(key, { status: 'loading', fetchedAt: Date.now() });
+    // Deliberately NOT forwarding the caller's abort signal: the in-flight
+    // promise is shared across subscribers (and StrictMode double-mounts), so
+    // one caller's abort must not doom it for everyone. Aborting a caller just
+    // abandons its await; the response still lands in the cache.
     const promise = this.api
-      .runQuery(spec, signal)
+      .runQuery(spec)
       .then((data) => {
         this.setEntry(key, { status: 'ok', data, fetchedAt: Date.now() });
         return data;
@@ -78,7 +82,7 @@ export class QueryCache {
     return promise;
   }
 
-  async distinct(spec: DistinctValuesSpec, signal?: AbortSignal): Promise<DistinctValuesResult> {
+  async distinct(spec: DistinctValuesSpec, _signal?: AbortSignal): Promise<DistinctValuesResult> {
     const key = stableStringify(spec);
     const cached = this.distinctResults.get(key);
     if (cached && Date.now() - cached.fetchedAt < DISTINCT_TTL_MS) return cached.data;
@@ -86,8 +90,9 @@ export class QueryCache {
     const inFlight = this.distinctInFlight.get(key);
     if (inFlight) return inFlight;
 
+    // Shared promise — never bound to one caller's signal (see run()).
     const promise = this.api
-      .getDistinctValues(spec, signal)
+      .getDistinctValues(spec)
       .then((data) => {
         this.distinctResults.set(key, { data, fetchedAt: Date.now() });
         return data;
