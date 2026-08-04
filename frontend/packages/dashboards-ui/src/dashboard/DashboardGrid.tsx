@@ -18,13 +18,21 @@ export interface DashboardGridProps {
   editable?: boolean;
   onLayoutChange?: (items: DashboardGridItem[]) => void;
   renderItem: (id: string) => ReactNode;
+  /** CSS selector for the per-tile drag handle; the whole tile drags when omitted. */
+  draggableHandle?: string;
 }
 
 /**
  * Serializable dashboard grid. Wraps react-grid-layout so the rest of the
  * library (and any fallback grid engine) only ever sees DashboardGridItem[].
  */
-export function DashboardGrid({ items, editable = false, onLayoutChange, renderItem }: DashboardGridProps) {
+export function DashboardGrid({
+  items,
+  editable = false,
+  onLayoutChange,
+  renderItem,
+  draggableHandle,
+}: DashboardGridProps) {
   const layout: Layout[] = useMemo(
     () =>
       items.map((item) => ({
@@ -48,6 +56,7 @@ export function DashboardGrid({ items, editable = false, onLayoutChange, renderI
       margin={[12, 12]}
       isDraggable={editable}
       isResizable={editable}
+      draggableHandle={draggableHandle}
       onLayoutChange={(next: Layout[]) =>
         onLayoutChange?.(
           next.map((l) => ({

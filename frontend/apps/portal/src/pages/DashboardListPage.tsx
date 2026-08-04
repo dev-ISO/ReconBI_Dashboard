@@ -1,8 +1,13 @@
+import { useNavigate } from 'react-router-dom';
+import { DashboardListPanel } from '@recon/dashboards-ui';
+
 export function DashboardListPage() {
+  const navigate = useNavigate();
+  const goToDashboard = (id: number) => navigate(`/dashboards/${id}`);
+
   return (
-    <div className="p-8">
-      <h1 className="text-xl font-semibold">Dashboards</h1>
-      <p className="mt-2 text-sm opacity-70">Dashboard list arrives with the vertical slice.</p>
+    <div className="h-full">
+      <DashboardListPanel onOpen={goToDashboard} onCreated={goToDashboard} />
     </div>
   );
 }

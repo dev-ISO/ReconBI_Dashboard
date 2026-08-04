@@ -1,0 +1,31 @@
+/* React Flow chrome themed with rcd tokens. The tokens themselves flip with
+   html[data-theme='dark'], so no separate dark rules are needed here. */
+.rcd-model-canvas {
+  --xy-background-color: transparent;
+  --xy-edge-stroke: var(--rcd-border);
+  --xy-edge-stroke-selected: var(--rcd-accent);
+  --xy-edge-label-background-color: var(--rcd-surface);
+  --xy-edge-label-color: var(--rcd-text-2);
+  --xy-controls-button-background-color: var(--rcd-surface);
+  --xy-controls-button-background-color-hover: var(--rcd-bg);
+  --xy-controls-button-color: var(--rcd-text-2);
+  --xy-controls-button-color-hover: var(--rcd-text);
+  --xy-controls-button-border-color: var(--rcd-border);
+  --xy-attribution-background-color: transparent;
+  --xy-handle-background-color: var(--rcd-accent);
+  --xy-handle-border-color: var(--rcd-surface);
+}
+
+/* Tiny per-column connection dots. */
+.rcd-model-canvas .react-flow__handle {
+  width: 7px;
+  height: 7px;
+  min-width: 0;
+  min-height: 0;
+  background-color: var(--rcd-accent);
+  border: 1px solid var(--rcd-surface);
+}
+
+.rcd-model-canvas .react-flow__edge {
+  cursor: pointer;
+}
