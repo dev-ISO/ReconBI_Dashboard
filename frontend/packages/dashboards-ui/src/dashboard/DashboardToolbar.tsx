@@ -149,7 +149,7 @@ export function DashboardToolbar({
         {name}
       </h1>
       {isShared && (
-        <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+        <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[11px] font-medium text-rcd-text-2 shadow-[var(--rcd-shadow-1)]">
           <Share2 size={11} />
           Shared
         </span>
@@ -247,7 +247,7 @@ export function DashboardToolbar({
                   title="Mobile layout"
                   aria-pressed={mobileLayoutOpen}
                   onClick={onToggleMobileLayout}
-                  className={mobileLayoutOpen ? 'bg-black/5 text-rcd-accent dark:bg-white/10' : ''}
+                  className={mobileLayoutOpen ? 'bg-black/5 text-[var(--rcd-accent-interactive)] dark:bg-white/10' : ''}
                 >
                   <Smartphone size={14} />
                 </RcdIconButton>

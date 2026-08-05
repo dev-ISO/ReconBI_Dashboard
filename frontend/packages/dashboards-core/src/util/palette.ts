@@ -9,13 +9,19 @@ import type { ChartThemeName } from '../types/chart';
  */
 export const CATEGORICAL_SLOTS = 8;
 
-/** Predefined 8-slot palettes selectable per chart via format.theme. */
+/**
+ * Predefined 8-slot palettes selectable per chart via format.theme. Hue
+ * identities are stable across releases (saved dashboards must stay
+ * recognizable); values are tuned toward the neutral shadcn-style UI — the
+ * palest tints were deepened and the near-invisible extremes lifted so every
+ * slot reads as a solid flat fill on both white and near-black surfaces.
+ */
 export const CHART_THEMES: Record<Exclude<ChartThemeName, 'default'>, readonly string[]> = {
-  ocean: ['#1868ae', '#26a5b8', '#7cd0d8', '#0e4d92', '#5aa9e6', '#173f5f', '#3caea3', '#8fd5a6'],
-  sunset: ['#f2542d', '#f9a03f', '#ffd166', '#d81159', '#8f2d56', '#fb6f92', '#ffb703', '#c1440e'],
-  forest: ['#2d6a4f', '#74c69d', '#40916c', '#b7e4c7', '#1b4332', '#95d5b2', '#588157', '#344e41'],
-  berry: ['#7b2cbf', '#c77dff', '#9d4edd', '#e0aaff', '#5a189a', '#ff5d8f', '#b5179e', '#3c096c'],
-  mono: ['#1f2937', '#4b5563', '#6b7280', '#9ca3af', '#374151', '#d1d5db', '#111827', '#e5e7eb'],
+  ocean: ['#1868ae', '#26a5b8', '#5fc3cd', '#0e4d92', '#5aa9e6', '#2d5f86', '#3caea3', '#6cc48f'],
+  sunset: ['#f2542d', '#f9a03f', '#f5c33c', '#d81159', '#8f2d56', '#fb6f92', '#eda60a', '#c1440e'],
+  forest: ['#2d6a4f', '#74c69d', '#40916c', '#93cfa9', '#27593f', '#7fc59b', '#588157', '#3f5d4b'],
+  berry: ['#7b2cbf', '#c77dff', '#9d4edd', '#c793f2', '#5a189a', '#ff5d8f', '#b5179e', '#53228c'],
+  mono: ['#1f2937', '#4b5563', '#6b7280', '#9ca3af', '#374151', '#aab1bb', '#111827', '#c3c8d0'],
 };
 
 export const seriesColor = (

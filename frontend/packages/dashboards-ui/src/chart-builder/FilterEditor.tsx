@@ -146,9 +146,9 @@ export function FilterEditor({
         </>
       }
     >
-      <div className="flex flex-col gap-3">
-        <label className="flex flex-col gap-1">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+      <div className="flex flex-col gap-4">
+        <label className="flex flex-col gap-1.5">
+          <span className="text-xs font-medium text-rcd-text-2">
             Operator
           </span>
           <RcdSelect
@@ -165,8 +165,8 @@ export function FilterEditor({
         </label>
 
         {mode === 'single' && (
-          <label className="flex flex-col gap-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-rcd-text-2">
               Value
             </span>
             <RcdInput
@@ -181,8 +181,8 @@ export function FilterEditor({
 
         {mode === 'pair' && (
           <div className="flex flex-wrap items-end gap-2">
-            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1">
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1.5">
+              <span className="text-xs font-medium text-rcd-text-2">
                 From
               </span>
               <RcdInput
@@ -193,8 +193,8 @@ export function FilterEditor({
               />
             </label>
             <span className="pb-2 text-xs text-rcd-muted">and</span>
-            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1">
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1.5">
+              <span className="text-xs font-medium text-rcd-text-2">
                 To
               </span>
               <RcdInput
@@ -208,8 +208,8 @@ export function FilterEditor({
         )}
 
         {mode === 'boolean' && (
-          <label className="flex flex-col gap-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-rcd-text-2">
               Value
             </span>
             <RcdSelect
@@ -224,8 +224,8 @@ export function FilterEditor({
         )}
 
         {mode === 'checklist' && (
-          <div className="flex flex-col gap-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs font-medium text-rcd-text-2">
               Values
             </span>
             <DistinctValueList

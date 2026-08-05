@@ -33,7 +33,7 @@ const OPTIONS: { type: ChartType; label: string; icon: LucideIcon }[] = [
   { type: 'table', label: 'Table', icon: Table2 },
 ];
 
-/** Icon grid of chart types. */
+/** Icon grid of chart types, styled as a shadcn toggle-group. */
 export function ChartTypePicker({ value, onChange }: ChartTypePickerProps) {
   return (
     <div className="flex flex-wrap gap-1" role="radiogroup" aria-label="Chart type">
@@ -48,10 +48,10 @@ export function ChartTypePicker({ value, onChange }: ChartTypePickerProps) {
             aria-label={label}
             title={label}
             onClick={() => onChange(type)}
-            className={`flex h-9 w-9 items-center justify-center rounded-md border transition-colors ${
+            className={`flex h-9 w-9 items-center justify-center rounded-md transition-colors ${
               selected
-                ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)] text-rcd-accent'
-                : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
+                ? 'bg-rcd-text text-rcd-surface shadow-[var(--rcd-shadow-1)]'
+                : 'text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
             }`}
           >
             <Icon size={17} />

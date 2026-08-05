@@ -259,7 +259,7 @@ export function AlertDialog({ open, dashboardId, modelId, source, onClose, onErr
               onChange={(event) => setRecipientsText(event.target.value)}
               placeholder="one@example.com, two@example.com"
               rows={2}
-              className="rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent"
+              className="rounded-lg border border-rcd-border bg-rcd-surface px-3 py-1.5 text-sm text-rcd-text shadow-[var(--rcd-shadow-1)] outline-none transition-[border-color,box-shadow] placeholder:text-rcd-muted focus:border-[var(--rcd-accent-interactive)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent-interactive)_20%,transparent)]"
             />
             {invalidRecipients.length > 0 && (
               <span className="text-xs text-[var(--rcd-status-critical)]">

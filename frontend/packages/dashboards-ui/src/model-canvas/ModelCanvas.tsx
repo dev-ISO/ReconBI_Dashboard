@@ -202,8 +202,8 @@ export function ModelCanvas({
         ...sideHandles(r.fromTable, r.fromColumn, r.toTable, r.toColumn),
         label: r.cardinality === 'manyToOne' ? '* — 1' : '1 — 1',
         style: r.isActive
-          ? { stroke: 'var(--rcd-accent)', strokeWidth: 1.5, opacity: 0.7 }
-          : { stroke: 'var(--rcd-accent)', strokeWidth: 1.5, opacity: 0.45, strokeDasharray: '7 5' },
+          ? { stroke: 'var(--rcd-muted)', strokeWidth: 1.5, opacity: 0.9 }
+          : { stroke: 'var(--rcd-muted)', strokeWidth: 1.5, opacity: 0.5, strokeDasharray: '7 5' },
         labelStyle: { fill: 'var(--rcd-text-2)', fontSize: 10 },
         labelBgStyle: { fill: 'var(--rcd-surface)', fillOpacity: 0.9 },
         labelBgPadding: [6, 3] as [number, number],

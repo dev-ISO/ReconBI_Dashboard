@@ -177,19 +177,19 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
                       <td className="px-3 py-2.5">
                         <div className="flex flex-wrap items-center gap-1">
                           {dashboard.ownerIsMe && (
-                            <span className="rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+                            <span className="rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                               Yours
                             </span>
                           )}
                           {dashboard.isShared && (
-                            <span className="inline-flex items-center gap-1 rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+                            <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                               <Share2 size={11} />
                               Shared
                             </span>
                           )}
                         </div>
                       </td>
-                      <td className="px-3 py-2.5 text-rcd-text-2">
+                      <td className="px-3 py-2.5 text-rcd-text-2 tabular-nums">
                         {formatUpdated(dashboard.updatedAtUtc)}
                       </td>
                       <td className="px-2 py-1.5" onClick={(event) => event.stopPropagation()}>

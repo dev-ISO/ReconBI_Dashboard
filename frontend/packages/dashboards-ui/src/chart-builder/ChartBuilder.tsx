@@ -197,7 +197,11 @@ export function ChartBuilder({
           </div>
 
           <div className="flex min-h-0 flex-col gap-3">
-            <div className="flex shrink-0 gap-1 border-b border-rcd-border" role="tablist" aria-label="Chart settings">
+            <div
+              className="flex w-fit shrink-0 items-center gap-1 rounded-lg bg-black/5 p-1 dark:bg-white/10"
+              role="tablist"
+              aria-label="Chart settings"
+            >
               {(['fields', 'format'] as const).map((id) => (
                 <button
                   key={id}
@@ -205,10 +209,10 @@ export function ChartBuilder({
                   role="tab"
                   aria-selected={tab === id}
                   onClick={() => setTab(id)}
-                  className={`-mb-px border-b-2 px-3 py-1.5 text-sm font-medium transition-colors ${
+                  className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
                     tab === id
-                      ? 'border-rcd-accent text-rcd-text'
-                      : 'border-transparent text-rcd-muted hover:text-rcd-text'
+                      ? 'bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)]'
+                      : 'text-rcd-muted hover:text-rcd-text'
                   }`}
                 >
                   {id === 'fields' ? 'Fields' : 'Format'}
@@ -219,7 +223,7 @@ export function ChartBuilder({
             {tab === 'fields' ? (
               <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto pr-1">
                 <label className="flex flex-col gap-1">
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+                  <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
                     Title
                   </span>
                   <RcdInput
@@ -232,7 +236,7 @@ export function ChartBuilder({
                 </label>
 
                 <div className="flex flex-col gap-1">
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+                  <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
                     Chart type
                   </span>
                   <ChartTypePicker
@@ -276,7 +280,7 @@ export function ChartBuilder({
           </div>
 
           <div className="flex min-h-0 flex-col gap-1">
-            <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+            <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
               Preview
             </span>
             <div className="min-h-0 flex-1 rounded-md border border-rcd-border bg-rcd-surface p-2">
@@ -287,7 +291,7 @@ export function ChartBuilder({
 
         <DragOverlay dropAnimation={null}>
           {activeDrag && (
-            <div className="flex w-max items-center gap-1.5 rounded-md border border-rcd-accent bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text shadow-md">
+            <div className="flex w-max items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-2)] ring-1 ring-[color-mix(in_srgb,var(--rcd-accent)_40%,transparent)]">
               {activeDrag.kind === 'measure' && <Sigma size={12} className="text-rcd-muted" />}
               {activeDrag.kind === 'parameter' && (
                 <Variable size={12} className="text-rcd-accent" />

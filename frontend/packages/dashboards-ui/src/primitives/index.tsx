@@ -15,30 +15,45 @@ import { X } from 'lucide-react';
 // rcd tokens only; literal class names throughout.
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
+type ButtonSize = 'default' | 'sm';
 
-/** Shared accent focus ring for every interactive control (keyboard only). */
+/** Shared focus ring (keyboard only): chromatic interactive accent so it never
+    vanishes against the neutral shadcn primary. */
 const FOCUS_RING =
-  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rcd-accent focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--rcd-bg)]';
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--rcd-bg)]';
 
+/** shadcn variants: primary (default), secondary (outline), ghost, destructive. */
 const buttonClasses: Record<ButtonVariant, string> = {
   primary:
     'bg-rcd-accent text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90 disabled:opacity-50 disabled:shadow-none',
   secondary:
     'border border-rcd-border bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)] hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 disabled:shadow-none',
-  ghost: 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40',
+  ghost: 'text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10 disabled:opacity-40',
   danger:
     'bg-[var(--rcd-status-critical)] text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90 disabled:opacity-50 disabled:shadow-none',
 };
 
+const buttonSizeClasses: Record<ButtonSize, string> = {
+  default: 'h-9 px-4',
+  sm: 'h-8 px-3',
+};
+
 export interface RcdButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: ButtonVariant;
+  size?: ButtonSize;
 }
 
-export function RcdButton({ variant = 'secondary', className = '', type = 'button', ...rest }: RcdButtonProps) {
+export function RcdButton({
+  variant = 'secondary',
+  size = 'default',
+  className = '',
+  type = 'button',
+  ...rest
+}: RcdButtonProps) {
   return (
     <button
       type={type}
-      className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors ${FOCUS_RING} ${buttonClasses[variant]} ${className}`}
+      className={`inline-flex ${buttonSizeClasses[size]} items-center gap-1.5 whitespace-nowrap rounded-lg text-sm font-medium transition-colors ${FOCUS_RING} ${buttonClasses[variant]} ${className}`}
       {...rest}
     />
   );
@@ -54,22 +69,17 @@ export function RcdIconButton({ className = '', type = 'button', ...rest }: Butt
   );
 }
 
+/** Shared shadcn input chrome: h-9, rounded-md-ish (control radius), hairline
+    border, shadow-sm at rest, 2px soft interactive ring on focus. */
+const FIELD_CLASSES =
+  'rounded-lg border border-rcd-border bg-rcd-surface text-sm text-rcd-text shadow-[var(--rcd-shadow-1)] outline-none transition-[border-color,box-shadow] duration-150 placeholder:text-rcd-muted focus:border-[var(--rcd-accent-interactive)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent-interactive)_20%,transparent)] disabled:opacity-50 disabled:shadow-none';
+
 export function RcdInput({ className = '', ...rest }: InputHTMLAttributes<HTMLInputElement>) {
-  return (
-    <input
-      className={`h-8 rounded-md border border-rcd-border bg-rcd-surface px-2.5 text-sm text-rcd-text outline-none transition-[border-color,box-shadow] duration-150 focus:border-rcd-accent focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent)_25%,transparent)] ${className}`}
-      {...rest}
-    />
-  );
+  return <input className={`h-9 px-3 ${FIELD_CLASSES} ${className}`} {...rest} />;
 }
 
 export function RcdSelect({ className = '', ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
-  return (
-    <select
-      className={`h-8 rounded-md border border-rcd-border bg-rcd-surface px-2 text-sm text-rcd-text outline-none transition-[border-color,box-shadow] duration-150 focus:border-rcd-accent focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent)_25%,transparent)] ${className}`}
-      {...rest}
-    />
-  );
+  return <select className={`h-9 px-2.5 ${FIELD_CLASSES} ${className}`} {...rest} />;
 }
 
 export function RcdSpinner({ label }: { label?: string }) {
@@ -281,23 +291,23 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
         aria-label={title}
         tabIndex={-1}
         style={panelStyle}
-        className={`relative z-10 flex max-h-[85vh] ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-[10px] border border-rcd-border bg-rcd-surface shadow-[var(--rcd-shadow-2)] outline-none`}
+        className={`relative z-10 flex max-h-[85vh] ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-xl border border-rcd-border bg-rcd-surface shadow-lg outline-none`}
       >
         <div
-          className={`flex items-center justify-between border-b border-rcd-border px-4 py-3 ${
+          className={`flex items-center justify-between border-b border-rcd-border py-4 pl-6 pr-4 ${
             draggable ? 'cursor-move touch-none select-none' : ''
           }`}
           onPointerDown={onTitlePointerDown}
           onPointerMove={onTitlePointerMove}
           onPointerUp={onTitlePointerUp}
         >
-          <h2 className="text-sm font-semibold text-rcd-text">{title}</h2>
+          <h2 className="text-base font-semibold leading-none tracking-tight text-rcd-text">{title}</h2>
           <RcdIconButton onClick={onClose} aria-label="Close dialog">
             <X size={16} />
           </RcdIconButton>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
-        {footer && <div className="flex justify-end gap-2 border-t border-rcd-border px-4 py-3">{footer}</div>}
+        <div className="min-h-0 flex-1 overflow-auto px-6 py-5">{children}</div>
+        {footer && <div className="flex justify-end gap-2 border-t border-rcd-border px-6 py-4">{footer}</div>}
         {resizable && (
           <div
             aria-hidden

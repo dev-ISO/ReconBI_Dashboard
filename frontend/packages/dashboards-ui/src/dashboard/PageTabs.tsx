@@ -59,20 +59,70 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
 
   return (
     <>
-      <div
-        role="tablist"
-        aria-label="Dashboard pages"
-        className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-rcd-border bg-rcd-bg px-2 py-1"
-      >
-        {pages.map((page) => {
-          const active = page.id === activePageId;
-          if (renaming?.pageId === page.id) {
+      <div className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-rcd-border bg-rcd-bg px-2 py-1.5">
+        {/* shadcn Tabs: muted rounded-lg container; the active tab is a raised
+            surface pill. The page-color dot stays on every tab. */}
+        <div
+          role="tablist"
+          aria-label="Dashboard pages"
+          className="flex shrink-0 items-center gap-0.5 rounded-lg bg-black/5 p-1 dark:bg-white/10"
+        >
+          {pages.map((page) => {
+            const active = page.id === activePageId;
+            if (renaming?.pageId === page.id) {
+              return (
+                <div
+                  key={page.id}
+                  role="tab"
+                  aria-selected={active}
+                  className="relative flex shrink-0 items-center gap-1.5 px-1 py-0.5"
+                >
+                  {page.color && (
+                    <span
+                      aria-hidden
+                      className="h-2 w-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: page.color }}
+                    />
+                  )}
+                  <input
+                    value={renaming.draft}
+                    onChange={(event) => setRenaming({ pageId: page.id, draft: event.target.value })}
+                    onBlur={commitRename}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') commitRename();
+                      if (event.key === 'Escape') setRenaming(null);
+                    }}
+                    aria-label={`Rename page ${page.name}`}
+                    autoFocus
+                    onFocus={(event) => event.target.select()}
+                    className="w-32 rounded-md border border-[var(--rcd-accent-interactive)] bg-rcd-surface px-1.5 py-0.5 text-sm text-rcd-text outline-none"
+                  />
+                </div>
+              );
+            }
             return (
-              <div
+              <button
                 key={page.id}
+                type="button"
                 role="tab"
                 aria-selected={active}
-                className="relative flex shrink-0 items-center gap-1.5 px-1.5 py-1"
+                title={page.name}
+                onClick={() => runtime.dashboards.setActivePage(page.id)}
+                onDoubleClick={editable ? () => startRename(page) : undefined}
+                onContextMenu={
+                  editable
+                    ? (event) => {
+                        // Context card instead of the native browser menu.
+                        event.preventDefault();
+                        setMenu({ pageId: page.id, x: event.clientX, y: event.clientY });
+                      }
+                    : undefined
+                }
+                className={`flex h-7 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm transition-colors ${
+                  active
+                    ? 'bg-rcd-surface font-medium text-rcd-text shadow-[var(--rcd-shadow-1)]'
+                    : 'text-rcd-text-2 hover:text-rcd-text'
+                }`}
               >
                 {page.color && (
                   <span
@@ -81,64 +131,11 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
                     style={{ backgroundColor: page.color }}
                   />
                 )}
-                <input
-                  value={renaming.draft}
-                  onChange={(event) => setRenaming({ pageId: page.id, draft: event.target.value })}
-                  onBlur={commitRename}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter') commitRename();
-                    if (event.key === 'Escape') setRenaming(null);
-                  }}
-                  aria-label={`Rename page ${page.name}`}
-                  autoFocus
-                  onFocus={(event) => event.target.select()}
-                  className="w-32 rounded border border-rcd-accent bg-rcd-surface px-1.5 py-0.5 text-sm text-rcd-text outline-none"
-                />
-              </div>
+                <span className="max-w-[10rem] truncate">{page.name}</span>
+              </button>
             );
-          }
-          return (
-            <button
-              key={page.id}
-              type="button"
-              role="tab"
-              aria-selected={active}
-              title={page.name}
-              onClick={() => runtime.dashboards.setActivePage(page.id)}
-              onDoubleClick={editable ? () => startRename(page) : undefined}
-              onContextMenu={
-                editable
-                  ? (event) => {
-                      // Context card instead of the native browser menu.
-                      event.preventDefault();
-                      setMenu({ pageId: page.id, x: event.clientX, y: event.clientY });
-                    }
-                  : undefined
-              }
-              className={`relative flex h-7 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm transition-colors ${
-                active
-                  ? 'border border-rcd-border bg-rcd-surface font-medium text-rcd-text shadow-[var(--rcd-shadow-1)]'
-                  : 'text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
-              }`}
-            >
-              {page.color && (
-                <span
-                  aria-hidden
-                  className="h-2 w-2 shrink-0 rounded-full"
-                  style={{ backgroundColor: page.color }}
-                />
-              )}
-              <span className="max-w-[10rem] truncate">{page.name}</span>
-              {active && (
-                <span
-                  aria-hidden
-                  className="absolute inset-x-2.5 bottom-0 h-0.5 rounded-full"
-                  style={{ backgroundColor: page.color ?? 'var(--rcd-accent)' }}
-                />
-              )}
-            </button>
-          );
-        })}
+          })}
+        </div>
 
         {editable && (
           <button
@@ -146,7 +143,7 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
             aria-label="Add page"
             title="Add page"
             onClick={() => runtime.dashboards.addPage()}
-            className="ml-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-dashed border-rcd-border text-rcd-text-2 transition-colors hover:border-rcd-accent hover:bg-black/5 hover:text-rcd-accent dark:hover:bg-white/10"
+            className="ml-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-rcd-text-2 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
           >
             <Plus size={14} />
           </button>

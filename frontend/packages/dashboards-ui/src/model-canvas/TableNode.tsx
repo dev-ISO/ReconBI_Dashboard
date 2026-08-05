@@ -36,18 +36,18 @@ export function TableNode({ data, selected }: NodeProps<TableNodeType>) {
     <div
       className={
         selected
-          ? 'w-52 overflow-hidden rounded-lg border border-rcd-accent bg-rcd-surface text-rcd-text shadow-md'
-          : 'w-52 overflow-hidden rounded-lg border border-rcd-border bg-rcd-surface text-rcd-text shadow-sm'
+          ? 'w-52 overflow-hidden rounded-lg border border-rcd-accent bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-2)] ring-1 ring-rcd-accent'
+          : 'w-52 overflow-hidden rounded-lg border border-rcd-border bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)] transition-shadow'
       }
     >
-      <div className="flex items-center gap-2 border-b border-rcd-border px-2.5 py-1.5">
+      <div className="flex items-center gap-2 border-b border-rcd-border bg-black/[0.02] px-2.5 py-1.5 dark:bg-white/[0.03]">
         <div className="min-w-0 flex-1">
           <div className="truncate text-xs font-semibold">{data.title}</div>
           <div className="truncate text-[10px] text-rcd-muted">{data.schema}</div>
         </div>
         <button
           type="button"
-          className="nodrag shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+          className="nodrag shrink-0 rounded-sm p-0.5 text-rcd-muted transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
           onClick={() => data.onRemove(data.tableKey)}
           aria-label={`Remove ${data.title} from model`}
         >

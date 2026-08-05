@@ -120,13 +120,13 @@ export function ImageTileDialog({ open, title, initial, onClose, onSave }: Image
               Choose file…
             </RcdButton>
             {isUpload && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+              <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                 Encoded upload ({Math.ceil(src.length / 1024)} KB)
                 <button
                   type="button"
                   aria-label="Remove uploaded image"
                   onClick={() => setSrc('')}
-                  className="rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                  className="rounded-md p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
                 >
                   <X size={11} />
                 </button>

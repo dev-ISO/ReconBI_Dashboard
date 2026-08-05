@@ -368,7 +368,7 @@ function DropdownSlicer({
         onClick={() => setOpen((o) => !o)}
         className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
-        } ${active ? 'border-rcd-accent' : 'border-rcd-border'}`}
+        } ${active ? 'border-[var(--rcd-accent-interactive)]' : 'border-rcd-border'}`}
       >
         <span className="min-w-0 truncate">
           {active ? `${selected.length} selected` : 'All values'}
@@ -449,7 +449,7 @@ function DropdownMultiSlicer({
         onClick={() => (open ? close() : setOpen(true))}
         className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
-        } ${active ? 'border-rcd-accent' : 'border-rcd-border'}`}
+        } ${active ? 'border-[var(--rcd-accent-interactive)]' : 'border-rcd-border'}`}
       >
         <span className="min-w-0 truncate">{summary}</span>
         <ChevronDown size={13} className="shrink-0 text-rcd-muted" />
@@ -833,7 +833,7 @@ function ButtonsSlicer({
             title={String(value)}
             // Uniform pill geometry (fixed height/radius, consistent gap); the
             // selected state is an accent FILL with readable inverted text.
-            className={`inline-flex max-w-full items-center truncate rounded-full border transition-colors ${
+            className={`inline-flex max-w-full items-center truncate rounded-md border transition-colors ${
               compact ? 'h-6 px-2.5 text-xs' : 'h-8 px-3 text-sm'
             } ${
               isActive
@@ -1010,7 +1010,7 @@ function FieldParamSlicer({
             aria-pressed={isActive}
             onClick={() => onPick(index)}
             title={option.label}
-            className={`inline-flex max-w-full items-center truncate rounded-full border transition-colors ${
+            className={`inline-flex max-w-full items-center truncate rounded-md border transition-colors ${
               compact ? 'h-6 px-2.5 text-xs' : 'h-8 px-3 text-sm'
             } ${
               isActive

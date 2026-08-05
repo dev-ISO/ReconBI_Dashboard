@@ -1,5 +1,5 @@
 import { useRef, useState, type ReactNode } from 'react';
-import { ChevronDown, ChevronRight, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
+import { ChevronDown, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
   CHART_THEMES,
@@ -93,13 +93,17 @@ const REFRESH_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
 ];
 
 const NUMBER_INPUT_CLASS =
-  'w-14 shrink-0 rounded-md border border-rcd-border bg-rcd-surface px-1.5 py-1 text-sm text-rcd-text outline-none focus:border-rcd-accent disabled:opacity-40';
+  'h-8 w-14 shrink-0 rounded-md border border-rcd-border bg-rcd-surface px-2 text-sm text-rcd-text outline-none transition-colors focus:border-rcd-accent disabled:opacity-40';
+
+/** Color pickers rendered as compact bordered chips (shadcn swatch language). */
+const COLOR_INPUT_CLASS =
+  'h-8 w-9 shrink-0 cursor-pointer rounded-md border border-rcd-border bg-rcd-surface p-1 transition-colors hover:border-rcd-muted disabled:cursor-default disabled:opacity-40';
 
 const RESET_BUTTON_CLASS =
-  'shrink-0 rounded p-1 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10';
+  'shrink-0 rounded-md p-1 text-rcd-muted transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10';
 
-/** Sub-group heading inside a section; matches the section-header language. */
-const SUBHEAD_CLASS = 'text-[11px] font-semibold uppercase tracking-wide text-rcd-muted';
+/** Sub-group heading inside a section. */
+const SUBHEAD_CLASS = 'pt-1 text-xs font-medium uppercase tracking-wide text-rcd-muted';
 
 /** Helper captions for the legend click-action modes. */
 const LEGEND_MODE_CAPTIONS: Record<'toggle' | 'isolate' | 'crossFilter', string> = {
@@ -128,18 +132,17 @@ function CollapsibleSection({
         type="button"
         aria-expanded={open}
         onClick={onToggle}
-        className="flex w-full items-center gap-1 rounded py-1 text-left hover:bg-black/5 dark:hover:bg-white/10"
+        className="group flex w-full items-center justify-between gap-2 rounded-md py-2 text-left text-sm font-medium text-rcd-text transition-colors"
       >
-        {open ? (
-          <ChevronDown size={12} className="shrink-0 text-rcd-muted" />
-        ) : (
-          <ChevronRight size={12} className="shrink-0 text-rcd-muted" />
-        )}
-        <span className="text-[11px] font-semibold uppercase tracking-wider text-rcd-muted">
-          {title}
-        </span>
+        <span className="min-w-0 truncate">{title}</span>
+        <ChevronDown
+          size={14}
+          className={`shrink-0 text-rcd-muted transition-transform duration-150 group-hover:text-rcd-text ${
+            open ? '' : '-rotate-90'
+          }`}
+        />
       </button>
-      {open && <div className="mt-1.5 flex flex-col gap-2 pb-1 pl-4">{children}</div>}
+      {open && <div className="flex flex-col gap-2 pb-2">{children}</div>}
     </section>
   );
 }
@@ -191,7 +194,7 @@ function SegmentedRow<T extends string>({
       <div
         role="group"
         aria-label={label}
-        className="flex shrink-0 overflow-hidden rounded-md border border-rcd-border"
+        className="flex shrink-0 items-center gap-0.5 rounded-md bg-black/5 p-0.5 dark:bg-white/10"
       >
         {options.map((option) => {
           const active = option.value === value;
@@ -201,10 +204,10 @@ function SegmentedRow<T extends string>({
               type="button"
               aria-pressed={active}
               aria-label={`${label}: ${option.label}`}
-              className={`px-2 py-0.5 text-[11px] font-medium transition-colors ${
+              className={`rounded-[5px] px-2 py-0.5 text-[11px] font-medium transition-colors ${
                 active
-                  ? 'bg-rcd-accent text-white'
-                  : 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
+                  ? 'bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)]'
+                  : 'text-rcd-muted hover:text-rcd-text'
               }`}
               onClick={() => onChange(option.value)}
             >
@@ -287,7 +290,7 @@ function ColorRow({
         type="color"
         aria-label={`${label} color`}
         disabled={disabled}
-        className="h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0 disabled:cursor-default disabled:opacity-40"
+        className={COLOR_INPUT_CLASS}
         value={value ?? fallback}
         onChange={(event) => onChange(event.target.value)}
       />
@@ -330,9 +333,9 @@ function TextStyleRow({
   };
 
   const toggleClass = (active: boolean) =>
-    `flex h-6 w-6 shrink-0 items-center justify-center rounded border text-xs ${
+    `flex h-8 w-8 shrink-0 items-center justify-center rounded-md border text-xs transition-colors ${
       active
-        ? 'border-rcd-accent bg-rcd-accent text-white'
+        ? 'border-rcd-text bg-rcd-text text-rcd-surface'
         : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
     }`;
 
@@ -383,7 +386,7 @@ function TextStyleRow({
       <input
         type="color"
         aria-label={`${label} color`}
-        className="h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0"
+        className={COLOR_INPUT_CLASS}
         value={value?.color ?? TEXT_SWATCH}
         onChange={(event) => set({ color: event.target.value })}
       />
@@ -557,15 +560,12 @@ function AxisFormatEditor({
 // Analytics / conditional formatting editors
 // ---------------------------------------------------------------------------
 
-const COLOR_INPUT_CLASS =
-  'h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0';
-
 /** Grow-to-fit numeric input for rule/constant values (decimals allowed). */
 const FLEX_NUMBER_INPUT_CLASS =
-  'min-w-0 flex-1 rounded-md border border-rcd-border bg-rcd-surface px-1.5 py-1 text-sm text-rcd-text outline-none focus:border-rcd-accent';
+  'h-8 min-w-0 flex-1 rounded-md border border-rcd-border bg-rcd-surface px-2.5 text-sm text-rcd-text outline-none transition-colors focus:border-rcd-accent';
 
 const ADD_BUTTON_CLASS =
-  'self-start rounded-md border border-rcd-border bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text hover:bg-black/5 dark:hover:bg-white/10';
+  'inline-flex h-8 items-center self-start rounded-md border border-rcd-border bg-rcd-surface px-3 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-1)] transition-colors hover:bg-black/5 dark:hover:bg-white/10';
 
 const parseNumberOr = (raw: string): number | undefined => {
   if (raw.trim() === '') return undefined;
@@ -677,7 +677,7 @@ function ReferenceLineRow({
   onRemove: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+    <div className="flex flex-col gap-2 rounded-lg border border-rcd-border p-2">
       <div className="flex items-center gap-1.5">
         <RcdSelect
           aria-label="Reference line kind"
@@ -783,7 +783,7 @@ function TrendlineRow({
   onRemove: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+    <div className="flex flex-col gap-2 rounded-lg border border-rcd-border p-2">
       <div className="flex items-center gap-1.5">
         <RcdSelect
           aria-label="Trendline kind"
@@ -896,7 +896,7 @@ function ConditionalFormatCard({
     onChange({ rules: [...item.rules, { op: 'gt', value: 0, color: DEFAULT_SWATCH }] });
 
   return (
-    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+    <div className="flex flex-col gap-2 rounded-lg border border-rcd-border p-2">
       <div className="flex items-center gap-1.5">
         <RcdSelect
           aria-label="Conditional format measure"
@@ -1067,7 +1067,7 @@ function RichTextDialog({
   };
 
   const toolButton =
-    'flex h-6 w-6 shrink-0 items-center justify-center rounded border border-rcd-border text-xs text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10';
+    'flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-rcd-border text-xs text-rcd-text-2 transition-colors hover:bg-black/5 dark:hover:bg-white/10';
 
   return (
     <RcdDialog
@@ -1132,7 +1132,7 @@ function RichTextDialog({
             type="color"
             aria-label="Text color"
             defaultValue="#1f2937"
-            className="h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0"
+            className={COLOR_INPUT_CLASS}
             onInput={(event) => exec('foreColor', event.currentTarget.value)}
           />
         </div>
@@ -1147,7 +1147,7 @@ function RichTextDialog({
           dangerouslySetInnerHTML={{ __html: initialHtml }}
         />
         <div className="flex flex-col gap-1">
-          <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+          <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
             Preview
           </span>
           <div className="min-h-[2.5rem] rounded-md border border-dashed border-rcd-border px-2.5 py-1.5 text-sm text-rcd-text">
@@ -1200,7 +1200,7 @@ function AxisTitleField({
       />
       {hasHtml && (
         <span
-          className="shrink-0 rounded bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] px-1 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rcd-accent"
+          className="shrink-0 rounded-md bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-rcd-accent"
           title="A rich title is set and overrides the plain title"
         >
           rich
@@ -1210,7 +1210,7 @@ function AxisTitleField({
         type="button"
         aria-label={`Edit ${axis} axis rich title`}
         title="Rich title editor"
-        className="flex h-6 shrink-0 items-center gap-0.5 rounded border border-rcd-border px-1.5 text-[11px] font-medium text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10"
+        className="flex h-8 shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 text-[11px] font-medium text-rcd-text-2 transition-colors hover:bg-black/5 dark:hover:bg-white/10"
         onClick={onEdit}
       >
         <span aria-hidden>aA</span>
@@ -1585,7 +1585,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           <div className="flex items-center gap-1">
             <button
               type="button"
-              className="rounded-md border border-rcd-border bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+              className="inline-flex h-8 items-center rounded-md border border-rcd-border bg-rcd-surface px-3 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-1)] transition-colors hover:bg-black/5 dark:hover:bg-white/10"
               onClick={() => setRichTarget('inner')}
             >
               {container?.innerTitleHtml ? 'Edit…' : 'Add…'}
@@ -1743,7 +1743,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                       <div
                         role="group"
                         aria-label={`Value axis for ${key}`}
-                        className="flex shrink-0 overflow-hidden rounded-md border border-rcd-border"
+                        className="flex shrink-0 items-center gap-0.5 rounded-md bg-black/5 p-0.5 dark:bg-white/10"
                       >
                         {(['Left', 'Right'] as const).map((side) => {
                           const active = side === 'Right' ? onRight : !onRight;
@@ -1753,10 +1753,10 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                               type="button"
                               aria-pressed={active}
                               aria-label={`${key} on the ${side.toLowerCase()} axis`}
-                              className={`px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                              className={`rounded-[5px] px-2 py-0.5 text-[11px] font-medium transition-colors ${
                                 active
-                                  ? 'bg-rcd-accent text-white'
-                                  : 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
+                                  ? 'bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)]'
+                                  : 'text-rcd-muted hover:text-rcd-text'
                               }`}
                               onClick={() => setSecondaryKey(key, side === 'Right')}
                             >
@@ -1865,7 +1865,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                   <input
                     type="color"
                     aria-label={`Color for ${key}`}
-                    className="h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0"
+                    className={COLOR_INPUT_CLASS}
                     value={override ?? DEFAULT_SWATCH}
                     onChange={(event) => setOverride(key, event.target.value)}
                   />

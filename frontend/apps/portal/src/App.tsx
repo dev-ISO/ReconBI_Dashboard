@@ -35,12 +35,12 @@ const navGroups = [
   },
 ];
 
-/** Product mark: accent square + wordmark, reused in the sidebar and splash. */
+/** Product mark: primary square + wordmark, reused in the sidebar and splash. */
 function ProductMark({ large = false }: { large?: boolean }) {
   return (
     <div className="flex items-center gap-2.5">
       <span
-        className={`flex shrink-0 items-center justify-center rounded-lg bg-[var(--color-accent)] text-white shadow-sm ${
+        className={`flex shrink-0 items-center justify-center rounded-lg bg-zinc-900 text-zinc-50 shadow-sm dark:bg-zinc-50 dark:text-zinc-900 ${
           large ? 'h-10 w-10' : 'h-7 w-7'
         }`}
       >
@@ -75,7 +75,7 @@ export function App() {
 
   return (
     <div className="flex h-screen">
-      <aside className="flex w-56 shrink-0 flex-col border-r border-black/10 bg-[var(--color-surface)] dark:border-white/10">
+      <aside className="flex w-56 shrink-0 flex-col border-r border-zinc-200 bg-[var(--color-surface)] dark:border-zinc-800">
         <div className="px-4 pb-4 pt-5">
           <ProductMark />
         </div>
@@ -83,7 +83,7 @@ export function App() {
         <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-2 pb-3">
           {navGroups.map((group) => (
             <div key={group.label} className="flex flex-col gap-0.5">
-              <p className="px-3 pb-1 text-[11px] font-semibold uppercase tracking-wider opacity-50">
+              <p className="px-3 pb-1 text-[11px] font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
                 {group.label}
               </p>
               {group.items.map(({ to, label, icon: Icon, end }) => (
@@ -94,8 +94,8 @@ export function App() {
                   className={({ isActive }) =>
                     `flex items-center gap-2.5 rounded-lg px-3 py-2 text-sm transition-colors ${
                       isActive
-                        ? 'bg-[color-mix(in_srgb,var(--color-accent)_12%,transparent)] font-medium text-[var(--color-accent)]'
-                        : 'opacity-80 hover:bg-black/5 hover:opacity-100 dark:hover:bg-white/10'
+                        ? 'bg-zinc-100 font-medium text-zinc-900 dark:bg-zinc-800 dark:text-zinc-50'
+                        : 'text-zinc-600 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/60 dark:hover:text-zinc-50'
                     }`
                   }
                 >
@@ -108,16 +108,16 @@ export function App() {
         </nav>
 
         {/* User picker + theme toggle, pinned to the sidebar foot. */}
-        <div className="flex items-center gap-2 border-t border-black/10 px-3 py-3 dark:border-white/10">
+        <div className="flex items-center gap-2 border-t border-zinc-200 px-3 py-3 dark:border-zinc-800">
           <span
             aria-hidden
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-black/5 dark:bg-white/10"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-zinc-100 dark:bg-zinc-800"
           >
-            <UserRound size={15} className="opacity-70" />
+            <UserRound size={15} className="text-zinc-500 dark:text-zinc-400" />
           </span>
           <select
             aria-label="Switch demo user"
-            className="h-8 min-w-0 flex-1 rounded-md border border-black/15 bg-[var(--color-surface)] px-2 text-sm outline-none transition-colors focus:border-[var(--color-accent)] dark:border-white/15"
+            className="h-8 min-w-0 flex-1 rounded-lg border border-zinc-200 bg-[var(--color-surface)] px-2 text-sm shadow-sm outline-none transition-[border-color,box-shadow] focus:border-blue-600 focus:ring-2 focus:ring-blue-600/20 dark:border-zinc-800 dark:focus:border-blue-500 dark:focus:ring-blue-500/25"
             value={currentUser ?? ''}
             onChange={(event) => void loginAs(event.target.value)}
           >
@@ -133,7 +133,7 @@ export function App() {
             onClick={toggle}
             aria-label="Toggle theme"
             title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-            className="shrink-0 rounded-md p-2 transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+            className="shrink-0 rounded-lg p-2 text-zinc-600 transition-colors hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800/60 dark:hover:text-zinc-50"
           >
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
           </button>
@@ -145,13 +145,16 @@ export function App() {
           {signingIn ? (
             // Sign-in splash: centered card with the product mark.
             <div className="flex h-full items-center justify-center p-6">
-              <div className="flex w-full max-w-sm flex-col items-center gap-5 rounded-[10px] border border-black/10 bg-[var(--color-surface)] px-8 py-10 shadow-[0_2px_4px_rgba(0,0,0,0.06),0_8px_18px_rgba(0,0,0,0.08)] dark:border-white/10">
+              <div className="flex w-full max-w-sm flex-col items-center gap-5 rounded-xl border border-zinc-200 bg-[var(--color-surface)] px-8 py-10 shadow-sm dark:border-zinc-800">
                 <ProductMark large />
-                <p className="text-center text-sm opacity-60">
+                <p className="text-center text-sm text-zinc-500 dark:text-zinc-400">
                   Build models, compose dashboards, and explore your data.
                 </p>
-                <div className="flex items-center gap-2 text-sm opacity-70" role="status">
-                  <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-black/20 border-t-[var(--color-accent)] dark:border-white/20" />
+                <div
+                  className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-400"
+                  role="status"
+                >
+                  <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-zinc-200 border-t-zinc-900 dark:border-zinc-700 dark:border-t-zinc-50" />
                   Signing in…
                 </div>
               </div>

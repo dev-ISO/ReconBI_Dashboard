@@ -211,7 +211,7 @@ export function TileFrame({
           >
             {editable && <GripVertical size={14} className="shrink-0 text-rcd-muted" />}
             <span
-              className="truncate text-[13px] font-semibold leading-5 text-rcd-text"
+              className="truncate text-sm font-medium leading-5 text-rcd-text"
               title={title}
             >
               {title}
@@ -231,7 +231,7 @@ export function TileFrame({
               the top edge always moves the tile. */}
           {editable && (
             <div
-              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-[10px] border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
+              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-xl border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
               title={`Drag to move ${title}`}
             >
               <GripHorizontal size={12} className="text-rcd-muted" />

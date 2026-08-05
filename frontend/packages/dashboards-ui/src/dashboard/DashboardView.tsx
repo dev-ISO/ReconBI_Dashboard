@@ -98,7 +98,7 @@ function TransientChip({
 }) {
   return (
     <div
-      className={`pointer-events-auto flex h-7 max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface pr-1 text-xs text-rcd-text shadow-md ${
+      className={`pointer-events-auto flex h-7 max-w-full items-center gap-1.5 rounded-lg border border-rcd-border bg-rcd-surface pr-1 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-2)] ${
         leading ? 'pl-1' : 'pl-2.5'
       }`}
     >
@@ -112,7 +112,7 @@ function TransientChip({
         aria-label={dismissLabel}
         title={dismissLabel}
         onClick={onDismiss}
-        className="shrink-0 rounded-full p-1 text-rcd-muted transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+        className="shrink-0 rounded-md p-1 text-rcd-muted transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
       >
         <X size={12} />
       </button>
@@ -1028,7 +1028,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
                 <button
                   type="button"
                   onClick={() => runtime.dashboards.returnFromDrillthrough()}
-                  className="flex h-full shrink-0 items-center gap-1 rounded-full px-2 text-rcd-text-2 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                  className="flex h-full shrink-0 items-center gap-1 rounded-md px-2 text-rcd-text-2 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
                 >
                   <ArrowLeft size={12} />
                   Back

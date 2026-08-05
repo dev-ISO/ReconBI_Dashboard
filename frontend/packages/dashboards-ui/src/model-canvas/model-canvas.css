@@ -2,7 +2,7 @@
    html[data-theme='dark'], so no separate dark rules are needed here. */
 .rcd-model-canvas {
   --xy-background-color: transparent;
-  --xy-edge-stroke: var(--rcd-border);
+  --xy-edge-stroke: var(--rcd-axis);
   --xy-edge-stroke-selected: var(--rcd-accent);
   --xy-edge-label-background-color: var(--rcd-surface);
   --xy-edge-label-color: var(--rcd-text-2);
@@ -16,16 +16,40 @@
   --xy-handle-border-color: var(--rcd-surface);
 }
 
-/* Tiny per-column connection dots. */
+/* Tiny per-column connection dots — neutral at rest, accent while wiring. */
 .rcd-model-canvas .react-flow__handle {
   width: 7px;
   height: 7px;
   min-width: 0;
   min-height: 0;
-  background-color: var(--rcd-accent);
+  background-color: var(--rcd-muted);
   border: 1px solid var(--rcd-surface);
+  transition: background-color 150ms ease;
+}
+
+.rcd-model-canvas .react-flow__handle:hover,
+.rcd-model-canvas .react-flow__handle.connectingfrom,
+.rcd-model-canvas .react-flow__handle.connectingto,
+.rcd-model-canvas .react-flow__handle.valid {
+  background-color: var(--rcd-accent);
 }
 
 .rcd-model-canvas .react-flow__edge {
   cursor: pointer;
+}
+
+/* Zoom controls as a small shadcn-style card. */
+.rcd-model-canvas .react-flow__controls {
+  overflow: hidden;
+  border: 1px solid var(--rcd-border);
+  border-radius: 8px;
+  box-shadow: var(--rcd-shadow-1);
+}
+
+.rcd-model-canvas .react-flow__controls-button {
+  border-bottom: 1px solid var(--rcd-border);
+}
+
+.rcd-model-canvas .react-flow__controls-button:last-child {
+  border-bottom: none;
 }

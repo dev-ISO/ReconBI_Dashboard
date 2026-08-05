@@ -331,16 +331,16 @@ function Well({ def, empty, children }: { def: WellDef; empty: boolean; children
         ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)] ring-1 ring-rcd-accent'
         : validTarget === true
           ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_5%,transparent)]'
-          : 'border-rcd-border';
+          : empty
+            ? 'border-rcd-border bg-black/[0.02] dark:bg-white/[0.03]'
+            : 'border-rcd-border';
 
   return (
     <div>
-      <div className="pb-1 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
-        {def.label}
-      </div>
+      <div className="pb-1.5 text-xs font-medium text-rcd-muted">{def.label}</div>
       <div
         ref={setNodeRef}
-        className={`flex min-h-[2.75rem] flex-col justify-center gap-1 rounded-md border ${
+        className={`flex min-h-[2.75rem] flex-col justify-center gap-1 rounded-lg border ${
           empty ? 'border-dashed' : ''
         } p-1.5 transition-colors ${borderClass}`}
       >
@@ -501,10 +501,10 @@ function Chip({
   onRemove: () => void;
 }) {
   return (
-    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
+    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs font-medium text-rcd-text">
       {leading}
       {icon && <span className="shrink-0 text-rcd-muted">{icon}</span>}
-      <span className="min-w-0 flex-1 truncate font-medium" title={label}>
+      <span className="min-w-0 flex-1 truncate" title={label}>
         {label}
       </span>
       {controls}
@@ -512,7 +512,7 @@ function Chip({
         type="button"
         aria-label={`Remove ${label}`}
         onClick={onRemove}
-        className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+        className="shrink-0 rounded-sm p-0.5 text-rcd-muted transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
       >
         <X size={12} />
       </button>
@@ -538,7 +538,7 @@ function ParamBindingChip({ name, onRemove }: { name: string; onRemove: () => vo
         aria-label={`Remove parameter binding ${name}`}
         title="Remove the parameter binding (keeps the fields underneath)"
         onClick={onRemove}
-        className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+        className="shrink-0 rounded-sm p-0.5 text-rcd-muted transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
       >
         <X size={12} />
       </button>
@@ -574,7 +574,7 @@ function FilterChip({
         type="button"
         aria-label={`Remove filter ${text}`}
         onClick={onRemove}
-        className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+        className="shrink-0 rounded-sm p-0.5 text-rcd-muted transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
       >
         <X size={12} />
       </button>
@@ -703,7 +703,7 @@ function CalcMenu({
               role="menu"
               aria-label="Quick calculation"
               style={{ top: menuPos.top, left: menuPos.left }}
-              className="fixed z-[71] w-60 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+              className="fixed z-[71] w-60 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
             >
             {items.map((item) => {
               const disabled =

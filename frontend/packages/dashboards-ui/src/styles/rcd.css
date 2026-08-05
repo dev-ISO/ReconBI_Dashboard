@@ -4,70 +4,97 @@
 @import 'react-resizable/css/styles.css';
 @import '@xyflow/react/dist/style.css';
 
-/* ReconDashboards theme contract.
+/* ReconDashboards theme contract — shadcn/ui design language on zinc neutrals.
    Every library surface renders inside .rcd-root. Tokens fall back through the
    hosts' CSS variables (--color-*) to standalone defaults, so the library is
    correctly styled both embedded and in the portal.
-   Categorical palette: validated 8-slot set (CVD-checked); dark values are
+
+   Accent doctrine: --rcd-accent is the shadcn "primary" (zinc-900 on light).
+   Because legacy call sites pair `bg-rcd-accent` with `text-white`, the accent
+   must stay white-text-safe in BOTH themes, so the dark default is blue-500
+   rather than the inverted zinc-50. --rcd-accent-interactive is the always-
+   chromatic blue used for focus rings / selection highlights where a neutral
+   primary would vanish.
+
+   Categorical palette: shadcn-charts-style 8-slot set; dark values are
    re-stepped for dark surfaces, not auto-flipped. */
 .rcd-root {
-  /* App background sits a step below the white surfaces so cards read as
-     raised layers rather than outlines on the same plane. */
-  --rcd-bg: var(--color-bg, #f4f4f1);
+  /* zinc-50 app background under pure-white card surfaces. */
+  --rcd-bg: var(--color-bg, #fafafa);
   --rcd-surface: var(--color-surface, #ffffff);
-  --rcd-text: var(--color-text, #0b0b0b);
-  --rcd-accent: var(--color-accent, #2a78d6);
-  --rcd-text-2: #52514e;
-  --rcd-muted: #898781;
-  --rcd-border: rgba(11, 11, 11, 0.1);
-  --rcd-grid-line: #e1e0d9;
-  --rcd-axis: #c3c2b7;
+  --rcd-text: var(--color-text, #09090b);
+  --rcd-accent: var(--color-accent, #18181b);
+  --rcd-accent-interactive: #2563eb;
+  --rcd-text-2: #52525b;
+  --rcd-muted: #71717a;
+  --rcd-border: #e4e4e7;
+  --rcd-grid-line: #e4e4e7;
+  --rcd-axis: #d4d4d8;
 
-  /* Elevation pair: -1 is the resting card shadow (soft, two layers), -2 the
-     hover/raised step. Referenced via shadow-[var(--rcd-shadow-1)] etc. */
-  --rcd-shadow-1: 0 1px 2px rgba(16, 15, 13, 0.05), 0 2px 6px rgba(16, 15, 13, 0.04);
-  --rcd-shadow-2: 0 2px 4px rgba(16, 15, 13, 0.06), 0 8px 18px rgba(16, 15, 13, 0.08);
+  /* Radius system: cards/dialogs 0.75rem, controls 0.5rem. */
+  --rcd-radius-card: 0.75rem;
+  --rcd-radius-control: 0.5rem;
 
-  --rcd-cat-1: #2a78d6;
-  --rcd-cat-2: #eb6834;
-  --rcd-cat-3: #1baf7a;
-  --rcd-cat-4: #eda100;
-  --rcd-cat-5: #e87ba4;
-  --rcd-cat-6: #008300;
-  --rcd-cat-7: #4a3aa7;
-  --rcd-cat-8: #e34948;
+  /* Elevation pair: -1 = resting (shadow-sm), -2 = raised step for menus /
+     popovers / hover (shadow-md). Referenced via shadow-[var(--rcd-shadow-1)]. */
+  --rcd-shadow-1: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+  --rcd-shadow-2: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
 
-  --rcd-status-good: #0ca30c;
-  --rcd-status-warn: #fab219;
-  --rcd-status-serious: #ec835a;
-  --rcd-status-critical: #d03b3b;
+  --rcd-cat-1: #2563eb;
+  --rcd-cat-2: #f97316;
+  --rcd-cat-3: #22c55e;
+  --rcd-cat-4: #a855f7;
+  --rcd-cat-5: #ef4444;
+  --rcd-cat-6: #06b6d4;
+  --rcd-cat-7: #eab308;
+  --rcd-cat-8: #ec4899;
+
+  --rcd-status-good: #16a34a;
+  --rcd-status-warn: #d97706;
+  --rcd-status-serious: #ea580c;
+  --rcd-status-critical: #dc2626;
 
   color: var(--rcd-text);
   background-color: var(--rcd-bg);
+  font-family:
+    Inter,
+    ui-sans-serif,
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
 }
 
 html[data-theme='dark'] .rcd-root {
-  --rcd-bg: var(--color-bg, #0b0b0c);
-  --rcd-surface: var(--color-surface, #17171a);
-  --rcd-text: var(--color-text, #ffffff);
-  --rcd-text-2: #c3c2b7;
-  --rcd-muted: #898781;
-  --rcd-border: rgba(255, 255, 255, 0.1);
-  --rcd-grid-line: #2c2c2a;
-  --rcd-axis: #383835;
+  --rcd-bg: var(--color-bg, #09090b);
+  --rcd-surface: var(--color-surface, #18181b);
+  --rcd-text: var(--color-text, #fafafa);
+  /* White-text-safe accent (see doctrine above): blue-500, not zinc-50. */
+  --rcd-accent: var(--color-accent, #3b82f6);
+  --rcd-accent-interactive: #3b82f6;
+  --rcd-text-2: #a1a1aa;
+  --rcd-muted: #71717a;
+  --rcd-border: #27272a;
+  --rcd-grid-line: #27272a;
+  --rcd-axis: #3f3f46;
 
   /* Dark surfaces get deeper, tighter shadows (light halos read as glow). */
-  --rcd-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.3);
-  --rcd-shadow-2: 0 2px 4px rgba(0, 0, 0, 0.45), 0 8px 18px rgba(0, 0, 0, 0.4);
+  --rcd-shadow-1: 0 1px 2px 0 rgb(0 0 0 / 0.35);
+  --rcd-shadow-2: 0 4px 6px -1px rgb(0 0 0 / 0.45), 0 2px 4px -2px rgb(0 0 0 / 0.35);
 
-  --rcd-cat-1: #3987e5;
-  --rcd-cat-2: #d95926;
-  --rcd-cat-3: #199e70;
-  --rcd-cat-4: #c98500;
-  --rcd-cat-5: #d55181;
-  --rcd-cat-6: #008300;
-  --rcd-cat-7: #9085e9;
-  --rcd-cat-8: #e66767;
+  --rcd-cat-1: #3b82f6;
+  --rcd-cat-2: #fb923c;
+  --rcd-cat-3: #4ade80;
+  --rcd-cat-4: #c084fc;
+  --rcd-cat-5: #f87171;
+  --rcd-cat-6: #22d3ee;
+  --rcd-cat-7: #facc15;
+  --rcd-cat-8: #f472b6;
+
+  --rcd-status-good: #22c55e;
+  --rcd-status-warn: #f59e0b;
+  --rcd-status-serious: #fb923c;
+  --rcd-status-critical: #ef4444;
 }
 
 /* Slim, token-colored scrollbars on every scroll container inside the library
@@ -107,23 +134,28 @@ html[data-theme='dark'] .rcd-root {
   scrollbar-color: var(--rcd-border) transparent;
 }
 
-/* Shared card elevation language: 1px border + soft two-layer shadow at rest,
-   slightly raised shadow + accent-tinted border on hover (150ms ease). Tiles,
-   list cards and floating panels opt in via .rcd-card; inline container
-   customization (style attribute) still wins over all of it. */
+/* Shared card language: shadcn card — hairline border, rounded-xl, shadow-sm
+   at rest, barely raised on hover (150ms ease). Tiles, list cards and floating
+   panels opt in via .rcd-card; inline container customization (style
+   attribute) still wins over all of it. */
 .rcd-card {
   border: 1px solid var(--rcd-border);
-  border-radius: 10px;
+  border-radius: var(--rcd-radius-card);
   background-color: var(--rcd-surface);
   box-shadow: var(--rcd-shadow-1);
-  transition:
-    box-shadow 150ms ease,
-    border-color 150ms ease;
+  transition: box-shadow 150ms ease;
 }
 
 .rcd-card:hover {
-  box-shadow: var(--rcd-shadow-2);
-  border-color: color-mix(in srgb, var(--rcd-accent) 25%, var(--rcd-border));
+  box-shadow:
+    0 1px 3px 0 rgb(0 0 0 / 0.1),
+    0 1px 2px -1px rgb(0 0 0 / 0.1);
+}
+
+html[data-theme='dark'] .rcd-card:hover {
+  box-shadow:
+    0 2px 4px 0 rgb(0 0 0 / 0.4),
+    0 1px 2px -1px rgb(0 0 0 / 0.35);
 }
 
 /* Skeleton shimmer for loading tiles. */

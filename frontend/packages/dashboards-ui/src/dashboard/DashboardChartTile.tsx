@@ -827,7 +827,7 @@ export function DashboardChartTile({
           title={drillMode ? 'Drill mode on: clicks drill down' : 'Turn on drill mode'}
           aria-pressed={drillMode}
           onClick={() => setDrillMode((on) => !on)}
-          className={`!p-1 ${drillMode ? 'bg-black/5 text-rcd-accent dark:bg-white/10' : ''}`}
+          className={`!p-1 ${drillMode ? 'bg-black/5 text-[var(--rcd-accent-interactive)] dark:bg-white/10' : ''}`}
         >
           <ArrowDown size={13} />
         </RcdIconButton>
@@ -837,7 +837,7 @@ export function DashboardChartTile({
 
   return (
     <div
-      className={`h-full rounded-[10px] ${editable && selected ? 'ring-2 ring-rcd-accent' : ''}`}
+      className={`h-full rounded-xl ${editable && selected ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''}`}
       onClick={editable ? onSelect : undefined}
     >
       <TileFrame

@@ -52,7 +52,7 @@ export function SuggestionEdge({
       <EdgeLabelRenderer>
         <button
           type="button"
-          className="nodrag nopan absolute rounded-full border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[10px] font-medium text-rcd-accent shadow-sm hover:border-rcd-accent"
+          className="nodrag nopan absolute rounded-full border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[10px] font-medium text-rcd-accent shadow-[var(--rcd-shadow-1)] transition-colors hover:border-rcd-accent"
           style={{
             transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`,
             pointerEvents: 'all',

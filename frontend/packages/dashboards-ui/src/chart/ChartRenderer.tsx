@@ -1,6 +1,5 @@
 import {
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -183,19 +182,15 @@ export interface ChartRendererProps {
 }
 
 /** Value/category tick type: slightly smaller and muted so data leads. */
-const axisTickStyle = { fontSize: 10, fill: 'var(--rcd-muted)' } as const;
+const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-muted)' } as const;
+
+/** Gap between tick text and the plot (shadcn charts breathe ~8px). */
+const TICK_MARGIN = 8;
 
 const legendWrapperStyle = { fontSize: 12, color: 'var(--rcd-text-2)' } as const;
 
-/** Recessive grid hairlines: 50% of the border token, dashed 3 3. */
+/** Recessive grid hairlines: SOLID at 50% of the border token (shadcn look). */
 const GRID_STROKE = 'color-mix(in srgb, var(--rcd-border) 50%, transparent)';
-const GRID_DASH = '3 3';
-
-/**
- * useId emits delimiter characters (":", "«») that break url(#…) references;
- * strip to a safe SVG id stem. Uniqueness per React root is preserved.
- */
-const svgSafeId = (raw: string): string => raw.replace(/[^a-zA-Z0-9_-]/g, '');
 
 /** Rounded corners on the VALUE END of a bar (radius 4). */
 const barEndRadius = (horizontal: boolean): [number, number, number, number] =>
@@ -420,7 +415,7 @@ function InteractiveLegendContent({
       className={
         layout === 'vertical'
           ? 'flex w-full flex-col items-start gap-1 pl-2'
-          : 'flex flex-wrap items-center justify-center gap-x-3 gap-y-1'
+          : 'flex flex-wrap items-center justify-center gap-x-2.5 gap-y-1'
       }
       onDoubleClick={interactive ? () => control.onReset(items) : undefined}
     >
@@ -462,7 +457,7 @@ function InteractiveLegendContent({
             >
               <span
                 aria-hidden
-                className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
+                className="h-2 w-2 shrink-0 rounded-sm"
                 style={{
                   background: item.color,
                   opacity: isHidden ? 0.35 : dimmedBySelection ? 0.45 : 1,
@@ -728,7 +723,7 @@ function guideReferenceLine(
   );
 }
 
-type TooltipCursor = 'fill' | 'line' | 'dashed' | 'none';
+type TooltipCursor = 'fill' | 'dashed' | 'none';
 
 /** Shape of one recharts tooltip payload entry (the fields we read). */
 interface TooltipPayloadEntry {
@@ -787,11 +782,11 @@ function RcdChartTooltip({
     payload.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
   return (
     <div
-      className="max-w-[280px] rounded-[10px] border border-rcd-border px-3 py-2 text-xs shadow-lg"
+      className="max-w-[280px] rounded-lg border border-rcd-border px-3 py-2 text-xs shadow-md"
       style={card}
     >
       {label !== undefined && label !== '' && (
-        <div className="mb-1 truncate font-semibold">{String(label)}</div>
+        <div className="mb-1 truncate font-medium">{String(label)}</div>
       )}
       <div className="flex flex-col gap-1">
         {payload.map((entry, i) => {
@@ -806,7 +801,7 @@ function RcdChartTooltip({
               {accent ? (
                 <span
                   aria-hidden
-                  className="h-3 w-[3px] shrink-0 rounded-full"
+                  className="h-3 w-[2.5px] shrink-0 rounded-full"
                   style={{ background: color }}
                 />
               ) : (
@@ -816,10 +811,10 @@ function RcdChartTooltip({
                   style={{ background: color }}
                 />
               )}
-              <span className="min-w-0 flex-1 truncate opacity-75">
+              <span className="min-w-0 flex-1 truncate opacity-70">
                 {entry.name != null ? String(entry.name) : ''}
               </span>
-              <span className="shrink-0 font-semibold tabular-nums">
+              <span className="shrink-0 text-right font-medium tabular-nums">
                 {formatEntry(entry.value, dataKey)}
                 {share}
               </span>
@@ -843,14 +838,14 @@ function themedTooltip(
   percent?: { active: boolean; total?: number },
 ): ReactNode {
   if (format.tooltip?.enabled === false) return null;
+  // Hover affordances, shadcn-style: bars get a soft muted rectangle behind
+  // the hovered category; line/area/scatter get a dashed vertical hairline.
   const cursorProp =
     cursor === 'fill'
-      ? { fill: 'var(--rcd-border)' }
-      : cursor === 'line'
-        ? { stroke: 'var(--rcd-axis)' }
-        : cursor === 'dashed'
-          ? { stroke: 'var(--rcd-axis)', strokeDasharray: '4 4' }
-          : false;
+      ? { fill: 'var(--rcd-text)', fillOpacity: 0.04 }
+      : cursor === 'dashed'
+        ? { stroke: 'var(--rcd-axis)', strokeDasharray: '3 3' }
+        : false;
   return (
     <Tooltip
       cursor={cursorProp}
@@ -1107,13 +1102,9 @@ function CartesianChart({
       ? buildTrendlines(trendSpecs, visibleSeries, shaped.data)
       : { rows: shaped.data, overlays: [] as TrendlineOverlay[] };
 
-  // ---- designed fills ------------------------------------------------------
-  // Per-color SVG gradients (bars: 100%→78% along the value axis; areas:
-  // 55%→4% top-down) + a soft line shadow. Colors can be CSS variables, so
-  // stops use stopColor + stopOpacity rather than blends. Ids come from a
-  // sanitized useId so multiple charts (and small-multiple panels) on one
-  // page never collide.
-  const uid = svgSafeId(useId());
+  // ---- designed fills (shadcn look) ---------------------------------------
+  // Bars are flat solid fills at full color (no gradient, no self-stroke);
+  // areas are the series color at a soft ~12% fill under a 2px stroke.
   /** Resolved fill for one bar cell (colorByCategory / barFill rules / series). */
   const resolveCellFill = (
     series: ChartSeries,
@@ -1140,19 +1131,6 @@ function CartesianChart({
         : undefined;
     return ruleFill ?? paletteFill;
   };
-  const markColors: string[] = [];
-  const addMarkColor = (color: string) => {
-    if (!markColors.includes(color)) markColors.push(color);
-  };
-  if (spec.type !== 'line') {
-    for (const series of visibleSeries) addMarkColor(series.color);
-    if (isBars && renderCells) {
-      for (const series of visibleSeries) {
-        rows.forEach((row, i) => addMarkColor(resolveCellFill(series, row, i)));
-      }
-    }
-  }
-  const fillUrl = (color: string): string => `url(#${uid}-f${markColors.indexOf(color)})`;
 
   /** ChartPointEvent for one struck row (+ series when a specific mark was hit). */
   const pointEvent = (
@@ -1228,7 +1206,9 @@ function CartesianChart({
       ? (dotProps: ActiveDotProps) => (
           <Dot
             {...dotProps}
-            r={3}
+            r={4}
+            stroke="var(--rcd-surface)"
+            strokeWidth={1}
             cursor="pointer"
             onClick={(_, event) => {
               const row = dotProps.payload as Record<string, CellValue> | undefined;
@@ -1312,39 +1292,16 @@ function CartesianChart({
                   : null),
               }
         }
+        // Slimmer default gaps between category slots (shadcn bars sit closer).
+        barCategoryGap="20%"
         onContextMenu={chartContextMenu}
         onMouseMove={chartMouseMove}
         onMouseLeave={onPointHover ? () => onPointHover(null) : undefined}
       >
-        <defs>
-          {markColors.map((color, i) => (
-            <linearGradient
-              key={`${i}-${color}`}
-              id={`${uid}-f${i}`}
-              // Bars fade from the VALUE END (100%) toward the baseline (78%);
-              // areas fade top-down (55% → 4%). Areas are never horizontal.
-              x1={isBars && horizontal ? '1' : '0'}
-              y1="0"
-              x2="0"
-              y2={isBars && horizontal ? '0' : '1'}
-            >
-              <stop offset="0" stopColor={color} stopOpacity={isBars ? 1 : 0.55} />
-              <stop offset="1" stopColor={color} stopOpacity={isBars ? 0.78 : 0.04} />
-            </linearGradient>
-          ))}
-          {spec.type === 'line' && (
-            // Very subtle drop shadow under line paths; black fades into dark
-            // surfaces, so it stays theme-safe.
-            <filter id={`${uid}-lineShadow`} x="-20%" y="-40%" width="140%" height="180%">
-              <feDropShadow dx="0" dy="2" stdDeviation="2" floodColor="#000000" floodOpacity="0.16" />
-            </filter>
-          )}
-        </defs>
         <CartesianGrid
           vertical={isBars ? horizontal : false}
           horizontal={isBars ? !horizontal : true}
           stroke={GRID_STROKE}
-          strokeDasharray={GRID_DASH}
         />
         {horizontal ? (
           <XAxis
@@ -1352,6 +1309,7 @@ function CartesianChart({
             tick={panel && !panel.showXTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={false}
+            tickMargin={panel ? 3 : TICK_MARGIN}
             tickFormatter={valueTickFormatter}
             domain={panel?.valueDomain}
             // Axis TITLES stay on the single chart; panels are too small.
@@ -1368,6 +1326,7 @@ function CartesianChart({
             tick={panel && !panel.showXTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={false}
+            tickMargin={panel ? 3 : TICK_MARGIN}
             // Dense category axes drop interior ticks instead of colliding;
             // first/last stay so the extent is always readable.
             interval="preserveStartEnd"
@@ -1387,6 +1346,7 @@ function CartesianChart({
             tick={panel && !panel.showYTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={false}
+            tickMargin={panel ? 3 : TICK_MARGIN}
             label={
               panel || htmlYTitle
                 ? undefined
@@ -1398,6 +1358,7 @@ function CartesianChart({
             tick={panel && !panel.showYTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={false}
+            tickMargin={panel ? 3 : TICK_MARGIN}
             width={panel ? (panel.showYTicks ? 42 : 8) : 56}
             tickFormatter={valueTickFormatter}
             domain={panel?.valueDomain}
@@ -1420,6 +1381,7 @@ function CartesianChart({
             tick={panel ? false : axisTickStyle}
             tickLine={false}
             axisLine={false}
+            tickMargin={panel ? 3 : TICK_MARGIN}
             width={panel ? 8 : 56}
             tickFormatter={y2TickFormatter}
             label={
@@ -1429,7 +1391,7 @@ function CartesianChart({
             }
           />
         )}
-        {themedTooltip(formatSeriesValue, format, isBars ? 'fill' : 'line', stacked ? { active: true } : undefined)}
+        {themedTooltip(formatSeriesValue, format, isBars ? 'fill' : 'dashed', stacked ? { active: true } : undefined)}
         {showLegend && chartLegend(format, seriesLegendItems(shaped.series), legend)}
         {visibleSeries.map((series) => {
           const yAxisId = y2Keys.has(series.key) ? 'y2' : undefined;
@@ -1450,13 +1412,12 @@ function CartesianChart({
                 yAxisId={yAxisId}
                 dataKey={series.key}
                 name={series.label}
-                fill={fillUrl(series.color)}
+                // Flat solid fill, no self-stroke (shadcn bars); stacked
+                // segments keep the 2px surface gap between members.
+                fill={series.color}
                 fillOpacity={dimSeries ? 0.35 : undefined}
-                // Stacked segments keep the 2px surface gap; plain bars take a
-                // crisp 1px stroke of their own color over the gradient fill.
-                stroke={stacked ? 'var(--rcd-surface)' : series.color}
-                strokeOpacity={!stacked && dimSeries ? 0.35 : undefined}
-                strokeWidth={stacked ? 2 : 1}
+                stroke={stacked ? 'var(--rcd-surface)' : undefined}
+                strokeWidth={stacked ? 2 : 0}
                 stackId={stacked ? 'stack' : undefined}
                 radius={roundEnd ? barEndRadius(horizontal) : 0}
                 isAnimationActive={false}
@@ -1484,10 +1445,9 @@ function CartesianChart({
                     return (
                       <Cell
                         key={dataIndex}
-                        fill={fillUrl(resolved)}
-                        stroke={stacked ? 'var(--rcd-surface)' : resolved}
+                        fill={resolved}
+                        stroke={stacked ? 'var(--rcd-surface)' : undefined}
                         fillOpacity={cellOpacity}
-                        strokeOpacity={stacked ? undefined : cellOpacity}
                       />
                     );
                   })}
@@ -1518,9 +1478,14 @@ function CartesianChart({
                 strokeOpacity={dimSeries ? 0.35 : undefined}
                 strokeWidth={lineStyle?.width ?? 2}
                 strokeDasharray={strokeDash(lineStyle)}
-                filter={`url(#${uid}-lineShadow)`}
                 dot={false}
-                activeDot={clickableActiveDot(series) ?? { r: 3 }}
+                activeDot={
+                  clickableActiveDot(series) ?? {
+                    r: 4,
+                    stroke: 'var(--rcd-surface)',
+                    strokeWidth: 1,
+                  }
+                }
                 isAnimationActive={false}
               />
             );
@@ -1536,10 +1501,18 @@ function CartesianChart({
               strokeOpacity={dimSeries ? 0.35 : undefined}
               strokeWidth={lineStyle?.width ?? 2}
               strokeDasharray={strokeDash(lineStyle)}
-              fill={fillUrl(series.color)}
-              fillOpacity={dimSeries ? 0.4 : 1}
+              // Soft solid area fill (~12% of the series color) under the
+              // full-strength 2px stroke — the shadcn area treatment.
+              fill={series.color}
+              fillOpacity={dimSeries ? 0.05 : 0.12}
               dot={false}
-              activeDot={clickableActiveDot(series)}
+              activeDot={
+                clickableActiveDot(series) ?? {
+                  r: 4,
+                  stroke: 'var(--rcd-surface)',
+                  strokeWidth: 1,
+                }
+              }
               isAnimationActive={false}
             />
           );
@@ -2132,7 +2105,7 @@ export default function ChartRenderer({
               margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}
               onMouseLeave={hover ? () => hover(null) : undefined}
             >
-              <CartesianGrid stroke={GRID_STROKE} strokeDasharray={GRID_DASH} />
+              <CartesianGrid stroke={GRID_STROKE} />
               <XAxis
                 type="number"
                 dataKey="x"
@@ -2140,6 +2113,7 @@ export default function ChartRenderer({
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={false}
+                tickMargin={TICK_MARGIN}
                 tickFormatter={axisTickFormatter(format.xAxisFormat)}
                 label={
                   htmlXTitle
@@ -2154,6 +2128,7 @@ export default function ChartRenderer({
                 tick={axisTickStyle}
                 tickLine={false}
                 axisLine={false}
+                tickMargin={TICK_MARGIN}
                 width={64}
                 tickFormatter={yTickFormatter}
                 label={

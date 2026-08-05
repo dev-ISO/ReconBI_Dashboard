@@ -288,7 +288,7 @@ function TextTileEditor({ tileId, spec }: { tileId: string; spec: TextTileSpec }
         onFocus={handleFocus}
         onKeyUp={saveSelection}
         onMouseUp={saveSelection}
-        className={`${RICH_TEXT_CLASSES} min-h-0 flex-1 cursor-text overflow-auto rounded-md p-1.5 outline-none ring-rcd-accent focus:ring-1`}
+        className={`${RICH_TEXT_CLASSES} min-h-0 flex-1 cursor-text overflow-auto rounded-md p-1.5 outline-none ring-[var(--rcd-accent-interactive)] focus:ring-1`}
         style={specStyle(spec)}
         dangerouslySetInnerHTML={{ __html: html }}
       />
@@ -416,7 +416,7 @@ function TextTileConfigMenu({
               onClick={() => runtime.dashboards.updateTextTile(tileId, { align: value })}
               className={`rounded-md border p-1.5 ${
                 align === value
-                  ? 'border-rcd-accent text-rcd-accent'
+                  ? 'border-rcd-border bg-black/10 text-rcd-text dark:bg-white/15'
                   : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
               }`}
             >

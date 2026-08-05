@@ -249,7 +249,7 @@ function FxBadge() {
 
 function SectionHeader({ label, icon }: { label: string; icon?: React.ReactNode }) {
   return (
-    <div className="flex items-center gap-1 px-3 pb-1 pt-3 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+    <div className="flex items-center gap-1 px-3 pb-1 pt-3 text-xs font-medium uppercase tracking-wide text-rcd-muted">
       {icon}
       <span className="truncate" title={label}>
         {label}

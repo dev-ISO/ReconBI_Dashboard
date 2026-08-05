@@ -74,7 +74,7 @@ export function ModelListPage() {
           </RcdButton>
         </div>
       ) : (
-        <div className="mt-6 overflow-hidden rounded-lg border border-rcd-border">
+        <div className="mt-6 overflow-hidden rounded-xl border border-rcd-border shadow-[var(--rcd-shadow-1)]">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-rcd-border bg-rcd-surface text-left text-xs text-rcd-muted">
@@ -101,18 +101,18 @@ export function ModelListPage() {
                   <td className="px-4 py-2.5">
                     <span className="flex flex-wrap items-center gap-1.5">
                       {model.ownerIsMe && (
-                        <span className="inline-flex items-center gap-1 rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+                        <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                           <User size={11} /> Yours
                         </span>
                       )}
                       {model.isShared && (
-                        <span className="inline-flex items-center gap-1 rounded-full border border-rcd-border px-2 py-0.5 text-[11px] text-rcd-text-2">
+                        <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                           <Share2 size={11} /> Shared
                         </span>
                       )}
                     </span>
                   </td>
-                  <td className="px-4 py-2.5 text-rcd-text-2">
+                  <td className="px-4 py-2.5 text-rcd-text-2 tabular-nums">
                     {updatedFormat.format(new Date(model.updatedAtUtc))}
                   </td>
                 </tr>
@@ -135,7 +135,7 @@ export function ModelListPage() {
               <li key={connection.name}>
                 <button
                   type="button"
-                  className="w-full rounded-md border border-rcd-border px-3 py-2 text-left hover:border-rcd-accent"
+                  className="w-full rounded-lg border border-rcd-border px-3 py-2 text-left shadow-[var(--rcd-shadow-1)] transition-colors hover:bg-black/5 dark:hover:bg-white/10"
                   onClick={() => goToNew(connection.name)}
                 >
                   <span className="block text-sm font-medium text-rcd-text">{connection.name}</span>
