@@ -62,7 +62,7 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
       <div
         role="tablist"
         aria-label="Dashboard pages"
-        className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-t border-rcd-border bg-rcd-bg px-1.5"
+        className="flex shrink-0 items-center gap-1 overflow-x-auto border-t border-rcd-border bg-rcd-bg px-2 py-1"
       >
         {pages.map((page) => {
           const active = page.id === activePageId;
@@ -115,9 +115,9 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
                     }
                   : undefined
               }
-              className={`relative flex shrink-0 items-center gap-1.5 px-3 py-1.5 text-sm transition-colors ${
+              className={`relative flex h-7 shrink-0 items-center gap-1.5 rounded-md px-3 text-sm transition-colors ${
                 active
-                  ? 'bg-rcd-surface font-medium text-rcd-text'
+                  ? 'border border-rcd-border bg-rcd-surface font-medium text-rcd-text shadow-[var(--rcd-shadow-1)]'
                   : 'text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
               }`}
             >
@@ -130,7 +130,11 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
               )}
               <span className="max-w-[10rem] truncate">{page.name}</span>
               {active && (
-                <span aria-hidden className="absolute inset-x-0 bottom-0 h-0.5 bg-rcd-accent" />
+                <span
+                  aria-hidden
+                  className="absolute inset-x-2.5 bottom-0 h-0.5 rounded-full"
+                  style={{ backgroundColor: page.color ?? 'var(--rcd-accent)' }}
+                />
               )}
             </button>
           );
@@ -142,7 +146,7 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
             aria-label="Add page"
             title="Add page"
             onClick={() => runtime.dashboards.addPage()}
-            className="ml-0.5 shrink-0 rounded-md p-1.5 text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+            className="ml-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-dashed border-rcd-border text-rcd-text-2 transition-colors hover:border-rcd-accent hover:bg-black/5 hover:text-rcd-accent dark:hover:bg-white/10"
           >
             <Plus size={14} />
           </button>
@@ -248,7 +252,7 @@ function PageTabMenu({
       aria-label={`Options for page ${page.name}`}
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(event) => event.preventDefault()}
-      className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-xl"
+      className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
     >
       <MenuButton
         onClick={() => {

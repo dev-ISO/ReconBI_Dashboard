@@ -89,6 +89,26 @@ export interface TableOptions {
   stripes?: boolean;
   /** Header click sorting (default true). */
   sortable?: boolean;
+  /** Excel-style per-column header filter menus (default true). */
+  filterable?: boolean;
+  /** Header text alignment (default 'center'). */
+  headerAlign?: 'left' | 'center' | 'right';
+  /** Per-column body alignment overrides keyed by result column NAME
+   *  (defaults: measures right, text left). */
+  columnAlign?: Record<string, 'left' | 'center' | 'right'>;
+  /** Vertical cell alignment (default 'middle'). */
+  verticalAlign?: 'top' | 'middle';
+  /** Cell border style (default 'rows'). */
+  borders?: 'none' | 'rows' | 'columns' | 'grid';
+  borderColor?: string | null;
+  headerBackground?: string | null;
+  headerColor?: string | null;
+  /** Bold header text (default true). */
+  headerBold?: boolean;
+  /** Row density (default 'normal'). */
+  density?: 'compact' | 'normal' | 'relaxed';
+  /** Body font size px (default theme). */
+  fontSize?: number;
 }
 
 /** Date axis label presets for bucketed dimensions. */

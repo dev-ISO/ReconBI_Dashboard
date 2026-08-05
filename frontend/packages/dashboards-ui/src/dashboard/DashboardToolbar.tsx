@@ -144,8 +144,8 @@ export function DashboardToolbar({
   };
 
   return (
-    <div className="flex items-center gap-2 border-b border-rcd-border bg-rcd-surface px-4 py-2.5">
-      <h1 className="truncate text-base font-semibold text-rcd-text" title={name}>
+    <div className="flex h-12 shrink-0 items-center gap-2 border-b border-rcd-border bg-rcd-surface px-4">
+      <h1 className="truncate text-[15px] font-semibold tracking-[-0.01em] text-rcd-text" title={name}>
         {name}
       </h1>
       {isShared && (
@@ -400,7 +400,7 @@ function AlertsBell({ firings }: { firings: AlertFiring[] }) {
         <div
           role="menu"
           aria-label="Recent alert firings"
-          className="absolute right-0 top-full z-40 mt-1 w-72 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+          className="absolute right-0 top-full z-40 mt-1 w-72 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
           {firings.length === 0 ? (
             <p className="px-3 py-1.5 text-xs text-rcd-muted">No recent alert firings.</p>
@@ -471,7 +471,7 @@ function OverflowMenu({ onSubscribe }: { onSubscribe: () => void }) {
         <div
           role="menu"
           aria-label="More actions"
-          className="absolute right-0 top-full z-40 mt-1 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+          className="absolute right-0 top-full z-40 mt-1 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
           <button
             type="button"
@@ -588,7 +588,7 @@ function BookmarksMenu({
         <div
           role="menu"
           aria-label="Bookmarks"
-          className="absolute right-0 top-full z-40 mt-1 w-60 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+          className="absolute right-0 top-full z-40 mt-1 w-60 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
           {bookmarks.length === 0 && (
             <p className="px-3 py-1.5 text-xs text-rcd-muted">No bookmarks yet.</p>
@@ -643,7 +643,7 @@ function BookmarksMenu({
                 {kebabFor === bookmark.id && (
                   <div
                     role="menu"
-                    className="absolute right-1 top-full z-50 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+                    className="absolute right-1 top-full z-50 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
                   >
                     <button
                       type="button"
@@ -811,7 +811,7 @@ function AddTileMenu({
         <div
           role="menu"
           aria-label="Add tile"
-          className="absolute right-0 top-full z-40 mt-1 w-40 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+          className="absolute right-0 top-full z-40 mt-1 w-40 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
           <AddMenuItem onClick={() => pick(onAddChart)}>
             <BarChart3 size={14} />

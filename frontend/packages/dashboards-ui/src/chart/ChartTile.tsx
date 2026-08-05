@@ -5,6 +5,7 @@ import {
   toWireSpec,
   type CellValue,
   type ChartPointEvent,
+  type ChartQuerySpec,
   type ChartSpec,
   type FilterClause,
   type QueryResult,
@@ -37,6 +38,23 @@ export interface ChartTableLayoutPatch {
 }
 
 /**
+ * One Excel-style per-column header filter on the interactive table (agreed
+ * renderer contract; keyed by result column NAME). 'values' keeps rows whose
+ * cell is one of the checked values; 'condition' applies one comparison.
+ */
+export type TableColumnFilter = { column: string } & (
+  | { kind: 'values'; values: CellValue[] }
+  | {
+      kind: 'condition';
+      operator: 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'between' | 'contains' | 'startsWith';
+      values: (string | number)[];
+    }
+);
+
+/** Wire HAVING entries (post-aggregation measure conditions). */
+export type ChartHavingClause = NonNullable<ChartQuerySpec['having']>[number];
+
+/**
  * Point/legend/table handlers the renderer exposes (agreed contract; typed
  * here so this file compiles against it regardless of when the renderer props
  * land — once ChartRendererProps carries them the intersection below is a
@@ -66,6 +84,11 @@ interface RendererPointHandlers {
   totalsRow?: (number | null)[] | null;
   /** Column drag/resize report (persist or keep transient — caller's call). */
   onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
+  /** Active per-column header filters + change hook (format.table.filterable). */
+  tableFilters?: TableColumnFilter[];
+  onTableFilterChange?: (filters: TableColumnFilter[]) => void;
+  /** Distinct values for a column's filter menu (Excel semantics upstream). */
+  onRequestColumnValues?: (column: string) => Promise<CellValue[]>;
 }
 
 const ChartRenderer = lazy(() => import('./ChartRenderer')) as ComponentType<
@@ -82,6 +105,11 @@ export interface ChartTileProps {
    * server-side table pagination. Part of the cache key like everything else.
    */
   offset?: number | null;
+  /**
+   * Post-aggregation measure conditions merged into the wire spec (SQL
+   * HAVING) — table measure-column filters. Cache-keyed like offset.
+   */
+  having?: ChartHavingClause[] | null;
   /** Debounce before running (builder preview); 0 for tiles. */
   debounceMs?: number;
   /**
@@ -117,6 +145,12 @@ export interface ChartTileProps {
   totalsRow?: (number | null)[] | null;
   /** Column width/order drag report (persist or transient — caller's call). */
   onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
+  /** Per-column header filter state + change hook (interactive tables). */
+  tableFilters?: TableColumnFilter[];
+  onTableFilterChange?: (filters: TableColumnFilter[]) => void;
+  /** Distinct values for a column's filter dropdown (caller applies Excel
+   *  minus-own-filter semantics). */
+  onRequestColumnValues?: (column: string) => Promise<CellValue[]>;
   /**
    * Ref-style report of the freshest rendered QueryResult (assignment only —
    * mirrors reportEffective). The dashboard tile uses it to map table sort
@@ -142,6 +176,7 @@ export function ChartTile({
   modelId,
   filters = EMPTY_FILTERS,
   offset = null,
+  having = null,
   debounceMs = 0,
   refreshKey,
   onDatumClick,
@@ -159,6 +194,9 @@ export function ChartTile({
   onTablePageChange,
   totalsRow = null,
   onTableLayoutChange,
+  tableFilters,
+  onTableFilterChange,
+  onRequestColumnValues,
   onResult,
 }: ChartTileProps) {
   const runtime = useRuntime();
@@ -166,10 +204,11 @@ export function ChartTile({
   const wireSpec = useMemo(() => {
     if (!runnable) return null;
     const base = toWireSpec(spec, modelId, filters);
-    // Offset rides the wire spec directly (ChartQuery has no offset field);
-    // it participates in the cache key like every other spec field.
-    return offset != null && offset > 0 ? { ...base, offset } : base;
-  }, [spec, modelId, filters, offset, runnable]);
+    // Offset and having ride the wire spec directly (ChartQuery carries
+    // neither); both participate in the cache key like every other spec field.
+    const withOffset = offset != null && offset > 0 ? { ...base, offset } : base;
+    return having != null && having.length > 0 ? { ...withOffset, having } : withOffset;
+  }, [spec, modelId, filters, offset, having, runnable]);
   const cacheKey = wireSpec ? runtime.queries.keyFor(wireSpec) : null;
   const entry = useQueryCacheState((state) => (cacheKey ? state.entries[cacheKey] : undefined));
   const [retryToken, setRetryToken] = useState(0);
@@ -271,6 +310,9 @@ export function ChartTile({
             onTablePageChange={onTablePageChange}
             totalsRow={totalsRow}
             onTableLayoutChange={onTableLayoutChange}
+            tableFilters={tableFilters}
+            onTableFilterChange={onTableFilterChange}
+            onRequestColumnValues={onRequestColumnValues}
           />
         </Suspense>
       </div>
@@ -298,7 +340,15 @@ export function ChartTile({
 
   const result: QueryResult = entry.data!;
   if (result.rows.length === 0) {
-    return <State icon={<BarChart3 size={22} className="text-rcd-muted" />}>No data for this selection.</State>;
+    // A table whose OWN column filters emptied it still renders (headers +
+    // filter menus stay reachable so the user can clear the filter); every
+    // other empty result shows the friendly empty state.
+    const tableFiltersActive =
+      spec.type === 'table' &&
+      ((tableFilters?.length ?? 0) > 0 || (having?.length ?? 0) > 0);
+    if (!tableFiltersActive) {
+      return <State icon={<BarChart3 size={22} className="text-rcd-muted" />}>No data for this selection.</State>;
+    }
   }
 
   return renderChart(spec, result, false);

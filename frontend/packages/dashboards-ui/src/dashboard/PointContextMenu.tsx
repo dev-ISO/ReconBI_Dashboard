@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, BellPlus, CornerUpLeft, FileDown, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, BellPlus, CornerUpLeft, FileDown, Rows3, Table2, Zap } from 'lucide-react';
 import type { FilterClause } from '@recon/dashboards-core';
 
 /** One candidate drillthrough page for the clicked point. */
@@ -39,6 +39,10 @@ export interface PointContextMenuProps {
   /** Drill hierarchy actions for the clicked point; null = no hierarchy. */
   drill?: PointDrillActions | null;
   onDrillthrough: (target: DrillthroughTarget) => void;
+  /** "See data" — the tile's current aggregated result in a table dialog. */
+  onSeeData?: (() => void) | null;
+  /** "See records for <label>" — underlying rows behind the clicked point. */
+  seeRecords?: { label: string; onClick: () => void } | null;
   /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
   onSetAlert?: (() => void) | null;
   onExport: (mode: 'summarized' | 'underlying') => void;
@@ -58,6 +62,8 @@ export function PointContextMenu({
   drillthroughTargets,
   drill = null,
   onDrillthrough,
+  onSeeData = null,
+  seeRecords = null,
   onSetAlert = null,
   onExport,
   onClose,
@@ -101,8 +107,38 @@ export function PointContextMenu({
       aria-label={`Point actions for ${title}`}
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(event) => event.preventDefault()}
-      className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+      className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
     >
+      {(onSeeData || seeRecords) && (
+        <>
+          {onSeeData && (
+            <ActionItem
+              icon={<Table2 size={14} />}
+              onClick={() => {
+                onSeeData();
+                onClose();
+              }}
+            >
+              See data
+            </ActionItem>
+          )}
+          {seeRecords && (
+            <ActionItem
+              icon={<Rows3 size={14} />}
+              onClick={() => {
+                seeRecords.onClick();
+                onClose();
+              }}
+            >
+              <span className="min-w-0 flex-1 truncate">
+                See records for <span className="font-medium">{seeRecords.label}</span>
+              </span>
+            </ActionItem>
+          )}
+          <div className="my-1 border-t border-rcd-border" />
+        </>
+      )}
+
       {drill && (drill.canDrillDeeper || drill.level > 0) && (
         <>
           <p className="px-3 pb-0.5 pt-1 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">

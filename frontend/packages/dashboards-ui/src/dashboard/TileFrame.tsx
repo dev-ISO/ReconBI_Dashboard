@@ -163,7 +163,7 @@ export function TileFrame({
       {menuOpen && !onMenu && (
         <div
           role="menu"
-          className="absolute right-0 top-full z-30 mt-1 w-36 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+          className="absolute right-0 top-full z-30 mt-1 w-36 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
           <MenuItem
             icon={Pencil}
@@ -200,17 +200,20 @@ export function TileFrame({
       ref={rootRef}
       onContextMenu={onContextMenu}
       style={frameStyleOf(container)}
-      className="group relative flex h-full flex-col rounded-lg border border-rcd-border bg-rcd-surface shadow-sm"
+      className="rcd-card group relative flex h-full flex-col"
     >
       {!hideHeader && (
-        <div className="flex items-center border-b border-rcd-border py-1 pl-2 pr-1">
+        <div className="flex items-center border-b border-rcd-border py-1 pl-2.5 pr-1">
           <div
             className={`flex min-w-0 flex-1 items-center gap-1.5 py-0.5 ${
               editable ? 'rcd-tile-drag-handle cursor-move' : ''
             }`}
           >
             {editable && <GripVertical size={14} className="shrink-0 text-rcd-muted" />}
-            <span className="truncate text-sm font-medium text-rcd-text" title={title}>
+            <span
+              className="truncate text-[13px] font-semibold leading-5 text-rcd-text"
+              title={title}
+            >
               {title}
             </span>
           </div>
@@ -228,7 +231,7 @@ export function TileFrame({
               the top edge always moves the tile. */}
           {editable && (
             <div
-              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-lg border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
+              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-[10px] border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
               title={`Drag to move ${title}`}
             >
               <GripHorizontal size={12} className="text-rcd-muted" />

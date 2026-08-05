@@ -122,6 +122,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             }
         }
 
+        ValidateHaving(spec.Having, measures);
+
         var involved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var d in dimensions)
         {
@@ -197,8 +199,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// Prepares a row-level export: the anchor is the FIRST measure's table
     /// (model measure -> its home table, inline measure -> its table), all of
     /// its physical columns are selected, and the spec's filters join in
-    /// exactly like a chart query. Dimensions/sort/topN are ignored — this is
-    /// the data behind the chart, not the chart.
+    /// exactly like a chart query. Dimensions/sort/topN/having are ignored —
+    /// this is the data behind the chart, not the chart; having is a
+    /// post-aggregation concept with no meaning on row-level output.
     /// </summary>
     public PreparedUnderlyingQuery PrepareUnderlying(
         ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
@@ -306,6 +309,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// Emits the final parameterized statement. When <see cref="ChartQuerySpec.TopN"/>
     /// is set, the ranking measure defines the row order and any explicit
     /// <see cref="ChartQuerySpec.Sort"/> is ignored.
+    /// <see cref="ChartQuerySpec.Having"/> conditions attach to the GROUP BY
+    /// stage — the base grouped statement, BEFORE any Top-N ranking or window
+    /// calc stage — by repeating each targeted measure's aggregate expression
+    /// (SQL standard; the select alias is not referenced) with parameterized
+    /// values. With zero dimensions there is no GROUP BY and the HAVING applies
+    /// to the single global aggregate row, which is valid SQL. Fan-out
+    /// detection is unaffected.
     /// </summary>
     public CompiledQuery Emit(
         PreparedQuery prepared,
@@ -347,17 +357,19 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
 
+        var havingParts = BuildHavingParts(spec.Having, measureExprs, bag);
+
         var effectiveLimit = EffectiveLimit(spec.Limit, limits, sourceOptions);
 
         if (spec.TopN is { } topN)
         {
             return EmitTopN(
-                prepared, spec, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings, calendarCtes);
+                prepared, spec, topN, dimensionExprs, selectItems, measureExprs, whereParts, havingParts, effectiveLimit, bag, warnings, calendarCtes);
         }
 
         if (prepared.Measures.Any(m => m.Calc is not null))
         {
-            var core = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+            var core = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
             return EmitWithCalcs(
                 prepared, spec, [.. calendarCtes], core.ToString(),
                 includeIsTopN: false, orderByAxisOnly: false, effectiveLimit, bag, warnings);
@@ -365,7 +377,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
 
-        var sql = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+        var sql = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
 
         if (orderParts.Count > 0)
         {
@@ -397,6 +409,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         IReadOnlyList<string> selectItems,
         IReadOnlyList<string> measureExprs,
         IReadOnlyList<string> whereParts,
+        IReadOnlyList<string> havingParts,
         int effectiveLimit,
         ParameterBag bag,
         List<EngineWarning> warnings,
@@ -425,7 +438,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             var rankRef = dialect.SupportsSelectAliasInOrderBy ? rankAlias : measureExprs[topN.ByMeasureIndex];
             var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(n + 1), NormalizedType.Integer));
 
-            var flat = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+            var flat = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
             flat.Append('\n').Append("ORDER BY ")
                 .Append(rankRef).Append(" DESC").Append(dialect.NullsLastSuffix)
                 .Append(", ").Append(dimensionExprs[0]).Append(" ASC").Append(dialect.NullsLastSuffix);
@@ -447,7 +460,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings);
         }
 
-        var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+        var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
 
         var nPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)n, NormalizedType.Integer));
 
@@ -1163,6 +1176,58 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
     }
 
+    /// <summary>
+    /// Having guards. Each condition must target an existing measure, use a
+    /// known operator with the right value count (between = 2, others = 1),
+    /// and carry only finite numbers that a SQL numeric parameter can hold —
+    /// NaN/Infinity (QRY_BAD_HAVING_VALUE) never reach the parameter bag.
+    /// </summary>
+    private static void ValidateHaving(IReadOnlyList<HavingSpec>? having, IReadOnlyList<ResolvedMeasure> measures)
+    {
+        if (having is null)
+        {
+            return;
+        }
+
+        foreach (var condition in having)
+        {
+            if (condition.MeasureIndex < 0 || condition.MeasureIndex >= measures.Count)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_HAVING",
+                    $"Having condition targets measure {condition.MeasureIndex}, which does not exist.");
+            }
+
+            var label = measures[condition.MeasureIndex].Label;
+            if (!Enum.IsDefined(condition.Operator))
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_HAVING", $"Having condition on measure '{label}': unknown operator.");
+            }
+
+            var expected = condition.Operator == HavingOperator.Between ? 2 : 1;
+            var count = condition.Values?.Count ?? 0;
+            if (count != expected)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_HAVING",
+                    $"Having condition on measure '{label}': operator {condition.Operator} expects {expected} value(s), got {count}.");
+            }
+
+            foreach (var value in condition.Values!)
+            {
+                // decimal.MaxValue ~ 7.9e28: reject anything a numeric
+                // parameter cannot represent alongside NaN/Infinity.
+                if (!double.IsFinite(value) || Math.Abs(value) > 7.9e28)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_HAVING_VALUE",
+                        $"Having condition on measure '{label}': values must be finite numbers.");
+                }
+            }
+        }
+    }
+
     private static bool IsAggregationCompatible(Aggregation aggregation, NormalizedType type)
     {
         if (type == NormalizedType.Other)
@@ -1225,13 +1290,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
     }
 
-    /// <summary>SELECT ... FROM ... JOINs ... WHERE ... GROUP BY — no ORDER BY or LIMIT.</summary>
+    /// <summary>
+    /// SELECT ... FROM ... JOINs ... WHERE ... GROUP BY ... HAVING — no ORDER
+    /// BY or LIMIT. With no dimensions there is no GROUP BY; having conditions
+    /// then constrain the single global aggregate row (valid SQL).
+    /// </summary>
     private StringBuilder BuildAggregateCore(
         IReadOnlyList<string> selectItems,
         JoinPlan plan,
         DatabaseSchema schema,
         IReadOnlyList<string> whereParts,
-        IReadOnlyList<string> groupByExprs)
+        IReadOnlyList<string> groupByExprs,
+        IReadOnlyList<string>? havingParts = null)
     {
         var sql = new StringBuilder();
         sql.Append("SELECT ").Append(string.Join(",\n       ", selectItems));
@@ -1248,7 +1318,59 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             sql.Append('\n').Append("GROUP BY ").Append(string.Join(", ", groupByExprs));
         }
 
+        if (havingParts is { Count: > 0 })
+        {
+            sql.Append('\n').Append("HAVING ").Append(string.Join("\n   AND ", havingParts));
+        }
+
         return sql;
+    }
+
+    /// <summary>
+    /// Renders the HAVING predicates: each condition repeats the targeted
+    /// measure's full aggregate expression (aliases may not be referenced in
+    /// HAVING per the SQL standard; any embedded measure-filter placeholders
+    /// are reused, which binds the same value twice in text but adds no new
+    /// parameter) and binds its threshold values as decimal parameters.
+    /// </summary>
+    private List<string> BuildHavingParts(
+        IReadOnlyList<HavingSpec>? having, IReadOnlyList<string> measureExprs, ParameterBag bag)
+    {
+        var parts = new List<string>();
+        if (having is null)
+        {
+            return parts;
+        }
+
+        foreach (var condition in having)
+        {
+            if (condition.MeasureIndex < 0 || condition.MeasureIndex >= measureExprs.Count)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_HAVING",
+                    $"Having condition targets measure {condition.MeasureIndex}, which does not exist.");
+            }
+
+            var expr = measureExprs[condition.MeasureIndex];
+
+            string Placeholder(int index) =>
+                dialect.ParameterPlaceholder(bag.Add((decimal)condition.Values[index], NormalizedType.Decimal));
+
+            parts.Add(condition.Operator switch
+            {
+                HavingOperator.Gt => $"{expr} > {Placeholder(0)}",
+                HavingOperator.Gte => $"{expr} >= {Placeholder(0)}",
+                HavingOperator.Lt => $"{expr} < {Placeholder(0)}",
+                HavingOperator.Lte => $"{expr} <= {Placeholder(0)}",
+                HavingOperator.Eq => $"{expr} = {Placeholder(0)}",
+                HavingOperator.Neq => $"{expr} <> {Placeholder(0)}",
+                HavingOperator.Between => $"({expr} >= {Placeholder(0)} AND {expr} <= {Placeholder(1)})",
+                _ => throw new QueryCompilationException(
+                    "QRY_BAD_HAVING", "Having condition uses an unknown operator."),
+            });
+        }
+
+        return parts;
     }
 
     /// <summary>

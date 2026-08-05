@@ -87,10 +87,18 @@ public sealed class ChartQueryService(
     /// <summary>Hard ceiling for export row caps regardless of what the caller asks for.</summary>
     public const int MaxExportRows = 100_000;
 
+    /// <summary>Default row cap for the JSON underlying-data endpoint when the caller does not send one.</summary>
+    public const int DefaultUnderlyingRows = 1_000;
+
+    /// <summary>Hard ceiling for the JSON underlying-data endpoint regardless of what the caller asks for.</summary>
+    public const int MaxUnderlyingRows = 10_000;
+
     /// <summary>
     /// CSV export twin of <see cref="RunAsync"/>. Summarized mode runs the
-    /// normal pipeline (calcs included); underlying mode selects the anchor
-    /// table's raw rows with the spec's filters. BOTH modes collect row filters
+    /// normal pipeline (calcs and having included); underlying mode selects the
+    /// anchor table's raw rows with the spec's filters — having is ignored
+    /// there (post-aggregation has no meaning on row-level output). BOTH modes
+    /// collect row filters
     /// over the full join plan through the same fail-closed path as /query.
     /// </summary>
     public async Task<ServiceResult<ExportOutcome>> RunExportAsync(
@@ -101,6 +109,21 @@ public sealed class ChartQueryService(
             return ServiceResult<ExportOutcome>.Fail(
                 ServiceErrorKind.BadRequest, "rcd.query.bad_export",
                 "Export mode must be 'summarized' or 'underlying'.");
+        }
+
+        var requestedCap = Math.Clamp(maxRows ?? DefaultExportRows, 1, MaxExportRows);
+
+        if (mode == ExportMode.Underlying)
+        {
+            var underlying = await RunUnderlyingCoreAsync(spec, requestedCap, principal, ct);
+            if (!underlying.Succeeded)
+            {
+                return ServiceResult<ExportOutcome>.Fail(underlying.Error!);
+            }
+
+            var (outcome, modelName) = underlying.Value!;
+            return ServiceResult<ExportOutcome>.Ok(
+                new ExportOutcome(outcome.Compiled, outcome.Rows, outcome.Truncated, modelName));
         }
 
         var context = await LoadContextAsync(spec.ModelId, ct);
@@ -114,27 +137,15 @@ public sealed class ChartQueryService(
             source.Dialect ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."),
             timeProvider);
 
-        var requestedCap = Math.Clamp(maxRows ?? DefaultExportRows, 1, MaxExportRows);
-
         CompiledQuery compiled;
         int rowCap;
         try
         {
-            if (mode == ExportMode.Summarized)
-            {
-                var prepared = compiler.Prepare(spec, model.Definition, schema, options.Limits);
-                var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
-                compiled = compiler.Emit(prepared, spec, rowFilters, options.Limits, source.Options);
-                // The normal query caps still bind; maxRows can only tighten them.
-                rowCap = Math.Min(requestedCap, Math.Min(options.Limits.MaxRows, source.Options.MaxRows));
-            }
-            else
-            {
-                var prepared = compiler.PrepareUnderlying(spec, model.Definition, schema, options.Limits);
-                var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
-                compiled = compiler.EmitUnderlying(prepared, rowFilters, requestedCap);
-                rowCap = requestedCap;
-            }
+            var prepared = compiler.Prepare(spec, model.Definition, schema, options.Limits);
+            var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
+            compiled = compiler.Emit(prepared, spec, rowFilters, options.Limits, source.Options);
+            // The normal query caps still bind; maxRows can only tighten them.
+            rowCap = Math.Min(requestedCap, Math.Min(options.Limits.MaxRows, source.Options.MaxRows));
         }
         catch (QueryCompilationException ex)
         {
@@ -147,15 +158,79 @@ public sealed class ChartQueryService(
                 ServiceErrorKind.Forbidden, "rcd.query.denied_by_scope", ex.Message);
         }
 
-        var outcome = await ExecuteAsync(spec, model, source, compiled, ct, distinctLimit: rowCap);
-        if (!outcome.Succeeded)
+        var executed = await ExecuteAsync(spec, model, source, compiled, ct, distinctLimit: rowCap);
+        if (!executed.Succeeded)
         {
-            return ServiceResult<ExportOutcome>.Fail(outcome.Error!);
+            return ServiceResult<ExportOutcome>.Fail(executed.Error!);
         }
 
-        var executed = outcome.Value!;
+        var value = executed.Value!;
         return ServiceResult<ExportOutcome>.Ok(
-            new ExportOutcome(executed.Compiled, executed.Rows, executed.Truncated, model.Name));
+            new ExportOutcome(value.Compiled, value.Rows, value.Truncated, model.Name));
+    }
+
+    /// <summary>
+    /// JSON twin of the underlying-data export mode: the anchor table's raw
+    /// rows (every physical column, no aggregation) with the spec's filters
+    /// applied. maxRows defaults to <see cref="DefaultUnderlyingRows"/> and is
+    /// clamped to [1, <see cref="MaxUnderlyingRows"/>]. The spec's `having` is
+    /// ignored — same as export underlying, post-aggregation has no meaning on
+    /// row-level output.
+    /// </summary>
+    public async Task<ServiceResult<QueryOutcome>> RunUnderlyingAsync(
+        ChartQuerySpec spec, int? maxRows, ClaimsPrincipal principal, CancellationToken ct)
+    {
+        var rowCap = Math.Clamp(maxRows ?? DefaultUnderlyingRows, 1, MaxUnderlyingRows);
+        var result = await RunUnderlyingCoreAsync(spec, rowCap, principal, ct);
+        return result.Succeeded
+            ? ServiceResult<QueryOutcome>.Ok(result.Value!.Outcome)
+            : ServiceResult<QueryOutcome>.Fail(result.Error!);
+    }
+
+    /// <summary>
+    /// The single underlying-data pipeline both the CSV export mode and the
+    /// JSON endpoint share: model visibility + drift check → PrepareUnderlying
+    /// (anchor = first measure's table, BFS-joined spec filters) → fail-closed
+    /// row-filter collection over the full join plan → EmitUnderlying (all
+    /// physical columns, ORDER BY first column, LIMIT rowCap+1 truncation
+    /// probe) → read-only, timeout-bounded execution capped at rowCap.
+    /// </summary>
+    private async Task<ServiceResult<(QueryOutcome Outcome, string ModelName)>> RunUnderlyingCoreAsync(
+        ChartQuerySpec spec, int rowCap, ClaimsPrincipal principal, CancellationToken ct)
+    {
+        var context = await LoadContextAsync(spec.ModelId, ct);
+        if (!context.Succeeded)
+        {
+            return ServiceResult<(QueryOutcome, string)>.Fail(context.Error!);
+        }
+
+        var (model, source, schema) = context.Value!;
+        var compiler = new QueryCompiler(
+            source.Dialect ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."),
+            timeProvider);
+
+        CompiledQuery compiled;
+        try
+        {
+            var prepared = compiler.PrepareUnderlying(spec, model.Definition, schema, options.Limits);
+            var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
+            compiled = compiler.EmitUnderlying(prepared, rowFilters, rowCap);
+        }
+        catch (QueryCompilationException ex)
+        {
+            return ServiceResult<(QueryOutcome, string)>.Fail(
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+        }
+        catch (RowFilterDeniedException ex)
+        {
+            return ServiceResult<(QueryOutcome, string)>.Fail(
+                ServiceErrorKind.Forbidden, "rcd.query.denied_by_scope", ex.Message);
+        }
+
+        var outcome = await ExecuteAsync(spec, model, source, compiled, ct, distinctLimit: rowCap);
+        return outcome.Succeeded
+            ? ServiceResult<(QueryOutcome, string)>.Ok((outcome.Value!, model.Name))
+            : ServiceResult<(QueryOutcome, string)>.Fail(outcome.Error!);
     }
 
     public async Task<ServiceResult<DistinctValuesResult>> GetDistinctValuesAsync(

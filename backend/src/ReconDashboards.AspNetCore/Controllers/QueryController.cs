@@ -51,6 +51,35 @@ public sealed class QueryController(
         return result.Succeeded ? new CsvExportResult(result.Value!) : FromError(result.Error!);
     }
 
+    /// <summary>
+    /// JSON "underlying data" of a chart query — the anchor table's raw rows
+    /// (every physical column, no aggregation) with the spec's filters applied.
+    /// Same auth policy, rate limiting, model visibility, fail-closed row-level
+    /// scoping, and read-only/timeout execution path as the underlying export
+    /// mode; the response reuses the /query result shape (columns/rows/meta,
+    /// truncation in meta.truncated). maxRows defaults to 1000 and clamps to
+    /// [1, 10000]. The spec's `having` is ignored — it is a post-aggregation
+    /// concept with no meaning on row-level output.
+    /// </summary>
+    [HttpPost("underlying")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> Underlying([FromBody] UnderlyingRequest request, CancellationToken ct)
+    {
+        if (request.Spec is null)
+        {
+            return BadRequest();
+        }
+
+        var result = await queryService.RunUnderlyingAsync(request.Spec, request.MaxRows, User, ct);
+        if (!result.Succeeded)
+        {
+            return FromError(result.Error!);
+        }
+
+        var includeSql = options.IncludeSqlInResponse && environment.IsDevelopment();
+        return Ok(DtoMapping.ToQueryResponse(result.Value!, includeSql));
+    }
+
     /// <summary>Distinct values for slicer/filter dropdowns (searchable, capped).</summary>
     [HttpPost("values")]
     [RcdPolicySlot(RcdPolicySlot.View)]

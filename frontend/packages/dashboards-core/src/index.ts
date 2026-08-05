@@ -15,6 +15,8 @@ export type {
   ValidationOutcome,
   ExportQueryBody,
   ExportCsvResult,
+  UnderlyingQueryBody,
+  UnderlyingQueryResult,
 } from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';

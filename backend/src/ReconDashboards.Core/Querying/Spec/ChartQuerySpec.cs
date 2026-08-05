@@ -95,6 +95,31 @@ public sealed record SortSpec(SortTarget Target, SortDirection Direction);
 
 public sealed record TopNSpec(int N, int ByMeasureIndex, bool IncludeOthers);
 
+/// <summary>Wire names: "gt", "gte", "lt", "lte", "eq", "neq", "between".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<HavingOperator>))]
+public enum HavingOperator
+{
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Eq,
+    Neq,
+    Between,
+}
+
+/// <summary>
+/// Post-aggregation condition (SQL HAVING) on the measure at
+/// <see cref="MeasureIndex"/> (into <see cref="ChartQuerySpec.Measures"/>).
+/// Conditions are ANDed. Between takes exactly two values (inclusive bounds);
+/// every other operator takes exactly one. The condition targets the RAW
+/// aggregated value of the measure — for a measure with a window
+/// <see cref="MeasureCalcSpec"/> the HAVING applies to the pre-calc base
+/// aggregate (window functions cannot appear in HAVING); for a calculated
+/// (expression) measure the whole expression is repeated in the HAVING clause.
+/// </summary>
+public sealed record HavingSpec(int MeasureIndex, HavingOperator Operator, IReadOnlyList<double> Values);
+
 /// <summary>
 /// Offset (wire "offset") skips rows of the FINAL select — after ORDER BY,
 /// before LIMIT — for server-side table pagination. Negative values clamp to 0;
@@ -102,6 +127,10 @@ public sealed record TopNSpec(int N, int ByMeasureIndex, bool IncludeOthers);
 /// explicit sort is allowed: the engine's default deterministic ordering still
 /// applies when dimensions exist, and any residual nondeterminism (e.g. a
 /// no-dimension query) is on the caller.
+/// Having (wire "having") filters grouped rows post-aggregation; with zero
+/// dimensions it applies to the single global aggregate row (alert-style
+/// specs). Only the aggregate pipeline honors it — row-level ("underlying")
+/// exports ignore it.
 /// </summary>
 public sealed record ChartQuerySpec(
     int ModelId,
@@ -111,7 +140,8 @@ public sealed record ChartQuerySpec(
     IReadOnlyList<SortSpec> Sort,
     TopNSpec? TopN,
     int? Limit,
-    int? Offset = null);
+    int? Offset = null,
+    IReadOnlyList<HavingSpec>? Having = null);
 
 /// <summary>
 /// CSV export mode: "summarized" runs the normal aggregate pipeline (including

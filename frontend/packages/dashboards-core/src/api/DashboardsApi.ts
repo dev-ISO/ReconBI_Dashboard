@@ -2,9 +2,11 @@ import type { RcdFetcher } from './fetcher';
 import type { Catalog, ConnectionInfo } from '../types/schema';
 import type { ModelDefinition, ModelDetail, ModelSummary } from '../types/model';
 import type {
+  CellValue,
   ChartQuerySpec,
   DistinctValuesResult,
   DistinctValuesSpec,
+  QueryColumn,
   QueryResult,
 } from '../types/query';
 import type {
@@ -54,6 +56,20 @@ export interface ExportCsvResult {
   blob: Blob;
   /** True when the server capped the row count (X-Rcd-Truncated header). */
   truncated: boolean;
+}
+
+/** Body of POST /query/underlying (raw source rows behind an aggregate). */
+export interface UnderlyingQueryBody {
+  spec: ChartQuerySpec;
+  /** Server default 1000. */
+  maxRows?: number;
+}
+
+/** JSON result of POST /query/underlying. */
+export interface UnderlyingQueryResult {
+  columns: QueryColumn[];
+  rows: CellValue[][];
+  meta: { rowCount: number; truncated: boolean };
 }
 
 /** Typed client over the api/rcd/v1 surface. baseUrl has no trailing slash. */
@@ -114,6 +130,14 @@ export class DashboardsApi {
 
   getDistinctValues(spec: DistinctValuesSpec, signal?: AbortSignal): Promise<DistinctValuesResult> {
     return this.fetcher(this.url('/query/values'), { method: 'POST', body: spec, signal });
+  }
+
+  /**
+   * Raw source rows behind an aggregate (the spec's filters apply; dimensions/
+   * measures are ignored server-side). Same auth/RLS as /query/export.
+   */
+  queryUnderlying(body: UnderlyingQueryBody, signal?: AbortSignal): Promise<UnderlyingQueryResult> {
+    return this.fetcher(this.url('/query/underlying'), { method: 'POST', body, signal });
   }
 
   /**

@@ -137,16 +137,23 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
             </RcdButton>
           </div>
         ) : list.length === 0 ? (
-          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center">
-            <LayoutDashboard size={32} className="text-rcd-muted" />
-            <p className="text-sm text-rcd-text-2">No dashboards yet.</p>
+          <div className="flex flex-1 flex-col items-center justify-center gap-4 text-center">
+            <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--rcd-accent)_10%,transparent)]">
+              <LayoutDashboard size={28} className="text-rcd-accent" />
+            </span>
+            <div className="flex flex-col gap-1">
+              <p className="text-sm font-medium text-rcd-text">No dashboards yet</p>
+              <p className="text-sm text-rcd-muted">
+                Create one, attach a model, and start dropping in charts.
+              </p>
+            </div>
             <RcdButton variant="primary" onClick={openCreate}>
               <Plus size={14} />
               Create your first dashboard
             </RcdButton>
           </div>
         ) : (
-          <div className="overflow-hidden rounded-lg border border-rcd-border bg-rcd-surface">
+          <div className="rcd-card overflow-hidden">
             <div className="overflow-x-auto">
               <table className="w-full border-collapse text-sm">
                 <thead>

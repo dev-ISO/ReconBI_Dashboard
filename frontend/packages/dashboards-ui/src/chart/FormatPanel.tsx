@@ -171,6 +171,52 @@ function CheckboxRow({
   );
 }
 
+/** Compact pill button group; matches the Left/Right axis-assignment look. */
+function SegmentedRow<T extends string>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: ReadonlyArray<{ value: T; label: string }>;
+  value: T;
+  onChange: (next: T) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+      <span className="min-w-0 flex-1 truncate" title={label}>
+        {label}
+      </span>
+      <div
+        role="group"
+        aria-label={label}
+        className="flex shrink-0 overflow-hidden rounded-md border border-rcd-border"
+      >
+        {options.map((option) => {
+          const active = option.value === value;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              aria-pressed={active}
+              aria-label={`${label}: ${option.label}`}
+              className={`px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                active
+                  ? 'bg-rcd-accent text-white'
+                  : 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
+              }`}
+              onClick={() => onChange(option.value)}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** Label + clamped integer input; empty clears back to the (theme) default. */
 function NumberRow({
   label,
@@ -1259,8 +1305,58 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.pageSize != null) next.pageSize = merged.pageSize;
     if (merged.stripes) next.stripes = true;
     if (merged.sortable === false) next.sortable = false;
+    if (merged.filterable === false) next.filterable = false;
+    if (merged.headerAlign !== undefined && merged.headerAlign !== 'center') {
+      next.headerAlign = merged.headerAlign;
+    }
+    if (merged.columnAlign && Object.keys(merged.columnAlign).length > 0) {
+      next.columnAlign = merged.columnAlign;
+    }
+    if (merged.verticalAlign === 'top') next.verticalAlign = 'top';
+    if (merged.borders !== undefined && merged.borders !== 'rows') next.borders = merged.borders;
+    if (merged.borderColor != null) next.borderColor = merged.borderColor;
+    if (merged.headerBackground != null) next.headerBackground = merged.headerBackground;
+    if (merged.headerColor != null) next.headerColor = merged.headerColor;
+    if (merged.headerBold === false) next.headerBold = false;
+    if (merged.density !== undefined && merged.density !== 'normal') next.density = merged.density;
+    if (merged.fontSize !== undefined) next.fontSize = merged.fontSize;
     patch({ table: Object.keys(next).length > 0 ? next : undefined });
   };
+
+  /** Auto (undefined) removes the key; the map itself drops via setTable's prune. */
+  const setColumnAlign = (key: string, align: 'left' | 'center' | 'right' | undefined) => {
+    const next = { ...format.table?.columnAlign };
+    if (align) next[key] = align;
+    else delete next[key];
+    setTable({ columnAlign: next });
+  };
+
+  // Table result columns for the per-column alignment editor. columnAlign is
+  // keyed by result column NAME, and toWireSpec emits names positionally:
+  // dimensions [axis, legend, smallMultiples] -> dim0..dimN, then measures ->
+  // meas0..measN — the same names TableChart keys columnWidths/columnAlign by.
+  const tableColumns: { key: string; label: string }[] = [];
+  if (spec.type === 'table') {
+    const dims = [spec.query.axis, spec.query.legend, spec.query.smallMultiples].filter(
+      (dim): dim is NonNullable<typeof dim> => dim != null,
+    );
+    dims.forEach((dim, index) => {
+      tableColumns.push({
+        key: `dim${index}`,
+        label: dim.dateBucket ? `${dim.column} (${dim.dateBucket})` : dim.column,
+      });
+    });
+    spec.query.measures.forEach((measure, index) => {
+      // Display only: alias > seriesKeys (measure display names when there is
+      // no legend split) > raw column; renames via seriesLabels still apply.
+      const base =
+        measure.alias ??
+        (spec.query.legend == null ? seriesKeys[index] : undefined) ??
+        measure.column ??
+        `Measure ${index + 1}`;
+      tableColumns.push({ key: `meas${index}`, label: format.seriesLabels?.[base] ?? base });
+    });
+  }
 
   /** Merge + prune: drops every default-valued field, then the object itself. */
   const setContainer = (partial: Partial<ContainerStyle>) => {
@@ -1928,6 +2024,121 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
 
       {spec.type === 'table' && (
         <CollapsibleSection title="Table" {...sectionProps('table')}>
+          <h4 className={SUBHEAD_CLASS}>Structure</h4>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Borders
+            <RcdSelect
+              aria-label="Table borders"
+              className="w-32 shrink-0"
+              value={format.table?.borders ?? 'rows'}
+              onChange={(event) =>
+                setTable({ borders: event.target.value as NonNullable<TableOptions['borders']> })
+              }
+            >
+              <option value="none">None</option>
+              <option value="rows">Rows</option>
+              <option value="columns">Columns</option>
+              <option value="grid">Grid</option>
+            </RcdSelect>
+          </label>
+          {(format.table?.borders ?? 'rows') !== 'none' && (
+            <ColorRow
+              label="Border color"
+              value={format.table?.borderColor}
+              fallback="#d1d5db"
+              onChange={(next) => setTable({ borderColor: next })}
+            />
+          )}
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Density
+            <RcdSelect
+              aria-label="Table row density"
+              className="w-32 shrink-0"
+              value={format.table?.density ?? 'normal'}
+              onChange={(event) =>
+                setTable({ density: event.target.value as NonNullable<TableOptions['density']> })
+              }
+            >
+              <option value="compact">Compact</option>
+              <option value="normal">Normal</option>
+              <option value="relaxed">Relaxed</option>
+            </RcdSelect>
+          </label>
+          <NumberRow
+            label="Body font size"
+            min={8}
+            max={32}
+            placeholder="theme"
+            value={format.table?.fontSize}
+            onChange={(next) => setTable({ fontSize: next })}
+          />
+          <SegmentedRow
+            label="Vertical align"
+            options={[
+              { value: 'top', label: 'Top' },
+              { value: 'middle', label: 'Middle' },
+            ]}
+            value={format.table?.verticalAlign ?? 'middle'}
+            onChange={(next) => setTable({ verticalAlign: next })}
+          />
+
+          <h4 className={SUBHEAD_CLASS}>Header</h4>
+          <SegmentedRow
+            label="Alignment"
+            options={[
+              { value: 'left', label: 'Left' },
+              { value: 'center', label: 'Center' },
+              { value: 'right', label: 'Right' },
+            ]}
+            value={format.table?.headerAlign ?? 'center'}
+            onChange={(next) => setTable({ headerAlign: next })}
+          />
+          <CheckboxRow
+            label="Bold header text"
+            checked={format.table?.headerBold ?? true}
+            onChange={(checked) => setTable({ headerBold: checked ? undefined : false })}
+          />
+          <ColorRow
+            label="Header background"
+            value={format.table?.headerBackground}
+            fallback="#f3f4f6"
+            onChange={(next) => setTable({ headerBackground: next })}
+          />
+          <ColorRow
+            label="Header text"
+            value={format.table?.headerColor}
+            fallback={TEXT_SWATCH}
+            onChange={(next) => setTable({ headerColor: next })}
+          />
+
+          <h4 className={SUBHEAD_CLASS}>Columns</h4>
+          {tableColumns.length === 0 ? (
+            <p className="text-xs text-rcd-muted">
+              Add rows or values to align individual columns.
+            </p>
+          ) : (
+            <>
+              {tableColumns.map(({ key, label }) => (
+                <SegmentedRow
+                  key={key}
+                  label={label}
+                  options={[
+                    { value: 'auto', label: 'Auto' },
+                    { value: 'left', label: 'L' },
+                    { value: 'center', label: 'C' },
+                    { value: 'right', label: 'R' },
+                  ]}
+                  value={format.table?.columnAlign?.[key] ?? 'auto'}
+                  onChange={(next) => setColumnAlign(key, next === 'auto' ? undefined : next)}
+                />
+              ))}
+              <p className="text-xs text-rcd-muted">
+                Auto aligns numbers right and text left.
+              </p>
+            </>
+          )}
+
+          <h4 className={SUBHEAD_CLASS}>Behavior</h4>
           <CheckboxRow
             label="Totals row"
             checked={format.table?.totals ?? false}
@@ -1989,6 +2200,14 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             checked={format.table?.sortable ?? true}
             onChange={(checked) => setTable({ sortable: checked ? undefined : false })}
           />
+          <CheckboxRow
+            label="Column filter menus"
+            checked={format.table?.filterable ?? true}
+            onChange={(checked) => setTable({ filterable: checked ? undefined : false })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Excel-style filter and sort menus in each column header.
+          </p>
           <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
             Pinned columns
             <RcdSelect

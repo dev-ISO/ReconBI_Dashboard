@@ -3,6 +3,7 @@ using System.Text.Json.Serialization;
 using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Querying.Compilation;
 using ReconDashboards.Core.Querying.Execution;
+using ReconDashboards.Core.Querying.Spec;
 using ReconDashboards.Core.Schema;
 using ReconDashboards.Core.Services;
 
@@ -129,6 +130,9 @@ public sealed record SaveDashboardRequest(
     JsonElement Layout,
     bool IsShared = false,
     DateTime? ExpectedUpdatedAtUtc = null);
+
+/// <summary>POST /query/underlying body. MaxRows defaults to 1000 and clamps to [1, 10000].</summary>
+public sealed record UnderlyingRequest(ChartQuerySpec Spec, int? MaxRows = null);
 
 public sealed record QueryColumnDto(
     string Name,

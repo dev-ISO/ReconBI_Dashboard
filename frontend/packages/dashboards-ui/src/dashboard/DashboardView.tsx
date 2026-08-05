@@ -51,6 +51,7 @@ import {
 } from './PointContextMenu';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
 import { relativePresetClause } from './relativeDate';
+import { SeeDataDialog, type SeeDataRequest } from './SeeDataDialog';
 import { SlicerTile } from './SlicerTile';
 import { SubscriptionsDialog } from './SubscriptionsDialog';
 import { TextTile } from './TextTile';
@@ -169,6 +170,17 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     chart: ChartSpec;
     event: ChartPointEvent;
   } | null>(null);
+  /**
+   * Chart-LEVEL right-click menu (view mode): opens when the right-click hit
+   * no chart point (KPIs, empty plot areas) so every tile has a menu.
+   */
+  const [tileMenu, setTileMenu] = useState<{
+    tileId: string;
+    chart: ChartSpec;
+    position: { x: number; y: number };
+  } | null>(null);
+  /** "See data" dialog: aggregated result or a point's underlying records. */
+  const [seeData, setSeeData] = useState<SeeDataRequest | null>(null);
   /** Transient toolbar-area notice (export failures / truncation). */
   const [notice, setNotice] = useState<string | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
@@ -361,9 +373,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       const chart = effective?.chart ?? (tile && isChartTile(tile) ? tile.chart : null);
       if (!chart || !isRunnable(chart)) return;
       const clauses = effective?.filters ?? runtime.dashboards.filtersForTile(tileId);
+      // Table measure-column filters (HAVING) ride the exported spec too, so
+      // the CSV matches exactly what the filtered table shows.
+      const having = effective?.having ?? null;
+      const wire = toWireSpec(chart, state.current.modelId, clauses);
       try {
         const { blob, truncated } = await runtime.api.exportQueryCsv({
-          spec: toWireSpec(chart, state.current.modelId, clauses),
+          spec: having !== null && having.length > 0 ? { ...wire, having } : wire,
           mode,
         });
         const url = URL.createObjectURL(blob);
@@ -474,6 +490,85 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     },
     [runtime],
   );
+
+  /**
+   * "See data": the tile's CURRENT aggregated result (effective spec +
+   * merged filters + table HAVING) rendered as a real table in a dialog.
+   */
+  const openSeeData = useCallback(
+    (tileId: string, chart: ChartSpec) => {
+      if (!isRunnable(chart)) return;
+      const effective = effectiveByTile.current.get(tileId);
+      setSeeData({
+        kind: 'aggregated',
+        tileId,
+        chart,
+        filters: effective?.filters ?? runtime.dashboards.filtersForTile(tileId),
+        having: effective?.having ?? null,
+      });
+    },
+    [runtime],
+  );
+
+  /**
+   * "See records for <point>": UNDERLYING source rows behind the clicked
+   * point — the tile's effective filters plus one eq/isNull clause per
+   * dimension value the point carries (axis, legend, small multiples).
+   */
+  const openSeeRecords = useCallback(() => {
+    if (!pointMenu) return;
+    const state = runtime.dashboards.store.getState();
+    if (state.current?.modelId == null) return;
+    const { tileId, chart, event } = pointMenu;
+    const effective = effectiveByTile.current.get(tileId);
+    const clauses = [...(effective?.filters ?? runtime.dashboards.filtersForTile(tileId))];
+    const pointDims = [
+      { dim: chart.query.axis ?? null, value: event.axisValue },
+      { dim: chart.query.legend ?? null, value: event.legendValue },
+      { dim: chart.query.smallMultiples ?? null, value: event.smallMultipleValue },
+    ];
+    for (const { dim, value } of pointDims) {
+      if (!dim || value === undefined) continue;
+      clauses.push(
+        value === null
+          ? { table: dim.table, column: dim.column, operator: 'isNull', values: [] }
+          : {
+              table: dim.table,
+              column: dim.column,
+              operator: 'eq',
+              values: [value as string | number | boolean],
+            },
+      );
+    }
+    const label =
+      [event.axisLabel, event.legendLabel].filter((part) => part && part !== '').join(' · ') ||
+      chart.title;
+    setSeeData({
+      kind: 'underlying',
+      tileId,
+      title: chart.title,
+      contextLabel: label,
+      spec: toWireSpec(chart, state.current.modelId, clauses),
+    });
+  }, [pointMenu, runtime]);
+
+  /**
+   * Drill actions for the chart-LEVEL menu: no point context, so only
+   * "Drill up"/"Back to top" apply (and only once the tile is drilled).
+   */
+  const tileMenuDrill = useMemo<PointDrillActions | null>(() => {
+    if (!tileMenu) return null;
+    const drill = effectiveByTile.current.get(tileMenu.tileId)?.drill ?? null;
+    if (!drill || drill.level === 0) return null;
+    return {
+      canDrillDeeper: false,
+      level: drill.level,
+      pointLabel: '',
+      onDrillDown: () => {},
+      onDrillUp: drill.drillUp,
+      onDrillReset: drill.resetDrill,
+    };
+  }, [tileMenu]);
 
   /** Chart tiles by title for the slicer config menus' "Applies to" list. */
   const chartTileInfos = useMemo(
@@ -807,6 +902,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         onCrossFilter={(effectiveChart, info) => handleDatumClick(tile.id, effectiveChart, info)}
         onLegendSelect={(effectiveChart, e) => handleLegendSelect(tile.id, effectiveChart, e)}
         onPointMenu={editable ? undefined : setPointMenu}
+        // Whole-tile right-click (view mode): chart-level menu whenever the
+        // click hit no chart point — every chart type incl. KPI gets a menu.
+        onChartMenu={editable ? undefined : setTileMenu}
         reportEffective={reportEffective}
       />
     );
@@ -968,11 +1066,18 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           }`}
         >
           {tiles.length === 0 ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-              <LayoutDashboard size={32} className="text-rcd-muted" />
+            <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
+              <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--rcd-accent)_10%,transparent)]">
+                <LayoutDashboard size={28} className="text-rcd-accent" />
+              </span>
               {editable ? (
                 <>
-                  <p className="text-sm text-rcd-text-2">Nothing here yet.</p>
+                  <div className="flex flex-col gap-1">
+                    <p className="text-sm font-medium text-rcd-text">Nothing here yet</p>
+                    <p className="text-sm text-rcd-muted">
+                      Add a chart, then arrange tiles by dragging their title bars.
+                    </p>
+                  </div>
                   <RcdButton variant="primary" onClick={openAddChart}>
                     <Plus size={14} />
                     Add your first chart
@@ -1081,6 +1186,11 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               onDrillthrough={(target) =>
                 runtime.dashboards.startDrillthrough(target.pageId, target.filters, target.label)
               }
+              seeRecords={
+                modelId !== null
+                  ? { label: pointMenu.event.axisLabel, onClick: openSeeRecords }
+                  : null
+              }
               onSetAlert={
                 !readonly && modelId !== null && pointMenu.chart.query.measures.length > 0
                   ? () => openAlertFor(pointMenu.tileId, pointMenu.chart)
@@ -1092,6 +1202,42 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           </div>,
           document.body,
         )}
+
+      {tileMenu &&
+        // Chart-LEVEL menu (view mode): same card + portal doctrine as the
+        // point menu, shown when the right-click hit no chart point.
+        createPortal(
+          <div className="rcd-root bg-transparent">
+            <PointContextMenu
+              title={tileMenu.chart.title}
+              position={tileMenu.position}
+              drillthroughTargets={[]}
+              drill={tileMenuDrill}
+              onDrillthrough={() => {}}
+              onSeeData={
+                isRunnable(tileMenu.chart)
+                  ? () => openSeeData(tileMenu.tileId, tileMenu.chart)
+                  : null
+              }
+              onSetAlert={
+                !readonly && modelId !== null && tileMenu.chart.query.measures.length > 0
+                  ? () => openAlertFor(tileMenu.tileId, tileMenu.chart)
+                  : null
+              }
+              onExport={(exportMode) => void exportChartCsv(tileMenu.tileId, exportMode)}
+              onClose={() => setTileMenu(null)}
+            />
+          </div>,
+          document.body,
+        )}
+
+      <SeeDataDialog
+        request={seeData}
+        modelId={modelId}
+        onClose={() => setSeeData(null)}
+        onExportSummarized={(tileId) => void exportChartCsv(tileId, 'summarized')}
+        onNotice={setNotice}
+      />
 
       <RcdDialog
         title={builder?.tileId ? 'Edit chart' : 'Add chart'}

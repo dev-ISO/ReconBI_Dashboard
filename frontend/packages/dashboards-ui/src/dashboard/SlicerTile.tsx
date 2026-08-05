@@ -377,7 +377,7 @@ function DropdownSlicer({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1 w-72 max-w-[80vw] rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-lg">
+        <div className="absolute left-0 top-full z-40 mt-1 w-72 max-w-[80vw] rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]">
           <DistinctValueList
             modelId={modelId}
             table={spec.table}
@@ -640,7 +640,7 @@ function MultiValuePopover({
       role="dialog"
       aria-label={`Select ${spec.label} values`}
       style={{ left: pos?.x ?? 0, top: pos?.y ?? 0, visibility: pos ? undefined : 'hidden' }}
-      className="fixed z-50 flex max-h-80 w-72 max-w-[92vw] flex-col rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-lg"
+      className="fixed z-50 flex max-h-80 w-72 max-w-[92vw] flex-col rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]"
     >
       <div className="relative shrink-0">
         <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-rcd-muted" />

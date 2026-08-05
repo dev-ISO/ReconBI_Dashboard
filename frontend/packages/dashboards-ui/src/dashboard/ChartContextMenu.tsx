@@ -81,7 +81,7 @@ export function ChartContextMenu({
         aria-label={`Actions for ${title}`}
         style={{ left: pos.x, top: pos.y }}
         onContextMenu={(event) => event.preventDefault()}
-        className="fixed z-50 flex w-44 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        className="fixed z-50 flex w-44 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
       >
         <MenuItem
           icon={Paintbrush}

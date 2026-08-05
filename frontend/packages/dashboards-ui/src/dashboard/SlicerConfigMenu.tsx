@@ -141,7 +141,7 @@ export function SlicerConfigMenu({
         aria-label={`Configure slicer ${spec.label}`}
         style={{ left: pos.x, top: pos.y }}
         onContextMenu={(event) => event.preventDefault()}
-        className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
       >
         {editable ? (
           <>

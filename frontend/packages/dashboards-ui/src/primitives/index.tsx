@@ -16,12 +16,18 @@ import { X } from 'lucide-react';
 
 type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 
+/** Shared accent focus ring for every interactive control (keyboard only). */
+const FOCUS_RING =
+  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rcd-accent focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--rcd-bg)]';
+
 const buttonClasses: Record<ButtonVariant, string> = {
-  primary: 'bg-rcd-accent text-white hover:opacity-90 disabled:opacity-50',
+  primary:
+    'bg-rcd-accent text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90 disabled:opacity-50 disabled:shadow-none',
   secondary:
-    'border border-rcd-border bg-rcd-surface text-rcd-text hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50',
+    'border border-rcd-border bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)] hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 disabled:shadow-none',
   ghost: 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40',
-  danger: 'bg-[var(--rcd-status-critical)] text-white hover:opacity-90 disabled:opacity-50',
+  danger:
+    'bg-[var(--rcd-status-critical)] text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90 disabled:opacity-50 disabled:shadow-none',
 };
 
 export interface RcdButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
@@ -32,7 +38,7 @@ export function RcdButton({ variant = 'secondary', className = '', type = 'butto
   return (
     <button
       type={type}
-      className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${buttonClasses[variant]} ${className}`}
+      className={`inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-sm font-medium transition-colors ${FOCUS_RING} ${buttonClasses[variant]} ${className}`}
       {...rest}
     />
   );
@@ -42,7 +48,7 @@ export function RcdIconButton({ className = '', type = 'button', ...rest }: Butt
   return (
     <button
       type={type}
-      className={`rounded-md p-1.5 text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10 disabled:opacity-40 ${className}`}
+      className={`rounded-md p-1.5 text-rcd-text-2 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10 disabled:opacity-40 ${FOCUS_RING} ${className}`}
       {...rest}
     />
   );
@@ -51,7 +57,7 @@ export function RcdIconButton({ className = '', type = 'button', ...rest }: Butt
 export function RcdInput({ className = '', ...rest }: InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
-      className={`rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent ${className}`}
+      className={`h-8 rounded-md border border-rcd-border bg-rcd-surface px-2.5 text-sm text-rcd-text outline-none transition-[border-color,box-shadow] duration-150 focus:border-rcd-accent focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent)_25%,transparent)] ${className}`}
       {...rest}
     />
   );
@@ -60,7 +66,7 @@ export function RcdInput({ className = '', ...rest }: InputHTMLAttributes<HTMLIn
 export function RcdSelect({ className = '', ...rest }: SelectHTMLAttributes<HTMLSelectElement>) {
   return (
     <select
-      className={`rounded-md border border-rcd-border bg-rcd-surface px-2 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent ${className}`}
+      className={`h-8 rounded-md border border-rcd-border bg-rcd-surface px-2 text-sm text-rcd-text outline-none transition-[border-color,box-shadow] duration-150 focus:border-rcd-accent focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent)_25%,transparent)] ${className}`}
       {...rest}
     />
   );
@@ -267,7 +273,7 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} aria-hidden />
+      <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} aria-hidden />
       <div
         ref={panelRef}
         role="dialog"
@@ -275,7 +281,7 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
         aria-label={title}
         tabIndex={-1}
         style={panelStyle}
-        className={`relative z-10 flex max-h-[85vh] ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-lg border border-rcd-border bg-rcd-surface shadow-xl outline-none`}
+        className={`relative z-10 flex max-h-[85vh] ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-[10px] border border-rcd-border bg-rcd-surface shadow-[var(--rcd-shadow-2)] outline-none`}
       >
         <div
           className={`flex items-center justify-between border-b border-rcd-border px-4 py-3 ${

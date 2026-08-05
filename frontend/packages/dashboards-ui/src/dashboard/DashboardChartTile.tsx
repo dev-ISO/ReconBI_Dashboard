@@ -1,22 +1,33 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
 import { ArrowDown, ArrowUp, ChevronsDown, CornerUpLeft } from 'lucide-react';
 import {
   stableStringify,
   toWireSpec,
+  type CellValue,
   type ChartPointEvent,
   type ChartSpec,
   type DashboardParameter,
   type DimensionRef,
   type FilterClause,
   type FilterValue,
+  type QueryColumn,
   type QueryResult,
   type SortSpec,
 } from '@recon/dashboards-core';
 import {
   ChartTile,
+  type ChartHavingClause,
   type ChartLegendSelectEvent,
   type ChartTableLayoutPatch,
   type ChartTableSort,
+  type TableColumnFilter,
 } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
@@ -47,6 +58,86 @@ interface TileTableState {
 
 const TABLE_ROOT: TileTableState = { sort: null, page: 0 };
 
+const NO_TABLE_FILTERS: TableColumnFilter[] = [];
+
+/** A chart's dimensions in wire order [axis, legend, smallMultiples] (mirrors toWireSpec). */
+const wireDimensionsOf = (chart: ChartSpec): DimensionRef[] => {
+  const dims: DimensionRef[] = [];
+  if (chart.query.axis) dims.push(chart.query.axis);
+  if (chart.query.legend) dims.push(chart.query.legend);
+  if (chart.query.smallMultiples) dims.push(chart.query.smallMultiples);
+  return dims;
+};
+
+type HavingOperator = ChartHavingClause['operator'];
+
+/** Table-filter condition operators expressible as wire HAVING conditions. */
+const HAVING_OPERATORS: ReadonlySet<string> = new Set([
+  'eq',
+  'neq',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'between',
+]);
+
+/**
+ * Translates the renderer's per-column header filters into wire terms, mapped
+ * through the RESULT columns onto the effective spec:
+ * - DIMENSION columns -> FilterClauses ('values' -> in, null-only -> isNull;
+ *   conditions map 1:1 onto FilterOperators, 'between' takes two values);
+ * - MEASURE columns -> HAVING entries {measureIndex, operator, values}
+ *   (numeric conditions only — contains/startsWith and value lists have no
+ *   post-aggregation wire form and are dropped).
+ */
+const translateTableFilters = (
+  list: TableColumnFilter[],
+  columns: QueryColumn[] | undefined,
+  dims: DimensionRef[],
+): { clauses: FilterClause[]; having: ChartHavingClause[] } => {
+  const clauses: FilterClause[] = [];
+  const having: ChartHavingClause[] = [];
+  if (!columns || list.length === 0) return { clauses, having };
+  const dimNames = columns.filter((c) => c.role === 'dimension').map((c) => c.name);
+  const measureNames = columns.filter((c) => c.role === 'measure').map((c) => c.name);
+  for (const filter of list) {
+    const dimIndex = dimNames.indexOf(filter.column);
+    if (dimIndex !== -1) {
+      const dim = dims[dimIndex];
+      if (!dim) continue;
+      if (filter.kind === 'values') {
+        const nonNull = filter.values.filter((v): v is FilterValue => v !== null);
+        if (nonNull.length === 0 && filter.values.length > 0) {
+          // Only the blank entry checked: keep exactly the null rows.
+          clauses.push({ table: dim.table, column: dim.column, operator: 'isNull', values: [] });
+        } else if (nonNull.length > 0) {
+          clauses.push({ table: dim.table, column: dim.column, operator: 'in', values: nonNull });
+        }
+      } else {
+        const values =
+          filter.operator === 'between' ? filter.values.slice(0, 2) : filter.values;
+        clauses.push({ table: dim.table, column: dim.column, operator: filter.operator, values });
+      }
+      continue;
+    }
+    const measureIndex = measureNames.indexOf(filter.column);
+    if (measureIndex === -1 || filter.kind !== 'condition') continue;
+    if (!HAVING_OPERATORS.has(filter.operator)) continue;
+    const numbers = filter.values
+      .map((v) => (typeof v === 'number' ? v : Number(v)))
+      .filter((n) => Number.isFinite(n));
+    const needed = filter.operator === 'between' ? 2 : 1;
+    if (numbers.length < needed) continue;
+    having.push({
+      measureIndex,
+      operator: filter.operator as HavingOperator,
+      values: filter.operator === 'between' ? numbers.slice(0, 2) : numbers.slice(0, 1),
+    });
+  }
+  return { clauses, having };
+};
+
 /** Drill operations the point context menu drives (exposed via reportEffective). */
 export interface TileDrillApi {
   /** True when the chart has a hierarchy and a deeper level exists. */
@@ -64,8 +155,12 @@ export interface TileDrillApi {
 export interface TileEffectiveState {
   /** Effective (param-substituted + drilled) chart spec. */
   chart: ChartSpec;
-  /** Dashboard-level filters merged into the tile's fetch. */
+  /** Dashboard-level filters merged into the tile's fetch (incl. any table
+   *  dimension-column filters). */
   filters: FilterClause[];
+  /** Post-aggregation measure conditions (table measure-column filters);
+   *  merged into wire specs built from this state (CSV export). */
+  having?: ChartHavingClause[];
   /** Drill runtime for the point context menu; null = no hierarchy. */
   drill: TileDrillApi | null;
 }
@@ -104,6 +199,16 @@ export interface DashboardChartTileProps {
   onLegendSelect: (chart: ChartSpec, e: ChartLegendSelectEvent | null) => void;
   /** Point right-click (view mode): the EFFECTIVE chart + point payload. */
   onPointMenu?: (payload: { tileId: string; chart: ChartSpec; event: ChartPointEvent }) => void;
+  /**
+   * View-mode right-click anywhere on the tile that did NOT hit a chart point
+   * (KPIs, empty plot area, headers): opens the chart-level context menu with
+   * the EFFECTIVE chart. Every chart type gets a menu through this.
+   */
+  onChartMenu?: (payload: {
+    tileId: string;
+    chart: ChartSpec;
+    position: { x: number; y: number };
+  }) => void;
   /**
    * Ref-style report of what this tile is CURRENTLY showing (effective spec +
    * filters + drill runtime) — the export menus build the exact wire spec from
@@ -169,6 +274,7 @@ export function DashboardChartTile({
   onCrossFilter,
   onLegendSelect,
   onPointMenu,
+  onChartMenu,
   reportEffective,
 }: DashboardChartTileProps) {
   const runtime = useRuntime();
@@ -284,17 +390,22 @@ export function DashboardChartTile({
     : null;
 
   const [tableState, setTableState] = useState<TileTableState>(TABLE_ROOT);
+  /** Transient Excel-style per-column header filters (renderer contract). */
+  const [tableFilters, setTableFilters] = useState<TableColumnFilter[]>(NO_TABLE_FILTERS);
   /** View-mode column width/order tweaks (edit mode persists to the doc). */
   const [tableLayoutOverride, setTableLayoutOverride] = useState<ChartTableLayoutPatch | null>(null);
 
-  // Sort/page reset whenever the EFFECTIVE query identity changes — drill
-  // level/path, drillthrough/slicer/cross-filter clauses, parameter swaps.
+  // Sort/page/column-filter reset whenever the EFFECTIVE query identity
+  // changes — drill level/path, drillthrough/slicer/cross-filter clauses,
+  // parameter swaps. (Deliberately keyed on the DASHBOARD filters, not the
+  // table's own translated clauses — a header filter must not reset itself.)
   const identityKey = useMemo(
     () => stableStringify({ query: drilledChart.query, filters }),
     [drilledChart.query, filters],
   );
   useEffect(() => {
     setTableState(TABLE_ROOT);
+    setTableFilters(NO_TABLE_FILTERS);
   }, [identityKey]);
 
   /** Freshest rendered result (ref assignment from ChartTile — no re-renders). */
@@ -329,6 +440,73 @@ export function DashboardChartTile({
   const handleTablePageChange = useCallback((page: number) => {
     setTableState((prev) => ({ ...prev, page: Math.max(0, page) }));
   }, []);
+
+  /* --------------------------------------------- table column filters */
+
+  // Translate-on-fetch: header filters map through the freshest result's
+  // column names onto the effective spec — dimension columns to FilterClauses,
+  // measure columns to wire HAVING entries.
+  const { clauses: tableFilterClauses, having: tableHaving } = useMemo(
+    () =>
+      translateTableFilters(
+        tableFilters,
+        lastResultRef.current?.columns,
+        wireDimensionsOf(drilledChart),
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- columns are read from a ref
+    [tableFilters, drilledChart],
+  );
+
+  /** Dashboard filters + table dimension-column filters — the tile's fetch set. */
+  const mergedFilters = useMemo(
+    () => (tableFilterClauses.length === 0 ? filters : [...filters, ...tableFilterClauses]),
+    [filters, tableFilterClauses],
+  );
+
+  const handleTableFilterChange = useCallback((next: TableColumnFilter[]) => {
+    setTableFilters(next);
+    // A different filter set starts back at the first page.
+    setTableState((prev) => (prev.page === 0 ? prev : { ...prev, page: 0 }));
+  }, []);
+
+  // Fresh inputs read through a ref so the async values callback stays stable.
+  const columnValuesInputRef = useRef({ drilledChart, filters, tableFilters });
+  columnValuesInputRef.current = { drilledChart, filters, tableFilters };
+
+  /**
+   * Distinct values for a column's filter dropdown. Dimension columns run a
+   * /query/values request through the shared cache WITH the tile's current
+   * filters minus that column's own header filter (Excel semantics: the open
+   * menu shows what the OTHER filters leave visible). Measure columns resolve
+   * empty (the renderer offers conditions only there).
+   */
+  const handleRequestColumnValues = useCallback(
+    async (column: string): Promise<CellValue[]> => {
+      if (modelId === null) return [];
+      const inputs = columnValuesInputRef.current;
+      const result = lastResultRef.current;
+      const dims = wireDimensionsOf(inputs.drilledChart);
+      const dimNames = (result?.columns ?? [])
+        .filter((c) => c.role === 'dimension')
+        .map((c) => c.name);
+      const dim = dims[dimNames.indexOf(column)];
+      if (!dim) return [];
+      const others = translateTableFilters(
+        inputs.tableFilters.filter((f) => f.column !== column),
+        result?.columns,
+        dims,
+      );
+      const values = await runtime.queries.distinct({
+        modelId,
+        table: dim.table,
+        column: dim.column,
+        filters: [...inputs.drilledChart.query.filters, ...inputs.filters, ...others.clauses],
+        limit: 1000,
+      });
+      return values.values;
+    },
+    [runtime, modelId],
+  );
 
   const handleTableLayoutChange = useCallback(
     (patch: ChartTableLayoutPatch) => {
@@ -394,7 +572,10 @@ export function DashboardChartTile({
   /* ------------------------------------------------------------ totals row */
 
   // Companion no-dimension query over the SAME measures + filters (incl. the
-  // drill path and every transient dashboard filter), through the query cache.
+  // drill path, every transient dashboard filter, and the table's own
+  // dimension-column filters), through the query cache. HAVING conditions are
+  // deliberately excluded: on a no-dimension query they would gate the single
+  // total row, not re-total the visible groups.
   const totalsSpec = useMemo(() => {
     if (!isTable || tableOptions?.totals !== true || modelId === null) return null;
     if (drilledChart.query.measures.length === 0) return null;
@@ -411,9 +592,9 @@ export function DashboardChartTile({
         },
       },
       modelId,
-      filters,
+      mergedFilters,
     );
-  }, [isTable, tableOptions?.totals, modelId, drilledChart, filters]);
+  }, [isTable, tableOptions?.totals, modelId, drilledChart, mergedFilters]);
 
   const totalsKey = totalsSpec ? runtime.queries.keyFor(totalsSpec) : null;
   const totalsEntry = useQueryCacheState((state) =>
@@ -525,11 +706,55 @@ export function DashboardChartTile({
   // the drill runtime — without extra renders.
   reportEffective(tileId, {
     chart: drilledChart,
-    filters,
+    // Includes the table's dimension-column filters (and having below) so CSV
+    // exports match exactly what the filtered table shows.
+    filters: mergedFilters,
+    ...(tableHaving.length > 0 ? { having: tableHaving } : {}),
     drill: hasHierarchy
       ? { canDrillDeeper, level, drillDownInto: drillDown, drillUp, resetDrill }
       : null,
   });
+
+  /* ------------------------------------------------- context-menu routing */
+
+  /**
+   * View-mode right-click routing: the renderer's point handler (an inner
+   * element) fires FIRST during the same native event's propagation and marks
+   * this flag, so the tile-level handler yields to the point menu. The flag
+   * self-clears on the next macrotask — a renderer that stops propagation can
+   * never strand it into swallowing the NEXT tile-level right-click.
+   */
+  const pointMenuFiredRef = useRef(false);
+  const markPointMenuFired = () => {
+    pointMenuFiredRef.current = true;
+    window.setTimeout(() => {
+      pointMenuFiredRef.current = false;
+    }, 0);
+  };
+
+  // Whole-tile right-click: edit mode keeps the chart config card; view mode
+  // opens the chart-level menu wherever no point menu claimed the click —
+  // KPIs, empty plot areas, and between-point misses all get a menu.
+  const handleTileContextMenu = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (editable) {
+      if (!onTileContextMenu) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onTileContextMenu({ x: event.clientX, y: event.clientY });
+      return;
+    }
+    if (!onChartMenu) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (pointMenuFiredRef.current) return;
+    onChartMenu({
+      tileId,
+      chart: drilledChart,
+      position: { x: event.clientX, y: event.clientY },
+    });
+  };
+
+  const contextMenuActive = editable ? onTileContextMenu !== undefined : onChartMenu !== undefined;
 
   /* -------------------------------------------------------- drill controls */
 
@@ -612,7 +837,7 @@ export function DashboardChartTile({
 
   return (
     <div
-      className={`h-full rounded-lg ${editable && selected ? 'ring-2 ring-rcd-accent' : ''}`}
+      className={`h-full rounded-[10px] ${editable && selected ? 'ring-2 ring-rcd-accent' : ''}`}
       onClick={editable ? onSelect : undefined}
     >
       <TileFrame
@@ -623,15 +848,7 @@ export function DashboardChartTile({
         onEdit={onEdit}
         onDuplicate={onDuplicate}
         onDelete={onDelete}
-        onContextMenu={
-          onTileContextMenu
-            ? (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                onTileContextMenu({ x: event.clientX, y: event.clientY });
-              }
-            : undefined
-        }
+        onContextMenu={contextMenuActive ? handleTileContextMenu : undefined}
       >
         {modelId === null ? (
           <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
@@ -642,8 +859,9 @@ export function DashboardChartTile({
             refreshKey={refreshKey}
             spec={queryChart}
             modelId={modelId}
-            filters={filters}
+            filters={mergedFilters}
             offset={tableOffset}
+            having={tableHaving.length > 0 ? tableHaving : null}
             // Drill mode owns clicks exclusively: on, clicks drill (never
             // cross-filter); off, clicks cross-filter exactly as before.
             onDatumClick={
@@ -652,7 +870,12 @@ export function DashboardChartTile({
             onPointClick={drillMode && canDrillDeeper ? drillDown : undefined}
             onPointContextMenu={
               onPointMenu
-                ? (event) => onPointMenu({ tileId, chart: drilledChart, event })
+                ? (event) => {
+                    // Claim this right-click before it bubbles to the tile
+                    // handler (which would otherwise open the chart-level menu).
+                    markPointMenuFired();
+                    onPointMenu({ tileId, chart: drilledChart, event });
+                  }
                 : undefined
             }
             // Legend clicks are never drill clicks — they cross-filter (or
@@ -671,6 +894,15 @@ export function DashboardChartTile({
             onTablePageChange={pageSize !== null ? handleTablePageChange : undefined}
             totalsRow={totalsRow}
             onTableLayoutChange={isTable ? handleTableLayoutChange : undefined}
+            tableFilters={isTable ? tableFilters : undefined}
+            onTableFilterChange={
+              isTable && tableOptions?.filterable !== false ? handleTableFilterChange : undefined
+            }
+            onRequestColumnValues={
+              isTable && tableOptions?.filterable !== false
+                ? handleRequestColumnValues
+                : undefined
+            }
             onResult={handleResult}
           />
         )}

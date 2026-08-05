@@ -367,7 +367,7 @@ function AddFilterButton({ tables, catalog, catalogStatus, modelReady, onPick }:
         <div
           role="dialog"
           aria-label="Add a filter field"
-          className="absolute right-0 top-full z-40 mt-1 flex w-64 flex-col gap-2 rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-lg"
+          className="absolute right-0 top-full z-40 mt-1 flex w-64 flex-col gap-2 rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]"
         >
           {!modelReady ? (
             <p className="p-1 text-xs text-rcd-muted">Loading the dashboard&apos;s model…</p>

@@ -77,6 +77,15 @@ export interface ChartQuerySpec {
   limit?: number | null;
   /** Row offset (applied after sort, before limit) — table pagination. */
   offset?: number | null;
+  /**
+   * Post-aggregation conditions (SQL HAVING) on measure values, ANDed.
+   * measureIndex targets spec.measures; 'between' takes two values.
+   */
+  having?: {
+    measureIndex: number;
+    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq' | 'between';
+    values: number[];
+  }[];
 }
 
 export interface QueryColumn {

@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -24,6 +25,7 @@ import {
   Scatter,
   ScatterChart,
   Tooltip,
+  usePlotArea,
   XAxis,
   YAxis,
   type ActiveDotProps,
@@ -68,9 +70,14 @@ import {
   type TrendlineOverlay,
 } from './analytics';
 import { textStyleToCss } from './textStyle';
-import { TableChart } from './TableChart';
+import { TableChart, type TableColumnFilter } from './TableChart';
 
-export type { TableLayoutPatch, TableSortState } from './TableChart';
+export type {
+  TableColumnFilter,
+  TableFilterOperator,
+  TableLayoutPatch,
+  TableSortState,
+} from './TableChart';
 
 /** Payload of a cross-filter datum click. */
 export interface ChartDatumClickInfo {
@@ -160,11 +167,39 @@ export interface ChartRendererProps {
   totalsRow?: (number | null)[] | null;
   /** Column resize / header drag-to-reorder patches for the tile to persist. */
   onTableLayoutChange?: (patch: { columnWidths?: Record<string, number>; columnOrder?: string[] }) => void;
+  /**
+   * Echo of the committed table header-menu filters — the TILE owns the list
+   * (it maps them onto wire FilterClauses / HAVING); the table renders badges
+   * and pre-populates its menus from it.
+   */
+  tableFilters?: TableColumnFilter[];
+  /** Header-menu filter commits: the FULL updated per-column filter list. */
+  onTableFilterChange?: (filters: TableColumnFilter[]) => void;
+  /**
+   * Distinct-value fetch for a DIMENSION column's checkbox filter list
+   * (server-side limited). Called lazily when a dimension header menu opens.
+   */
+  onRequestColumnValues?: (column: string) => Promise<CellValue[]>;
 }
 
-const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-text-2)' } as const;
+/** Value/category tick type: slightly smaller and muted so data leads. */
+const axisTickStyle = { fontSize: 10, fill: 'var(--rcd-muted)' } as const;
 
 const legendWrapperStyle = { fontSize: 12, color: 'var(--rcd-text-2)' } as const;
+
+/** Recessive grid hairlines: 50% of the border token, dashed 3 3. */
+const GRID_STROKE = 'color-mix(in srgb, var(--rcd-border) 50%, transparent)';
+const GRID_DASH = '3 3';
+
+/**
+ * useId emits delimiter characters (":", "«») that break url(#…) references;
+ * strip to a safe SVG id stem. Uniqueness per React root is preserved.
+ */
+const svgSafeId = (raw: string): string => raw.replace(/[^a-zA-Z0-9_-]/g, '');
+
+/** Rounded corners on the VALUE END of a bar (radius 4). */
+const barEndRadius = (horizontal: boolean): [number, number, number, number] =>
+  horizontal ? [0, 4, 4, 0] : [4, 4, 0, 0];
 
 /** Debounce (ms) for ResponsiveContainer re-measures during grid/tile resizes. */
 const RESIZE_DEBOUNCE = 60;
@@ -752,7 +787,7 @@ function RcdChartTooltip({
     payload.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
   return (
     <div
-      className="max-w-[280px] rounded-lg border border-rcd-border px-2.5 py-2 text-xs shadow-lg"
+      className="max-w-[280px] rounded-[10px] border border-rcd-border px-3 py-2 text-xs shadow-lg"
       style={card}
     >
       {label !== undefined && label !== '' && (
@@ -877,6 +912,52 @@ function CenteredPieFrame({ legendRight, children }: { legendRight: boolean; chi
         {children}
       </div>
     </div>
+  );
+}
+
+/**
+ * Donut-hole total, rendered INSIDE the recharts tree so it reads the real
+ * plot area (which already accounts for legend placement) via usePlotArea.
+ * Radii mirror the <Pie> percentages (inner 55% / max radius = half the
+ * smaller plot dimension). Hidden when the hole is too small to read; the
+ * value font shrinks to fit the hole before giving up.
+ */
+function DonutCenterTotal({ text }: { text: string }) {
+  const plotArea = usePlotArea();
+  if (!plotArea || plotArea.width <= 0 || plotArea.height <= 0) return null;
+  const innerRadius = (Math.min(plotArea.width, plotArea.height) / 2) * 0.55;
+  if (innerRadius < 32) return null;
+  const cx = plotArea.x + plotArea.width / 2;
+  const cy = plotArea.y + plotArea.height / 2;
+  // Fit the formatted total inside the hole (~0.62em average glyph width).
+  const maxTextWidth = innerRadius * 1.7;
+  const fontSize = Math.max(
+    11,
+    Math.min(20, innerRadius * 0.32, maxTextWidth / Math.max(1, text.length * 0.62)),
+  );
+  return (
+    <g pointerEvents="none" aria-hidden>
+      <text
+        x={cx}
+        y={cy - fontSize * 0.55}
+        textAnchor="middle"
+        fontSize={10}
+        fill="var(--rcd-muted)"
+      >
+        Total
+      </text>
+      <text
+        x={cx}
+        y={cy + fontSize * 0.72}
+        textAnchor="middle"
+        fontSize={fontSize}
+        fontWeight={600}
+        fill="var(--rcd-text)"
+        style={{ fontVariantNumeric: 'tabular-nums' }}
+      >
+        {text}
+      </text>
+    </g>
   );
 }
 
@@ -1025,6 +1106,53 @@ function CartesianChart({
     trendSpecs.length > 0
       ? buildTrendlines(trendSpecs, visibleSeries, shaped.data)
       : { rows: shaped.data, overlays: [] as TrendlineOverlay[] };
+
+  // ---- designed fills ------------------------------------------------------
+  // Per-color SVG gradients (bars: 100%→78% along the value axis; areas:
+  // 55%→4% top-down) + a soft line shadow. Colors can be CSS variables, so
+  // stops use stopColor + stopOpacity rather than blends. Ids come from a
+  // sanitized useId so multiple charts (and small-multiple panels) on one
+  // page never collide.
+  const uid = svgSafeId(useId());
+  /** Resolved fill for one bar cell (colorByCategory / barFill rules / series). */
+  const resolveCellFill = (
+    series: ChartSeries,
+    row: Record<string, CellValue>,
+    dataIndex: number,
+  ): string => {
+    const categoryLabel = String(row[shaped.axisKey] ?? '');
+    // Fill precedence: explicit colorOverrides keyed by the CATEGORY label
+    // (colorByCategory mode) > first matching barFill rule > palette slot /
+    // series color. An explicit per-category override is the strongest user
+    // intent; rules still beat the default palette.
+    const paletteFill = colorByCategory
+      ? seriesColor(dataIndex, categoryLabel, format.colorOverrides, format.theme)
+      : series.color;
+    const overridden = colorByCategory && Boolean(format.colorOverrides?.[categoryLabel]);
+    const ruleFill =
+      !overridden && barFillActive
+        ? conditionalColor(
+            format.conditionalFormats,
+            'barFill',
+            series.styleKey,
+            row[series.key] ?? null,
+          )
+        : undefined;
+    return ruleFill ?? paletteFill;
+  };
+  const markColors: string[] = [];
+  const addMarkColor = (color: string) => {
+    if (!markColors.includes(color)) markColors.push(color);
+  };
+  if (spec.type !== 'line') {
+    for (const series of visibleSeries) addMarkColor(series.color);
+    if (isBars && renderCells) {
+      for (const series of visibleSeries) {
+        rows.forEach((row, i) => addMarkColor(resolveCellFill(series, row, i)));
+      }
+    }
+  }
+  const fillUrl = (color: string): string => `url(#${uid}-f${markColors.indexOf(color)})`;
 
   /** ChartPointEvent for one struck row (+ series when a specific mark was hit). */
   const pointEvent = (
@@ -1188,10 +1316,35 @@ function CartesianChart({
         onMouseMove={chartMouseMove}
         onMouseLeave={onPointHover ? () => onPointHover(null) : undefined}
       >
+        <defs>
+          {markColors.map((color, i) => (
+            <linearGradient
+              key={`${i}-${color}`}
+              id={`${uid}-f${i}`}
+              // Bars fade from the VALUE END (100%) toward the baseline (78%);
+              // areas fade top-down (55% → 4%). Areas are never horizontal.
+              x1={isBars && horizontal ? '1' : '0'}
+              y1="0"
+              x2="0"
+              y2={isBars && horizontal ? '0' : '1'}
+            >
+              <stop offset="0" stopColor={color} stopOpacity={isBars ? 1 : 0.55} />
+              <stop offset="1" stopColor={color} stopOpacity={isBars ? 0.78 : 0.04} />
+            </linearGradient>
+          ))}
+          {spec.type === 'line' && (
+            // Very subtle drop shadow under line paths; black fades into dark
+            // surfaces, so it stays theme-safe.
+            <filter id={`${uid}-lineShadow`} x="-20%" y="-40%" width="140%" height="180%">
+              <feDropShadow dx="0" dy="2" stdDeviation="2" floodColor="#000000" floodOpacity="0.16" />
+            </filter>
+          )}
+        </defs>
         <CartesianGrid
           vertical={isBars ? horizontal : false}
           horizontal={isBars ? !horizontal : true}
-          stroke="var(--rcd-grid-line)"
+          stroke={GRID_STROKE}
+          strokeDasharray={GRID_DASH}
         />
         {horizontal ? (
           <XAxis
@@ -1214,7 +1367,7 @@ function CartesianChart({
             dataKey={shaped.axisKey}
             tick={panel && !panel.showXTicks ? false : axisTickStyle}
             tickLine={false}
-            axisLine={{ stroke: 'var(--rcd-axis)' }}
+            axisLine={false}
             // Dense category axes drop interior ticks instead of colliding;
             // first/last stay so the extent is always readable.
             interval="preserveStartEnd"
@@ -1233,7 +1386,7 @@ function CartesianChart({
             width={panel ? (panel.showYTicks ? 70 : 8) : 110}
             tick={panel && !panel.showYTicks ? false : axisTickStyle}
             tickLine={false}
-            axisLine={{ stroke: 'var(--rcd-axis)' }}
+            axisLine={false}
             label={
               panel || htmlYTitle
                 ? undefined
@@ -1286,18 +1439,26 @@ function CartesianChart({
           const dimSeries = seriesDimmed(series);
           if (isBars) {
             const handleClick = barClick(series);
+            // Only the OUTERMOST stacked segment rounds (the stack renders in
+            // series order, so the last visible member is the value end);
+            // plain bars always round their value end.
+            const roundEnd =
+              !stacked || series.key === visibleSeries[visibleSeries.length - 1]?.key;
             return (
               <Bar
                 key={series.key}
                 yAxisId={yAxisId}
                 dataKey={series.key}
                 name={series.label}
-                fill={series.color}
+                fill={fillUrl(series.color)}
                 fillOpacity={dimSeries ? 0.35 : undefined}
-                stroke="var(--rcd-surface)"
+                // Stacked segments keep the 2px surface gap; plain bars take a
+                // crisp 1px stroke of their own color over the gradient fill.
+                stroke={stacked ? 'var(--rcd-surface)' : series.color}
+                strokeOpacity={!stacked && dimSeries ? 0.35 : undefined}
                 strokeWidth={stacked ? 2 : 1}
                 stackId={stacked ? 'stack' : undefined}
-                radius={stacked ? 0 : horizontal ? [0, 2, 2, 0] : [2, 2, 0, 0]}
+                radius={roundEnd ? barEndRadius(horizontal) : 0}
                 isAnimationActive={false}
                 cursor={handleClick ? 'pointer' : undefined}
                 onClick={handleClick}
@@ -1307,25 +1468,7 @@ function CartesianChart({
                 {renderCells &&
                   rows.map((row, dataIndex) => {
                     const categoryLabel = String(row[shaped.axisKey] ?? '');
-                    // Fill precedence: explicit colorOverrides keyed by the
-                    // CATEGORY label (colorByCategory mode) > first matching
-                    // barFill rule > palette slot / series color. An explicit
-                    // per-category override is the strongest user intent;
-                    // rules still beat the default palette.
-                    const paletteFill = colorByCategory
-                      ? seriesColor(dataIndex, categoryLabel, format.colorOverrides, format.theme)
-                      : series.color;
-                    const overridden =
-                      colorByCategory && Boolean(format.colorOverrides?.[categoryLabel]);
-                    const ruleFill =
-                      !overridden && barFillActive
-                        ? conditionalColor(
-                            format.conditionalFormats,
-                            'barFill',
-                            series.styleKey,
-                            row[series.key] ?? null,
-                          )
-                        : undefined;
+                    const resolved = resolveCellFill(series, row, dataIndex);
                     // Opacity precedence: hover highlight (category mode)
                     // beats the activeCategory cross-filter dim while
                     // present; both dim NON-matching categories to 0.35.
@@ -1333,17 +1476,18 @@ function CartesianChart({
                       highlightCategoryMode &&
                       highlightCategory !== null &&
                       categoryLabel !== highlightCategory.label;
+                    const cellOpacity = dimmedByHighlight
+                      ? 0.35
+                      : dimming && activeCategory && categoryLabel !== activeCategory.label
+                        ? 0.35
+                        : undefined;
                     return (
                       <Cell
                         key={dataIndex}
-                        fill={ruleFill ?? paletteFill}
-                        fillOpacity={
-                          dimmedByHighlight
-                            ? 0.35
-                            : dimming && activeCategory && categoryLabel !== activeCategory.label
-                              ? 0.35
-                              : undefined
-                        }
+                        fill={fillUrl(resolved)}
+                        stroke={stacked ? 'var(--rcd-surface)' : resolved}
+                        fillOpacity={cellOpacity}
+                        strokeOpacity={stacked ? undefined : cellOpacity}
                       />
                     );
                   })}
@@ -1367,13 +1511,14 @@ function CartesianChart({
               <Line
                 key={series.key}
                 yAxisId={yAxisId}
-                type="linear"
+                type="monotone"
                 dataKey={series.key}
                 name={series.label}
                 stroke={series.color}
                 strokeOpacity={dimSeries ? 0.35 : undefined}
                 strokeWidth={lineStyle?.width ?? 2}
                 strokeDasharray={strokeDash(lineStyle)}
+                filter={`url(#${uid}-lineShadow)`}
                 dot={false}
                 activeDot={clickableActiveDot(series) ?? { r: 3 }}
                 isAnimationActive={false}
@@ -1384,15 +1529,15 @@ function CartesianChart({
             <Area
               key={series.key}
               yAxisId={yAxisId}
-              type="linear"
+              type="monotone"
               dataKey={series.key}
               name={series.label}
               stroke={series.color}
               strokeOpacity={dimSeries ? 0.35 : undefined}
               strokeWidth={lineStyle?.width ?? 2}
               strokeDasharray={strokeDash(lineStyle)}
-              fill={series.color}
-              fillOpacity={dimSeries ? 0.1 : 0.25}
+              fill={fillUrl(series.color)}
+              fillOpacity={dimSeries ? 0.4 : 1}
               dot={false}
               activeDot={clickableActiveDot(series)}
               isAnimationActive={false}
@@ -1667,6 +1812,9 @@ export default function ChartRenderer({
   onTablePageChange,
   totalsRow = null,
   onTableLayoutChange,
+  tableFilters,
+  onTableFilterChange,
+  onRequestColumnValues,
 }: ChartRendererProps) {
   const [hiddenSeries, setHiddenSeries] = useState<ReadonlySet<string>>(NO_HIDDEN);
   const format = spec.format;
@@ -1871,8 +2019,12 @@ export default function ChartRenderer({
                 nameKey="label"
                 innerRadius={spec.type === 'donut' ? '55%' : 0}
                 outerRadius="85%"
+                // Slice gaps come from paddingAngle; the 1px surface stroke
+                // keeps rounded corners crisp against the card.
+                paddingAngle={1.5}
+                cornerRadius={3}
                 stroke="var(--rcd-surface)"
-                strokeWidth={2}
+                strokeWidth={1}
                 isAnimationActive={false}
                 cursor={handleSliceClick ? 'pointer' : undefined}
                 onClick={handleSliceClick}
@@ -1898,6 +2050,9 @@ export default function ChartRenderer({
                   />
                 ))}
               </Pie>
+              {spec.type === 'donut' && (
+                <DonutCenterTotal text={formatValue(visibleTotal)} />
+              )}
             </PieChart>
           </ResponsiveContainer>
         </CenteredPieFrame>
@@ -1977,14 +2132,14 @@ export default function ChartRenderer({
               margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}
               onMouseLeave={hover ? () => hover(null) : undefined}
             >
-              <CartesianGrid stroke="var(--rcd-grid-line)" />
+              <CartesianGrid stroke={GRID_STROKE} strokeDasharray={GRID_DASH} />
               <XAxis
                 type="number"
                 dataKey="x"
                 name={xColumn.label}
                 tick={axisTickStyle}
                 tickLine={false}
-                axisLine={{ stroke: 'var(--rcd-axis)' }}
+                axisLine={false}
                 tickFormatter={axisTickFormatter(format.xAxisFormat)}
                 label={
                   htmlXTitle
@@ -2015,6 +2170,10 @@ export default function ChartRenderer({
                   name={series.label}
                   data={series.points}
                   fill={series.color}
+                  // 70% points with a 1px surface ring keep overlapping dots
+                  // legible; the hovered point pops to full strength/size.
+                  stroke="var(--rcd-surface)"
+                  strokeWidth={1}
                   // Highlight: the split value IS the series identity here,
                   // so any label match dims the OTHER series' points.
                   fillOpacity={
@@ -2022,8 +2181,9 @@ export default function ChartRenderer({
                     scatter.series.some((s) => s.label === highlightCategory.label) &&
                     series.label !== highlightCategory.label
                       ? 0.35
-                      : undefined
+                      : 0.7
                   }
+                  activeShape={{ size: 120, fillOpacity: 1 }}
                   isAnimationActive={false}
                   cursor={onPointClick ? 'pointer' : undefined}
                   onClick={
@@ -2105,21 +2265,29 @@ export default function ChartRenderer({
       );
 
       return (
-        <div className="flex h-full flex-col items-center justify-center gap-1.5 p-4 text-center">
+        <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center">
           {/* leading-none: the number's font box otherwise sits optically low
               in the tile (4xl line-height adds ~25% dead space above/below). */}
           <div
-            className="text-4xl font-semibold leading-none tabular-nums text-rcd-text"
+            className="text-4xl font-semibold leading-none tracking-tight tabular-nums text-rcd-text"
             style={kpiColor ? { color: kpiColor } : undefined}
           >
             {kpiText(primaryValue, primary)}
           </div>
-          <div className="text-sm text-rcd-text-2" style={textStyleToCss(format.titleStyle)}>
+          <div
+            className="text-xs font-medium uppercase tracking-[0.08em] text-rcd-text-2"
+            style={textStyleToCss(format.titleStyle)}
+          >
             {kpiLabel(primary)}
           </div>
           {secondary && (
-            <div className="mt-1 text-sm tabular-nums text-rcd-muted">
-              {kpiText(secondaryValue, secondary)} {kpiLabel(secondary)}
+            // Delta-ready secondary row: value leads in weight, its label
+            // trails muted — ready to carry a change indicator.
+            <div className="mt-0.5 flex items-baseline gap-1.5 text-sm">
+              <span className="font-medium tabular-nums text-rcd-text-2">
+                {kpiText(secondaryValue, secondary)}
+              </span>
+              <span className="text-xs text-rcd-muted">{kpiLabel(secondary)}</span>
             </div>
           )}
         </div>
@@ -2145,6 +2313,9 @@ export default function ChartRenderer({
           onTablePageChange={onTablePageChange}
           totalsRow={totalsRow}
           onTableLayoutChange={onTableLayoutChange}
+          tableFilters={tableFilters}
+          onTableFilterChange={onTableFilterChange}
+          onRequestColumnValues={onRequestColumnValues}
         />
       );
 

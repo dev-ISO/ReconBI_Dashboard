@@ -11,8 +11,10 @@
    Categorical palette: validated 8-slot set (CVD-checked); dark values are
    re-stepped for dark surfaces, not auto-flipped. */
 .rcd-root {
-  --rcd-bg: var(--color-bg, #f9f9f7);
-  --rcd-surface: var(--color-surface, #fcfcfb);
+  /* App background sits a step below the white surfaces so cards read as
+     raised layers rather than outlines on the same plane. */
+  --rcd-bg: var(--color-bg, #f4f4f1);
+  --rcd-surface: var(--color-surface, #ffffff);
   --rcd-text: var(--color-text, #0b0b0b);
   --rcd-accent: var(--color-accent, #2a78d6);
   --rcd-text-2: #52514e;
@@ -20,6 +22,11 @@
   --rcd-border: rgba(11, 11, 11, 0.1);
   --rcd-grid-line: #e1e0d9;
   --rcd-axis: #c3c2b7;
+
+  /* Elevation pair: -1 is the resting card shadow (soft, two layers), -2 the
+     hover/raised step. Referenced via shadow-[var(--rcd-shadow-1)] etc. */
+  --rcd-shadow-1: 0 1px 2px rgba(16, 15, 13, 0.05), 0 2px 6px rgba(16, 15, 13, 0.04);
+  --rcd-shadow-2: 0 2px 4px rgba(16, 15, 13, 0.06), 0 8px 18px rgba(16, 15, 13, 0.08);
 
   --rcd-cat-1: #2a78d6;
   --rcd-cat-2: #eb6834;
@@ -40,14 +47,18 @@
 }
 
 html[data-theme='dark'] .rcd-root {
-  --rcd-bg: var(--color-bg, #0d0d0d);
-  --rcd-surface: var(--color-surface, #1a1a19);
+  --rcd-bg: var(--color-bg, #0b0b0c);
+  --rcd-surface: var(--color-surface, #17171a);
   --rcd-text: var(--color-text, #ffffff);
   --rcd-text-2: #c3c2b7;
   --rcd-muted: #898781;
   --rcd-border: rgba(255, 255, 255, 0.1);
   --rcd-grid-line: #2c2c2a;
   --rcd-axis: #383835;
+
+  /* Dark surfaces get deeper, tighter shadows (light halos read as glow). */
+  --rcd-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.3);
+  --rcd-shadow-2: 0 2px 4px rgba(0, 0, 0, 0.45), 0 8px 18px rgba(0, 0, 0, 0.4);
 
   --rcd-cat-1: #3987e5;
   --rcd-cat-2: #d95926;
@@ -94,6 +105,25 @@ html[data-theme='dark'] .rcd-root {
 .rcd-root {
   scrollbar-width: thin;
   scrollbar-color: var(--rcd-border) transparent;
+}
+
+/* Shared card elevation language: 1px border + soft two-layer shadow at rest,
+   slightly raised shadow + accent-tinted border on hover (150ms ease). Tiles,
+   list cards and floating panels opt in via .rcd-card; inline container
+   customization (style attribute) still wins over all of it. */
+.rcd-card {
+  border: 1px solid var(--rcd-border);
+  border-radius: 10px;
+  background-color: var(--rcd-surface);
+  box-shadow: var(--rcd-shadow-1);
+  transition:
+    box-shadow 150ms ease,
+    border-color 150ms ease;
+}
+
+.rcd-card:hover {
+  box-shadow: var(--rcd-shadow-2);
+  border-color: color-mix(in srgb, var(--rcd-accent) 25%, var(--rcd-border));
 }
 
 /* Skeleton shimmer for loading tiles. */
