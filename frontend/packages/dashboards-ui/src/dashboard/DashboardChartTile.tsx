@@ -8,7 +8,7 @@ import {
   type FilterClause,
   type FilterValue,
 } from '@recon/dashboards-core';
-import { ChartTile } from '../chart/ChartTile';
+import { ChartTile, type ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { RcdIconButton } from '../primitives';
 import { TileFrame } from './TileFrame';
@@ -36,12 +36,18 @@ export interface DashboardChartTileProps {
   modelId: number | null;
   editable: boolean;
   selected: boolean;
-  /** Remount key segment from the dashboard/tile refresh tokens. */
+  /**
+   * Refresh token from the dashboard/tile refresh counters. Passed to
+   * ChartTile as a PROP (not a React key): the tile stays mounted and keeps
+   * its previous chart visible (dimmed, updating bar) while the refetch runs.
+   */
   refreshKey: string;
   /** Dashboard-level filters (slicers + cards + cross-filter + drillthrough). */
   filters: FilterClause[];
-  /** Category label while this tile is the cross-filter source (dims others). */
+  /** Category label while this tile is the AXIS cross-filter source (dims others). */
   activeCategoryLabel: string | null;
+  /** Legend label while this tile is the LEGEND cross-filter source (emphasis). */
+  selectedLegendLabel: string | null;
   onSelect: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
@@ -50,6 +56,11 @@ export interface DashboardChartTileProps {
   onTileContextMenu?: (position: { x: number; y: number }) => void;
   /** Cross-filter datum click, called with the EFFECTIVE (drilled) chart. */
   onCrossFilter: (chart: ChartSpec, info: ChartDatumClickInfo) => void;
+  /**
+   * Legend cross-filter selection (legendMode 'crossFilter'), called with the
+   * EFFECTIVE (drilled) chart; null event = clear the page-wide filter.
+   */
+  onLegendSelect: (chart: ChartSpec, e: ChartLegendSelectEvent | null) => void;
   /** Point right-click (view mode): the EFFECTIVE chart + point payload. */
   onPointMenu?: (payload: { tileId: string; chart: ChartSpec; event: ChartPointEvent }) => void;
   /**
@@ -76,12 +87,14 @@ export function DashboardChartTile({
   refreshKey,
   filters,
   activeCategoryLabel,
+  selectedLegendLabel,
   onSelect,
   onEdit,
   onDuplicate,
   onDelete,
   onTileContextMenu,
   onCrossFilter,
+  onLegendSelect,
   onPointMenu,
   reportEffective,
 }: DashboardChartTileProps) {
@@ -187,20 +200,22 @@ export function DashboardChartTile({
     : [];
 
   const drillControls = hasHierarchy ? (
-    <div className="flex min-w-0 shrink-0 items-center gap-0.5" onClick={(e) => e.stopPropagation()}>
+    <div className="flex min-w-0 shrink-0 items-center gap-1" onClick={(e) => e.stopPropagation()}>
       {crumbs.length > 0 && (
-        <span className="flex max-w-[12rem] items-center gap-0.5 truncate text-[11px] text-rcd-muted">
+        <span className="flex max-w-[12rem] items-center gap-0.5 truncate text-[11px] leading-none text-rcd-muted">
           {crumbs.map((crumb, i) => (
             <span key={crumb.level} className="flex min-w-0 items-center gap-0.5">
-              {i > 0 && <span aria-hidden>▸</span>}
+              {i > 0 && <span aria-hidden className="opacity-70">▸</span>}
               {crumb.level === level ? (
-                <span className="truncate font-medium text-rcd-text-2">{crumb.label}</span>
+                <span className="truncate font-medium text-rcd-text-2" title={crumb.label}>
+                  {crumb.label}
+                </span>
               ) : (
                 <button
                   type="button"
                   title={`Back to ${crumb.label}`}
                   onClick={() => popToLevel(crumb.level)}
-                  className="truncate hover:text-rcd-text hover:underline"
+                  className="truncate rounded px-0.5 py-0.5 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
                 >
                   {crumb.label}
                 </button>
@@ -209,33 +224,35 @@ export function DashboardChartTile({
           ))}
         </span>
       )}
-      <RcdIconButton
-        aria-label="Drill up"
-        title="Drill up"
-        disabled={level === 0}
-        onClick={drillUp}
-        className="disabled:opacity-40"
-      >
-        <ArrowUp size={13} />
-      </RcdIconButton>
-      <RcdIconButton
-        aria-label="Go to the next level in the hierarchy"
-        title="Go to the next level in the hierarchy"
-        disabled={!canDrillDeeper}
-        onClick={nextLevel}
-        className="disabled:opacity-40"
-      >
-        <ChevronsDown size={13} />
-      </RcdIconButton>
-      <RcdIconButton
-        aria-label={drillMode ? 'Drill mode on (clicks drill down)' : 'Drill mode off (clicks cross-filter)'}
-        title={drillMode ? 'Drill mode on: clicks drill down' : 'Turn on drill mode'}
-        aria-pressed={drillMode}
-        onClick={() => setDrillMode((on) => !on)}
-        className={drillMode ? 'bg-black/5 text-rcd-accent dark:bg-white/10' : ''}
-      >
-        <ArrowDown size={13} />
-      </RcdIconButton>
+      <span className="flex items-center gap-0.5">
+        <RcdIconButton
+          aria-label="Drill up"
+          title="Drill up"
+          disabled={level === 0}
+          onClick={drillUp}
+          className="!p-1"
+        >
+          <ArrowUp size={13} />
+        </RcdIconButton>
+        <RcdIconButton
+          aria-label="Go to the next level in the hierarchy"
+          title="Go to the next level in the hierarchy"
+          disabled={!canDrillDeeper}
+          onClick={nextLevel}
+          className="!p-1"
+        >
+          <ChevronsDown size={13} />
+        </RcdIconButton>
+        <RcdIconButton
+          aria-label={drillMode ? 'Drill mode on (clicks drill down)' : 'Drill mode off (clicks cross-filter)'}
+          title={drillMode ? 'Drill mode on: clicks drill down' : 'Turn on drill mode'}
+          aria-pressed={drillMode}
+          onClick={() => setDrillMode((on) => !on)}
+          className={`!p-1 ${drillMode ? 'bg-black/5 text-rcd-accent dark:bg-white/10' : ''}`}
+        >
+          <ArrowDown size={13} />
+        </RcdIconButton>
+      </span>
     </div>
   ) : null;
 
@@ -268,7 +285,7 @@ export function DashboardChartTile({
           </div>
         ) : (
           <ChartTile
-            key={refreshKey}
+            refreshKey={refreshKey}
             spec={effectiveChart}
             modelId={modelId}
             filters={filters}
@@ -283,6 +300,10 @@ export function DashboardChartTile({
                 ? (event) => onPointMenu({ tileId, chart: effectiveChart, event })
                 : undefined
             }
+            // Legend clicks are never drill clicks — they cross-filter (or
+            // clear) regardless of drill mode.
+            onLegendSelect={(e) => onLegendSelect(effectiveChart, e)}
+            selectedLegendLabel={selectedLegendLabel}
             activeCategory={activeCategoryLabel !== null ? { label: activeCategoryLabel } : null}
           />
         )}

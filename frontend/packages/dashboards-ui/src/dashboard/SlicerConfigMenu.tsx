@@ -21,6 +21,7 @@ export interface SlicerConfigMenuProps {
 const VARIANTS: { value: SlicerVariant; label: string }[] = [
   { value: 'checklist', label: 'Checklist' },
   { value: 'dropdown', label: 'Dropdown' },
+  { value: 'dropdownMulti', label: 'Dropdown (multi-select)' },
   { value: 'buttons', label: 'Buttons' },
   { value: 'dateRange', label: 'Date range' },
 ];
@@ -137,7 +138,7 @@ export function SlicerConfigMenu({
         aria-label={`Configure slicer ${spec.label}`}
         style={{ left: pos.x, top: pos.y }}
         onContextMenu={(event) => event.preventDefault()}
-        className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-xl"
+        className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
       >
         {editable ? (
           <>

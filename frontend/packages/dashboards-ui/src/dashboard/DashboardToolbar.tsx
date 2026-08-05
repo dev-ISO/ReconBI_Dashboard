@@ -124,7 +124,7 @@ export function DashboardToolbar({
   };
 
   return (
-    <div className="flex items-center gap-3 border-b border-rcd-border bg-rcd-surface px-4 py-2.5">
+    <div className="flex items-center gap-2 border-b border-rcd-border bg-rcd-surface px-4 py-2.5">
       <h1 className="truncate text-base font-semibold text-rcd-text" title={name}>
         {name}
       </h1>
@@ -182,7 +182,12 @@ export function DashboardToolbar({
       )}
 
       {onExport && (
-        <RcdIconButton aria-label="Export as PDF" title="Export as PDF (print)" onClick={onExport}>
+        <RcdIconButton
+          aria-label="Export as PDF"
+          title="Export as PDF (print)"
+          onClick={onExport}
+          className="shrink-0"
+        >
           <Printer size={14} />
         </RcdIconButton>
       )}
@@ -190,7 +195,12 @@ export function DashboardToolbar({
       {onRefresh && (
         <>
           {lastRefreshAt && <LastRefreshCaption at={lastRefreshAt} />}
-          <RcdIconButton aria-label="Refresh tiles" title="Refresh tiles" onClick={onRefresh}>
+          <RcdIconButton
+            aria-label="Refresh tiles"
+            title="Refresh tiles"
+            onClick={onRefresh}
+            className="shrink-0"
+          >
             <RefreshCw size={14} className={refreshing ? 'animate-spin' : undefined} />
           </RcdIconButton>
         </>
@@ -426,6 +436,7 @@ function BookmarksMenu({
                 {canManage && (
                   <RcdIconButton
                     aria-label={`Actions for bookmark ${bookmark.name}`}
+                    title="Bookmark actions"
                     aria-haspopup="menu"
                     aria-expanded={kebabFor === bookmark.id}
                     onClick={() => setKebabFor((id) => (id === bookmark.id ? null : bookmark.id))}

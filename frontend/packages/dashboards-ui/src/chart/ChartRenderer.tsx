@@ -1,5 +1,6 @@
 import {
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -31,6 +32,7 @@ import {
 import {
   formatAxisValue,
   formatCellValue,
+  sanitizeRichHtml,
   seriesColor,
   type AxisValueFormat,
   type CellValue,
@@ -46,6 +48,7 @@ import {
   type TooltipStyle,
 } from '@recon/dashboards-core';
 import {
+  measureNameForKey,
   RAW_AXIS_KEY,
   shapeChartData,
   shapePieData,
@@ -107,6 +110,22 @@ export interface ChartRendererProps {
    * stacked charts skip dimming (a category there spans several marks).
    */
   activeCategory?: { label: string } | null;
+  /**
+   * Legend cross-filter hook (format.legendMode === 'crossFilter'): clicking a
+   * legend item fires with the RAW legend-dimension cell (pie: the slice's
+   * raw) + formatted label; clicking the currently selected item — or
+   * double-click reset — fires null to clear. The renderer stays
+   * query-agnostic: the CALLER maps the raw value onto its legend dimension
+   * and builds the FilterClause. Charts without a legend identity fall back to
+   * 'isolate' and never fire this.
+   */
+  onLegendSelect?: (e: { raw: CellValue; label: string } | null) => void;
+  /**
+   * Echo of the active legend cross-filter selection (the `label` the consumer
+   * received from onLegendSelect). The matching legend item renders emphasized
+   * (bold); the rest dim. Null/undefined = no selection marking.
+   */
+  selectedLegendLabel?: string | null;
 }
 
 const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-text-2)' } as const;
@@ -155,9 +174,11 @@ function makeValueFormatter(format: ChartFormat, measureColumns: QueryColumn[]):
   const overrideColumn = format.valueFormat ? formatHintColumn(format.valueFormat) : null;
   return (value, seriesKey) => {
     if (typeof value !== 'number') return value == null ? '' : String(value);
+    // measureNameForKey unwraps combo (measure × legend) dataKeys to their
+    // measure column; plain keys pass through unchanged.
     const column =
       overrideColumn ??
-      (seriesKey ? measureColumns.find((c) => c.name === seriesKey) : undefined) ??
+      (seriesKey ? measureColumns.find((c) => c.name === measureNameForKey(seriesKey)) : undefined) ??
       measureColumns[0];
     return column ? formatCellValue(value, column) : String(value);
   };
@@ -182,11 +203,66 @@ function legendProps(format: ChartFormat) {
   } as const;
 }
 
-/** One legend entry: dataKey (toggle identity), display label, swatch color. */
+/**
+ * One legend entry: dataKey (visibility identity), display label, swatch
+ * color. `raw`/`legendLabel` are present only when the entry is backed by a
+ * legend-dimension value (or pie slice) — the identity crossFilter mode needs.
+ */
 interface LegendItemDatum {
   key: string;
   label: string;
   color: string;
+  raw?: CellValue;
+  legendLabel?: string;
+}
+
+type LegendMode = NonNullable<ChartFormat['legendMode']>;
+
+/**
+ * Legend interaction state + handlers, built once in ChartRenderer and shared
+ * by every chart shape (single cartesian, small-multiple grids, pie, scatter).
+ * Handlers receive the full item list so isolate can compute "everything but
+ * the clicked item" and crossFilter can resolve its identity fallback.
+ */
+interface LegendControl {
+  /** Configured mode; crossFilter may still fall back per chart (see effectiveLegendMode). */
+  mode: LegendMode;
+  hidden: ReadonlySet<string>;
+  /** Consumer echo of the active legend cross-filter selection. */
+  selectedLabel: string | null;
+  /** `multi` = Ctrl/Cmd held (isolate multi-select). */
+  onItemClick: (items: LegendItemDatum[], item: LegendItemDatum, multi: boolean) => void;
+  /** Double-click reset: restore all series / clear the cross-filter. */
+  onReset: (items: LegendItemDatum[]) => void;
+}
+
+/**
+ * crossFilter needs a legend identity to filter by; when the series come from
+ * measures (no item carries legendLabel) it falls back to isolate, per the
+ * ChartFormat contract.
+ */
+const effectiveLegendMode = (mode: LegendMode, items: LegendItemDatum[]): LegendMode =>
+  mode === 'crossFilter' && !items.some((i) => i.legendLabel !== undefined) ? 'isolate' : mode;
+
+/** Hover hint describing what a legend click will do in the active mode. */
+function legendItemTitle(
+  mode: LegendMode,
+  label: string,
+  isHidden: boolean,
+  isSelected: boolean,
+  soleVisible: boolean,
+): string {
+  switch (mode) {
+    case 'isolate':
+      if (soleVisible) return 'Click to restore all (double-click also resets)';
+      return isHidden
+        ? `Click to isolate ${label}; Ctrl+click to add it`
+        : `Click to isolate ${label}`;
+    case 'crossFilter':
+      return isSelected ? 'Click to clear the cross-filter' : `Click to cross-filter by ${label}`;
+    default:
+      return isHidden ? `Show ${label}` : `Hide ${label}`;
+  }
 }
 
 /**
@@ -194,43 +270,81 @@ interface LegendItemDatum {
  * inherits placement + wrapperStyle (fontSize/color cascade to the buttons via
  * the preflight `color: inherit`). Items come from OUR series list — never the
  * recharts payload, which omits series we filtered out — so hidden entries stay
- * visible (dimmed + struck-through) and can be toggled back.
+ * visible (dimmed + struck-through) and can be toggled back. Double-clicking
+ * anywhere on the list resets (restores all / clears the cross-filter).
  */
 function InteractiveLegendContent({
   items,
-  hidden,
-  onToggle,
+  control,
   layout,
+  interactive = true,
 }: {
   items: LegendItemDatum[];
-  hidden: ReadonlySet<string>;
-  onToggle: (key: string) => void;
+  control: LegendControl;
   layout: 'horizontal' | 'vertical';
+  /** Small-multiple grids render this list even when legendInteractive === false. */
+  interactive?: boolean;
 }) {
+  const mode = effectiveLegendMode(control.mode, items);
+  const visibleCount = items.filter((i) => !control.hidden.has(i.key)).length;
   return (
     <ul
       className={
         layout === 'vertical'
-          ? 'flex flex-col items-start gap-1 pl-2'
+          ? 'flex w-full flex-col items-start gap-1 pl-2'
           : 'flex flex-wrap items-center justify-center gap-x-3 gap-y-1'
       }
+      onDoubleClick={interactive ? () => control.onReset(items) : undefined}
     >
       {items.map((item, i) => {
-        const isHidden = hidden.has(item.key);
+        const isHidden = control.hidden.has(item.key);
+        const isSelected =
+          mode === 'crossFilter' &&
+          control.selectedLabel !== null &&
+          (item.legendLabel ?? item.label) === control.selectedLabel;
+        // With an active cross-filter selection every OTHER item dims, so the
+        // selected one reads as the page-wide focus.
+        const dimmedBySelection =
+          mode === 'crossFilter' && control.selectedLabel !== null && !isSelected;
         return (
           <li key={`${i}-${item.key}`} className="min-w-0 max-w-full">
             <button
               type="button"
-              onClick={() => onToggle(item.key)}
-              title={isHidden ? `Show ${item.label}` : `Hide ${item.label}`}
-              className="flex min-w-0 max-w-full cursor-pointer items-center gap-1.5"
+              onClick={
+                interactive
+                  ? (e) => control.onItemClick(items, item, e.ctrlKey || e.metaKey)
+                  : undefined
+              }
+              title={
+                interactive
+                  ? legendItemTitle(
+                      mode,
+                      item.label,
+                      isHidden,
+                      isSelected,
+                      !isHidden && visibleCount === 1,
+                    )
+                  : undefined
+              }
+              // Fixed row height keeps vertical legends evenly ribbed and
+              // gives every item the same (larger-than-swatch) hit target.
+              className={`flex h-5 min-w-0 max-w-full items-center gap-1.5 ${
+                interactive ? 'cursor-pointer' : 'cursor-default'
+              }`}
             >
               <span
                 aria-hidden
                 className="h-2.5 w-2.5 shrink-0 rounded-[3px]"
-                style={{ background: item.color, opacity: isHidden ? 0.35 : 1 }}
+                style={{
+                  background: item.color,
+                  opacity: isHidden ? 0.35 : dimmedBySelection ? 0.45 : 1,
+                }}
               />
-              <span className={`truncate ${isHidden ? 'line-through opacity-45' : ''}`}>
+              <span
+                className={`truncate ${
+                  isHidden ? 'line-through opacity-45' : dimmedBySelection ? 'opacity-45' : ''
+                } ${isSelected ? 'font-semibold' : ''}`}
+              >
                 {item.label}
               </span>
             </button>
@@ -242,7 +356,7 @@ function InteractiveLegendContent({
 }
 
 /**
- * Legend element for one chart: interactive (click toggles series visibility)
+ * Legend element for one chart: interactive (clicks act per format.legendMode)
  * unless format.legendInteractive === false, which falls back to the plain
  * recharts legend. Placement/text style (legendPosition/legendStyle) apply to
  * both variants.
@@ -250,8 +364,7 @@ function InteractiveLegendContent({
 function chartLegend(
   format: ChartFormat,
   items: LegendItemDatum[],
-  hidden: ReadonlySet<string>,
-  onToggle: (key: string) => void,
+  control: LegendControl,
 ): ReactNode {
   const placement = legendProps(format);
   if (format.legendInteractive === false) return <Legend {...placement} />;
@@ -261,8 +374,7 @@ function chartLegend(
       content={
         <InteractiveLegendContent
           items={items}
-          hidden={hidden}
-          onToggle={onToggle}
+          control={control}
           layout={format.legendPosition === 'right' ? 'vertical' : 'horizontal'}
         />
       }
@@ -317,13 +429,63 @@ const yAxisLabelProps = (text: string | undefined, style?: TextStyle) =>
       }
     : undefined;
 
-/** Base margins, widened when an axis title needs room. */
+/**
+ * Base margins, widened when an axis title needs room. Rich-HTML titles render
+ * OUTSIDE the plot (AxisTitleFrame reserves their space in flow), so they
+ * suppress both the SVG label and its margin allowance.
+ */
 const chartMargin = (format: ChartFormat, extras?: { bottom?: boolean; left?: boolean }) => ({
   top: 8,
   right: 12,
-  bottom: format.xAxisLabel || extras?.bottom ? 18 : 4,
-  left: format.yAxisLabel || extras?.left ? 8 : 4,
+  bottom: (format.xAxisLabel && !format.xAxisLabelHtml) || extras?.bottom ? 18 : 4,
+  left: (format.yAxisLabel && !format.yAxisLabelHtml) || extras?.left ? 8 : 4,
 });
+
+/**
+ * Rich-HTML axis titles (format.xAxisLabelHtml / yAxisLabelHtml). Instead of
+ * absolute overlays fighting recharts margins, the frame RESERVES their space
+ * in normal flow: y title in a left rail (vertical writing mode rotated 180°
+ * so it reads bottom-up, matching the SVG -90° label), x title in a strip
+ * centered below the plot. The chart shrinks accordingly, so titles can never
+ * overlap ticks at any size. Content is sanitized again at render (belt on top
+ * of the editor's write-time sanitize). Small-multiple grids wrap the WHOLE
+ * grid — one shared pair of titles, not per panel. When neither html title is
+ * set the frame is a pass-through and the plain xAxisLabel/yAxisLabel SVG
+ * labels keep working untouched.
+ */
+function AxisTitleFrame({ format, children }: { format: ChartFormat; children: ReactNode }) {
+  const xHtml = useMemo(
+    () => (format.xAxisLabelHtml ? sanitizeRichHtml(format.xAxisLabelHtml) : ''),
+    [format.xAxisLabelHtml],
+  );
+  const yHtml = useMemo(
+    () => (format.yAxisLabelHtml ? sanitizeRichHtml(format.yAxisLabelHtml) : ''),
+    [format.yAxisLabelHtml],
+  );
+  if (xHtml === '' && yHtml === '') return <>{children}</>;
+  return (
+    <div className="flex h-full w-full min-w-0">
+      {yHtml !== '' && (
+        <div className="flex shrink-0 items-center justify-center pl-0.5">
+          <div
+            className="max-h-full overflow-hidden text-xs text-rcd-text-2"
+            style={{ writingMode: 'vertical-rl', transform: 'rotate(180deg)' }}
+            dangerouslySetInnerHTML={{ __html: yHtml }}
+          />
+        </div>
+      )}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="min-h-0 min-w-0 flex-1">{children}</div>
+        {xHtml !== '' && (
+          <div
+            className="shrink-0 overflow-hidden px-2 pb-1 pt-0.5 text-center text-xs text-rcd-text-2"
+            dangerouslySetInnerHTML={{ __html: xHtml }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
 
 /**
  * One <ReferenceLine> from a spec + resolved value. `axis` names the VALUE
@@ -424,7 +586,7 @@ function RcdChartTooltip({
     payload.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
   return (
     <div
-      className="max-w-[280px] rounded-lg border border-rcd-border px-2.5 py-2 text-xs shadow-md"
+      className="max-w-[280px] rounded-lg border border-rcd-border px-2.5 py-2 text-xs shadow-lg"
       style={card}
     >
       {label !== undefined && label !== '' && (
@@ -580,8 +742,7 @@ interface CartesianChartProps {
   spec: ChartSpec;
   shaped: ShapedChartData;
   formatValue: ValueFormatter;
-  hidden: ReadonlySet<string>;
-  onToggleSeries: (key: string) => void;
+  legend: LegendControl;
   onDatumClick?: (info: ChartDatumClickInfo) => void;
   onPointClick?: (e: ChartPointEvent) => void;
   onPointContextMenu?: (e: ChartPointEvent) => void;
@@ -589,6 +750,16 @@ interface CartesianChartProps {
   /** Present when rendering as one small-multiples panel (no legend, tight axes). */
   panel?: PanelContext;
 }
+
+/** Legend entries for shaped series (legend identity riding along when present). */
+const seriesLegendItems = (series: ChartSeries[]): LegendItemDatum[] =>
+  series.map((s) => ({
+    key: s.key,
+    label: s.label,
+    color: s.color,
+    raw: s.legendRaw,
+    legendLabel: s.legendLabel,
+  }));
 
 /**
  * The whole cartesian family (column/bar/stacked/line/area) on one
@@ -600,8 +771,7 @@ function CartesianChart({
   spec,
   shaped,
   formatValue,
-  hidden,
-  onToggleSeries,
+  legend,
   onDatumClick,
   onPointClick,
   onPointContextMenu,
@@ -609,9 +779,14 @@ function CartesianChart({
   panel,
 }: CartesianChartProps) {
   const format = spec.format;
+  const hidden = legend.hidden;
   const horizontal = spec.type === 'bar' || spec.type === 'stackedBar';
   const stacked = spec.type === 'stackedColumn' || spec.type === 'stackedBar';
   const isBars = spec.type !== 'line' && spec.type !== 'area';
+  // Rich-HTML axis titles render OUTSIDE the plot (AxisTitleFrame) and replace
+  // the SVG labels entirely.
+  const htmlXTitle = Boolean(format.xAxisLabelHtml);
+  const htmlYTitle = Boolean(format.yAxisLabelHtml);
   // Panels never render their own legend — the grid shares ONE legend.
   const showLegend = !panel && (format.showLegend ?? shaped.series.length > 1);
   const visibleSeries = shaped.series.filter((s) => !hidden.has(s.key));
@@ -654,7 +829,15 @@ function CartesianChart({
     axisValue: row?.[RAW_AXIS_KEY] ?? null,
     axisLabel: String(row?.[shaped.axisKey] ?? ''),
     legendValue: shaped.hasLegend && series ? (series.legendRaw ?? null) : undefined,
-    legendLabel: shaped.hasLegend && series ? series.label : undefined,
+    // Combo series (measure × legend): report the LEGEND half, not the full
+    // combo name. Plain legend series keep the display label as before
+    // (styleKey === legendLabel there).
+    legendLabel:
+      shaped.hasLegend && series
+        ? series.legendLabel !== undefined && series.legendLabel !== series.styleKey
+          ? series.legendLabel
+          : series.label
+        : undefined,
     smallMultipleValue: panel?.smallMultipleValue,
     measureKey: series?.styleKey,
     value:
@@ -762,7 +945,12 @@ function CartesianChart({
             tickFormatter={valueTickFormatter}
             domain={panel?.valueDomain}
             // Axis TITLES stay on the single chart; panels are too small.
-            label={panel ? undefined : xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
+            // HTML titles render outside the plot instead (AxisTitleFrame).
+            label={
+              panel || htmlXTitle
+                ? undefined
+                : xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)
+            }
           />
         ) : (
           <XAxis
@@ -770,7 +958,15 @@ function CartesianChart({
             tick={panel && !panel.showXTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={{ stroke: 'var(--rcd-axis)' }}
-            label={panel ? undefined : xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)}
+            // Dense category axes drop interior ticks instead of colliding;
+            // first/last stay so the extent is always readable.
+            interval="preserveStartEnd"
+            minTickGap={8}
+            label={
+              panel || htmlXTitle
+                ? undefined
+                : xAxisLabelProps(format.xAxisLabel, format.axisTitleStyle)
+            }
           />
         )}
         {horizontal ? (
@@ -781,7 +977,11 @@ function CartesianChart({
             tick={panel && !panel.showYTicks ? false : axisTickStyle}
             tickLine={false}
             axisLine={{ stroke: 'var(--rcd-axis)' }}
-            label={panel ? undefined : yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
+            label={
+              panel || htmlYTitle
+                ? undefined
+                : yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)
+            }
           />
         ) : (
           <YAxis
@@ -791,17 +991,15 @@ function CartesianChart({
             width={panel ? (panel.showYTicks ? 42 : 8) : 56}
             tickFormatter={valueTickFormatter}
             domain={panel?.valueDomain}
-            label={panel ? undefined : yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)}
+            label={
+              panel || htmlYTitle
+                ? undefined
+                : yAxisLabelProps(format.yAxisLabel, format.axisTitleStyle)
+            }
           />
         )}
         {themedTooltip(formatValue, format, isBars ? 'fill' : 'line', stacked ? { active: true } : undefined)}
-        {showLegend &&
-          chartLegend(
-            format,
-            shaped.series.map((s) => ({ key: s.key, label: s.label, color: s.color })),
-            hidden,
-            onToggleSeries,
-          )}
+        {showLegend && chartLegend(format, seriesLegendItems(shaped.series), legend)}
         {visibleSeries.map((series) => {
           if (isBars) {
             const handleClick = barClick(series);
@@ -942,8 +1140,7 @@ interface SmallMultiplesChartProps {
   spec: ChartSpec;
   panels: SmallMultiplePanel[];
   formatValue: ValueFormatter;
-  hidden: ReadonlySet<string>;
-  onToggleSeries: (key: string) => void;
+  legend: LegendControl;
   onDatumClick?: (info: ChartDatumClickInfo) => void;
   onPointClick?: (e: ChartPointEvent) => void;
   onPointContextMenu?: (e: ChartPointEvent) => void;
@@ -963,13 +1160,13 @@ function SmallMultiplesChart({
   spec,
   panels,
   formatValue,
-  hidden,
-  onToggleSeries,
+  legend,
   onDatumClick,
   onPointClick,
   onPointContextMenu,
   activeCategory = null,
 }: SmallMultiplesChartProps) {
+  const hidden = legend.hidden;
   const frameRef = useRef<HTMLDivElement>(null);
   const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
   useEffect(() => {
@@ -1055,10 +1252,10 @@ function SmallMultiplesChart({
       style={{ ...legendWrapperStyle, ...textStyleToCss(format.legendStyle) }}
     >
       <InteractiveLegendContent
-        items={canonical.series.map((s) => ({ key: s.key, label: s.label, color: s.color }))}
-        hidden={hidden}
-        onToggle={format.legendInteractive === false ? () => undefined : onToggleSeries}
+        items={seriesLegendItems(canonical.series)}
+        control={legend}
         layout={legendRight ? 'vertical' : 'horizontal'}
+        interactive={format.legendInteractive !== false}
       />
     </div>
   ) : null;
@@ -1084,8 +1281,10 @@ function SmallMultiplesChart({
           return (
             <div key={`${i}-${panel.title}`} className="flex min-h-0 min-w-0 flex-col">
               {showTitles && (
+                // Subtle caption, not a heading: muted, medium weight, capped
+                // to one truncated line (full text on the title tooltip).
                 <div
-                  className="shrink-0 truncate px-1 text-center text-[11px] leading-4 text-rcd-muted"
+                  className="shrink-0 truncate px-1 text-center text-[11px] font-medium leading-4 text-rcd-muted"
                   title={panel.title}
                 >
                   {panel.title}
@@ -1096,8 +1295,7 @@ function SmallMultiplesChart({
                   spec={spec}
                   shaped={shaped}
                   formatValue={formatValue}
-                  hidden={hidden}
-                  onToggleSeries={onToggleSeries}
+                  legend={legend}
                   onDatumClick={onDatumClick}
                   onPointClick={onPointClick}
                   onPointContextMenu={onPointContextMenu}
@@ -1143,19 +1341,70 @@ export default function ChartRenderer({
   onPointClick,
   onPointContextMenu,
   activeCategory = null,
+  onLegendSelect,
+  selectedLegendLabel = null,
 }: ChartRendererProps) {
   const [hiddenSeries, setHiddenSeries] = useState<ReadonlySet<string>>(NO_HIDDEN);
   const format = spec.format;
   // When the legend is non-interactive every series renders, even if hidden
   // state lingers from before the flag was flipped.
   const hidden = format.legendInteractive === false ? NO_HIDDEN : hiddenSeries;
-  const toggleSeries = (key: string) =>
-    setHiddenSeries((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
-      return next;
-    });
+  const legendMode: LegendMode = format.legendMode ?? 'toggle';
+
+  /**
+   * One legend controller for every chart shape. crossFilter emits to the
+   * consumer instead of touching local visibility; toggle/isolate mutate the
+   * local hidden set. Handlers resolve the EFFECTIVE mode from the item list
+   * they're given, so measure-series charts under 'crossFilter' isolate.
+   */
+  const legendControl: LegendControl = {
+    mode: legendMode,
+    hidden,
+    selectedLabel: selectedLegendLabel ?? null,
+    onItemClick: (items, item, multi) => {
+      const mode = effectiveLegendMode(legendMode, items);
+      if (mode === 'toggle') {
+        setHiddenSeries((prev) => {
+          const next = new Set(prev);
+          if (next.has(item.key)) next.delete(item.key);
+          else next.add(item.key);
+          return next;
+        });
+        return;
+      }
+      if (mode === 'isolate') {
+        setHiddenSeries((prev) => {
+          // Ctrl/Cmd+click while isolation is active: toggle the clicked
+          // series in/out of the visible set (Power BI multi-select).
+          if (multi && prev.size > 0) {
+            const next = new Set(prev);
+            if (next.has(item.key)) next.delete(item.key);
+            else next.add(item.key);
+            // Hiding the last visible series would blank the chart — restore
+            // everything instead.
+            return items.some((i) => !next.has(i.key)) ? next : NO_HIDDEN;
+          }
+          const visible = items.filter((i) => !prev.has(i.key));
+          // Clicking the sole visible (isolated) item restores all.
+          if (visible.length === 1 && visible[0]!.key === item.key) return NO_HIDDEN;
+          return new Set(items.filter((i) => i.key !== item.key).map((i) => i.key));
+        });
+        return;
+      }
+      // crossFilter: emit; the CONSUMER filters the page and echoes the
+      // selection back via selectedLegendLabel. Clicking the selected item
+      // again clears.
+      const label = item.legendLabel ?? item.label;
+      if (selectedLegendLabel != null && selectedLegendLabel === label) onLegendSelect?.(null);
+      else onLegendSelect?.({ raw: item.raw ?? null, label });
+    },
+    onReset: (items) => {
+      setHiddenSeries(NO_HIDDEN);
+      if (effectiveLegendMode(legendMode, items) === 'crossFilter' && selectedLegendLabel != null) {
+        onLegendSelect?.(null);
+      }
+    },
+  };
 
   const measureColumns = result.columns.filter((c) => c.role === 'measure');
   const formatValue = makeValueFormatter(format, measureColumns);
@@ -1171,32 +1420,35 @@ export default function ChartRenderer({
       // panel grid (cartesian family only — other types ignore it).
       const panels = splitSmallMultiples(result, spec);
       if (panels && panels.length > 0) {
+        // The title frame wraps the WHOLE grid: one shared x/y title pair.
         return (
-          <SmallMultiplesChart
+          <AxisTitleFrame format={format}>
+            <SmallMultiplesChart
+              spec={spec}
+              panels={panels}
+              formatValue={formatValue}
+              legend={legendControl}
+              onDatumClick={onDatumClick}
+              onPointClick={onPointClick}
+              onPointContextMenu={onPointContextMenu}
+              activeCategory={activeCategory}
+            />
+          </AxisTitleFrame>
+        );
+      }
+      return (
+        <AxisTitleFrame format={format}>
+          <CartesianChart
             spec={spec}
-            panels={panels}
+            shaped={shapeChartData(result, spec)}
             formatValue={formatValue}
-            hidden={hidden}
-            onToggleSeries={toggleSeries}
+            legend={legendControl}
             onDatumClick={onDatumClick}
             onPointClick={onPointClick}
             onPointContextMenu={onPointContextMenu}
             activeCategory={activeCategory}
           />
-        );
-      }
-      return (
-        <CartesianChart
-          spec={spec}
-          shaped={shapeChartData(result, spec)}
-          formatValue={formatValue}
-          hidden={hidden}
-          onToggleSeries={toggleSeries}
-          onDatumClick={onDatumClick}
-          onPointClick={onPointClick}
-          onPointContextMenu={onPointContextMenu}
-          activeCategory={activeCategory}
-        />
+        </AxisTitleFrame>
       );
     }
 
@@ -1205,9 +1457,27 @@ export default function ChartRenderer({
       const { slices } = shapePieData(result, spec);
       if (slices.length === 0) return <Placeholder>Pie needs a measure.</Placeholder>;
       const showLegend = format.showLegend ?? slices.length > 1;
-      // Hidden slices are removed from the pie entirely (the visible total is
-      // the percent denominator); the interactive legend still lists them.
-      const visibleSlices = slices.filter((s) => !hidden.has(s.label));
+      // Slices carry a legend identity (crossFilter) only when a dimension
+      // labels them; a dimensionless pie is a single measure-named slice.
+      const hasSliceDimension = result.columns.some((c) => c.role === 'dimension');
+      const sliceLegendItems: LegendItemDatum[] = slices.map((s) => ({
+        key: s.label,
+        label: s.label,
+        color: s.color,
+        raw: hasSliceDimension ? s.raw : undefined,
+        legendLabel: hasSliceDimension ? s.label : undefined,
+      }));
+      const pieMode = effectiveLegendMode(legendMode, sliceLegendItems);
+      // Isolate DIMS the non-isolated slices (0.15) instead of removing them:
+      // removal re-normalizes the survivors, so an isolated slice becomes a
+      // featureless full circle — dimming keeps the ring geometry and the
+      // slice's true share visible. Toggle keeps the original remove-and-
+      // renormalize behavior.
+      const dimHiddenSlices = pieMode === 'isolate';
+      // Toggle mode: hidden slices are removed from the pie entirely (the
+      // visible total is the percent denominator); the interactive legend
+      // still lists them.
+      const visibleSlices = dimHiddenSlices ? slices : slices.filter((s) => !hidden.has(s.label));
       const visibleTotal = visibleSlices.reduce((sum, s) => sum + s.value, 0);
       // The slice label IS the (first) dimension, so it rides as axisValue;
       // measureKey reports the sliced measure.
@@ -1246,13 +1516,7 @@ export default function ChartRenderer({
           <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
             <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
               {themedTooltip(formatValue, format, 'none', { active: true, total: visibleTotal })}
-              {showLegend &&
-                chartLegend(
-                  format,
-                  slices.map((s) => ({ key: s.label, label: s.label, color: s.color })),
-                  hidden,
-                  toggleSeries,
-                )}
+              {showLegend && chartLegend(format, sliceLegendItems, legendControl)}
               <Pie
                 data={visibleSlices}
                 dataKey="value"
@@ -1271,7 +1535,11 @@ export default function ChartRenderer({
                     key={`${i}-${slice.label}`}
                     fill={slice.color}
                     fillOpacity={
-                      activeCategory && slice.label !== activeCategory.label ? 0.35 : undefined
+                      dimHiddenSlices && hidden.has(slice.label)
+                        ? 0.15
+                        : activeCategory && slice.label !== activeCategory.label
+                          ? 0.35
+                          : undefined
                     }
                   />
                 ))}
@@ -1296,6 +1564,20 @@ export default function ChartRenderer({
       };
       const showLegend = format.showLegend ?? scatter.series.length > 1;
       const visibleSeries = scatter.series.filter((s) => !hidden.has(s.key));
+      // The split carries a legend identity (crossFilter) only when it IS the
+      // legend dimension; an axis-only split still colors groups but has
+      // nothing to cross-filter by.
+      const splitIsLegend = Boolean(spec.query.legend);
+      const scatterLegendItems: LegendItemDatum[] = scatter.series.map((s) => ({
+        key: s.key,
+        label: s.label,
+        color: s.color,
+        raw: splitIsLegend ? s.raw : undefined,
+        legendLabel: splitIsLegend ? s.key : undefined,
+      }));
+      // Rich-HTML axis titles render outside the plot (AxisTitleFrame).
+      const htmlXTitle = Boolean(format.xAxisLabelHtml);
+      const htmlYTitle = Boolean(format.yAxisLabelHtml);
       // A scatter point is (x measure, y measure) within a split-dimension
       // series: the split doubles as the axis identity, and y — the
       // conventional "value" — reports as measureKey/value.
@@ -1334,9 +1616,10 @@ export default function ChartRenderer({
       const allY = scatter.series.flatMap((s) => s.points.map((p) => p.y));
       const yTickFormatter = axisTickFormatter(format.yAxisFormat);
       return (
-        <div className="relative h-full w-full min-w-0 overflow-hidden">
+        <AxisTitleFrame format={format}>
+          <div className="relative h-full w-full min-w-0 overflow-hidden">
           <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
-            <ScatterChart margin={chartMargin(format, { bottom: true, left: true })}>
+            <ScatterChart margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}>
               <CartesianGrid stroke="var(--rcd-grid-line)" />
               <XAxis
                 type="number"
@@ -1346,7 +1629,11 @@ export default function ChartRenderer({
                 tickLine={false}
                 axisLine={{ stroke: 'var(--rcd-axis)' }}
                 tickFormatter={axisTickFormatter(format.xAxisFormat)}
-                label={xAxisLabelProps(format.xAxisLabel ?? xColumn.label, format.axisTitleStyle)}
+                label={
+                  htmlXTitle
+                    ? undefined
+                    : xAxisLabelProps(format.xAxisLabel ?? xColumn.label, format.axisTitleStyle)
+                }
               />
               <YAxis
                 type="number"
@@ -1357,16 +1644,14 @@ export default function ChartRenderer({
                 axisLine={false}
                 width={64}
                 tickFormatter={yTickFormatter}
-                label={yAxisLabelProps(format.yAxisLabel ?? yColumn.label, format.axisTitleStyle)}
+                label={
+                  htmlYTitle
+                    ? undefined
+                    : yAxisLabelProps(format.yAxisLabel ?? yColumn.label, format.axisTitleStyle)
+                }
               />
               {themedTooltip(formatPoint, format, 'dashed')}
-              {showLegend &&
-                chartLegend(
-                  format,
-                  scatter.series.map((s) => ({ key: s.key, label: s.label, color: s.color })),
-                  hidden,
-                  toggleSeries,
-                )}
+              {showLegend && chartLegend(format, scatterLegendItems, legendControl)}
               {visibleSeries.map((series) => (
                 <Scatter
                   key={series.key}
@@ -1418,7 +1703,8 @@ export default function ChartRenderer({
               +{scatter.droppedSeries} more series not shown
             </div>
           )}
-        </div>
+          </div>
+        </AxisTitleFrame>
       );
     }
 
@@ -1447,9 +1733,11 @@ export default function ChartRenderer({
       );
 
       return (
-        <div className="flex h-full flex-col items-center justify-center gap-1 p-4 text-center">
+        <div className="flex h-full flex-col items-center justify-center gap-1.5 p-4 text-center">
+          {/* leading-none: the number's font box otherwise sits optically low
+              in the tile (4xl line-height adds ~25% dead space above/below). */}
           <div
-            className="text-4xl font-semibold tabular-nums text-rcd-text"
+            className="text-4xl font-semibold leading-none tabular-nums text-rcd-text"
             style={kpiColor ? { color: kpiColor } : undefined}
           >
             {kpiText(primaryValue, primary)}

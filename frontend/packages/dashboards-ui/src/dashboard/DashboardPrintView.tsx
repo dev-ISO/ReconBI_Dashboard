@@ -143,8 +143,15 @@ export function PrintSheets({
             modelId={modelId}
             filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
             activeCategory={
-              crossFilter && crossFilter.sourceTileId === tile.id
+              crossFilter &&
+              crossFilter.sourceTileId === tile.id &&
+              (crossFilter.kind ?? 'axis') === 'axis'
                 ? { label: crossFilter.categoryLabel }
+                : null
+            }
+            selectedLegendLabel={
+              crossFilter && crossFilter.sourceTileId === tile.id && crossFilter.kind === 'legend'
+                ? crossFilter.categoryLabel
                 : null
             }
           />

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, ArrowLeft, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, Filter, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
 import {
   emptyChart,
   filterCardIsActive,
@@ -17,6 +17,7 @@ import {
   type FilterClause,
 } from '@recon/dashboards-core';
 import { ChartBuilder } from '../chart-builder/ChartBuilder';
+import type { ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
@@ -43,6 +44,49 @@ export interface DashboardViewProps {
 
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+/**
+ * The ONE transient-chip style (cross-filter / drillthrough / notices): pill
+ * of fixed height with a muted icon, truncating label, and a dismiss ✕ —
+ * identical radius/colors/shadow across every chip bar. `leading` prepends an
+ * extra action (the drillthrough "Back" button) inside the pill.
+ */
+function TransientChip({
+  icon,
+  leading,
+  dismissLabel,
+  onDismiss,
+  children,
+}: {
+  icon: ReactNode;
+  leading?: ReactNode;
+  dismissLabel: string;
+  onDismiss: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={`pointer-events-auto flex h-7 max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface pr-1 text-xs text-rcd-text shadow-md ${
+        leading ? 'pl-1' : 'pl-2.5'
+      }`}
+    >
+      {leading}
+      <span aria-hidden className="shrink-0 text-rcd-muted">
+        {icon}
+      </span>
+      <span className="min-w-0 truncate">{children}</span>
+      <button
+        type="button"
+        aria-label={dismissLabel}
+        title={dismissLabel}
+        onClick={onDismiss}
+        className="shrink-0 rounded-full p-1 text-rcd-muted transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
 
 /** Filesystem-safe download name from a chart title. */
 const csvFileName = (title: string): string => {
@@ -216,6 +260,39 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         clause,
         `${dimension.column}: ${info.label}`,
         info.label,
+      );
+    },
+    [runtime],
+  );
+
+  // Legend cross-filter (legendMode 'crossFilter'): the renderer reports the
+  // clicked legend item's raw value + label (null = clear). The clause targets
+  // the chart's LEGEND dimension and drives the same transient cross-filter
+  // path as datum clicks — every other tile filters; the source tile shows
+  // persistent legend emphasis (selectedLegendLabel) instead of dimming.
+  const handleLegendSelect = useCallback(
+    (tileId: string, chart: ChartSpec, e: ChartLegendSelectEvent | null) => {
+      if (e === null) {
+        // The emitting chart cleared its selection; only ITS legend filter
+        // clears (never someone else's active cross-filter).
+        const active = runtime.dashboards.store.getState().crossFilter;
+        if (active && active.sourceTileId === tileId && active.kind === 'legend') {
+          runtime.dashboards.clearCrossFilter();
+        }
+        return;
+      }
+      const dimension = chart.query.legend ?? null;
+      if (!dimension) return;
+      const clause: FilterClause =
+        e.raw === null || e.raw === ''
+          ? { table: dimension.table, column: dimension.column, operator: 'isNull', values: [] }
+          : { table: dimension.table, column: dimension.column, operator: 'eq', values: [e.raw] };
+      runtime.dashboards.setCrossFilter(
+        tileId,
+        clause,
+        `${dimension.column}: ${e.label}`,
+        e.label,
+        'legend',
       );
     },
     [runtime],
@@ -553,7 +630,16 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         refreshKey={`${refreshToken}:${tileRefreshTokens[tile.id] ?? 0}`}
         filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
         activeCategoryLabel={
-          crossFilter && crossFilter.sourceTileId === tile.id ? crossFilter.categoryLabel : null
+          crossFilter &&
+          crossFilter.sourceTileId === tile.id &&
+          (crossFilter.kind ?? 'axis') === 'axis'
+            ? crossFilter.categoryLabel
+            : null
+        }
+        selectedLegendLabel={
+          crossFilter && crossFilter.sourceTileId === tile.id && crossFilter.kind === 'legend'
+            ? crossFilter.categoryLabel
+            : null
         }
         onSelect={() => runtime.dashboards.selectTile(tile.id)}
         onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
@@ -567,6 +653,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             : undefined
         }
         onCrossFilter={(effectiveChart, info) => handleDatumClick(tile.id, effectiveChart, info)}
+        onLegendSelect={(effectiveChart, e) => handleLegendSelect(tile.id, effectiveChart, e)}
         onPointMenu={editable ? undefined : setPointMenu}
         reportEffective={reportEffective}
       />
@@ -662,60 +749,47 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       {/* Flex row: grid area + (optional) right-docked Filters pane. */}
       <div className="relative flex min-h-0 flex-1">
         {/* Chip strip under the toolbar: drillthrough context (on its target
-            page), the cross-filter chip, and transient export notices. */}
+            page), the cross-filter chip, and transient export notices — all on
+            the shared TransientChip style (icon + label + dismiss). */}
         <div className="pointer-events-none absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 flex-col items-center gap-1.5">
           {drillthrough && drillthrough.targetPageId === activePage?.id && (
-            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-1 pr-1 text-xs text-rcd-text shadow-md">
-              <button
-                type="button"
-                onClick={() => runtime.dashboards.returnFromDrillthrough()}
-                className="flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-              >
-                <ArrowLeft size={12} />
-                Back
-              </button>
-              <span className="truncate">
-                Drillthrough: <span className="font-medium">{drillthrough.label}</span>
-              </span>
-              <button
-                type="button"
-                aria-label="Clear drillthrough filter"
-                onClick={() => runtime.dashboards.clearDrillthrough()}
-                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-              >
-                <X size={12} />
-              </button>
-            </div>
+            <TransientChip
+              icon={<Zap size={12} />}
+              dismissLabel="Clear drillthrough filter"
+              onDismiss={() => runtime.dashboards.clearDrillthrough()}
+              leading={
+                <button
+                  type="button"
+                  onClick={() => runtime.dashboards.returnFromDrillthrough()}
+                  className="flex h-full shrink-0 items-center gap-1 rounded-full px-2 text-rcd-text-2 transition-colors hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                >
+                  <ArrowLeft size={12} />
+                  Back
+                </button>
+              }
+            >
+              Drillthrough: <span className="font-medium">{drillthrough.label}</span>
+            </TransientChip>
           )}
           {notice && (
-            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
-              <AlertTriangle size={12} className="shrink-0 text-[var(--rcd-status-warn)]" />
-              <span className="truncate">{notice}</span>
-              <button
-                type="button"
-                aria-label="Dismiss notice"
-                onClick={() => setNotice(null)}
-                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-              >
-                <X size={12} />
-              </button>
-            </div>
+            <TransientChip
+              icon={<AlertTriangle size={12} className="text-[var(--rcd-status-warn)]" />}
+              dismissLabel="Dismiss notice"
+              onDismiss={() => setNotice(null)}
+            >
+              {notice}
+            </TransientChip>
           )}
-          {/* Cross-filter chip: floats under the toolbar in BOTH modes. */}
+          {/* Cross-filter chip: floats under the toolbar in BOTH modes; shows
+              legend selections and datum clicks identically. */}
           {crossFilter && (
-            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
-              <span className="truncate">
-                Filtered by <span className="font-medium">{crossFilter.label}</span>
-              </span>
-              <button
-                type="button"
-                aria-label="Clear cross-filter"
-                onClick={() => runtime.dashboards.clearCrossFilter()}
-                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-              >
-                <X size={12} />
-              </button>
-            </div>
+            <TransientChip
+              icon={<Filter size={12} />}
+              dismissLabel="Clear cross-filter"
+              onDismiss={() => runtime.dashboards.clearCrossFilter()}
+            >
+              Filtered by <span className="font-medium">{crossFilter.label}</span>
+            </TransientChip>
           )}
         </div>
 

@@ -18,6 +18,7 @@ export interface AddSlicerDialogProps {
 const VARIANT_OPTIONS: { value: SlicerVariant; label: string }[] = [
   { value: 'checklist', label: 'Checklist' },
   { value: 'dropdown', label: 'Dropdown' },
+  { value: 'dropdownMulti', label: 'Dropdown (multi-select)' },
   { value: 'buttons', label: 'Buttons' },
   { value: 'dateRange', label: 'Date range' },
 ];

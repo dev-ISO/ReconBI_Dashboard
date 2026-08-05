@@ -287,9 +287,9 @@ function Well({ def, empty, children }: { def: WellDef; empty: boolean; children
     validTarget === false
       ? 'border-rcd-border opacity-40'
       : isOver && validTarget === true
-        ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)]'
+        ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)] ring-1 ring-rcd-accent'
         : validTarget === true
-          ? 'border-rcd-accent'
+          ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_5%,transparent)]'
           : 'border-rcd-border';
 
   return (
@@ -408,7 +408,7 @@ function SortableLevelChip({
     <div
       ref={setNodeRef}
       style={{ transform: CSS.Translate.toString(transform), transition }}
-      className={`flex items-center gap-1 ${isDragging ? 'relative z-10 opacity-80' : ''}`}
+      className={`flex min-w-0 max-w-full items-center gap-1 ${isDragging ? 'relative z-10 opacity-80' : ''}`}
     >
       {index > 0 && (
         <span aria-hidden className="text-[10px] text-rcd-muted">
@@ -460,7 +460,7 @@ function Chip({
   onRemove: () => void;
 }) {
   return (
-    <div className="flex items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
+    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
       {leading}
       {icon && <span className="shrink-0 text-rcd-muted">{icon}</span>}
       <span className="min-w-0 flex-1 truncate font-medium" title={label}>
@@ -493,7 +493,7 @@ function FilterChip({
   const text = `${columnLabelOf(model, clause.table, clause.column)} · ${filterSummary(clause)}`;
 
   return (
-    <div className="flex items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
+    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
       <Filter size={12} className="shrink-0 text-rcd-muted" />
       <button
         type="button"
@@ -617,7 +617,7 @@ function CalcMenu({
         onClick={toggle}
         className={`flex shrink-0 items-center rounded p-0.5 ${
           active
-            ? 'bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] px-1 text-rcd-accent'
+            ? 'bg-[color-mix(in_srgb,var(--rcd-accent)_20%,transparent)] px-1 text-rcd-accent ring-1 ring-inset ring-[color-mix(in_srgb,var(--rcd-accent)_40%,transparent)]'
             : 'text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10'
         }`}
       >

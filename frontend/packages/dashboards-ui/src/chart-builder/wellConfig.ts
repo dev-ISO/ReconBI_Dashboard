@@ -69,6 +69,11 @@ export const FILTERS_WELL: WellDef = {
   hint: 'Drop a column to filter by',
 };
 
+/**
+ * Unrestricted cartesian wells: a legend dimension AND multiple values may
+ * coexist (the renderer supports legend × measures for line/area/scatter).
+ * Only the stacked types constrain the combo (legend required, one measure).
+ */
 const CARTESIAN: readonly WellDef[] = [DRILL_AXIS, LEGEND, VALUES, SMALL_MULTIPLES];
 
 const STACKED: readonly WellDef[] = [

@@ -1,5 +1,5 @@
 import { useRef, useState, type ReactNode } from 'react';
-import { ChevronDown, ChevronRight, ChevronUp, Trash2, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
   CHART_THEMES,
@@ -91,6 +91,16 @@ const NUMBER_INPUT_CLASS =
 
 const RESET_BUTTON_CLASS =
   'shrink-0 rounded p-1 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10';
+
+/** Sub-group heading inside a section; matches the section-header language. */
+const SUBHEAD_CLASS = 'text-[11px] font-semibold uppercase tracking-wide text-rcd-muted';
+
+/** Helper captions for the legend click-action modes. */
+const LEGEND_MODE_CAPTIONS: Record<'toggle' | 'isolate' | 'crossFilter', string> = {
+  toggle: 'Click hides or shows the clicked series.',
+  isolate: 'Click shows only that series; click again to restore.',
+  crossFilter: 'Click highlights that group across every chart on the page.',
+};
 
 const clampFontSize = (value: number): number => Math.min(32, Math.max(8, Math.trunc(value)));
 
@@ -798,7 +808,7 @@ function ConditionalFormatCard({
           onChange={(next) => onChange({ dataBarColor: next })}
         />
       )}
-      <h4 className="text-xs font-medium text-rcd-muted">Rules</h4>
+      <h4 className={SUBHEAD_CLASS}>Rules</h4>
       {item.rules.map((rule, index) => (
         <div key={index} className="flex items-center gap-1.5">
           <RcdSelect
@@ -877,19 +887,24 @@ function ConditionalFormatCard({
 }
 
 /**
- * Minimal self-contained rich-text editor for the tile's inner title:
- * contentEditable plus a B/I/U/size/color toolbar driven by the legacy
- * execCommand API (deprecated but universally shipped; every call is wrapped in
- * try/catch so an engine without it degrades to plain-text editing).
- * styleWithCSS is requested first so output prefers span/style over <font>
- * tags. The live preview and the applied value both run through the core
- * sanitizeRichHtml allowlist, so nothing outside it ever reaches the spec.
+ * Minimal self-contained rich-text editor dialog, shared by the tile's inner
+ * title and the rich axis titles: contentEditable plus a B/I/U/size/color
+ * toolbar driven by the legacy execCommand API (deprecated but universally
+ * shipped; every call is wrapped in try/catch so an engine without it degrades
+ * to plain-text editing). styleWithCSS is requested first so output prefers
+ * span/style over <font> tags. The live preview and the applied value both run
+ * through the core sanitizeRichHtml allowlist, so nothing outside it ever
+ * reaches the spec. Applying an empty editor emits undefined (clears the
+ * target field).
  */
-function InnerTitleDialog({
+function RichTextDialog({
+  title,
   initialHtml,
   onApply,
   onCancel,
 }: {
+  /** Dialog + aria title, e.g. "Inner title" or "X axis title". */
+  title: string;
   initialHtml: string;
   onApply: (html: string | undefined) => void;
   onCancel: () => void;
@@ -922,7 +937,7 @@ function InnerTitleDialog({
 
   return (
     <RcdDialog
-      title="Inner title"
+      title={title}
       open
       onClose={onCancel}
       footer={
@@ -992,7 +1007,7 @@ function InnerTitleDialog({
           contentEditable
           role="textbox"
           aria-multiline="true"
-          aria-label="Inner title rich text"
+          aria-label={`${title} rich text`}
           className="min-h-[5rem] rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent"
           onInput={(event) => setHtml(event.currentTarget.innerHTML)}
           dangerouslySetInnerHTML={{ __html: initialHtml }}
@@ -1004,7 +1019,7 @@ function InnerTitleDialog({
           <div className="min-h-[2.5rem] rounded-md border border-dashed border-rcd-border px-2.5 py-1.5 text-sm text-rcd-text">
             {isEmpty ? (
               <span className="text-xs text-rcd-muted">
-                Empty — applying clears the inner title.
+                Empty — applying clears this title.
               </span>
             ) : (
               <div dangerouslySetInnerHTML={{ __html: sanitized }} />
@@ -1017,18 +1032,85 @@ function InnerTitleDialog({
 }
 
 /**
+ * Plain axis-title input plus the rich-title affordances: an "aA"-pencil button
+ * opening the shared RichTextDialog, a "rich" badge once html is set (the plain
+ * input dims — the rich title overrides it), and a clear button removing the
+ * html again.
+ */
+function AxisTitleField({
+  axis,
+  plain,
+  html,
+  onPlainChange,
+  onEdit,
+  onClear,
+}: {
+  /** "X" | "Y" — used for placeholder + aria labels. */
+  axis: 'X' | 'Y';
+  plain: string;
+  html: string | null | undefined;
+  onPlainChange: (next: string | undefined) => void;
+  onEdit: () => void;
+  onClear: () => void;
+}) {
+  const hasHtml = html != null && html !== '';
+  return (
+    <div className="flex items-center gap-1.5">
+      <RcdInput
+        className={`min-w-0 flex-1 ${hasHtml ? 'opacity-50' : ''}`}
+        value={plain}
+        placeholder={`${axis} axis title`}
+        aria-label={`${axis} axis title`}
+        title={hasHtml ? 'Rich title overrides this' : undefined}
+        onChange={(event) => onPlainChange(event.target.value || undefined)}
+      />
+      {hasHtml && (
+        <span
+          className="shrink-0 rounded bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] px-1 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-rcd-accent"
+          title="A rich title is set and overrides the plain title"
+        >
+          rich
+        </span>
+      )}
+      <button
+        type="button"
+        aria-label={`Edit ${axis} axis rich title`}
+        title="Rich title editor"
+        className="flex h-6 shrink-0 items-center gap-0.5 rounded border border-rcd-border px-1.5 text-[11px] font-medium text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10"
+        onClick={onEdit}
+      >
+        <span aria-hidden>aA</span>
+        <PenLine size={10} aria-hidden />
+      </button>
+      {hasHtml && (
+        <button
+          type="button"
+          aria-label={`Clear ${axis} axis rich title`}
+          title="Remove the rich title"
+          className={RESET_BUTTON_CLASS}
+          onClick={onClear}
+        >
+          <X size={12} />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
  * Power BI-style format pane: collapsible sections over the full ChartFormat
  * contract. Every control writes the whole next ChartFormat through onChange;
  * resets remove fields so persisted specs stay minimal. The panel itself keeps
- * no format state — only which sections are expanded and whether the inner
- * title dialog is open.
+ * no format state — only which sections are expanded and which rich-text
+ * dialog (inner title / axis title) is open.
  */
 export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const format = spec.format;
   const patch = (partial: Partial<ChartFormat>) => onChange({ ...format, ...partial });
 
   const [openSections, setOpenSections] = useState<ReadonlySet<string>>(() => new Set(['theme']));
-  const [innerTitleOpen, setInnerTitleOpen] = useState(false);
+  /** Which rich-text dialog is open (shared RichTextDialog instance). */
+  const [richTarget, setRichTarget] = useState<'inner' | 'x' | 'y' | null>(null);
 
   const toggleSection = (id: string) =>
     setOpenSections((previous) => {
@@ -1045,6 +1127,8 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
 
   const container = format.container;
   const showLegend = format.showLegend ?? seriesKeys.length >= 2;
+  const legendInteractive = format.legendInteractive ?? true;
+  const legendMode = format.legendMode ?? 'toggle';
   const hasAxes = !AXISLESS_TYPES.includes(spec.type);
   const horizontal = HORIZONTAL_TYPES.includes(spec.type);
   const isLineType = LINE_TYPES.includes(spec.type);
@@ -1253,6 +1337,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
           Shadow
           <RcdSelect
+            className="w-32 shrink-0"
             value={container?.shadow ?? 'none'}
             onChange={(event) =>
               setContainer({
@@ -1280,7 +1365,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             <button
               type="button"
               className="rounded-md border border-rcd-border bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-              onClick={() => setInnerTitleOpen(true)}
+              onClick={() => setRichTarget('inner')}
             >
               {container?.innerTitleHtml ? 'Edit…' : 'Add…'}
             </button>
@@ -1310,6 +1395,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
           Position
           <RcdSelect
+            className="w-32 shrink-0"
             value={format.legendPosition ?? 'bottom'}
             disabled={!showLegend}
             onChange={(event) =>
@@ -1323,10 +1409,35 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         </label>
         <CheckboxRow
           label="Interactive legend"
-          checked={format.legendInteractive ?? true}
+          checked={legendInteractive}
           onChange={(checked) => patch({ legendInteractive: checked ? undefined : false })}
         />
-        <p className="text-xs text-rcd-muted">Clicking a legend item shows or hides its series.</p>
+        {legendInteractive && (
+          <>
+            <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+              Click action
+              <RcdSelect
+                aria-label="Legend click action"
+                className="w-32 shrink-0"
+                disabled={!showLegend}
+                value={legendMode}
+                onChange={(event) =>
+                  patch({
+                    legendMode:
+                      event.target.value === 'toggle'
+                        ? undefined
+                        : (event.target.value as 'isolate' | 'crossFilter'),
+                  })
+                }
+              >
+                <option value="toggle">Toggle series</option>
+                <option value="isolate">Isolate series</option>
+                <option value="crossFilter">Highlight page</option>
+              </RcdSelect>
+            </label>
+            <p className="text-xs text-rcd-muted">{LEGEND_MODE_CAPTIONS[legendMode]}</p>
+          </>
+        )}
         <TextStyleRow
           label="Legend text"
           value={format.legendStyle}
@@ -1336,17 +1447,21 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
 
       {hasAxes && (
         <CollapsibleSection title="Axes" {...sectionProps('axes')}>
-          <RcdInput
-            value={format.xAxisLabel ?? ''}
-            placeholder="X axis title"
-            aria-label="X axis title"
-            onChange={(event) => patch({ xAxisLabel: event.target.value || undefined })}
+          <AxisTitleField
+            axis="X"
+            plain={format.xAxisLabel ?? ''}
+            html={format.xAxisLabelHtml}
+            onPlainChange={(next) => patch({ xAxisLabel: next })}
+            onEdit={() => setRichTarget('x')}
+            onClear={() => patch({ xAxisLabelHtml: undefined })}
           />
-          <RcdInput
-            value={format.yAxisLabel ?? ''}
-            placeholder="Y axis title"
-            aria-label="Y axis title"
-            onChange={(event) => patch({ yAxisLabel: event.target.value || undefined })}
+          <AxisTitleField
+            axis="Y"
+            plain={format.yAxisLabel ?? ''}
+            html={format.yAxisLabelHtml}
+            onPlainChange={(next) => patch({ yAxisLabel: next })}
+            onEdit={() => setRichTarget('y')}
+            onClear={() => patch({ yAxisLabelHtml: undefined })}
           />
           <TextStyleRow
             label="Axis titles"
@@ -1412,7 +1527,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         )}
         {seriesKeys.length > 0 && (
           <>
-            <h4 className="text-xs font-medium text-rcd-muted">Names</h4>
+            <h4 className={SUBHEAD_CLASS}>Names</h4>
             {seriesKeys.map((key) => (
               <div key={key} className="flex items-center gap-2">
                 <span className="min-w-0 flex-1 truncate text-sm text-rcd-text-2" title={key}>
@@ -1427,7 +1542,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                 />
               </div>
             ))}
-            <h4 className="text-xs font-medium text-rcd-muted">Colors</h4>
+            <h4 className={SUBHEAD_CLASS}>Colors</h4>
             {seriesKeys.map((key) => {
               const override = format.colorOverrides?.[key];
               return (
@@ -1470,7 +1585,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         )}
         {isLineType && seriesKeys.length > 0 && (
           <>
-            <h4 className="text-xs font-medium text-rcd-muted">Line style</h4>
+            <h4 className={SUBHEAD_CLASS}>Line style</h4>
             {seriesKeys.map((key) => {
               const style = format.lineStyles?.[key];
               return (
@@ -1586,7 +1701,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           </p>
         ) : (
           <>
-            <h4 className="text-xs font-medium text-rcd-muted">Reference lines</h4>
+            <h4 className={SUBHEAD_CLASS}>Reference lines</h4>
             {(format.referenceLines ?? []).map((line) => (
               <ReferenceLineRow
                 key={line.id}
@@ -1599,7 +1714,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             <button type="button" className={ADD_BUTTON_CLASS} onClick={addReferenceLine}>
               + Add reference line
             </button>
-            <h4 className="text-xs font-medium text-rcd-muted">Trendlines</h4>
+            <h4 className={SUBHEAD_CLASS}>Trendlines</h4>
             {(format.trendlines ?? []).map((line) => (
               <TrendlineRow
                 key={line.id}
@@ -1656,6 +1771,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               Columns
               <RcdSelect
                 aria-label="Small multiples columns"
+                className="w-32 shrink-0"
                 value={
                   format.smallMultiples?.columns === undefined
                     ? 'auto'
@@ -1708,6 +1824,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           Refresh
           <RcdSelect
             aria-label="Live refresh interval"
+            className="w-32 shrink-0"
             value={format.refreshSeconds != null ? String(format.refreshSeconds) : ''}
             onChange={(event) =>
               patch({
@@ -1728,14 +1845,29 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         </p>
       </CollapsibleSection>
 
-      {innerTitleOpen && (
-        <InnerTitleDialog
-          initialHtml={sanitizeRichHtml(container?.innerTitleHtml ?? '')}
+      {richTarget !== null && (
+        <RichTextDialog
+          title={
+            richTarget === 'inner'
+              ? 'Inner title'
+              : richTarget === 'x'
+                ? 'X axis title'
+                : 'Y axis title'
+          }
+          initialHtml={sanitizeRichHtml(
+            (richTarget === 'inner'
+              ? container?.innerTitleHtml
+              : richTarget === 'x'
+                ? format.xAxisLabelHtml
+                : format.yAxisLabelHtml) ?? '',
+          )}
           onApply={(next) => {
-            setContainer({ innerTitleHtml: next });
-            setInnerTitleOpen(false);
+            if (richTarget === 'inner') setContainer({ innerTitleHtml: next });
+            else if (richTarget === 'x') patch({ xAxisLabelHtml: next });
+            else patch({ yAxisLabelHtml: next });
+            setRichTarget(null);
           }}
-          onCancel={() => setInnerTitleOpen(false)}
+          onCancel={() => setRichTarget(null)}
         />
       )}
     </div>

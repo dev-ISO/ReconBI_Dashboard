@@ -12,7 +12,7 @@ export interface TileLayout {
 }
 
 /** How a slicer tile renders its value picker. */
-export type SlicerVariant = 'checklist' | 'dropdown' | 'buttons' | 'dateRange';
+export type SlicerVariant = 'checklist' | 'dropdown' | 'dropdownMulti' | 'buttons' | 'dateRange';
 
 /** Visual tweaks for a slicer tile; absent fields keep the standard look. */
 export interface SlicerTileStyle {
@@ -306,8 +306,18 @@ export interface CrossFilter {
   clause: FilterClause;
   /** Human chip text, e.g. "region: West". */
   label: string;
-  /** Plain formatted category label — the source chart's dimming key. */
+  /**
+   * Plain formatted category label — the source chart's emphasis key: dimming
+   * for 'axis' clicks, persistent legend emphasis for 'legend' selections.
+   */
   categoryLabel: string;
+  /**
+   * What was clicked on the source chart: 'axis' = a datum/category (default,
+   * absent on legacy state), 'legend' = a legend item (legendMode
+   * 'crossFilter'). The source tile renders emphasis differently per kind —
+   * the page-wide filtering path is identical.
+   */
+  kind?: 'axis' | 'legend';
 }
 
 /**

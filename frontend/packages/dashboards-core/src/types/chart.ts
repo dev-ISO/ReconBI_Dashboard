@@ -199,6 +199,22 @@ export interface ChartFormat {
   tooltip?: TooltipStyle;
   /** Legend items toggle series visibility on click (default true). */
   legendInteractive?: boolean;
+  /**
+   * What a legend click does (when legendInteractive): 'toggle' hides the
+   * clicked series (default); 'isolate' shows ONLY it, second click restores;
+   * 'crossFilter' spotlights that group across the entire page — the renderer
+   * emits the clicked legend group and the tile cross-filters the dashboard by
+   * its legend dimension (falls back to 'isolate' when there is no legend
+   * dimension, e.g. measure-series legends).
+   */
+  legendMode?: 'toggle' | 'isolate' | 'crossFilter';
+  /**
+   * Sanitized rich-HTML axis titles (util/richText allowlist), rendered as
+   * HTML overlays; when set they take precedence over the plain
+   * xAxisLabel/yAxisLabel + axisTitleStyle pair.
+   */
+  xAxisLabelHtml?: string | null;
+  yAxisLabelHtml?: string | null;
   /** Per-tile live refresh in seconds (overrides dashboard refresh; null = off). */
   refreshSeconds?: number | null;
   /** Guide lines drawn over cartesian charts (constant/average/median/min/max). */

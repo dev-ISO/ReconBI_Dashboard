@@ -677,12 +677,16 @@ export class DashboardStore {
    * Clicking the SAME datum on the same source again (same source tile +
    * structurally identical clause, compared via stableStringify) toggles it
    * off; any other click replaces the active filter (one at a time, v1).
+   * `kind` records what was clicked on the source ('axis' datum by default;
+   * 'legend' for legendMode 'crossFilter' selections) — the filtering path is
+   * identical, only the source tile's emphasis rendering differs.
    */
   setCrossFilter(
     sourceTileId: string,
     clause: FilterClause,
     label: string,
     categoryLabel: string,
+    kind: 'axis' | 'legend' = 'axis',
   ): void {
     const active = this.state.crossFilter;
     if (
@@ -693,7 +697,7 @@ export class DashboardStore {
       this.set({ crossFilter: null });
       return;
     }
-    this.set({ crossFilter: { sourceTileId, clause, label, categoryLabel } });
+    this.set({ crossFilter: { sourceTileId, clause, label, categoryLabel, kind } });
   }
 
   clearCrossFilter(): void {

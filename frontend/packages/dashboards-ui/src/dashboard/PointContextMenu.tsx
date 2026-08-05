@@ -80,7 +80,7 @@ export function PointContextMenu({
       aria-label={`Point actions for ${title}`}
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(event) => event.preventDefault()}
-      className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-xl"
+      className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
     >
       {drillthroughTargets.length > 0 && (
         <>

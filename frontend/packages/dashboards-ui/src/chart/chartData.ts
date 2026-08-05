@@ -24,6 +24,13 @@ export interface ChartSeries {
    * mode (the series is a measure, not a legend value).
    */
   legendRaw?: CellValue;
+  /**
+   * FORMATTED legend cell (pre-seriesLabels-override) backing this series.
+   * Present only in legend-pivot mode — its presence is what marks a series as
+   * carrying a legend identity (crossFilter legend mode needs one). In combo
+   * mode this is the legend half of the name; `label` holds the full combo.
+   */
+  legendLabel?: string;
 }
 
 export interface ShapedChartData {
@@ -43,6 +50,27 @@ const AXIS_KEY = '__axis';
  * stays display-only. Never rendered — recharts only reads declared dataKeys.
  */
 export const RAW_AXIS_KEY = '__rawAxis';
+
+/**
+ * Separator inside combo (measure × legend) dataKeys: `<column name><US><legend
+ * label>`. U+001F (unit separator) never appears in wire column names or
+ * formatted cells, so combo keys can't collide with plain keys or each other.
+ */
+const COMBO_KEY_SEP = String.fromCharCode(0x1f);
+
+/** Default display name of a combo series: "<Measure> — <Legend value>". */
+const comboName = (measureLabel: string, legendLabel: string): string =>
+  `${measureLabel} — ${legendLabel}`;
+
+/**
+ * Wire measure-column name behind a series dataKey. Combo keys encode it
+ * before the separator; every other key passes through unchanged (measure-mode
+ * keys ARE column names; legend labels simply won't match any column).
+ */
+export const measureNameForKey = (key: string): string => {
+  const sep = key.indexOf(COMBO_KEY_SEP);
+  return sep === -1 ? key : key.slice(0, sep);
+};
 
 /**
  * Display name for a series: format.seriesLabels override (keyed by the
@@ -66,8 +94,9 @@ const categoryLabel = (value: CellValue, column: QueryColumn, spec: ChartSpec): 
 
 /**
  * Pivots the engine's columnar result into recharts-friendly rows.
- * With a legend dimension: one series per legend value (first measure).
- * Without: one series per measure.
+ * With a legend dimension: one series per legend value (first measure) —
+ * except line/area with MULTIPLE measures, which get one series per
+ * (measure × legend value) combo. Without a legend: one series per measure.
  */
 export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChartData {
   const dimensionColumns = result.columns.filter((c) => c.role === 'dimension');
@@ -99,11 +128,16 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
     return { data, series, axisKey: AXIS_KEY, hasLegend: false };
   }
 
-  // Legend pivot: axis x legend -> value of the FIRST measure.
+  // Legend pivot. line/area with SEVERAL measures keep them all: one series
+  // per (measure × legend value) combo. Every other chart type — and
+  // single-measure line/area — pivots the FIRST measure only, exactly as
+  // before (dataKeys, colors and labels byte-identical, so existing dashboards
+  // never reshuffle).
   const legendColumn = dimensionColumns[1]!;
   const legendIndex = result.columns.indexOf(legendColumn);
-  const measureColumn = measureColumns[0];
-  const measureIndex = measureColumn ? result.columns.indexOf(measureColumn) : -1;
+  const comboMode =
+    (spec.type === 'line' || spec.type === 'area') && measureColumns.length > 1;
+  const pivotMeasures = comboMode ? measureColumns : measureColumns.slice(0, 1);
 
   const byAxis = new Map<string, Record<string, CellValue>>();
   const legendValues: string[] = [];
@@ -125,16 +159,47 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
       };
       byAxis.set(axisLabel, item);
     }
-    item[legendLabel] = measureIndex >= 0 ? toNumber(row[measureIndex] ?? null) : null;
+    if (pivotMeasures.length === 0) {
+      item[legendLabel] = null;
+    } else {
+      for (const measure of pivotMeasures) {
+        const key = comboMode ? `${measure.name}${COMBO_KEY_SEP}${legendLabel}` : legendLabel;
+        item[key] = toNumber(row[result.columns.indexOf(measure)] ?? null);
+      }
+    }
   }
 
-  const series: ChartSeries[] = legendValues.map((value, i) => ({
-    key: value,
-    label: displayLabel(value, spec),
-    color: seriesColor(i, value, spec.format.colorOverrides, spec.format.theme),
-    styleKey: value,
-    legendRaw: legendRawByLabel.get(value) ?? null,
-  }));
+  // Combo series are MEASURE-major ("Revenue — East, Revenue — West, Profit —
+  // East, …") so the legend groups by measure; the palette index advances per
+  // combo. styleKey is the full combo name, so seriesLabels / colorOverrides /
+  // lineStyles keyed by "<Measure> — <Legend value>" all resolve.
+  const series: ChartSeries[] = comboMode
+    ? pivotMeasures.flatMap((measure, mi) =>
+        legendValues.map((value, li) => {
+          const name = comboName(measure.label, value);
+          return {
+            key: `${measure.name}${COMBO_KEY_SEP}${value}`,
+            label: displayLabel(name, spec),
+            color: seriesColor(
+              mi * legendValues.length + li,
+              name,
+              spec.format.colorOverrides,
+              spec.format.theme,
+            ),
+            styleKey: name,
+            legendRaw: legendRawByLabel.get(value) ?? null,
+            legendLabel: value,
+          };
+        }),
+      )
+    : legendValues.map((value, i) => ({
+        key: value,
+        label: displayLabel(value, spec),
+        color: seriesColor(i, value, spec.format.colorOverrides, spec.format.theme),
+        styleKey: value,
+        legendRaw: legendRawByLabel.get(value) ?? null,
+        legendLabel: value,
+      }));
 
   return { data: [...byAxis.values()], series, axisKey: AXIS_KEY, hasLegend: true };
 }
@@ -212,6 +277,9 @@ export const SCATTER_SERIES_CAP = 3;
  * x = first measure, y = second measure. When a dimension is present it splits
  * points into one series per distinct value — first SCATTER_SERIES_CAP distinct
  * values in row order; the remainder are dropped and counted in droppedSeries.
+ * The LEGEND dimension is the preferred split when the spec has one (points
+ * group into colored legend series even when an axis dimension is also
+ * present); otherwise the first dimension splits, as before.
  */
 export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedScatterData {
   const measureColumns = result.columns.filter((c) => c.role === 'measure');
@@ -221,7 +289,11 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
 
   const xIndex = result.columns.indexOf(xColumn);
   const yIndex = result.columns.indexOf(yColumn);
-  const splitColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
+  // Wire dimension order is [axis?, legend?, smallMultiples?] (toWireSpec).
+  const dimensionColumns = result.columns.filter((c) => c.role === 'dimension');
+  const splitColumn = spec.query.legend
+    ? (dimensionColumns[spec.query.axis ? 1 : 0] ?? dimensionColumns[0] ?? null)
+    : (dimensionColumns[0] ?? null);
   const splitIndex = splitColumn ? result.columns.indexOf(splitColumn) : -1;
 
   const bySeries = new Map<string, { points: ScatterPoint[]; raw: CellValue }>();
