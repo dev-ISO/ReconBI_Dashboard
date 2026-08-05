@@ -60,10 +60,11 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
     ) : spec.variant === 'checklist' ? (
       // Compact overrides reach INTO DistinctValueList via arbitrary variants
       // (its rows are labels): tighter rows + smaller text. Literal classes.
+      // max-w keeps rows readable on wide tiles (anchored top-left).
       <div
-        className={
-          compact ? '[&_label]:gap-1.5 [&_label]:py-0.5 [&_label]:text-xs' : ''
-        }
+        className={`max-w-[24rem]${
+          compact ? ' [&_label]:gap-1.5 [&_label]:py-0.5 [&_label]:text-xs' : ''
+        }`}
       >
         <DistinctValueList
           modelId={modelId}
@@ -237,7 +238,7 @@ function DropdownSlicer({
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className={`flex w-full items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
+        className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
         } ${active ? 'border-rcd-accent' : 'border-rcd-border'}`}
       >
@@ -430,13 +431,15 @@ function DateRangeSlicer({
     }
   };
 
+  // w-full + max-w: each field caps at 18rem but still shrinks in narrow
+  // tiles; flex-wrap puts From/To side by side when the tile is wide enough.
   const labelClasses = compact
-    ? 'flex flex-col gap-0.5 text-[11px] text-rcd-text-2'
-    : 'flex flex-col gap-1 text-xs text-rcd-text-2';
-  const inputClasses = compact ? 'h-7 text-xs' : '';
+    ? 'flex w-full max-w-[18rem] flex-col gap-0.5 text-[11px] text-rcd-text-2'
+    : 'flex w-full max-w-[18rem] flex-col gap-1 text-xs text-rcd-text-2';
+  const inputClasses = compact ? 'h-7 w-full text-xs' : 'w-full';
 
   return (
-    <div className={compact ? 'flex flex-col gap-1 p-0.5' : 'flex flex-col gap-2 p-0.5'}>
+    <div className={compact ? 'flex flex-wrap gap-1 p-0.5' : 'flex flex-wrap gap-2 p-0.5'}>
       <label className={labelClasses}>
         From
         <RcdInput

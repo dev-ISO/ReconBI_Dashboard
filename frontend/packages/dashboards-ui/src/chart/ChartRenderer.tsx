@@ -1,4 +1,4 @@
-import { useState, type CSSProperties, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import {
   Area,
   AreaChart,
@@ -73,6 +73,12 @@ const RESIZE_DEBOUNCE = 60;
 
 const TABLE_ROW_CAP = 500;
 
+/** Width (px) reserved beside a pie/donut for a right-positioned legend. */
+const PIE_RIGHT_LEGEND_WIDTH = 230;
+
+/** Horizontal breathing room around a pie/donut without a right legend. */
+const PIE_SIDE_PAD = 32;
+
 /** Shared empty set: the "nothing hidden" value (also used when non-interactive). */
 const NO_HIDDEN: ReadonlySet<string> = new Set();
 
@@ -114,7 +120,9 @@ function legendProps(format: ChartFormat) {
       layout: 'vertical',
       align: 'right',
       verticalAlign: 'middle',
-      wrapperStyle,
+      // Vertical legends size to their longest label; cap the wrapper so they
+      // can never crowd out the plot (items ellipsize via `truncate`).
+      wrapperStyle: { ...wrapperStyle, maxWidth: 'min(35%, 240px)' },
     } as const;
   }
   return {
@@ -385,6 +393,9 @@ function themedTooltip(
     <Tooltip
       cursor={cursorProp}
       isAnimationActive={false}
+      // Flip to the TOP-LEFT of the cursor so the card never covers the datum
+      // under inspection; still clamps inside the chart (no allowEscapeViewBox).
+      reverseDirection={{ x: true, y: true }}
       content={
         <RcdChartTooltip
           styleSpec={format.tooltip}
@@ -394,6 +405,51 @@ function themedTooltip(
         />
       }
     />
+  );
+}
+
+/**
+ * Pie/donut only: anchors the legend to the chart instead of letting
+ * ResponsiveContainer stretch across a wide tile (which parks the pie in the
+ * middle of the leftover space and glues a right legend to the far edge).
+ * Width is capped at the pie's natural footprint — the container height (the
+ * pie is height-bound) plus room for a right legend or a small side pad — and
+ * the capped box is centered, so the legend hugs the pie at any tile width.
+ * Measurement is a ResizeObserver debounced like ResponsiveContainer's
+ * re-measures; until the first measure lands we render full-width.
+ */
+function CenteredPieFrame({ legendRight, children }: { legendRight: boolean; children: ReactNode }) {
+  const frameRef = useRef<HTMLDivElement>(null);
+  const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
+  useEffect(() => {
+    const node = frameRef.current;
+    if (!node) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const measure = () => setFrameSize({ width: node.clientWidth, height: node.clientHeight });
+    measure();
+    const observer = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(measure, RESIZE_DEBOUNCE);
+    });
+    observer.observe(node);
+    return () => {
+      clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, []);
+  const width =
+    frameSize === null
+      ? '100%'
+      : Math.min(
+          frameSize.width,
+          frameSize.height + (legendRight ? PIE_RIGHT_LEGEND_WIDTH : PIE_SIDE_PAD),
+        );
+  return (
+    <div ref={frameRef} className="flex h-full w-full justify-center">
+      <div className="h-full" style={{ width }}>
+        {children}
+      </div>
+    </div>
   );
 }
 
@@ -712,40 +768,42 @@ export default function ChartRenderer({
           }
         : undefined;
       return (
-        <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
-          <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
-            {themedTooltip(formatValue, format, 'none', { active: true, total: visibleTotal })}
-            {showLegend &&
-              chartLegend(
-                format,
-                slices.map((s) => ({ key: s.label, label: s.label, color: s.color })),
-                hidden,
-                toggleSeries,
-              )}
-            <Pie
-              data={visibleSlices}
-              dataKey="value"
-              nameKey="label"
-              innerRadius={spec.type === 'donut' ? '55%' : 0}
-              outerRadius="85%"
-              stroke="var(--rcd-surface)"
-              strokeWidth={2}
-              isAnimationActive={false}
-              cursor={handleSliceClick ? 'pointer' : undefined}
-              onClick={handleSliceClick}
-            >
-              {visibleSlices.map((slice, i) => (
-                <Cell
-                  key={`${i}-${slice.label}`}
-                  fill={slice.color}
-                  fillOpacity={
-                    activeCategory && slice.label !== activeCategory.label ? 0.35 : undefined
-                  }
-                />
-              ))}
-            </Pie>
-          </PieChart>
-        </ResponsiveContainer>
+        <CenteredPieFrame legendRight={showLegend && format.legendPosition === 'right'}>
+          <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
+            <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+              {themedTooltip(formatValue, format, 'none', { active: true, total: visibleTotal })}
+              {showLegend &&
+                chartLegend(
+                  format,
+                  slices.map((s) => ({ key: s.label, label: s.label, color: s.color })),
+                  hidden,
+                  toggleSeries,
+                )}
+              <Pie
+                data={visibleSlices}
+                dataKey="value"
+                nameKey="label"
+                innerRadius={spec.type === 'donut' ? '55%' : 0}
+                outerRadius="85%"
+                stroke="var(--rcd-surface)"
+                strokeWidth={2}
+                isAnimationActive={false}
+                cursor={handleSliceClick ? 'pointer' : undefined}
+                onClick={handleSliceClick}
+              >
+                {visibleSlices.map((slice, i) => (
+                  <Cell
+                    key={`${i}-${slice.label}`}
+                    fill={slice.color}
+                    fillOpacity={
+                      activeCategory && slice.label !== activeCategory.label ? 0.35 : undefined
+                    }
+                  />
+                ))}
+              </Pie>
+            </PieChart>
+          </ResponsiveContainer>
+        </CenteredPieFrame>
       );
     }
 

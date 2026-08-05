@@ -154,6 +154,7 @@ export function FilterEditor({
           <RcdSelect
             value={operator}
             onChange={(event) => setOperator(event.target.value as FilterOperator)}
+            className="w-full max-w-[18rem]"
           >
             {operators.map((op) => (
               <option key={op} value={op}>
@@ -173,13 +174,14 @@ export function FilterEditor({
               value={single}
               onChange={(event) => setSingle(event.target.value)}
               placeholder="Value"
+              className="w-full max-w-[18rem]"
             />
           </label>
         )}
 
         {mode === 'pair' && (
-          <div className="flex items-end gap-2">
-            <label className="flex min-w-0 flex-1 flex-col gap-1">
+          <div className="flex flex-wrap items-end gap-2">
+            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
                 From
               </span>
@@ -191,7 +193,7 @@ export function FilterEditor({
               />
             </label>
             <span className="pb-2 text-xs text-rcd-muted">and</span>
-            <label className="flex min-w-0 flex-1 flex-col gap-1">
+            <label className="flex min-w-0 max-w-[18rem] flex-1 basis-32 flex-col gap-1">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
                 To
               </span>
@@ -213,6 +215,7 @@ export function FilterEditor({
             <RcdSelect
               value={boolChoice}
               onChange={(event) => setBoolChoice(event.target.value as 'true' | 'false')}
+              className="w-full max-w-[18rem]"
             >
               <option value="true">True</option>
               <option value="false">False</option>

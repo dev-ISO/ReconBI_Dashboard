@@ -84,7 +84,8 @@ export function DistinctValueList({ modelId, table, column, selected, onToggle }
 
   return (
     <div className="flex flex-col gap-2">
-      <div className="relative">
+      {/* max-w keeps the search box from stretching edge-to-edge in wide hosts. */}
+      <div className="relative max-w-[18rem]">
         <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-rcd-muted" />
         <RcdInput
           value={search}

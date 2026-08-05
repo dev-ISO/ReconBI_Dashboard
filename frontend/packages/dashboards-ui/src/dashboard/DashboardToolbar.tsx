@@ -38,6 +38,10 @@ export interface DashboardToolbarProps {
   onChangeRefreshSeconds?: (seconds: number | null) => void;
   /** Manual "refresh all tiles now" (both modes). */
   onRefresh?: () => void;
+  /** Spins the refresh icon while a (manual or auto) refresh is in flight. */
+  refreshing?: boolean;
+  /** When the dashboard's data was last (re)loaded; null before first load. */
+  lastRefreshAt?: Date | null;
   /** Opens the PDF-export (print) configurator (both modes). */
   onExport?: () => void;
   /** Toggles the Filters pane (both modes). */
@@ -76,6 +80,8 @@ export function DashboardToolbar({
   refreshSeconds = null,
   onChangeRefreshSeconds,
   onRefresh,
+  refreshing = false,
+  lastRefreshAt = null,
   onExport,
   onToggleFilters,
   filtersOpen = false,
@@ -140,9 +146,12 @@ export function DashboardToolbar({
       )}
 
       {onRefresh && (
-        <RcdIconButton aria-label="Refresh tiles" title="Refresh tiles" onClick={onRefresh}>
-          <RefreshCw size={14} />
-        </RcdIconButton>
+        <>
+          {lastRefreshAt && <LastRefreshCaption at={lastRefreshAt} />}
+          <RcdIconButton aria-label="Refresh tiles" title="Refresh tiles" onClick={onRefresh}>
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : undefined} />
+          </RcdIconButton>
+        </>
       )}
 
       {mode === 'view'
@@ -201,6 +210,36 @@ export function DashboardToolbar({
         onCancel={() => setConfirmDiscard(false)}
       />
     </div>
+  );
+}
+
+/** "Updated just now" / "Updated 2m ago" / "Updated 3:41 PM" (hour-plus old). */
+const formatUpdated = (at: Date): string => {
+  const ageMs = Date.now() - at.getTime();
+  if (ageMs < 60_000) return 'Updated just now';
+  if (ageMs < 3_600_000) return `Updated ${Math.floor(ageMs / 60_000)}m ago`;
+  return `Updated ${at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
+};
+
+/**
+ * Subtle "last refreshed" caption beside the refresh button. Ticks every 30s
+ * so the relative label stays current — the tick only re-renders this span,
+ * it never touches any data. Hidden on very narrow toolbars.
+ */
+function LastRefreshCaption({ at }: { at: Date }) {
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setTick((tick) => tick + 1), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  return (
+    <span
+      className="hidden shrink-0 text-[11px] text-rcd-muted sm:inline"
+      title={`Last refreshed ${at.toLocaleString()}`}
+    >
+      {formatUpdated(at)}
+    </span>
   );
 }
 

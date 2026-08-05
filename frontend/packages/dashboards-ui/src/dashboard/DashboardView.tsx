@@ -190,13 +190,41 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     [tiles],
   );
 
+  // Refresh indicator: when THIS dashboard's data was last (re)loaded —
+  // initial open, manual refresh, and each dashboard auto-refresh tick.
+  // Tile fetches aren't observable from here (each ChartTile fetches on its
+  // own), so `refreshing` is a brief ~800ms pulse that spins the toolbar icon.
+  const [lastRefreshAt, setLastRefreshAt] = useState<Date | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const spinTimer = useRef<number | null>(null);
+  const markRefreshed = useCallback(() => {
+    setLastRefreshAt(new Date());
+    setRefreshing(true);
+    if (spinTimer.current !== null) window.clearTimeout(spinTimer.current);
+    spinTimer.current = window.setTimeout(() => setRefreshing(false), 800);
+  }, []);
+  useEffect(
+    () => () => {
+      if (spinTimer.current !== null) window.clearTimeout(spinTimer.current);
+    },
+    [],
+  );
+
+  // Initial load (and dashboard switches): stamp the load time once the open
+  // dashboard matches this view; reset while another one is (still) loading.
+  const dashboardLoaded = current?.id === dashboardId;
+  useEffect(() => {
+    setLastRefreshAt(dashboardLoaded ? new Date() : null);
+  }, [dashboardLoaded, dashboardId]);
+
   // Auto-refresh: invalidate the shared query cache, then bump a token that
   // keys ChartTile — remounting refetches (brief skeleton) with fresh data.
   const [refreshToken, setRefreshToken] = useState(0);
   const refreshTiles = useCallback(() => {
     runtime.queries.invalidateAll();
     setRefreshToken((token) => token + 1);
-  }, [runtime]);
+    markRefreshed();
+  }, [runtime, markRefreshed]);
 
   const refreshSeconds = current?.id === dashboardId ? (current.layout.refreshSeconds ?? null) : null;
 
@@ -487,6 +515,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         refreshSeconds={refreshSeconds}
         onChangeRefreshSeconds={(seconds) => runtime.dashboards.setRefreshSeconds(seconds)}
         onRefresh={refreshTiles}
+        refreshing={refreshing}
+        lastRefreshAt={lastRefreshAt}
         onExport={() => setPrintConfigOpen(true)}
         onToggleFilters={() => setFiltersPaneOpen((open) => !open)}
         filtersOpen={filtersPaneOpen}
