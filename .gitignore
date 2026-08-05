@@ -30,3 +30,6 @@ logs/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# start/stop script state (PIDs + logs)
+.run/
