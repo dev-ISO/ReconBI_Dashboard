@@ -39,7 +39,6 @@ import {
   type ChartFormat,
   type ChartPointEvent,
   type ChartSpec,
-  type ConditionalFormatSpec,
   type QueryColumn,
   type QueryResult,
   type ReferenceLineSpec,
@@ -63,13 +62,15 @@ import {
   buildTrendlines,
   conditionalColor,
   linearFitSegment,
-  matchRuleColor,
   referenceLineValue,
   seriesValues,
   sharedValueDomain,
   type TrendlineOverlay,
 } from './analytics';
 import { textStyleToCss } from './textStyle';
+import { TableChart } from './TableChart';
+
+export type { TableLayoutPatch, TableSortState } from './TableChart';
 
 /** Payload of a cross-filter datum click. */
 export interface ChartDatumClickInfo {
@@ -126,6 +127,39 @@ export interface ChartRendererProps {
    * (bold); the rest dim. Null/undefined = no selection marking.
    */
   selectedLegendLabel?: string | null;
+  /**
+   * Page hover-highlight source: fires when the pointer enters a datum (bars
+   * and stacked segments, the ACTIVE category of line/area charts via
+   * chart-level mousemove, pie slices, scatter points, table rows) and null
+   * when it leaves the plot. Emission is throttled internally (~60ms,
+   * trailing) so consumers aren't flooded; leave (null) flushes immediately.
+   * Suppressed entirely when format.hoverHighlight === false — CONSUMERS gate
+   * whether they APPLY highlights, the source gates emitting.
+   */
+  onPointHover?: (e: ChartPointEvent | null) => void;
+  /**
+   * Page hover-highlight echo: NON-matching categories/series render at ~0.35
+   * opacity while set (matching marks stay full). Category matches dim per
+   * category on bar-family charts (the Cell path), pie slices and table rows;
+   * a label matching a SERIES (display name, styleKey or legend half) dims
+   * the other series instead — including line/area strokes and scatter
+   * groups. Distinct from the activeCategory cross-filter dim: both can
+   * coexist, and the hover highlight wins visually while present.
+   */
+  highlightCategory?: { label: string } | null;
+  /** Echo of the tile's table sort (indicator arrows); see TableChart. */
+  tableSort?: { column: string; direction: 'asc' | 'desc' } | null;
+  /** Table header click cycles asc -> desc -> none (table.sortable !== false). */
+  onTableSortChange?: (s: { column: string; direction: 'asc' | 'desc' } | null) => void;
+  /** 0-based page the tile is serving (footer shows Page N = tablePage + 1). */
+  tablePage?: number;
+  /** Total pages; null = unknown, keeps "next" enabled until the tile knows. */
+  tablePageCount?: number | null;
+  onTablePageChange?: (page: number) => void;
+  /** Full-data totals aligned to the measure columns (bold pinned bottom row). */
+  totalsRow?: (number | null)[] | null;
+  /** Column resize / header drag-to-reorder patches for the tile to persist. */
+  onTableLayoutChange?: (patch: { columnWidths?: Record<string, number>; columnOrder?: string[] }) => void;
 }
 
 const axisTickStyle = { fontSize: 11, fill: 'var(--rcd-text-2)' } as const;
@@ -134,8 +168,6 @@ const legendWrapperStyle = { fontSize: 12, color: 'var(--rcd-text-2)' } as const
 
 /** Debounce (ms) for ResponsiveContainer re-measures during grid/tile resizes. */
 const RESIZE_DEBOUNCE = 60;
-
-const TABLE_ROW_CAP = 500;
 
 /** Width (px) reserved beside a pie/donut for a right-positioned legend. */
 const PIE_RIGHT_LEGEND_WIDTH = 230;
@@ -170,18 +202,79 @@ const formatHintColumn = (formatHint: string): QueryColumn => ({
   formatHint,
 });
 
+/**
+ * Is format.valueFormat a full Excel-style pattern (digit placeholders /
+ * sections) rather than one of the legacy hint strings ("$", "%", "currency",
+ * "percent")? Any `#`, `0` or `;` routes through formatNumberPattern (via
+ * formatAxisValue kind 'custom'); bare hints keep the legacy path, so existing
+ * specs render byte-identically.
+ */
+const looksLikeNumberPattern = (s: string): boolean => /[#0;]/.test(s);
+
+/** valueFormat-aware number text: pattern engine or the legacy hint column. */
+const valueFormatText = (value: number, valueFormat: string): string =>
+  looksLikeNumberPattern(valueFormat)
+    ? formatAxisValue(value, { kind: 'custom', pattern: valueFormat })
+    : formatCellValue(value, formatHintColumn(valueFormat));
+
 function makeValueFormatter(format: ChartFormat, measureColumns: QueryColumn[]): ValueFormatter {
-  const overrideColumn = format.valueFormat ? formatHintColumn(format.valueFormat) : null;
+  const valueFormat = format.valueFormat;
   return (value, seriesKey) => {
     if (typeof value !== 'number') return value == null ? '' : String(value);
+    if (valueFormat) return valueFormatText(value, valueFormat);
     // measureNameForKey unwraps combo (measure × legend) dataKeys to their
     // measure column; plain keys pass through unchanged.
     const column =
-      overrideColumn ??
       (seriesKey ? measureColumns.find((c) => c.name === measureNameForKey(seriesKey)) : undefined) ??
       measureColumns[0];
     return column ? formatCellValue(value, column) : String(value);
   };
+}
+
+/** Trailing-throttle window for onPointHover emission. */
+const HOVER_THROTTLE_MS = 60;
+
+/**
+ * Trailing ~60ms throttle around onPointHover so chart-level mousemove can't
+ * flood the consumer; the LATEST event in a window wins. A null (pointer left
+ * the plot) cancels the window and flushes immediately — a highlight that
+ * lingers after leave reads as lag. Returns undefined when there is no
+ * consumer so children skip attaching handlers altogether.
+ */
+function useThrottledPointHover(
+  cb: ((e: ChartPointEvent | null) => void) | undefined,
+): ((e: ChartPointEvent | null) => void) | undefined {
+  const cbRef = useRef(cb);
+  cbRef.current = cb;
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingRef = useRef<ChartPointEvent | null>(null);
+  useEffect(
+    () => () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+    },
+    [],
+  );
+  const throttled = useMemo(
+    () => (e: ChartPointEvent | null) => {
+      if (e === null) {
+        if (timerRef.current) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        pendingRef.current = null;
+        cbRef.current?.(null);
+        return;
+      }
+      pendingRef.current = e;
+      if (timerRef.current) return; // the trailing emit picks up the latest
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        if (pendingRef.current) cbRef.current?.(pendingRef.current);
+      }, HOVER_THROTTLE_MS);
+    },
+    [],
+  );
+  return cb ? throttled : undefined;
 }
 
 /** Legend placement + text style from spec.format; bottom is the default. */
@@ -429,6 +522,48 @@ const yAxisLabelProps = (text: string | undefined, style?: TextStyle) =>
       }
     : undefined;
 
+/** Right-hand (y2) axis title: mirrors the left, rotated the other way. */
+const y2AxisLabelProps = (text: string | undefined, style?: TextStyle) =>
+  text
+    ? {
+        value: text,
+        angle: 90,
+        position: 'insideRight' as const,
+        offset: 8,
+        ...axisTitleTextProps(style),
+      }
+    : undefined;
+
+/**
+ * dataKeys of the series plotted on the secondary (right) axis. Assignment
+ * matches format.secondaryAxisKeys against the series' display-name key
+ * (styleKey / label) OR the MEASURE display name behind it — so listing a
+ * measure moves every (measure × legend) combo series of that measure at
+ * once, while an exact full combo name still targets one series.
+ *
+ * STACK RULE: a stack must live on ONE axis — recharts computes stack offsets
+ * per axis, so splitting members across axes would draw two half-stacks with
+ * independent baselines and lie about totals. If ANY member is assigned, the
+ * WHOLE stack moves to y2.
+ */
+function secondarySeriesKeys(
+  series: ChartSeries[],
+  format: ChartFormat,
+  stacked: boolean,
+): Set<string> {
+  const assigned = format.secondaryAxisKeys ?? [];
+  if (assigned.length === 0) return new Set();
+  const names = new Set(assigned);
+  const matches = (s: ChartSeries) =>
+    names.has(s.styleKey) ||
+    names.has(s.label) ||
+    (s.measureLabel !== undefined && names.has(s.measureLabel));
+  const hits = series.filter(matches);
+  if (hits.length === 0) return new Set();
+  if (stacked) return new Set(series.map((s) => s.key));
+  return new Set(hits.map((s) => s.key));
+}
+
 /**
  * Base margins, widened when an axis title needs room. Rich-HTML titles render
  * OUTSIDE the plot (AxisTitleFrame reserves their space in flow), so they
@@ -453,7 +588,20 @@ const chartMargin = (format: ChartFormat, extras?: { bottom?: boolean; left?: bo
  * set the frame is a pass-through and the plain xAxisLabel/yAxisLabel SVG
  * labels keep working untouched.
  */
-function AxisTitleFrame({ format, children }: { format: ChartFormat; children: ReactNode }) {
+function AxisTitleFrame({
+  format,
+  y2 = false,
+  children,
+}: {
+  format: ChartFormat;
+  /**
+   * Secondary-axis intent: the chart type supports y2 and secondaryAxisKeys
+   * is non-empty. Gates the RIGHT rail (y2AxisLabelHtml) — a right title on a
+   * chart with no right axis would just be confusing.
+   */
+  y2?: boolean;
+  children: ReactNode;
+}) {
   const xHtml = useMemo(
     () => (format.xAxisLabelHtml ? sanitizeRichHtml(format.xAxisLabelHtml) : ''),
     [format.xAxisLabelHtml],
@@ -462,7 +610,11 @@ function AxisTitleFrame({ format, children }: { format: ChartFormat; children: R
     () => (format.yAxisLabelHtml ? sanitizeRichHtml(format.yAxisLabelHtml) : ''),
     [format.yAxisLabelHtml],
   );
-  if (xHtml === '' && yHtml === '') return <>{children}</>;
+  const y2Html = useMemo(
+    () => (y2 && format.y2AxisLabelHtml ? sanitizeRichHtml(format.y2AxisLabelHtml) : ''),
+    [y2, format.y2AxisLabelHtml],
+  );
+  if (xHtml === '' && yHtml === '' && y2Html === '') return <>{children}</>;
   return (
     <div className="flex h-full w-full min-w-0">
       {yHtml !== '' && (
@@ -483,6 +635,17 @@ function AxisTitleFrame({ format, children }: { format: ChartFormat; children: R
           />
         )}
       </div>
+      {y2Html !== '' && (
+        // Right rail mirroring the left one; unrotated vertical-rl reads
+        // top-down — the conventional direction for a right-side axis title.
+        <div className="flex shrink-0 items-center justify-center pr-0.5">
+          <div
+            className="max-h-full overflow-hidden text-xs text-rcd-text-2"
+            style={{ writingMode: 'vertical-rl' }}
+            dangerouslySetInnerHTML={{ __html: y2Html }}
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -498,6 +661,8 @@ function guideReferenceLine(
   value: number,
   axis: 'x' | 'y',
   formatText: (value: number) => string,
+  /** Value-axis id ('y2' anchors to the secondary right axis). */
+  yAxisId?: string,
 ): ReactNode {
   const color = ref.color ?? 'var(--rcd-muted)';
   // Label: explicit label, else "<kind> <formatted value>". 'constant' keeps
@@ -506,6 +671,7 @@ function guideReferenceLine(
   return (
     <ReferenceLine
       key={ref.id}
+      {...(yAxisId ? { yAxisId } : null)}
       {...(axis === 'x' ? { x: value } : { y: value })}
       stroke={color}
       strokeWidth={ref.width ?? 1}
@@ -746,7 +912,10 @@ interface CartesianChartProps {
   onDatumClick?: (info: ChartDatumClickInfo) => void;
   onPointClick?: (e: ChartPointEvent) => void;
   onPointContextMenu?: (e: ChartPointEvent) => void;
+  /** Already throttled by ChartRenderer; undefined = don't attach handlers. */
+  onPointHover?: (e: ChartPointEvent | null) => void;
   activeCategory?: { label: string } | null;
+  highlightCategory?: { label: string } | null;
   /** Present when rendering as one small-multiples panel (no legend, tight axes). */
   panel?: PanelContext;
 }
@@ -775,7 +944,9 @@ function CartesianChart({
   onDatumClick,
   onPointClick,
   onPointContextMenu,
+  onPointHover,
   activeCategory = null,
+  highlightCategory = null,
   panel,
 }: CartesianChartProps) {
   const format = spec.format;
@@ -805,10 +976,45 @@ function CartesianChart({
   // restriction (a rule recoloring one segment of a stack would lie).
   const barFillActive =
     singleSeriesBar && (format.conditionalFormats ?? []).some((f) => f.style === 'barFill');
-  const renderCells = colorByCategory || dimming || barFillActive;
   const valueTickFormatter = axisTickFormatter(
     horizontal ? format.xAxisFormat : format.yAxisFormat,
   );
+
+  // Secondary (right) value axis. Vertical value axes only: on horizontal
+  // bars the value axis is X, and a "right axis" has no meaning there —
+  // secondaryAxisKeys is ignored silently. The axis renders ONLY when at
+  // least one series is assigned.
+  const y2Keys = horizontal
+    ? new Set<string>()
+    : secondarySeriesKeys(shaped.series, format, stacked);
+  const hasSecondary = y2Keys.size > 0;
+  const y2TickFormatter = axisTickFormatter(format.y2AxisFormat);
+  // Tooltips and data labels format PER AXIS: y2 series use y2AxisFormat when
+  // set; everything else keeps the shared valueFormat / measure-hint path.
+  const formatSeriesValue: ValueFormatter = (value, seriesKey) =>
+    seriesKey && y2Keys.has(seriesKey) && format.y2AxisFormat && typeof value === 'number'
+      ? formatAxisValue(value, format.y2AxisFormat)
+      : formatValue(value, seriesKey);
+
+  // Hover-highlight echo. A label matching a CATEGORY dims the other
+  // categories via the per-bar Cell path (bar family only — a line/area path
+  // can't be part-dimmed); otherwise a label matching a SERIES (display name,
+  // styleKey, or the legend half of a combo) dims the other series whole.
+  const seriesMatchesHighlight = (s: ChartSeries): boolean =>
+    highlightCategory !== null &&
+    (s.label === highlightCategory.label ||
+      s.styleKey === highlightCategory.label ||
+      s.legendLabel === highlightCategory.label);
+  const highlightCategoryMode =
+    highlightCategory !== null &&
+    isBars &&
+    shaped.data.some((row) => String(row[shaped.axisKey] ?? '') === highlightCategory.label);
+  const highlightSeriesMode =
+    highlightCategory !== null && !highlightCategoryMode && shaped.series.some(seriesMatchesHighlight);
+  const seriesDimmed = (s: ChartSeries): boolean =>
+    highlightSeriesMode && !seriesMatchesHighlight(s);
+
+  const renderCells = colorByCategory || dimming || barFillActive || highlightCategoryMode;
 
   // Trendlines: column/stackedColumn/line/area only — horizontal bars would
   // need value-axis fitting and are skipped silently (as are pie/kpi/table).
@@ -875,6 +1081,15 @@ function CartesianChart({
           onPointContextMenu(pointEvent(row, series, event));
         }
       : undefined;
+  // Hover source (bar family): per-mark enter reports the exact struck series
+  // + value; throttling already happened upstream.
+  const barHover = (series: ChartSeries) =>
+    onPointHover
+      ? (_: unknown, index: number, event: ReactMouseEvent) => {
+          const row = rows[index];
+          if (row) onPointHover(pointEvent(row, series, event));
+        }
+      : undefined;
 
   // Line/area click target: a custom activeDot ELEMENT. The object form of
   // activeDot adapts handlers against the option object and drops the DOM
@@ -895,18 +1110,34 @@ function CartesianChart({
         )
       : undefined;
 
+  // Active hovered row from chart-level state (line/area handlers).
+  const rowFromChartState = (state: MouseHandlerDataParam) => {
+    const raw = state.activeTooltipIndex;
+    const index = typeof raw === 'number' ? raw : raw != null ? Number(raw) : NaN;
+    return Number.isInteger(index) ? rows[index] : undefined;
+  };
+
   // Line/area context menu resolves the ACTIVE hovered category from the
   // chart-level hover state; no specific series is struck, so measureKey and
   // value stay undefined. Bars use per-mark onContextMenu instead.
   const chartContextMenu =
     !isBars && onPointContextMenu
       ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
-          const raw = state.activeTooltipIndex;
-          const index = typeof raw === 'number' ? raw : raw != null ? Number(raw) : NaN;
-          const row = Number.isInteger(index) ? rows[index] : undefined;
+          const row = rowFromChartState(state);
           if (!row) return;
           event.preventDefault();
           onPointContextMenu(pointEvent(row, undefined, event));
+        }
+      : undefined;
+
+  // Line/area hover source: the ACTIVE category via chart-level mousemove
+  // (paths have no per-datum enter); bars use per-mark handlers instead so
+  // the exact struck series rides along.
+  const chartMouseMove =
+    !isBars && onPointHover
+      ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
+          const row = rowFromChartState(state);
+          if (row) onPointHover(pointEvent(row, undefined, event));
         }
       : undefined;
 
@@ -915,12 +1146,26 @@ function CartesianChart({
   // (see referenceLineValue for why visibility is ignored); in small-multiple
   // panels each panel computes its own stats — every panel is its own chart.
   const referenceLines = (format.referenceLines ?? []).flatMap((ref) => {
+    // ref.secondary anchors to y2 — but only while the secondary axis exists
+    // (some series assigned); with the axis hidden there is no scale to
+    // anchor to, so the guide is skipped rather than drawn against the
+    // wrong axis.
+    const onSecondary = Boolean(ref.secondary);
+    if (onSecondary && !hasSecondary) return [];
     const target =
       (ref.measureKey ? shaped.series.find((s) => s.styleKey === ref.measureKey) : undefined) ??
       shaped.series[0];
     const value = referenceLineValue(ref, target ? seriesValues(shaped.data, target.key) : []);
     if (value === null) return [];
-    return [guideReferenceLine(ref, value, horizontal ? 'x' : 'y', valueTickFormatter)];
+    return [
+      guideReferenceLine(
+        ref,
+        value,
+        horizontal ? 'x' : 'y',
+        onSecondary ? y2TickFormatter : valueTickFormatter,
+        onSecondary ? 'y2' : undefined,
+      ),
+    ];
   });
 
   return (
@@ -928,8 +1173,20 @@ function CartesianChart({
       <ComposedChart
         data={rows}
         layout={horizontal ? 'vertical' : 'horizontal'}
-        margin={panel ? { top: 4, right: 6, bottom: 2, left: 2 } : chartMargin(format)}
+        margin={
+          panel
+            ? { top: 4, right: 6, bottom: 2, left: 2 }
+            : {
+                ...chartMargin(format),
+                // Room for the y2 SVG title (an HTML title lives outside).
+                ...(hasSecondary && format.y2AxisLabel && !format.y2AxisLabelHtml
+                  ? { right: 18 }
+                  : null),
+              }
+        }
         onContextMenu={chartContextMenu}
+        onMouseMove={chartMouseMove}
+        onMouseLeave={onPointHover ? () => onPointHover(null) : undefined}
       >
         <CartesianGrid
           vertical={isBars ? horizontal : false}
@@ -998,17 +1255,45 @@ function CartesianChart({
             }
           />
         )}
-        {themedTooltip(formatValue, format, isBars ? 'fill' : 'line', stacked ? { active: true } : undefined)}
+        {hasSecondary && (
+          // Secondary (right) value axis. Grid lines stay bound to the
+          // PRIMARY axis (recharts' CartesianGrid follows the first y-axis),
+          // so y2 never adds a second, conflicting set of rules. Panels keep
+          // the scale but hide the ticks — small multiples are too narrow
+          // for a second tick rail.
+          <YAxis
+            yAxisId="y2"
+            orientation="right"
+            tick={panel ? false : axisTickStyle}
+            tickLine={false}
+            axisLine={false}
+            width={panel ? 8 : 56}
+            tickFormatter={y2TickFormatter}
+            label={
+              panel || format.y2AxisLabelHtml
+                ? undefined
+                : y2AxisLabelProps(format.y2AxisLabel, format.axisTitleStyle)
+            }
+          />
+        )}
+        {themedTooltip(formatSeriesValue, format, isBars ? 'fill' : 'line', stacked ? { active: true } : undefined)}
         {showLegend && chartLegend(format, seriesLegendItems(shaped.series), legend)}
         {visibleSeries.map((series) => {
+          const yAxisId = y2Keys.has(series.key) ? 'y2' : undefined;
+          // Highlight (series mode) dims non-matching series whole; the
+          // hover highlight wins visually over the activeCategory dim (which
+          // stays per-category on the Cell path below).
+          const dimSeries = seriesDimmed(series);
           if (isBars) {
             const handleClick = barClick(series);
             return (
               <Bar
                 key={series.key}
+                yAxisId={yAxisId}
                 dataKey={series.key}
                 name={series.label}
                 fill={series.color}
+                fillOpacity={dimSeries ? 0.35 : undefined}
                 stroke="var(--rcd-surface)"
                 strokeWidth={stacked ? 2 : 1}
                 stackId={stacked ? 'stack' : undefined}
@@ -1017,6 +1302,7 @@ function CartesianChart({
                 cursor={handleClick ? 'pointer' : undefined}
                 onClick={handleClick}
                 onContextMenu={barContextMenu(series)}
+                onMouseEnter={barHover(series)}
               >
                 {renderCells &&
                   rows.map((row, dataIndex) => {
@@ -1040,14 +1326,23 @@ function CartesianChart({
                             row[series.key] ?? null,
                           )
                         : undefined;
+                    // Opacity precedence: hover highlight (category mode)
+                    // beats the activeCategory cross-filter dim while
+                    // present; both dim NON-matching categories to 0.35.
+                    const dimmedByHighlight =
+                      highlightCategoryMode &&
+                      highlightCategory !== null &&
+                      categoryLabel !== highlightCategory.label;
                     return (
                       <Cell
                         key={dataIndex}
                         fill={ruleFill ?? paletteFill}
                         fillOpacity={
-                          dimming && activeCategory && categoryLabel !== activeCategory.label
+                          dimmedByHighlight
                             ? 0.35
-                            : undefined
+                            : dimming && activeCategory && categoryLabel !== activeCategory.label
+                              ? 0.35
+                              : undefined
                         }
                       />
                     );
@@ -1059,7 +1354,7 @@ function CartesianChart({
                     fontSize={10}
                     fill="var(--rcd-text-2)"
                     formatter={(label) =>
-                      typeof label === 'number' ? formatValue(label, series.key) : label
+                      typeof label === 'number' ? formatSeriesValue(label, series.key) : label
                     }
                   />
                 )}
@@ -1071,10 +1366,12 @@ function CartesianChart({
             return (
               <Line
                 key={series.key}
+                yAxisId={yAxisId}
                 type="linear"
                 dataKey={series.key}
                 name={series.label}
                 stroke={series.color}
+                strokeOpacity={dimSeries ? 0.35 : undefined}
                 strokeWidth={lineStyle?.width ?? 2}
                 strokeDasharray={strokeDash(lineStyle)}
                 dot={false}
@@ -1086,14 +1383,16 @@ function CartesianChart({
           return (
             <Area
               key={series.key}
+              yAxisId={yAxisId}
               type="linear"
               dataKey={series.key}
               name={series.label}
               stroke={series.color}
+              strokeOpacity={dimSeries ? 0.35 : undefined}
               strokeWidth={lineStyle?.width ?? 2}
               strokeDasharray={strokeDash(lineStyle)}
               fill={series.color}
-              fillOpacity={0.25}
+              fillOpacity={dimSeries ? 0.1 : 0.25}
               dot={false}
               activeDot={clickableActiveDot(series)}
               isAnimationActive={false}
@@ -1103,6 +1402,8 @@ function CartesianChart({
         {overlays.map((overlay) => (
           <Line
             key={overlay.dataKey}
+            // A trendline rides the axis of the series it was fitted to.
+            yAxisId={y2Keys.has(overlay.source.key) ? 'y2' : undefined}
             type="linear"
             dataKey={overlay.dataKey}
             stroke={overlay.spec.color ?? overlay.source.color}
@@ -1144,7 +1445,9 @@ interface SmallMultiplesChartProps {
   onDatumClick?: (info: ChartDatumClickInfo) => void;
   onPointClick?: (e: ChartPointEvent) => void;
   onPointContextMenu?: (e: ChartPointEvent) => void;
+  onPointHover?: (e: ChartPointEvent | null) => void;
   activeCategory?: { label: string } | null;
+  highlightCategory?: { label: string } | null;
 }
 
 /**
@@ -1164,7 +1467,9 @@ function SmallMultiplesChart({
   onDatumClick,
   onPointClick,
   onPointContextMenu,
+  onPointHover,
   activeCategory = null,
+  highlightCategory = null,
 }: SmallMultiplesChartProps) {
   const hidden = legend.hidden;
   const frameRef = useRef<HTMLDivElement>(null);
@@ -1217,7 +1522,15 @@ function SmallMultiplesChart({
 
   // sharedY: one value-axis domain over every panel, from the VISIBLE series
   // only, so legend toggles re-scale exactly like a single chart would.
-  const visibleKeys = canonical.series.filter((s) => !hidden.has(s.key)).map((s) => s.key);
+  // Secondary-axis series are excluded — the shared domain binds the PRIMARY
+  // axis; each panel's y2 auto-scales on its own.
+  const horizontal = spec.type === 'bar' || spec.type === 'stackedBar';
+  const y2Keys = horizontal
+    ? new Set<string>()
+    : secondarySeriesKeys(canonical.series, format, stacked);
+  const visibleKeys = canonical.series
+    .filter((s) => !hidden.has(s.key) && !y2Keys.has(s.key))
+    .map((s) => s.key);
   const valueDomain = sharedY
     ? sharedValueDomain(
         panelShaped.map((p) => p.shaped.data),
@@ -1299,7 +1612,9 @@ function SmallMultiplesChart({
                   onDatumClick={onDatumClick}
                   onPointClick={onPointClick}
                   onPointContextMenu={onPointContextMenu}
+                  onPointHover={onPointHover}
                   activeCategory={activeCategory}
+                  highlightCategory={highlightCategory}
                   panel={{
                     smallMultipleValue: panel.value,
                     showXTicks: !sharedY || bottomRow,
@@ -1343,9 +1658,24 @@ export default function ChartRenderer({
   activeCategory = null,
   onLegendSelect,
   selectedLegendLabel = null,
+  onPointHover,
+  highlightCategory = null,
+  tableSort = null,
+  onTableSortChange,
+  tablePage = 0,
+  tablePageCount = null,
+  onTablePageChange,
+  totalsRow = null,
+  onTableLayoutChange,
 }: ChartRendererProps) {
   const [hiddenSeries, setHiddenSeries] = useState<ReadonlySet<string>>(NO_HIDDEN);
   const format = spec.format;
+  // Hover EMISSION is gated by format.hoverHighlight (consumers gate whether
+  // they APPLY highlights); the throttle keeps chart-level mousemoves from
+  // flooding the consumer.
+  const hover = useThrottledPointHover(
+    format.hoverHighlight !== false ? onPointHover : undefined,
+  );
   // When the legend is non-interactive every series renders, even if hidden
   // state lingers from before the flag was flipped.
   const hidden = format.legendInteractive === false ? NO_HIDDEN : hiddenSeries;
@@ -1416,13 +1746,18 @@ export default function ChartRenderer({
     case 'stackedBar':
     case 'line':
     case 'area': {
+      // y2 title rail intent: vertical value axes only, and only when the
+      // user assigned something (the axis itself still hides until a series
+      // actually matches).
+      const horizontal = spec.type === 'bar' || spec.type === 'stackedBar';
+      const y2Titles = !horizontal && (format.secondaryAxisKeys?.length ?? 0) > 0;
       // Small multiples: the third ordered dimension splits the chart into a
       // panel grid (cartesian family only — other types ignore it).
       const panels = splitSmallMultiples(result, spec);
       if (panels && panels.length > 0) {
         // The title frame wraps the WHOLE grid: one shared x/y title pair.
         return (
-          <AxisTitleFrame format={format}>
+          <AxisTitleFrame format={format} y2={y2Titles}>
             <SmallMultiplesChart
               spec={spec}
               panels={panels}
@@ -1431,13 +1766,15 @@ export default function ChartRenderer({
               onDatumClick={onDatumClick}
               onPointClick={onPointClick}
               onPointContextMenu={onPointContextMenu}
+              onPointHover={hover}
               activeCategory={activeCategory}
+              highlightCategory={highlightCategory}
             />
           </AxisTitleFrame>
         );
       }
       return (
-        <AxisTitleFrame format={format}>
+        <AxisTitleFrame format={format} y2={y2Titles}>
           <CartesianChart
             spec={spec}
             shaped={shapeChartData(result, spec)}
@@ -1446,7 +1783,9 @@ export default function ChartRenderer({
             onDatumClick={onDatumClick}
             onPointClick={onPointClick}
             onPointContextMenu={onPointContextMenu}
+            onPointHover={hover}
             activeCategory={activeCategory}
+            highlightCategory={highlightCategory}
           />
         </AxisTitleFrame>
       );
@@ -1511,10 +1850,19 @@ export default function ChartRenderer({
             onPointContextMenu(pieEvent(slice, event));
           }
         : undefined;
+      const handleSliceHover = hover
+        ? (_: unknown, index: number, event: ReactMouseEvent) => {
+            const slice = visibleSlices[index];
+            if (slice) hover(pieEvent(slice, event));
+          }
+        : undefined;
       return (
         <CenteredPieFrame legendRight={showLegend && format.legendPosition === 'right'}>
           <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
-            <PieChart margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+            <PieChart
+              margin={{ top: 8, right: 8, bottom: 8, left: 8 }}
+              onMouseLeave={hover ? () => hover(null) : undefined}
+            >
               {themedTooltip(formatValue, format, 'none', { active: true, total: visibleTotal })}
               {showLegend && chartLegend(format, sliceLegendItems, legendControl)}
               <Pie
@@ -1529,17 +1877,23 @@ export default function ChartRenderer({
                 cursor={handleSliceClick ? 'pointer' : undefined}
                 onClick={handleSliceClick}
                 onContextMenu={handleSliceContextMenu}
+                onMouseEnter={handleSliceHover}
               >
                 {visibleSlices.map((slice, i) => (
                   <Cell
                     key={`${i}-${slice.label}`}
                     fill={slice.color}
+                    // Opacity precedence: isolate's hidden dim (strongest,
+                    // 0.15) > hover highlight > activeCategory cross-filter
+                    // dim — highlight wins over activeCategory while present.
                     fillOpacity={
                       dimHiddenSlices && hidden.has(slice.label)
                         ? 0.15
-                        : activeCategory && slice.label !== activeCategory.label
+                        : highlightCategory && slice.label !== highlightCategory.label
                           ? 0.35
-                          : undefined
+                          : activeCategory && slice.label !== activeCategory.label
+                            ? 0.35
+                            : undefined
                     }
                   />
                 ))}
@@ -1557,10 +1911,10 @@ export default function ChartRenderer({
       if (!xColumn || !yColumn) {
         return <Placeholder>Scatter needs two measures (x and y).</Placeholder>;
       }
-      const overrideColumn = format.valueFormat ? formatHintColumn(format.valueFormat) : null;
       const formatPoint = (value: unknown, dataKey: string | undefined): string => {
         if (typeof value !== 'number') return value == null ? '' : String(value);
-        return formatCellValue(value, overrideColumn ?? (dataKey === 'y' ? yColumn : xColumn));
+        if (format.valueFormat) return valueFormatText(value, format.valueFormat);
+        return formatCellValue(value, dataKey === 'y' ? yColumn : xColumn);
       };
       const showLegend = format.showLegend ?? scatter.series.length > 1;
       const visibleSeries = scatter.series.filter((s) => !hidden.has(s.key));
@@ -1619,7 +1973,10 @@ export default function ChartRenderer({
         <AxisTitleFrame format={format}>
           <div className="relative h-full w-full min-w-0 overflow-hidden">
           <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
-            <ScatterChart margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}>
+            <ScatterChart
+              margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}
+              onMouseLeave={hover ? () => hover(null) : undefined}
+            >
               <CartesianGrid stroke="var(--rcd-grid-line)" />
               <XAxis
                 type="number"
@@ -1658,6 +2015,15 @@ export default function ChartRenderer({
                   name={series.label}
                   data={series.points}
                   fill={series.color}
+                  // Highlight: the split value IS the series identity here,
+                  // so any label match dims the OTHER series' points.
+                  fillOpacity={
+                    highlightCategory &&
+                    scatter.series.some((s) => s.label === highlightCategory.label) &&
+                    series.label !== highlightCategory.label
+                      ? 0.35
+                      : undefined
+                  }
                   isAnimationActive={false}
                   cursor={onPointClick ? 'pointer' : undefined}
                   onClick={
@@ -1672,6 +2038,12 @@ export default function ChartRenderer({
                           event.preventDefault();
                           onPointContextMenu(scatterEvent(series, item, event));
                         }
+                      : undefined
+                  }
+                  onMouseEnter={
+                    hover
+                      ? (item: unknown, _i: number, event: ReactMouseEvent) =>
+                          hover(scatterEvent(series, item, event))
                       : undefined
                   }
                 />
@@ -1715,7 +2087,7 @@ export default function ChartRenderer({
 
       const kpiText = (value: CellValue, column: QueryColumn): string =>
         typeof value === 'number' && format.valueFormat
-          ? formatCellValue(value, formatHintColumn(format.valueFormat))
+          ? valueFormatText(value, format.valueFormat)
           : formatCellValue(value, column);
 
       const primaryValue = row[result.columns.indexOf(primary)] ?? null;
@@ -1754,172 +2126,27 @@ export default function ChartRenderer({
       );
     }
 
-    case 'table': {
-      const rows = result.rows.slice(0, TABLE_ROW_CAP);
-      // Header text follows legendStyle; measure headers honor seriesLabels.
-      const headerStyle = textStyleToCss(format.legendStyle);
-      // Row click cross-filters by the FIRST dimension column (when present).
-      // No dimming for tables (v1) — the active row isn't visually marked.
-      const clickColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
-      const clickIndex = clickColumn ? result.columns.indexOf(clickColumn) : -1;
-      const handleRowClick =
-        onDatumClick && clickColumn
-          ? (row: CellValue[]) =>
-              onDatumClick({
-                value: row[clickIndex] ?? null,
-                label: formatCellValue(row[clickIndex] ?? null, clickColumn),
-              })
-          : null;
-      // Point events also need the dimension for axisValue; rows without one
-      // stay silent (there is nothing meaningful to report).
-      const rowEvent =
-        clickColumn && (onPointClick || onPointContextMenu)
-          ? (row: CellValue[], e: { clientX: number; clientY: number }): ChartPointEvent => ({
-              axisValue: row[clickIndex] ?? null,
-              axisLabel: formatCellValue(row[clickIndex] ?? null, clickColumn),
-              clientX: e.clientX,
-              clientY: e.clientY,
-            })
-          : null;
-      // Data bars scale to the DISPLAYED rows' max |value| per column (rows
-      // beyond the cap aren't rendered, and scaling to them would mislead).
-      const dataBars = new Map<
-        string,
-        { cf: ConditionalFormatSpec; maxAbs: number; hasNegative: boolean }
-      >();
-      for (const column of measureColumns) {
-        const cf = format.conditionalFormats?.find(
-          (f) => f.style === 'dataBar' && f.measureKey === column.label,
-        );
-        if (!cf) continue;
-        const columnIndex = result.columns.indexOf(column);
-        let maxAbs = 0;
-        let hasNegative = false;
-        for (const row of rows) {
-          const v = row[columnIndex];
-          if (typeof v !== 'number') continue;
-          if (Math.abs(v) > maxAbs) maxAbs = Math.abs(v);
-          if (v < 0) hasNegative = true;
-        }
-        if (maxAbs > 0) dataBars.set(column.name, { cf, maxAbs, hasNegative });
-      }
-      const clickable = Boolean(handleRowClick) || Boolean(rowEvent && onPointClick);
+    case 'table':
+      // The tile drives the DATA (server-side sort/offset/limit + a separate
+      // totals query); TableChart renders the chrome and emits intents.
       return (
-        <div className="h-full w-full overflow-auto">
-          <table className="w-full border-separate border-spacing-0 text-sm">
-            <thead>
-              <tr>
-                {result.columns.map((column) => (
-                  <th
-                    key={column.name}
-                    style={headerStyle}
-                    className={`sticky top-0 border-b border-rcd-border bg-rcd-surface px-3 py-2 text-xs font-semibold text-rcd-text-2 ${
-                      column.role === 'measure' ? 'text-right' : 'text-left'
-                    }`}
-                  >
-                    {column.role === 'measure'
-                      ? (format.seriesLabels?.[column.label] ?? column.label)
-                      : column.label}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row, rowIndex) => (
-                <tr
-                  key={rowIndex}
-                  onClick={
-                    handleRowClick || (rowEvent && onPointClick)
-                      ? (e) => {
-                          handleRowClick?.(row);
-                          if (rowEvent && onPointClick) onPointClick(rowEvent(row, e));
-                        }
-                      : undefined
-                  }
-                  onContextMenu={
-                    rowEvent && onPointContextMenu
-                      ? (e) => {
-                          e.preventDefault();
-                          onPointContextMenu(rowEvent(row, e));
-                        }
-                      : undefined
-                  }
-                  className={
-                    clickable
-                      ? 'cursor-pointer hover:bg-black/5 dark:hover:bg-white/10'
-                      : 'hover:bg-black/5 dark:hover:bg-white/10'
-                  }
-                >
-                  {result.columns.map((column, columnIndex) => {
-                    const raw = row[columnIndex] ?? null;
-                    const isMeasure = column.role === 'measure';
-                    // cellBackground / cellText rules key the measure's
-                    // DEFAULT label; first matching spec (then rule) wins.
-                    const cellBackground = isMeasure
-                      ? conditionalColor(format.conditionalFormats, 'cellBackground', column.label, raw)
-                      : undefined;
-                    const cellText = isMeasure
-                      ? conditionalColor(format.conditionalFormats, 'cellText', column.label, raw)
-                      : undefined;
-                    const dataBar = isMeasure ? dataBars.get(column.name) : undefined;
-                    const text = formatCellValue(raw, column);
-                    let content: ReactNode = text;
-                    if (dataBar && typeof raw === 'number') {
-                      // Proportional bar behind the value, scaled to the
-                      // column's max |value|. With negatives, zero sits at
-                      // mid-cell: positives grow right, negatives left, each
-                      // scaled into its half; all-positive columns use the
-                      // full width. Rules may recolor a matching cell's bar;
-                      // dataBarColor (default theme accent) otherwise.
-                      const fraction = Math.abs(raw) / dataBar.maxAbs;
-                      const barColor =
-                        matchRuleColor(dataBar.cf.rules, raw) ??
-                        dataBar.cf.dataBarColor ??
-                        'var(--rcd-accent)';
-                      const barBox: CSSProperties = dataBar.hasNegative
-                        ? raw >= 0
-                          ? { left: '50%', width: `${fraction * 50}%` }
-                          : { right: '50%', width: `${fraction * 50}%` }
-                        : { left: 0, width: `${fraction * 100}%` };
-                      content = (
-                        <div className="relative">
-                          <div
-                            aria-hidden
-                            className="absolute inset-y-0 rounded-sm"
-                            style={{ ...barBox, background: barColor, opacity: 0.3 }}
-                          />
-                          <span className="relative">{text}</span>
-                        </div>
-                      );
-                    }
-                    return (
-                      <td
-                        key={column.name}
-                        style={
-                          cellBackground || cellText
-                            ? { background: cellBackground, color: cellText }
-                            : undefined
-                        }
-                        className={`border-b border-rcd-border px-3 py-1.5 text-rcd-text ${
-                          isMeasure ? 'text-right tabular-nums' : 'text-left'
-                        }`}
-                      >
-                        {content}
-                      </td>
-                    );
-                  })}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {result.rows.length > TABLE_ROW_CAP && (
-            <div className="px-3 py-2 text-xs text-rcd-muted">
-              Showing {TABLE_ROW_CAP} of {result.rows.length} rows
-            </div>
-          )}
-        </div>
+        <TableChart
+          spec={spec}
+          result={result}
+          onDatumClick={onDatumClick}
+          onPointClick={onPointClick}
+          onPointContextMenu={onPointContextMenu}
+          onPointHover={hover}
+          highlightCategory={highlightCategory}
+          tableSort={tableSort}
+          onTableSortChange={onTableSortChange}
+          tablePage={tablePage}
+          tablePageCount={tablePageCount}
+          onTablePageChange={onTablePageChange}
+          totalsRow={totalsRow}
+          onTableLayoutChange={onTableLayoutChange}
+        />
       );
-    }
 
     default:
       return <Placeholder>Chart type “{spec.type}” isn’t supported.</Placeholder>;

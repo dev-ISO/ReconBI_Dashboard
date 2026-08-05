@@ -5,23 +5,27 @@ import {
   emptyLayout,
   filterCardClauses,
   isSlicerTile,
+  slicerClauseOf,
   type CrossFilter,
   type DashboardDetail,
   type DashboardLayoutDoc,
   type DashboardBookmark,
   type DashboardPage,
+  type DashboardParameter,
   type DashboardSummary,
   type DashboardTile,
   type DrillthroughState,
   type FilterCard,
   type PageDrillthrough,
+  type PageMobileLayout,
   type ImageTileSpec,
   type SlicerTileSpec,
+  type SlicerValue,
   type SlicerValues,
   type SlicerVariant,
   type TextTileSpec,
 } from '../types/dashboard';
-import type { FilterClause, FilterValue } from '../types/query';
+import type { CellValue, FilterClause, FilterValue } from '../types/query';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
 import { sanitizeRichHtml } from '../util/richText';
@@ -59,6 +63,18 @@ export interface DashboardStoreState {
   /** Transient click-to-highlight filter; NOT persisted; reset on page switch. */
   crossFilter: CrossFilter | null;
   /**
+   * Transient page-wide hover highlight raised by hovering a datum on a chart
+   * tile: every OTHER chart on the page whose effective axis/legend dimension
+   * matches dims non-matching categories. NEVER persisted; never triggers
+   * fetches; cleared on page switch and when the source tile unhovers/unmounts.
+   */
+  hoverHighlight: HoverHighlight | null;
+  /**
+   * Transient field-parameter selections (option index) keyed by parameter id.
+   * Initialized from each parameter's defaultIndex on open; NEVER persisted.
+   */
+  parameterSelections: Record<string, number>;
+  /**
    * Transient drillthrough context (set by invoking "Drill through" from a
    * point menu). NEVER persisted; its filters reach every chart tile on the
    * TARGET page via filtersForTile. Survives page switches so revisiting the
@@ -87,6 +103,18 @@ export interface FilterCardOverride {
   basicValues?: FilterValue[] | null;
 }
 
+/** Transient hover cross-highlight payload (see DashboardStoreState.hoverHighlight). */
+export interface HoverHighlight {
+  /** Dimension of the hovered category on the SOURCE chart (its effective axis/legend). */
+  dimension: { table: string; column: string };
+  /** RAW (pre-format) hovered cell value. */
+  raw: CellValue;
+  /** Formatted category label — the key other charts dim against. */
+  label: string;
+  /** Chart tile the hover came from; that tile never dims itself. */
+  sourceTileId: string;
+}
+
 const initialState: DashboardStoreState = {
   list: [],
   listStatus: 'idle',
@@ -98,6 +126,8 @@ const initialState: DashboardStoreState = {
   selectedTileId: null,
   slicerValues: {},
   crossFilter: null,
+  hoverHighlight: null,
+  parameterSelections: {},
   drillthrough: null,
   lastAppliedBookmarkId: null,
   filterCardOverrides: {},
@@ -167,6 +197,8 @@ export class DashboardStore {
       selectedTileId: null,
       slicerValues: {},
       crossFilter: null,
+      hoverHighlight: null,
+      parameterSelections: defaultParameterSelections(current.layout),
       drillthrough: null,
       lastAppliedBookmarkId: null,
       filterCardOverrides: {},
@@ -291,6 +323,10 @@ export class DashboardStore {
     if (this.state.crossFilter?.sourceTileId === tileId) {
       this.set({ crossFilter: null });
     }
+    // …and a removed hover-highlight source.
+    if (this.state.hoverHighlight?.sourceTileId === tileId) {
+      this.set({ hoverHighlight: null });
+    }
     // Visual-scope filter cards targeting the removed tile go with it.
     const cards = this.state.current?.layout.filterCards ?? [];
     if (cards.some((c) => c.scope === 'visual' && c.targetTileId === tileId)) {
@@ -353,8 +389,15 @@ export class DashboardStore {
     this.set({ selectedTileId: tileId });
   }
 
-  /** Adds a slicer TILE to the active page; variant defaults to checklist. */
-  addSlicer(def: { table: string; column: string; label: string; variant?: SlicerVariant }): void {
+  /** Adds a slicer TILE to the active page; variant defaults to checklist.
+   *  The fieldParam variant passes parameterId and empty table/column. */
+  addSlicer(def: {
+    table?: string;
+    column?: string;
+    label: string;
+    variant?: SlicerVariant;
+    parameterId?: string | null;
+  }): void {
     this.mutateActiveTiles((tiles) => {
       const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
       const tile: DashboardTile = {
@@ -362,10 +405,11 @@ export class DashboardStore {
         kind: 'slicer',
         layout: { x: 0, y: maxY, w: 6, h: 5, minW: 3, minH: 3 },
         slicer: {
-          table: def.table,
-          column: def.column,
+          table: def.table ?? '',
+          column: def.column ?? '',
           label: def.label,
           variant: def.variant ?? 'checklist',
+          ...(def.parameterId != null ? { parameterId: def.parameterId } : {}),
         },
       };
       return [...tiles, tile];
@@ -384,12 +428,33 @@ export class DashboardStore {
     this.removeTile(tileId);
   }
 
-  setSlicerValue(slicerId: string, clause: FilterClause | null): void {
+  setSlicerValue(slicerId: string, value: SlicerValue): void {
     // Any slicer change diverges from the last-applied bookmark's snapshot.
     this.set({
-      slicerValues: { ...this.state.slicerValues, [slicerId]: clause },
+      slicerValues: { ...this.state.slicerValues, [slicerId]: value },
       lastAppliedBookmarkId: null,
     });
+  }
+
+  /**
+   * Sets/clears the transient hover highlight. Writes only when the payload
+   * actually differs (same source + label + dimension is a no-op) so hover
+   * jitter never storms the store; a null clears.
+   */
+  setHoverHighlight(next: HoverHighlight | null): void {
+    const current = this.state.hoverHighlight;
+    if (current === null && next === null) return;
+    if (
+      current !== null &&
+      next !== null &&
+      current.sourceTileId === next.sourceTileId &&
+      current.label === next.label &&
+      current.dimension.table === next.dimension.table &&
+      current.dimension.column === next.dimension.column
+    ) {
+      return;
+    }
+    this.set({ hoverHighlight: next });
   }
 
   /* -------------------------------------------------------- text/image tiles */
@@ -545,9 +610,27 @@ export class DashboardStore {
     this.set({
       activePageId: pageId,
       crossFilter: null,
+      hoverHighlight: null,
       selectedTileId: null,
       lastAppliedBookmarkId: null,
     });
+  }
+
+  /** Sets or clears a page's phone layout (persisted with the doc). */
+  setPageMobileLayout(pageId: string, mobileLayout: PageMobileLayout | null): void {
+    const current = this.state.current;
+    if (!current) return;
+    const page = pagesOf(current.layout).find((p) => p.id === pageId);
+    if (!page) return;
+    if (stableStringify(page.mobileLayout ?? null) === stableStringify(mobileLayout)) return;
+    this.mutatePages((pages) =>
+      pages.map((p) => {
+        if (p.id !== pageId) return p;
+        if (mobileLayout !== null) return { ...p, mobileLayout };
+        const { mobileLayout: _removed, ...rest } = p;
+        return rest;
+      }),
+    );
   }
 
   /** Sets or clears a page's drillthrough target config (persisted with the doc). */
@@ -709,7 +792,7 @@ export class DashboardStore {
     const clauses: FilterClause[] = [];
     for (const tile of this.activeTiles()) {
       if (!isSlicerTile(tile)) continue;
-      const clause = this.state.slicerValues[tile.id];
+      const clause = slicerClauseOf(this.state.slicerValues[tile.id]);
       if (clause != null) clauses.push(clause);
     }
     return clauses;
@@ -738,7 +821,7 @@ export class DashboardStore {
       if (!isSlicerTile(tile)) continue;
       const targets = tile.slicer.targets;
       if (targets != null && !targets.includes(tileId)) continue;
-      const clause = this.state.slicerValues[tile.id];
+      const clause = slicerClauseOf(this.state.slicerValues[tile.id]);
       if (clause != null) clauses.push(clause);
     }
     for (const card of layout.filterCards ?? []) {
@@ -890,7 +973,72 @@ export class DashboardStore {
   setRefreshSeconds(seconds: number | null): void {
     this.mutateLayout((layout) => ({ ...layout, refreshSeconds: seconds }));
   }
+
+  /* ------------------------------------------------------- field parameters */
+
+  private mutateParameters(mutate: (parameters: DashboardParameter[]) => DashboardParameter[]): void {
+    this.mutateLayout((layout) => ({ ...layout, parameters: mutate(layout.parameters ?? []) }));
+  }
+
+  /** Adds a field parameter (id assigned here); returns the new id. */
+  addParameter(parameter: Omit<DashboardParameter, 'id'>): string {
+    const id = newId();
+    this.mutateParameters((parameters) => [...parameters, { ...parameter, id }]);
+    // A fresh parameter starts at its default selection.
+    this.set({
+      parameterSelections: {
+        ...this.state.parameterSelections,
+        [id]: clampIndex(parameter.defaultIndex ?? 0, parameter.options.length),
+      },
+    });
+    return id;
+  }
+
+  /** Patches a field parameter (doc edit — dirties the draft). */
+  updateParameter(id: string, patch: Partial<Omit<DashboardParameter, 'id'>>): void {
+    this.mutateParameters((parameters) =>
+      parameters.map((p) => (p.id === id ? { ...p, ...patch, id } : p)),
+    );
+    // The option list may have shrunk under the current selection.
+    const updated = (this.state.current?.layout.parameters ?? []).find((p) => p.id === id);
+    if (updated) {
+      const selection = this.state.parameterSelections[id] ?? updated.defaultIndex ?? 0;
+      const clamped = clampIndex(selection, updated.options.length);
+      if (clamped !== selection) {
+        this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
+      }
+    }
+  }
+
+  /** Removes a field parameter and its transient selection. Charts bound to it
+   *  fall back to their own axis/measures; fieldParam slicers show a hint. */
+  removeParameter(id: string): void {
+    this.mutateParameters((parameters) => parameters.filter((p) => p.id !== id));
+    if (id in this.state.parameterSelections) {
+      const { [id]: _removed, ...rest } = this.state.parameterSelections;
+      this.set({ parameterSelections: rest });
+    }
+  }
+
+  /** Transient selection of a field parameter's option (never persisted). */
+  setParameterSelection(id: string, index: number): void {
+    const parameter = (this.state.current?.layout.parameters ?? []).find((p) => p.id === id);
+    if (!parameter) return;
+    const clamped = clampIndex(index, parameter.options.length);
+    if (this.state.parameterSelections[id] === clamped) return;
+    this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
+  }
 }
+
+/** Clamp an option index into [0, count-1] (0 when the list is empty). */
+const clampIndex = (index: number, count: number): number =>
+  count <= 0 ? 0 : Math.min(Math.max(Math.trunc(index), 0), count - 1);
+
+/** Default selections: every parameter starts at its defaultIndex (clamped). */
+const defaultParameterSelections = (layout: DashboardLayoutDoc): Record<string, number> =>
+  Object.fromEntries(
+    (layout.parameters ?? []).map((p) => [p.id, clampIndex(p.defaultIndex ?? 0, p.options.length)]),
+  );
 
 const toOpen = (detail: DashboardDetail): OpenDashboard => ({
   id: detail.id,

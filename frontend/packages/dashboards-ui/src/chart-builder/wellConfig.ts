@@ -30,7 +30,6 @@ export interface WellDef {
   hint: string;
 }
 
-const AXIS: WellDef = { id: 'axis', label: 'Axis', capacity: 'one', hint: 'Drop a column' };
 /**
  * Drill-capable axis: the first chip is the axis (level 0), every further
  * dropped dimension appends to query.drillLevels below it.
@@ -103,7 +102,7 @@ export const WELL_CONFIG: Record<ChartType, readonly WellDef[]> = {
   ],
   kpi: [{ ...VALUES, max: 2, hint: 'Drop 1–2 measures' }],
   table: [
-    { ...AXIS, label: 'Rows', hint: 'Optional: drop a column for rows' },
+    { ...DRILL_AXIS, label: 'Rows', hint: 'Drop a column — more columns build a drill hierarchy' },
     { ...LEGEND, label: 'Columns', hint: 'Optional: drop a column to pivot' },
     VALUES,
   ],
@@ -115,8 +114,8 @@ const hasWell = (type: ChartType, id: WellId): boolean =>
   wellsFor(type).some((well) => well.id === id);
 
 /**
- * Types whose axis well is the multi-level drill hierarchy. The table's "Rows"
- * well stays single-chip — drill affordances are cartesian-only.
+ * Types whose axis well is the multi-level drill hierarchy — every cartesian
+ * type plus the table's "Rows" well (Region → Site → Priority row drilling).
  */
 export const supportsDrill = (type: ChartType): boolean =>
   wellsFor(type).some((well) => well.id === 'axis' && well.capacity === 'many');
@@ -130,13 +129,30 @@ export const acceptsDimension = (_well: WellId): boolean => true;
 /** Measures only ever land in the values well (filters are column-based). */
 export const acceptsMeasure = (well: WellId): boolean => well === 'values';
 
+/**
+ * Dashboard-level field parameter surfaced in the builder's field list. The
+ * dashboard side threads these through ChartBuilder; the standalone builder
+ * never provides them.
+ */
+export interface BuilderParameter {
+  id: string;
+  name: string;
+  /** 'dimension' params bind to the axis; 'measure' params to the values well. */
+  kind: 'dimension' | 'measure';
+}
+
 /** Drag payload carried by every field-list entry (dnd-kit `data`). */
 export type FieldDragData =
   | { kind: 'column'; table: string; column: string; type: ColumnType }
-  | { kind: 'measure'; measureId: string; name: string };
+  | { kind: 'measure'; measureId: string; name: string }
+  | { kind: 'parameter'; parameterId: string; name: string; paramKind: 'dimension' | 'measure' };
 
-export const canAccept = (well: WellId, data: FieldDragData): boolean =>
-  data.kind === 'column' ? acceptsDimension(well) : acceptsMeasure(well);
+export const canAccept = (well: WellId, data: FieldDragData): boolean => {
+  if (data.kind === 'parameter') {
+    return data.paramKind === 'dimension' ? well === 'axis' : well === 'values';
+  }
+  return data.kind === 'column' ? acceptsDimension(well) : acceptsMeasure(well);
+};
 
 const toDimension = (data: Extract<FieldDragData, { kind: 'column' }>): DimensionRef => ({
   table: data.table,
@@ -152,7 +168,7 @@ const toDimension = (data: Extract<FieldDragData, { kind: 'column' }>): Dimensio
 const looksLikeIdentifier = (column: string): boolean =>
   /(^|_)(id|key|code|num|number|no)$/i.test(column) || /^id$/i.test(column);
 
-const toValueMeasure = (data: FieldDragData): MeasureRef =>
+const toValueMeasure = (data: Exclude<FieldDragData, { kind: 'parameter' }>): MeasureRef =>
   data.kind === 'measure'
     ? { measureId: data.measureId }
     : {
@@ -184,6 +200,18 @@ export const applyDrop = (
   data: FieldDragData,
 ): ChartQuery => {
   if (well === 'filters' || !canAccept(well, data)) return query;
+
+  if (data.kind === 'parameter') {
+    // Parameter chips bind (not replace) — the axis/measures themselves stay
+    // in the spec; the dashboard runtime substitutes them at query time.
+    if (data.paramKind === 'dimension' && well === 'axis') {
+      return { ...query, paramBindings: { ...query.paramBindings, axis: data.parameterId } };
+    }
+    if (data.paramKind === 'measure' && well === 'values') {
+      return { ...query, paramBindings: { ...query.paramBindings, measures: data.parameterId } };
+    }
+    return query;
+  }
 
   if (well === 'values') {
     const ref = toValueMeasure(data);
@@ -221,8 +249,17 @@ export const applyDrop = (
   return { ...query, legend: ref };
 };
 
+/** Clears one param binding; the paramBindings object drops entirely once empty. */
+export const clearParamBinding = (query: ChartQuery, key: 'axis' | 'measures'): ChartQuery => {
+  const next = { ...query.paramBindings };
+  delete next[key];
+  const hasAny = next.axis != null || next.measures != null;
+  return { ...query, paramBindings: hasAny ? next : undefined };
+};
+
 /** Click-to-add routing: measures/numeric → values; temporal → axis; else first free dimension well. */
 export const defaultWellFor = (type: ChartType, query: ChartQuery, data: FieldDragData): WellId => {
+  if (data.kind === 'parameter') return data.paramKind === 'dimension' ? 'axis' : 'values';
   if (data.kind === 'measure' || isNumericType(data.type)) return 'values';
   if (isTemporalType(data.type) && hasWell(type, 'axis')) return 'axis';
   if (hasWell(type, 'axis') && !query.axis) return 'axis';
@@ -242,6 +279,9 @@ export const normalizeQueryForType = (type: ChartType, query: ChartQuery): Chart
     next = { ...next, legend: next.axis, axis: null };
   }
   if (!hasWell(type, 'axis') && next.axis) next = { ...next, axis: null };
+  if (!hasWell(type, 'axis') && next.paramBindings?.axis != null) {
+    next = clearParamBinding(next, 'axis');
+  }
   if (!hasWell(type, 'legend') && next.legend) next = { ...next, legend: null };
   if (!supportsDrill(type) && next.drillLevels?.length) {
     next = { ...next, drillLevels: undefined };

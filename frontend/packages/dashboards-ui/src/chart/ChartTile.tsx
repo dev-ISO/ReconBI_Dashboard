@@ -23,11 +23,25 @@ export interface ChartLegendSelectEvent {
   label: string;
 }
 
+/** Column sort state the interactive table renders/reports. */
+export interface ChartTableSort {
+  /** Result column NAME. */
+  column: string;
+  direction: 'asc' | 'desc';
+}
+
+/** Persistable table layout tweak reported by the renderer (drag/resize). */
+export interface ChartTableLayoutPatch {
+  columnWidths?: Record<string, number>;
+  columnOrder?: string[];
+}
+
 /**
- * Point/legend handlers the renderer exposes (agreed contract; typed here so
- * this file compiles against it regardless of when the renderer props land —
- * once ChartRendererProps carries them the intersection below is a no-op).
- * The existing onDatumClick cross-filter callback keeps firing alongside.
+ * Point/legend/table handlers the renderer exposes (agreed contract; typed
+ * here so this file compiles against it regardless of when the renderer props
+ * land — once ChartRendererProps carries them the intersection below is a
+ * no-op). The existing onDatumClick cross-filter callback keeps firing
+ * alongside.
  */
 interface RendererPointHandlers {
   onPointClick?: (e: ChartPointEvent) => void;
@@ -36,6 +50,22 @@ interface RendererPointHandlers {
   onLegendSelect?: (e: ChartLegendSelectEvent | null) => void;
   /** Active legend selection passed back for persistent emphasis. */
   selectedLegendLabel?: string | null;
+  /** Hover cross-highlight source hook; null = pointer left the datum. */
+  onPointHover?: (e: ChartPointEvent | null) => void;
+  /** Set while ANOTHER tile hovers a matching category (dims non-matches). */
+  highlightCategory?: { label: string } | null;
+  /* ----- interactive table (format.table) ----- */
+  tableSort?: ChartTableSort | null;
+  onTableSortChange?: (sort: ChartTableSort | null) => void;
+  /** 0-based page (server-side offset pagination). */
+  tablePage?: number;
+  /** Known page count; null while unknown (› disabled on a short page). */
+  tablePageCount?: number | null;
+  onTablePageChange?: (page: number) => void;
+  /** Totals row aligned to measure columns; null = none. */
+  totalsRow?: (number | null)[] | null;
+  /** Column drag/resize report (persist or keep transient — caller's call). */
+  onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
 }
 
 const ChartRenderer = lazy(() => import('./ChartRenderer')) as ComponentType<
@@ -47,6 +77,11 @@ export interface ChartTileProps {
   modelId: number;
   /** Dashboard-level filters (slicers + cross-filter) merged into the chart's own. */
   filters?: FilterClause[];
+  /**
+   * Row offset merged into the wire spec (applied after sort, before limit) —
+   * server-side table pagination. Part of the cache key like everything else.
+   */
+  offset?: number | null;
   /** Debounce before running (builder preview); 0 for tiles. */
   debounceMs?: number;
   /**
@@ -67,6 +102,27 @@ export interface ChartTileProps {
   selectedLegendLabel?: string | null;
   /** Set while this tile is the active cross-filter SOURCE (dims non-matches). */
   activeCategory?: { label: string } | null;
+  /** Hover cross-highlight pass-through (source side; null = unhover). */
+  onPointHover?: (e: ChartPointEvent | null) => void;
+  /** Set while ANOTHER tile's hover matches this chart's category dimension. */
+  highlightCategory?: { label: string } | null;
+  /** Interactive-table sort state + change hook (format.table charts). */
+  tableSort?: ChartTableSort | null;
+  onTableSortChange?: (sort: ChartTableSort | null) => void;
+  /** Interactive-table 0-based page + known page count (null = unknown). */
+  tablePage?: number;
+  tablePageCount?: number | null;
+  onTablePageChange?: (page: number) => void;
+  /** Totals row aligned to measure columns (companion no-dimension query). */
+  totalsRow?: (number | null)[] | null;
+  /** Column width/order drag report (persist or transient — caller's call). */
+  onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
+  /**
+   * Ref-style report of the freshest rendered QueryResult (assignment only —
+   * mirrors reportEffective). The dashboard tile uses it to map table sort
+   * column names onto wire dimension/measure indices and to derive page count.
+   */
+  onResult?: (result: QueryResult) => void;
 }
 
 const EMPTY_FILTERS: FilterClause[] = [];
@@ -85,6 +141,7 @@ export function ChartTile({
   spec,
   modelId,
   filters = EMPTY_FILTERS,
+  offset = null,
   debounceMs = 0,
   refreshKey,
   onDatumClick,
@@ -93,13 +150,26 @@ export function ChartTile({
   onLegendSelect,
   selectedLegendLabel = null,
   activeCategory = null,
+  onPointHover,
+  highlightCategory = null,
+  tableSort = null,
+  onTableSortChange,
+  tablePage = 0,
+  tablePageCount = null,
+  onTablePageChange,
+  totalsRow = null,
+  onTableLayoutChange,
+  onResult,
 }: ChartTileProps) {
   const runtime = useRuntime();
   const runnable = isRunnable(spec);
-  const wireSpec = useMemo(
-    () => (runnable ? toWireSpec(spec, modelId, filters) : null),
-    [spec, modelId, filters, runnable],
-  );
+  const wireSpec = useMemo(() => {
+    if (!runnable) return null;
+    const base = toWireSpec(spec, modelId, filters);
+    // Offset rides the wire spec directly (ChartQuery has no offset field);
+    // it participates in the cache key like every other spec field.
+    return offset != null && offset > 0 ? { ...base, offset } : base;
+  }, [spec, modelId, filters, offset, runnable]);
   const cacheKey = wireSpec ? runtime.queries.keyFor(wireSpec) : null;
   const entry = useQueryCacheState((state) => (cacheKey ? state.entries[cacheKey] : undefined));
   const [retryToken, setRetryToken] = useState(0);
@@ -116,7 +186,35 @@ export function ChartTile({
   const lastGoodRef = useRef<{ spec: ChartSpec; result: QueryResult } | null>(null);
   if (entry?.status === 'ok' && entry.data) {
     lastGoodRef.current = { spec, result: entry.data };
+    // Assignment-only report (like wireSpecRef): the dashboard tile reads the
+    // freshest result without extra renders or effect churn.
+    onResult?.(entry.data);
   }
+
+  /* ---- table pagination mechanics (format.table.pageSize charts only) ---- */
+
+  const pageSize = spec.type === 'table' ? (spec.format.table?.pageSize ?? null) : null;
+  const pagingActive = pageSize != null && pageSize > 0 && onTablePageChange !== undefined;
+  const okRowCount = entry?.status === 'ok' && entry.data ? entry.data.rows.length : null;
+
+  /**
+   * Known page count: a SHORT page (fewer rows than pageSize) marks the last
+   * page — › disables; a full page keeps it unknown (null). The caller's
+   * tablePageCount passes through when paging is off.
+   */
+  const derivedPageCount =
+    pagingActive && okRowCount !== null
+      ? okRowCount < pageSize
+        ? tablePage + 1
+        : null
+      : tablePageCount;
+
+  // Paging past the end (exactly-full last page + ›) lands on an empty page;
+  // step back automatically so the user is never stranded on "No data".
+  useEffect(() => {
+    if (!pagingActive || okRowCount !== 0 || tablePage <= 0) return;
+    onTablePageChange?.(tablePage - 1);
+  }, [pagingActive, okRowCount, tablePage, onTablePageChange]);
 
   useEffect(() => {
     if (!cacheKey) return;
@@ -164,6 +262,15 @@ export function ChartTile({
             onLegendSelect={onLegendSelect}
             selectedLegendLabel={selectedLegendLabel}
             activeCategory={activeCategory}
+            onPointHover={onPointHover}
+            highlightCategory={highlightCategory}
+            tableSort={tableSort}
+            onTableSortChange={onTableSortChange}
+            tablePage={tablePage}
+            tablePageCount={derivedPageCount}
+            onTablePageChange={onTablePageChange}
+            totalsRow={totalsRow}
+            onTableLayoutChange={onTableLayoutChange}
           />
         </Suspense>
       </div>

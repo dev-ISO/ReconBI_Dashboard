@@ -19,6 +19,8 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
     public DbSet<DataModelRecord> DataModels => Set<DataModelRecord>();
     public DbSet<DashboardRecord> Dashboards => Set<DashboardRecord>();
     public DbSet<QueryAuditRecord> QueryAudit => Set<QueryAuditRecord>();
+    public DbSet<SubscriptionRecord> Subscriptions => Set<SubscriptionRecord>();
+    public DbSet<AlertRecord> Alerts => Set<AlertRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -65,6 +67,44 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
                 .HasFilter(notDeletedFilter);
         });
 
+        modelBuilder.Entity<SubscriptionRecord>(entity =>
+        {
+            entity.ToTable("rcd_subscriptions");
+            entity.Property(e => e.OwnerUserId).HasMaxLength(128);
+            entity.Property(e => e.Name).HasMaxLength(128);
+            entity.Property(e => e.Recipients).HasMaxLength(2048);
+            // Small discriminated strings, readable in psql; never cron.
+            entity.Property(e => e.ScheduleKind).HasConversion<string>().HasMaxLength(16);
+            entity.Property(e => e.Format).HasConversion<string>().HasMaxLength(8);
+            entity.HasOne<DashboardRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.DashboardId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(e => e.OwnerUserId);
+            entity.HasIndex(e => e.DashboardId);
+            entity.HasIndex(e => new { e.Enabled, e.LastRunUtc });
+        });
+
+        modelBuilder.Entity<AlertRecord>(entity =>
+        {
+            entity.ToTable("rcd_alerts");
+            entity.Property(e => e.OwnerUserId).HasMaxLength(128);
+            entity.Property(e => e.Name).HasMaxLength(128);
+            entity.Property(e => e.Recipients).HasMaxLength(2048);
+            entity.Property(e => e.Operator).HasConversion<string>().HasMaxLength(8);
+            entity.Property(e => e.Threshold).HasPrecision(28, 8);
+            entity.Property(e => e.LastValue).HasPrecision(28, 8);
+            if (jsonColumnType is not null)
+            {
+                entity.Property(e => e.SpecJson).HasColumnType(jsonColumnType);
+            }
+
+            entity.HasIndex(e => e.OwnerUserId);
+            entity.HasIndex(e => e.DashboardId);
+            entity.HasIndex(e => new { e.Enabled, e.LastEvaluatedUtc });
+            entity.HasIndex(e => e.LastFiredUtc);
+        });
+
         modelBuilder.Entity<QueryAuditRecord>(entity =>
         {
             entity.ToTable("rcd_query_audit");
@@ -80,7 +120,7 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             foreach (var entityType in modelBuilder.Model.GetEntityTypes())
             {
                 foreach (var property in entityType.GetProperties()
-                             .Where(p => p.ClrType == typeof(DateTime)))
+                             .Where(p => p.ClrType == typeof(DateTime) || p.ClrType == typeof(DateTime?)))
                 {
                     property.SetColumnType("timestamp without time zone");
                     property.SetValueConverter(utcConverter);

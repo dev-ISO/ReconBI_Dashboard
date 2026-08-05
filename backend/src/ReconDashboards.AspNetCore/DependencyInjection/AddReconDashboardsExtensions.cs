@@ -71,6 +71,13 @@ public static class AddReconDashboardsExtensions
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
         services.AddScoped<ChartQueryService>();
+        services.AddScoped<SubscriptionService>();
+        services.AddScoped<AlertService>(sp => new AlertService(
+            sp.GetRequiredService<ReconDashboardsDbContext>(),
+            sp.GetRequiredService<ICurrentUserProvider>(),
+            sp.GetRequiredService<DataModelService>(),
+            sp,
+            sp.GetRequiredService<TimeProvider>()));
 
         // Per-user token bucket for query endpoints. Takes effect when the host
         // pipeline calls UseRateLimiter() (both production hosts already do).

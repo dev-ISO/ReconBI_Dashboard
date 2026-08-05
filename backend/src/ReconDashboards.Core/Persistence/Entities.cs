@@ -1,3 +1,6 @@
+using System.Text.Json.Serialization;
+using ReconDashboards.Core.Json;
+
 namespace ReconDashboards.Core.Persistence;
 
 /// <summary>rcd_data_models — semantic model definitions. OwnerUserId is an opaque host-supplied id; no FK to host tables.</summary>
@@ -28,6 +31,104 @@ public sealed class DashboardRecord
     public bool IsDeleted { get; set; }
     public DateTime CreatedAtUtc { get; set; }
     public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>How a subscription's next run is derived. Stored as small discriminated columns, never cron strings. Wire names: "interval", "daily", "weekly".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SubscriptionScheduleKind>))]
+public enum SubscriptionScheduleKind
+{
+    /// <summary>Every <see cref="SubscriptionRecord.IntervalMinutes"/> minutes.</summary>
+    Interval = 0,
+
+    /// <summary>Once a day at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (UTC).</summary>
+    Daily = 1,
+
+    /// <summary>Once a week on <see cref="SubscriptionRecord.DayOfWeekUtc"/> at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (UTC).</summary>
+    Weekly = 2,
+}
+
+/// <summary>Snapshot delivery format. Wire names: "html", "csv".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SubscriptionFormat>))]
+public enum SubscriptionFormat
+{
+    Html = 0,
+    Csv = 1,
+}
+
+/// <summary>
+/// rcd_subscriptions — scheduled email snapshots of a dashboard, rendered and
+/// row-filtered under the OWNER's identity. Recipients is a semicolon list.
+/// All times are UTC (DST-agnostic by construction).
+/// </summary>
+public sealed class SubscriptionRecord
+{
+    public int Id { get; set; }
+    public int DashboardId { get; set; }
+    public string OwnerUserId { get; set; } = "";
+    public string Name { get; set; } = "";
+    public SubscriptionScheduleKind ScheduleKind { get; set; }
+
+    /// <summary>Interval kind: minutes between runs (&gt;= 5).</summary>
+    public int? IntervalMinutes { get; set; }
+
+    /// <summary>Daily/Weekly kinds: minutes past UTC midnight (0..1439).</summary>
+    public int? TimeOfDayMinutesUtc { get; set; }
+
+    /// <summary>Weekly kind: 0 = Sunday .. 6 = Saturday (matches <see cref="DayOfWeek"/>).</summary>
+    public int? DayOfWeekUtc { get; set; }
+
+    /// <summary>Semicolon-separated email addresses.</summary>
+    public string Recipients { get; set; } = "";
+
+    public SubscriptionFormat Format { get; set; }
+    public bool Enabled { get; set; } = true;
+    public DateTime? LastRunUtc { get; set; }
+    public DateTime CreatedUtc { get; set; }
+}
+
+/// <summary>Comparison an alert applies to its single evaluated value. Wire names: "gt", "gte", "lt", "lte", "eq".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<AlertOperator>))]
+public enum AlertOperator
+{
+    Gt = 0,
+    Gte = 1,
+    Lt = 2,
+    Lte = 3,
+    Eq = 4,
+}
+
+/// <summary>
+/// rcd_alerts — a single-value chart query (0 dimensions, 1 measure) evaluated
+/// on a fixed cadence under the OWNER's identity; fires email when the
+/// condition holds and the cooldown has elapsed.
+/// </summary>
+public sealed class AlertRecord
+{
+    public int Id { get; set; }
+    public string OwnerUserId { get; set; } = "";
+    public int? DashboardId { get; set; }
+    public string Name { get; set; } = "";
+
+    /// <summary>A ChartQuerySpec (wire JSON) producing exactly one value.</summary>
+    public string SpecJson { get; set; } = "";
+
+    public AlertOperator Operator { get; set; }
+    public decimal Threshold { get; set; }
+
+    /// <summary>Semicolon-separated email addresses.</summary>
+    public string Recipients { get; set; } = "";
+
+    /// <summary>Evaluation cadence in minutes (min 5).</summary>
+    public int EveryMinutes { get; set; }
+
+    /// <summary>Minutes after a firing during which the alert stays silent.</summary>
+    public int CooldownMinutes { get; set; }
+
+    public bool Enabled { get; set; } = true;
+    public DateTime? LastEvaluatedUtc { get; set; }
+    public DateTime? LastFiredUtc { get; set; }
+    public decimal? LastValue { get; set; }
+    public DateTime CreatedUtc { get; set; }
 }
 
 /// <summary>rcd_query_audit — written only when EnableQueryAudit; retention is host-driven.</summary>

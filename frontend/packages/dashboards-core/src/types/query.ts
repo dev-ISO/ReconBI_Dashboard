@@ -75,6 +75,8 @@ export interface ChartQuerySpec {
   sort: SortSpec[];
   topN?: { n: number; byMeasureIndex: number; includeOthers: boolean } | null;
   limit?: number | null;
+  /** Row offset (applied after sort, before limit) — table pagination. */
+  offset?: number | null;
 }
 
 export interface QueryColumn {

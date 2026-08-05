@@ -314,6 +314,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         RcdLimits limits,
         DataSourceOptions sourceOptions)
     {
+        ValidateOffset(spec);
+
         var bag = new ParameterBag();
         var plan = prepared.Plan;
         var warnings = CollectFanOutWarnings(prepared);
@@ -363,8 +365,6 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
 
-        var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
-
         var sql = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
 
         if (orderParts.Count > 0)
@@ -372,7 +372,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             sql.Append('\n').Append("ORDER BY ").Append(string.Join(", ", orderParts));
         }
 
-        sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+        AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
         return new CompiledQuery(
             CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, BuildColumnPlans(prepared), warnings);
@@ -435,10 +435,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             {
                 // Calcs apply over the Top-N output: the flat ranked+limited
                 // query becomes the base and windows run over those rows.
+                // Offset (like the outer limit) applies to the final select.
                 return EmitWithCalcs(
                     prepared, spec, [.. calendarCtes], flat.ToString(),
                     includeIsTopN: false, orderByAxisOnly: true, effectiveLimit, bag, warnings);
             }
+
+            AppendOffset(flat, spec, bag);
 
             return new CompiledQuery(
                 CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings);
@@ -528,8 +531,6 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 includeIsTopN: true, orderByAxisOnly: true, effectiveLimit, bag, warnings);
         }
 
-        var outerLimitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
-
         var sql = new StringBuilder();
         sql.Append("WITH ");
         foreach (var calendarCte in calendarCtes)
@@ -541,7 +542,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         sql.Append(groupedCore);
         sql.Append('\n').Append("ORDER BY ").Append(isTopAlias).Append(" DESC, ")
             .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix);
-        sql.Append('\n').Append(dialect.LimitClause(outerLimitPlaceholder));
+        AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
         return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings);
     }
@@ -667,8 +668,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             sql.Append('\n').Append("ORDER BY ").Append(string.Join(", ", orderParts));
         }
 
-        var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
-        sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+        AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
         return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN), warnings);
     }
@@ -1543,6 +1543,42 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     {
         var cap = Math.Min(limits.MaxRows, sourceOptions.MaxRows);
         return requested is { } r && r > 0 ? Math.Min(r, cap) : cap;
+    }
+
+    /// <summary>Hard ceiling on <see cref="ChartQuerySpec.Offset"/>; larger values are a client error.</summary>
+    public const int MaxOffset = 1_000_000;
+
+    /// <summary>Negative offsets clamp to 0 (no clause); absurd offsets are rejected.</summary>
+    private static void ValidateOffset(ChartQuerySpec spec)
+    {
+        if (spec.Offset is { } offset && offset > MaxOffset)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_OFFSET", $"Offset must be at most {MaxOffset:N0}, got {offset}.");
+        }
+    }
+
+    /// <summary>
+    /// Appends the final statement's LIMIT (effective limit + 1 truncation
+    /// probe) and, when the spec asks for one, a parameterized OFFSET. Only the
+    /// FINAL select of a compiled statement gets the offset — inner CTEs keep
+    /// their own limits untouched.
+    /// </summary>
+    private void AppendLimitAndOffset(StringBuilder sql, int effectiveLimit, ChartQuerySpec spec, ParameterBag bag)
+    {
+        var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
+        sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+        AppendOffset(sql, spec, bag);
+    }
+
+    private void AppendOffset(StringBuilder sql, ChartQuerySpec spec, ParameterBag bag)
+    {
+        var offset = Math.Max(spec.Offset ?? 0, 0);
+        if (offset > 0)
+        {
+            var offsetPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)offset, NormalizedType.Integer));
+            sql.Append('\n').Append(dialect.OffsetClause(offsetPlaceholder));
+        }
     }
 
     private static string EscapeLikePattern(string value) =>

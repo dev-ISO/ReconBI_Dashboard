@@ -1,6 +1,13 @@
 // Dashboard layout document (rcd_dashboards.LayoutJson) + API envelopes.
 import type { ChartSpec } from './chart';
-import type { FilterClause, FilterOperator, FilterValue } from './query';
+import type {
+  ChartQuerySpec,
+  DimensionRef,
+  FilterClause,
+  FilterOperator,
+  FilterValue,
+  MeasureRef,
+} from './query';
 
 export interface TileLayout {
   x: number;
@@ -12,7 +19,16 @@ export interface TileLayout {
 }
 
 /** How a slicer tile renders its value picker. */
-export type SlicerVariant = 'checklist' | 'dropdown' | 'dropdownMulti' | 'buttons' | 'dateRange';
+export type SlicerVariant =
+  | 'checklist'
+  | 'dropdown'
+  | 'dropdownMulti'
+  | 'buttons'
+  | 'dateRange'
+  /** Rolling/relative date presets (Last 30 days, YTD, …) over a date column. */
+  | 'relativeDate'
+  /** Drives a dashboard field parameter's selection instead of filtering. */
+  | 'fieldParam';
 
 /** Visual tweaks for a slicer tile; absent fields keep the standard look. */
 export interface SlicerTileStyle {
@@ -23,6 +39,7 @@ export interface SlicerTileStyle {
 }
 
 export interface SlicerTileSpec {
+  /** Source column ('' for the fieldParam variant — it has no column). */
   table: string;
   column: string;
   label: string;
@@ -33,6 +50,15 @@ export interface SlicerTileSpec {
   targets?: string[] | null;
   /** Visual mode tweaks (frameless / compact); absent = standard look. */
   style?: SlicerTileStyle;
+  /** fieldParam variant: id of the DashboardParameter this slicer drives. */
+  parameterId?: string | null;
+  /**
+   * relativeDate variant: persisted preset id (e.g. 'last30d', 'ytd',
+   * 'lastN:6:month') applied when the dashboard opens with no runtime
+   * selection yet. Runtime preset choices live in SlicerValues (bookmarks
+   * capture them there); edit-mode choices also write here so they reload.
+   */
+  preset?: string | null;
 }
 
 /** Static rich-text tile content. `html` is ALWAYS a sanitized subset — every
@@ -187,6 +213,21 @@ export interface PageDrillthrough {
   fields: DrillthroughField[];
 }
 
+/**
+ * Per-PAGE single-column phone layout (viewports narrower than 640px). Lives
+ * on the page — each page stacks its own tiles, and tile ids are page-scoped
+ * anyway. Absent = derive order from the grid (top-left → bottom-right) with
+ * default heights and nothing hidden.
+ */
+export interface PageMobileLayout {
+  /** Tile ids in stack order; ids missing here append in grid order. */
+  order: string[];
+  /** Per-tile pixel height overrides; absent tiles use kind-based defaults. */
+  heights?: Record<string, number>;
+  /** Tile ids skipped entirely on phones. */
+  hidden?: string[];
+}
+
 /** One tab of a multi-page dashboard; tiles live per page (ids stay unique across pages). */
 export interface DashboardPage {
   id: string;
@@ -196,6 +237,31 @@ export interface DashboardPage {
   tiles: DashboardTile[];
   /** Drillthrough target config; absent/null = page is not a drillthrough target. */
   drillthrough?: PageDrillthrough | null;
+  /** Phone (narrow-container) layout for this page; absent = grid-derived. */
+  mobileLayout?: PageMobileLayout | null;
+}
+
+/* ----------------------------------------------------------- field parameters
+ * Power BI-style field parameters: a named, persisted list of dimension or
+ * measure options. Charts opt in via query.paramBindings; a 'fieldParam'
+ * slicer drives the transient selection (parameterSelections in the store).
+ */
+
+export interface DashboardParameterOption {
+  label: string;
+  /** Present iff the parameter's kind is 'dimension'. */
+  dimension?: DimensionRef;
+  /** Present iff the parameter's kind is 'measure'. */
+  measure?: MeasureRef;
+}
+
+export interface DashboardParameter {
+  id: string;
+  name: string;
+  kind: 'dimension' | 'measure';
+  options: DashboardParameterOption[];
+  /** Option selected when the dashboard opens (default 0). */
+  defaultIndex?: number;
 }
 
 /* ------------------------------------------------------------------ bookmarks
@@ -250,6 +316,11 @@ export interface DashboardLayoutDoc {
    * Absent on older docs = none; readers treat null/absent as empty.
    */
   bookmarks?: DashboardBookmark[] | null;
+  /**
+   * Field parameters (v1-compatible evolution; the wire version stays 1).
+   * Absent on older docs = none; readers treat null/absent as empty.
+   */
+  parameters?: DashboardParameter[] | null;
 }
 
 export const isSlicerTile = (
@@ -337,8 +408,103 @@ export interface DrillthroughState {
   label: string;
 }
 
+/**
+ * Rich runtime slicer selection (relative-date slicers): the compiled clause
+ * plus the preset id that produced it, so bookmarks capture the PRESET and
+ * reapplying recomputes fresh dates instead of restoring stale ones.
+ */
+export interface SlicerPresetSelection {
+  clause: FilterClause | null;
+  /** Relative-date preset id ('last30d', 'ytd', 'lastN:<n>:<unit>', …). */
+  presetId: string;
+}
+
+/**
+ * One slicer's runtime value: a bare clause (every classic variant), a
+ * preset-carrying selection (relative-date), or null (cleared). Bare clauses
+ * stay the common shape so pre-existing bookmarks keep working.
+ */
+export type SlicerValue = FilterClause | SlicerPresetSelection | null;
+
 /** Slicer selections (null = no selection) keyed by slicer tile id. */
-export type SlicerValues = Record<string, FilterClause | null>;
+export type SlicerValues = Record<string, SlicerValue>;
+
+/** The wire clause behind a slicer value (either shape), null when cleared. */
+export const slicerClauseOf = (value: SlicerValue | undefined): FilterClause | null => {
+  if (value == null) return null;
+  return 'presetId' in value ? value.clause : value;
+};
+
+/** The relative-date preset id riding a slicer value, if any. */
+export const slicerPresetOf = (value: SlicerValue | undefined): string | null =>
+  value != null && 'presetId' in value ? value.presetId : null;
 
 export const mergedSlicerFilters = (values: SlicerValues): FilterClause[] =>
-  Object.values(values).filter((clause): clause is FilterClause => clause !== null);
+  Object.values(values)
+    .map(slicerClauseOf)
+    .filter((clause): clause is FilterClause => clause !== null);
+
+/* ------------------------------------------------------ subscriptions/alerts
+ * Wire mirrors of api/rcd/v1/subscriptions and api/rcd/v1/alerts (email
+ * subscriptions + threshold alerts; the backend evaluates them server-side).
+ */
+
+export interface SubscriptionSchedule {
+  kind: 'interval' | 'daily' | 'weekly';
+  /** kind 'interval': minutes between sends. */
+  everyMinutes?: number | null;
+  /** kind 'daily'/'weekly': send time "HH:mm" (UTC). */
+  timeUtc?: string | null;
+  /** kind 'weekly': 0 (Sunday) … 6 (Saturday). */
+  dayOfWeek?: number | null;
+}
+
+export interface DashboardSubscription {
+  id: number;
+  dashboardId: number;
+  name: string;
+  schedule: SubscriptionSchedule;
+  recipients: string[];
+  format: 'html' | 'csv';
+  enabled: boolean;
+}
+
+/** Create/update body (id is server-assigned). */
+export type SaveSubscriptionBody = Omit<DashboardSubscription, 'id'>;
+
+export type AlertOperator = 'gt' | 'gte' | 'lt' | 'lte' | 'eq';
+
+export interface DashboardAlert {
+  id: number;
+  dashboardId?: number | null;
+  name: string;
+  /** 0-dimension, 1-measure query producing the scalar the alert watches. */
+  spec: ChartQuerySpec;
+  operator: AlertOperator;
+  threshold: number;
+  recipients: string[];
+  /** Evaluation cadence in minutes. */
+  everyMinutes: number;
+  /** Minimum minutes between consecutive firings. */
+  cooldownMinutes: number;
+  enabled: boolean;
+}
+
+/** Create/update body (id is server-assigned). */
+export type SaveAlertBody = Omit<DashboardAlert, 'id'>;
+
+/** POST alerts/{id}/test → the current value and whether it would fire. */
+export interface AlertTestResult {
+  value: number | null;
+  wouldFire: boolean;
+}
+
+/** One row of GET alerts/recent-firings. */
+export interface AlertFiring {
+  alertId: number;
+  alertName: string;
+  dashboardId?: number | null;
+  firedAtUtc: string;
+  value: number | null;
+  threshold: number;
+}

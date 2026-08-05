@@ -95,6 +95,14 @@ public sealed record SortSpec(SortTarget Target, SortDirection Direction);
 
 public sealed record TopNSpec(int N, int ByMeasureIndex, bool IncludeOthers);
 
+/// <summary>
+/// Offset (wire "offset") skips rows of the FINAL select — after ORDER BY,
+/// before LIMIT — for server-side table pagination. Negative values clamp to 0;
+/// values above 1,000,000 are rejected (QRY_BAD_OFFSET). Offset without an
+/// explicit sort is allowed: the engine's default deterministic ordering still
+/// applies when dimensions exist, and any residual nondeterminism (e.g. a
+/// no-dimension query) is on the caller.
+/// </summary>
 public sealed record ChartQuerySpec(
     int ModelId,
     IReadOnlyList<DimensionSpec> Dimensions,
@@ -102,7 +110,8 @@ public sealed record ChartQuerySpec(
     IReadOnlyList<FilterSpec> Filters,
     IReadOnlyList<SortSpec> Sort,
     TopNSpec? TopN,
-    int? Limit);
+    int? Limit,
+    int? Offset = null);
 
 /// <summary>
 /// CSV export mode: "summarized" runs the normal aggregate pipeline (including

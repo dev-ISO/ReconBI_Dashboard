@@ -62,9 +62,33 @@ export interface ContainerStyle {
 
 /** Numeric axis label formatting. */
 export interface AxisValueFormat {
-  kind?: 'auto' | 'number' | 'currency' | 'percent' | 'compact';
+  kind?: 'auto' | 'number' | 'currency' | 'percent' | 'compact' | 'custom';
   /** Fraction digits (compact/number/currency/percent). */
   decimals?: number;
+  /**
+   * Excel-style pattern for kind 'custom' (util/format formatNumberPattern):
+   * pos;neg;zero sections, #/0 digits + grouping, %, "literal", trailing
+   * commas scale by thousands (e.g. `$#,##0;($#,##0)`, `0.0,,"M"`).
+   */
+  pattern?: string;
+}
+
+/** Persisted table-chart behavior/layout options (all optional). */
+export interface TableOptions {
+  /** Column widths px, keyed by result column NAME. */
+  columnWidths?: Record<string, number>;
+  /** Display order of result column names; unlisted columns append. */
+  columnOrder?: string[];
+  /** First N displayed columns stick while scrolling horizontally. */
+  pinned?: number;
+  /** Totals row over the FULL filtered data (fetched via a no-dimension query). */
+  totals?: boolean;
+  /** Rows per page (server-side offset pagination); null/undefined = single page. */
+  pageSize?: number | null;
+  /** Zebra striping. */
+  stripes?: boolean;
+  /** Header click sorting (default true). */
+  sortable?: boolean;
 }
 
 /** Date axis label presets for bucketed dimensions. */
@@ -100,6 +124,8 @@ export interface TooltipStyle {
 /** Horizontal/vertical guide drawn over cartesian charts. */
 export interface ReferenceLineSpec {
   id: string;
+  /** Draw against the secondary (right) value axis. */
+  secondary?: boolean;
   /** 'constant' uses `value`; the rest are computed from the plotted series. */
   kind: 'constant' | 'average' | 'median' | 'min' | 'max';
   value?: number;
@@ -194,6 +220,24 @@ export interface ChartFormat {
   yAxisFormat?: AxisValueFormat;
   /** Date label preset for bucketed date dimensions on the axis. */
   dateFormat?: DateFormatPreset;
+  /**
+   * Custom date mask (wins over dateFormat): yyyy yy MMMM MMM MM M dd d
+   * EEEE EEE Qq HH mm literals in quotes (util/format formatDatePattern).
+   */
+  dateFormatPattern?: string | null;
+  /** Right-hand value axis: format/labels used when any series is assigned. */
+  y2AxisFormat?: AxisValueFormat;
+  y2AxisLabel?: string;
+  y2AxisLabelHtml?: string | null;
+  /**
+   * Series display-name keys (same keys as colorOverrides) plotted against the
+   * secondary right axis (line/area/column combos).
+   */
+  secondaryAxisKeys?: string[];
+  /** This chart participates in page hover highlighting (default true). */
+  hoverHighlight?: boolean;
+  /** Table-chart behavior/layout (sorting, paging, totals, columns). */
+  table?: TableOptions;
   /** Per-series line style, keyed like colorOverrides (line/area charts). */
   lineStyles?: Record<string, SeriesLineStyle>;
   tooltip?: TooltipStyle;
@@ -276,6 +320,14 @@ export interface ChartQuery {
   legend?: DimensionRef | null;
   /** Panel-per-value split (column/bar/line/area); rendered as a grid. */
   smallMultiples?: DimensionRef | null;
+  /**
+   * Field-parameter bindings (dashboard-level parameter ids). 'axis'
+   * substitutes the axis dimension with the parameter's current selection;
+   * 'measures' REPLACES the measure list with the selected measure. The
+   * dashboard runtime resolves these before building the wire spec; unbound
+   * charts and the standalone builder ignore them.
+   */
+  paramBindings?: { axis?: string | null; measures?: string | null };
   measures: MeasureRef[];
   filters: FilterClause[];
   sort?: SortSpec[];

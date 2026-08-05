@@ -17,10 +17,84 @@ namespace ReconDashboards.Postgres.Migrations
         {
 #pragma warning disable 612, 618
             modelBuilder
-                .HasAnnotation("ProductVersion", "10.0.0")
+                .HasAnnotation("ProductVersion", "10.0.8")
                 .HasAnnotation("Relational:MaxIdentifierLength", 63);
 
             NpgsqlModelBuilderExtensions.UseIdentityByDefaultColumns(modelBuilder);
+
+            modelBuilder.Entity("ReconDashboards.Core.Persistence.AlertRecord", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<int>("CooldownMinutes")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime>("CreatedUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<int?>("DashboardId")
+                        .HasColumnType("integer");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<int>("EveryMinutes")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("LastEvaluatedUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<DateTime?>("LastFiredUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<decimal?>("LastValue")
+                        .HasPrecision(28, 8)
+                        .HasColumnType("numeric(28,8)");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Operator")
+                        .IsRequired()
+                        .HasMaxLength(8)
+                        .HasColumnType("character varying(8)");
+
+                    b.Property<string>("OwnerUserId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Recipients")
+                        .IsRequired()
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
+
+                    b.Property<string>("SpecJson")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.Property<decimal>("Threshold")
+                        .HasPrecision(28, 8)
+                        .HasColumnType("numeric(28,8)");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DashboardId");
+
+                    b.HasIndex("LastFiredUtc");
+
+                    b.HasIndex("OwnerUserId");
+
+                    b.HasIndex("Enabled", "LastEvaluatedUtc");
+
+                    b.ToTable("rcd_alerts", (string)null);
+                });
 
             modelBuilder.Entity("ReconDashboards.Core.Persistence.DashboardRecord", b =>
                 {
@@ -179,6 +253,80 @@ namespace ReconDashboards.Postgres.Migrations
                     b.HasIndex("ExecutedAtUtc");
 
                     b.ToTable("rcd_query_audit", (string)null);
+                });
+
+            modelBuilder.Entity("ReconDashboards.Core.Persistence.SubscriptionRecord", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("integer");
+
+                    NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
+
+                    b.Property<DateTime>("CreatedUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<int>("DashboardId")
+                        .HasColumnType("integer");
+
+                    b.Property<int?>("DayOfWeekUtc")
+                        .HasColumnType("integer");
+
+                    b.Property<bool>("Enabled")
+                        .HasColumnType("boolean");
+
+                    b.Property<string>("Format")
+                        .IsRequired()
+                        .HasMaxLength(8)
+                        .HasColumnType("character varying(8)");
+
+                    b.Property<int?>("IntervalMinutes")
+                        .HasColumnType("integer");
+
+                    b.Property<DateTime?>("LastRunUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("OwnerUserId")
+                        .IsRequired()
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("Recipients")
+                        .IsRequired()
+                        .HasMaxLength(2048)
+                        .HasColumnType("character varying(2048)");
+
+                    b.Property<string>("ScheduleKind")
+                        .IsRequired()
+                        .HasMaxLength(16)
+                        .HasColumnType("character varying(16)");
+
+                    b.Property<int?>("TimeOfDayMinutesUtc")
+                        .HasColumnType("integer");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("DashboardId");
+
+                    b.HasIndex("OwnerUserId");
+
+                    b.HasIndex("Enabled", "LastRunUtc");
+
+                    b.ToTable("rcd_subscriptions", (string)null);
+                });
+
+            modelBuilder.Entity("ReconDashboards.Core.Persistence.SubscriptionRecord", b =>
+                {
+                    b.HasOne("ReconDashboards.Core.Persistence.DashboardRecord", null)
+                        .WithMany()
+                        .HasForeignKey("DashboardId")
+                        .OnDelete(DeleteBehavior.Cascade)
+                        .IsRequired();
                 });
 #pragma warning restore 612, 618
         }

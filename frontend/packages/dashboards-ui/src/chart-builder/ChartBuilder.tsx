@@ -8,7 +8,7 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import { Sigma } from 'lucide-react';
+import { Sigma, Variable } from 'lucide-react';
 import {
   isRunnable,
   stableStringify,
@@ -35,6 +35,7 @@ import {
   defaultWellFor,
   measureLabel,
   normalizeQueryForType,
+  type BuilderParameter,
   type FieldDragData,
   type WellId,
 } from './wellConfig';
@@ -47,6 +48,12 @@ export interface ChartBuilderProps {
   onCancel: () => void;
   /** Column metadata for the model's data source; FieldList falls back to measures when null. */
   catalog?: Catalog | null;
+  /**
+   * Dashboard field parameters, draggable into the axis/values wells as
+   * bindings (query.paramBindings). Absent = the Parameters section is hidden
+   * (the standalone builder never provides them; the dashboard side wires it).
+   */
+  parameters?: BuilderParameter[];
   /** Tab shown when the builder opens (a dashboard-side "Format chart" flow passes 'format'). */
   initialTab?: 'fields' | 'format';
 }
@@ -68,6 +75,7 @@ export function ChartBuilder({
   onSave,
   onCancel,
   catalog,
+  parameters,
   initialTab = 'fields',
 }: ChartBuilderProps) {
   const runtime = useRuntime();
@@ -180,6 +188,7 @@ export function ChartBuilder({
             <FieldList
               model={model}
               catalog={catalog ?? null}
+              parameters={parameters}
               onAdd={handleClickAdd}
               onAddFilter={(data) =>
                 setFilterTarget({ index: null, table: data.table, column: data.column })
@@ -243,6 +252,7 @@ export function ChartBuilder({
                   query={draft.query}
                   model={model}
                   catalog={catalog ?? null}
+                  parameters={parameters}
                   onChange={(query) => setDraft((current) => ({ ...current, query }))}
                   onEditFilter={(index) => {
                     const clause = draft.query.filters[index];
@@ -279,7 +289,10 @@ export function ChartBuilder({
           {activeDrag && (
             <div className="flex w-max items-center gap-1.5 rounded-md border border-rcd-accent bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text shadow-md">
               {activeDrag.kind === 'measure' && <Sigma size={12} className="text-rcd-muted" />}
-              {activeDrag.kind === 'measure' ? activeDrag.name : activeDrag.column}
+              {activeDrag.kind === 'parameter' && (
+                <Variable size={12} className="text-rcd-accent" />
+              )}
+              {activeDrag.kind === 'column' ? activeDrag.column : activeDrag.name}
             </div>
           )}
         </DragOverlay>

@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, ArrowLeft, Filter, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
 import {
@@ -10,31 +18,54 @@ import {
   isSlicerTile,
   isTextTile,
   newId,
+  slicerPresetOf,
   toWireSpec,
+  type AlertFiring,
   type ChartPointEvent,
   type ChartSpec,
   type DashboardTile,
   type FilterClause,
 } from '@recon/dashboards-core';
-import { ChartBuilder } from '../chart-builder/ChartBuilder';
+import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuilder';
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
 import { AddSlicerDialog } from './AddSlicerDialog';
+import { AlertDialog, type AlertSource } from './AlertDialog';
 import { ChartContextMenu } from './ChartContextMenu';
-import { DashboardChartTile } from './DashboardChartTile';
+import { DashboardChartTile, type TileEffectiveState } from './DashboardChartTile';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
+import { FieldParameterDialog } from './FieldParameterDialog';
 import { FiltersPane } from './FiltersPane';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
+import { MOBILE_BREAKPOINT, MobileLayoutEditor, MobileStack } from './MobileLayout';
 import { PageTabs } from './PageTabs';
-import { PointContextMenu, type DrillthroughTarget } from './PointContextMenu';
+import {
+  PointContextMenu,
+  type DrillthroughTarget,
+  type PointDrillActions,
+} from './PointContextMenu';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
+import { relativePresetClause } from './relativeDate';
 import { SlicerTile } from './SlicerTile';
+import { SubscriptionsDialog } from './SubscriptionsDialog';
 import { TextTile } from './TextTile';
+
+/**
+ * The chart builder's field-parameter prop, typed locally so this compiles
+ * regardless of when the builder lands it (same doctrine as ChartTile's
+ * renderer contract; once ChartBuilderProps carries `parameters` the
+ * intersection is a no-op).
+ */
+const ChartBuilderWithParams = ChartBuilder as ComponentType<
+  ChartBuilderProps & {
+    parameters?: { id: string; name: string; kind: 'dimension' | 'measure' }[];
+  }
+>;
 
 export interface DashboardViewProps {
   dashboardId: number;
@@ -147,6 +178,16 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [printOptions, setPrintOptions] = useState<PrintOptions | null>(null);
   /** Filters pane visibility (collapsed by default, both modes). */
   const [filtersPaneOpen, setFiltersPaneOpen] = useState(false);
+  /** Field-parameter manage dialog (edit mode, Add ▾ > Field parameter…). */
+  const [paramsOpen, setParamsOpen] = useState(false);
+  /** Subscriptions dialog (view mode, ⋯ > Subscribe…). */
+  const [subscribeOpen, setSubscribeOpen] = useState(false);
+  /** Alert dialog + the chart context it was invoked from. */
+  const [alertSource, setAlertSource] = useState<AlertSource | null>(null);
+  /** Recent alert firings (bell); null until the first successful poll. */
+  const [alertFirings, setAlertFirings] = useState<AlertFiring[] | null>(null);
+  /** Edit mode: the canvas shows the phone-layout editor instead of the grid. */
+  const [mobileEditOpen, setMobileEditOpen] = useState(false);
 
   const openDashboard = useCallback(() => {
     setOpenError(null);
@@ -216,17 +257,15 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
   /**
    * What each chart tile is CURRENTLY showing — the drill-derived effective
-   * spec + merged filters, reported by DashboardChartTile on every render
-   * (ref assignment, no re-renders). The export menus build the exact wire
-   * spec the tile's own fetch used from this.
+   * spec + merged filters + drill runtime, reported by DashboardChartTile on
+   * every render (ref assignment, no re-renders). The export menus build the
+   * exact wire spec the tile's own fetch used from this; the point context
+   * menu drives drill actions through it.
    */
-  const effectiveByTile = useRef(new Map<string, { chart: ChartSpec; filters: FilterClause[] }>());
-  const reportEffective = useCallback(
-    (tileId: string, effective: { chart: ChartSpec; filters: FilterClause[] }) => {
-      effectiveByTile.current.set(tileId, effective);
-    },
-    [],
-  );
+  const effectiveByTile = useRef(new Map<string, TileEffectiveState>());
+  const reportEffective = useCallback((tileId: string, effective: TileEffectiveState) => {
+    effectiveByTile.current.set(tileId, effective);
+  }, []);
 
   // Toolbar badge: enabled cards visible on this page currently contributing
   // at least one clause (visual cards of ANY chart on the page count — they
@@ -402,6 +441,40 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     return targets;
   }, [pointMenu, pages, activePage]);
 
+  /**
+   * Drill actions for the open point menu, driven through the effective-state
+   * ref the tile reports every render — the menu can drill into the clicked
+   * value even when the tile's drill-mode toggle is OFF.
+   */
+  const pointMenuDrill = useMemo<PointDrillActions | null>(() => {
+    if (!pointMenu) return null;
+    const drill = effectiveByTile.current.get(pointMenu.tileId)?.drill ?? null;
+    if (!drill) return null;
+    const { event } = pointMenu;
+    return {
+      canDrillDeeper: drill.canDrillDeeper,
+      level: drill.level,
+      pointLabel: event.axisLabel,
+      onDrillDown: () => drill.drillDownInto(event),
+      onDrillUp: drill.drillUp,
+      onDrillReset: drill.resetDrill,
+    };
+  }, [pointMenu]);
+
+  /** Opens the alert dialog pre-filled from a tile's CURRENT effective state. */
+  const openAlertFor = useCallback(
+    (tileId: string, chart?: ChartSpec) => {
+      const effective = effectiveByTile.current.get(tileId);
+      const chartSpec = chart ?? effective?.chart;
+      if (!chartSpec || chartSpec.query.measures.length === 0) return;
+      setAlertSource({
+        chart: chartSpec,
+        filters: effective?.filters ?? runtime.dashboards.filtersForTile(tileId),
+      });
+    },
+    [runtime],
+  );
+
   /** Chart tiles by title for the slicer config menus' "Applies to" list. */
   const chartTileInfos = useMemo(
     () => tiles.filter(isChartTile).map((tile) => ({ id: tile.id, title: tile.chart.title })),
@@ -440,14 +513,43 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     setLastRefreshAt(dashboardLoaded ? new Date() : null);
   }, [dashboardLoaded, dashboardId]);
 
+  /**
+   * Relative-date slicers hold clauses computed from "today" at selection
+   * time; every refresh recomputes any active preset so rolling windows stay
+   * anchored to the current clock (store writes no-op when the dates are
+   * unchanged — the common case within a day).
+   */
+  const recomputeRelativeSlicers = useCallback(() => {
+    const state = runtime.dashboards.store.getState();
+    const layout = state.current?.layout;
+    if (!layout) return;
+    for (const page of layout.pages ?? []) {
+      for (const tile of page.tiles) {
+        if (!isSlicerTile(tile) || tile.slicer.variant !== 'relativeDate') continue;
+        const presetId = slicerPresetOf(state.slicerValues[tile.id]);
+        if (presetId === null) continue;
+        const clause = relativePresetClause(presetId, tile.slicer.table, tile.slicer.column);
+        const current = state.slicerValues[tile.id];
+        const currentClause =
+          current != null && 'presetId' in current ? current.clause : null;
+        if (JSON.stringify(clause) === JSON.stringify(currentClause)) continue;
+        runtime.dashboards.setSlicerValue(
+          tile.id,
+          clause === null ? null : { clause, presetId },
+        );
+      }
+    }
+  }, [runtime]);
+
   // Auto-refresh: invalidate the shared query cache, then bump a token that
   // keys ChartTile — remounting refetches (brief skeleton) with fresh data.
   const [refreshToken, setRefreshToken] = useState(0);
   const refreshTiles = useCallback(() => {
+    recomputeRelativeSlicers();
     runtime.queries.invalidateAll();
     setRefreshToken((token) => token + 1);
     markRefreshed();
-  }, [runtime, markRefreshed]);
+  }, [runtime, markRefreshed, recomputeRelativeSlicers]);
 
   const refreshSeconds = current?.id === dashboardId ? (current.layout.refreshSeconds ?? null) : null;
 
@@ -535,6 +637,56 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       for (const timer of timers) window.clearInterval(timer);
     };
   }, [mode, printOptions, tileRefreshGroups, refreshTileGroup]);
+
+  // Alerts bell: poll recent firings on dashboard open + every 5 minutes.
+  // Failures keep the bell hidden (null) — the backend may not be deployed.
+  useEffect(() => {
+    if (!dashboardLoaded) {
+      setAlertFirings(null);
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      runtime.api
+        .listRecentAlertFirings(dashboardId)
+        .then((firings) => {
+          if (!cancelled) setAlertFirings(firings);
+        })
+        .catch(() => {
+          // keep the previous list (or stay hidden) on failure
+        });
+    };
+    poll();
+    const timer = window.setInterval(poll, 5 * 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [runtime, dashboardLoaded, dashboardId]);
+
+  // Mobile detection: a ResizeObserver on the VIEW ROOT (not the window — the
+  // library can be embedded in a host pane narrower than the screen).
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [containerWidth, setContainerWidth] = useState<number | null>(null);
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width !== undefined) setContainerWidth(width);
+    });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, []);
+
+  const isMobileView =
+    mode === 'view' && containerWidth !== null && containerWidth < MOBILE_BREAKPOINT;
+
+  // The phone-layout editor only makes sense while editing; leaving edit mode
+  // (save/discard) drops back to the desktop canvas.
+  useEffect(() => {
+    if (mode !== 'edit') setMobileEditOpen(false);
+  }, [mode]);
 
   const handleLayoutChange = useCallback(
     (items: DashboardGridItem[]) => {
@@ -694,12 +846,19 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       );
     }
     return (
-      <ChartBuilder
+      <ChartBuilderWithParams
         modelId={modelId}
         model={openModel.definition}
         catalog={builderCatalog}
         initial={builder.spec}
         initialTab={builder.initialTab}
+        // Dashboard field parameters (id/name/kind) so the builder can offer
+        // paramBindings for the axis/measures wells.
+        parameters={(current.layout.parameters ?? []).map((p) => ({
+          id: p.id,
+          name: p.name,
+          kind: p.kind,
+        }))}
         onSave={handleBuilderSave}
         onCancel={() => setBuilder(null)}
       />
@@ -710,7 +869,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const chartMenuTile = chartMenu ? tiles.find((t) => t.id === chartMenu.tileId) : undefined;
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-rcd-bg">
+    <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-rcd-bg">
       <DashboardToolbar
         name={current.name}
         isShared={current.isShared}
@@ -739,11 +898,21 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         bookmarks={(bookmarks ?? []).map((b) => ({ id: b.id, name: b.name }))}
         lastAppliedBookmarkId={lastAppliedBookmarkId}
         canManageBookmarks={!readonly}
-        onApplyBookmark={(id) => runtime.dashboards.applyBookmark(id)}
+        onApplyBookmark={(id) => {
+          runtime.dashboards.applyBookmark(id);
+          // Bookmarks capture relative-date PRESETS; recompute their dates so
+          // "Last 30 days" means the last 30 days from today, not capture day.
+          recomputeRelativeSlicers();
+        }}
         onAddBookmark={(name) => void runtime.dashboards.addBookmark(name)}
         onUpdateBookmark={(id) => runtime.dashboards.updateBookmark(id)}
         onRenameBookmark={(id, name) => runtime.dashboards.renameBookmark(id, name)}
         onDeleteBookmark={(id) => runtime.dashboards.deleteBookmark(id)}
+        onManageParameters={() => setParamsOpen(true)}
+        onSubscribe={readonly ? undefined : () => setSubscribeOpen(true)}
+        alertFirings={alertFirings ?? undefined}
+        mobileLayoutOpen={mobileEditOpen}
+        onToggleMobileLayout={() => setMobileEditOpen((open) => !open)}
       />
 
       {/* Flex row: grid area + (optional) right-docked Filters pane. */}
@@ -793,7 +962,11 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           )}
         </div>
 
-        <div className="h-full min-w-0 flex-1 overflow-auto p-3">
+        <div
+          className={`h-full min-w-0 flex-1 overflow-auto ${
+            (editable && mobileEditOpen) || isMobileView ? '' : 'p-3'
+          }`}
+        >
           {tiles.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
               <LayoutDashboard size={32} className="text-rcd-muted" />
@@ -812,6 +985,25 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
                 </p>
               )}
             </div>
+          ) : editable && mobileEditOpen ? (
+            // Edit mode, phone toggle on: the centered ~380px column where
+            // tiles are reordered / resized / hidden; saves into the page doc.
+            <MobileLayoutEditor
+              tiles={tiles}
+              layout={activePage?.mobileLayout ?? null}
+              onChange={(mobileLayout) => {
+                if (activePage) runtime.dashboards.setPageMobileLayout(activePage.id, mobileLayout);
+              }}
+              renderTile={renderTile}
+            />
+          ) : isMobileView ? (
+            // Narrow container (view mode): single-column phone stack in the
+            // configured order; hidden tiles skipped; no dragging.
+            <MobileStack
+              tiles={tiles}
+              layout={activePage?.mobileLayout ?? null}
+              renderTile={renderTile}
+            />
           ) : (
             <DashboardGrid
               items={gridItems}
@@ -864,6 +1056,11 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               }
               onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
               onExport={(exportMode) => void exportChartCsv(chartMenuTile.id, exportMode)}
+              onSetAlert={
+                modelId !== null && chartMenuTile.chart.query.measures.length > 0
+                  ? () => openAlertFor(chartMenuTile.id)
+                  : null
+              }
               onDelete={() => runtime.dashboards.removeTile(chartMenuTile.id)}
               onClose={() => setChartMenu(null)}
             />
@@ -880,8 +1077,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               title={pointMenu.chart.title}
               position={{ x: pointMenu.event.clientX, y: pointMenu.event.clientY }}
               drillthroughTargets={drillthroughTargets}
+              drill={pointMenuDrill}
               onDrillthrough={(target) =>
                 runtime.dashboards.startDrillthrough(target.pageId, target.filters, target.label)
+              }
+              onSetAlert={
+                !readonly && modelId !== null && pointMenu.chart.query.measures.length > 0
+                  ? () => openAlertFor(pointMenu.tileId, pointMenu.chart)
+                  : null
               }
               onExport={(exportMode) => void exportChartCsv(pointMenu.tileId, exportMode)}
               onClose={() => setPointMenu(null)}
@@ -906,6 +1109,26 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           open={addSlicerOpen}
           modelId={modelId}
           onClose={() => setAddSlicerOpen(false)}
+        />
+      )}
+
+      <FieldParameterDialog open={paramsOpen} onClose={() => setParamsOpen(false)} />
+
+      <SubscriptionsDialog
+        open={subscribeOpen}
+        dashboardId={dashboardId}
+        onClose={() => setSubscribeOpen(false)}
+        onError={setNotice}
+      />
+
+      {modelId !== null && (
+        <AlertDialog
+          open={alertSource !== null}
+          dashboardId={dashboardId}
+          modelId={modelId}
+          source={alertSource}
+          onClose={() => setAlertSource(null)}
+          onError={setNotice}
         />
       )}
 

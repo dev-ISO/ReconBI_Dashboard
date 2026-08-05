@@ -94,4 +94,6 @@ public sealed class PostgresSqlDialect : ISqlDialect
     public bool SupportsSelectAliasInOrderBy => true;
 
     public string LimitClause(string parameterPlaceholder) => $"LIMIT {parameterPlaceholder}";
+
+    public string OffsetClause(string parameterPlaceholder) => $"OFFSET {parameterPlaceholder}";
 }

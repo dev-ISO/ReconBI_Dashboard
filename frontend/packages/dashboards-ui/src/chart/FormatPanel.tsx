@@ -3,6 +3,8 @@ import { ChevronDown, ChevronRight, ChevronUp, PenLine, Trash2, X } from 'lucide
 import {
   CATEGORICAL_SLOTS,
   CHART_THEMES,
+  formatDatePattern,
+  formatNumberPattern,
   newId,
   sanitizeRichHtml,
   type AxisValueFormat,
@@ -18,6 +20,7 @@ import {
   type ReferenceLineSpec,
   type SeriesLineStyle,
   type SmallMultiplesFormat,
+  type TableOptions,
   type TextStyle,
   type TooltipStyle,
   type TrendlineSpec,
@@ -76,6 +79,9 @@ const DATE_FORMAT_OPTIONS: ReadonlyArray<{ value: DateFormatPreset; label: strin
   { value: 'year', label: 'Year (2026)' },
   { value: 'isoDate', label: 'ISO date (2026-08-04)' },
 ];
+
+/** Table page-size presets; anything else renders through the Custom input. */
+const TABLE_PAGE_SIZE_PRESETS: readonly number[] = [25, 50, 100, 250];
 
 const REFRESH_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
   { value: '', label: 'Off' },
@@ -349,10 +355,66 @@ function TextStyleRow({
   );
 }
 
+/** formatNumberPattern with malformed-pattern safety for the live previews. */
+const safeNumberPattern = (value: number, pattern: string): string => {
+  try {
+    return formatNumberPattern(value, pattern);
+  } catch {
+    return '—';
+  }
+};
+
+/** formatDatePattern with malformed-mask safety for the live preview. */
+const safeDatePattern = (date: Date, pattern: string): string => {
+  try {
+    return formatDatePattern(date, pattern);
+  } catch {
+    return '—';
+  }
+};
+
+/** Compact token cheat-sheet shown under every custom number-pattern input. */
+const NUMBER_PATTERN_CHEAT = 'Tokens: 0 # , . % ; "text" — trailing , = ÷1000';
+
+/**
+ * Monospace Excel-style pattern input with a live preview (a large positive and
+ * a negative sample) plus the token cheat sheet. Shared by the axis custom
+ * formats and the Values section's custom pattern mode.
+ */
+function NumberPatternField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <RcdInput
+        className="min-w-0 font-mono"
+        value={value}
+        placeholder='e.g. $#,##0;($#,##0)'
+        aria-label={`${label} custom pattern`}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {value.trim() !== '' && (
+        <p className="font-mono text-xs text-rcd-muted">
+          1234567.891 → {safeNumberPattern(1234567.891, value)} · -1234.5 →{' '}
+          {safeNumberPattern(-1234.5, value)}
+        </p>
+      )}
+      <p className="text-xs text-rcd-muted">{NUMBER_PATTERN_CHEAT}</p>
+    </div>
+  );
+}
+
 /**
  * Numeric value-axis format editor: kind select + decimals (0-4). "Auto"
  * removes the whole AxisValueFormat so specs stay minimal; decimals are only
- * meaningful (and enabled) once a concrete kind is chosen.
+ * meaningful (and enabled) once a concrete non-custom kind is chosen.
+ * "Custom…" swaps decimals for an Excel-style pattern input with live preview.
  */
 function AxisFormatEditor({
   label,
@@ -373,14 +435,24 @@ function AxisFormatEditor({
       return;
     }
     const next: AxisValueFormat = { kind: nextKind };
-    if (value?.decimals !== undefined) next.decimals = value.decimals;
+    if (nextKind === 'custom') {
+      if (value?.pattern) next.pattern = value.pattern;
+    } else if (value?.decimals !== undefined) {
+      next.decimals = value.decimals;
+    }
     onChange(next);
   };
 
   const setDecimals = (decimals: number | undefined) => {
-    if (kind === 'auto') return;
+    if (kind === 'auto' || kind === 'custom') return;
     const next: AxisValueFormat = { kind };
     if (decimals !== undefined) next.decimals = decimals;
+    onChange(next);
+  };
+
+  const setPattern = (pattern: string) => {
+    const next: AxisValueFormat = { kind: 'custom' };
+    if (pattern !== '') next.pattern = pattern;
     onChange(next);
   };
 
@@ -403,6 +475,7 @@ function AxisFormatEditor({
           <option value="currency">Currency</option>
           <option value="percent">Percent</option>
           <option value="compact">Compact</option>
+          <option value="custom">Custom…</option>
         </RcdSelect>
         <input
           type="number"
@@ -411,9 +484,9 @@ function AxisFormatEditor({
           aria-label={`${label} decimals`}
           title="Decimal places"
           placeholder="dp"
-          disabled={kind === 'auto'}
+          disabled={kind === 'auto' || kind === 'custom'}
           className={NUMBER_INPUT_CLASS}
-          value={value?.decimals ?? ''}
+          value={kind === 'custom' ? '' : (value?.decimals ?? '')}
           onChange={(event) => {
             if (event.target.value === '') {
               setDecimals(undefined);
@@ -426,6 +499,9 @@ function AxisFormatEditor({
           }}
         />
       </div>
+      {kind === 'custom' && (
+        <NumberPatternField label={label} value={value?.pattern ?? ''} onChange={setPattern} />
+      )}
       {helper && <p className="text-xs text-rcd-muted">{helper}</p>}
     </div>
   );
@@ -543,11 +619,14 @@ function StrokeWidthInput({
 function ReferenceLineRow({
   line,
   seriesKeys,
+  showSecondary,
   onChange,
   onRemove,
 }: {
   line: ReferenceLineSpec;
   seriesKeys: string[];
+  /** Offer the "Right axis" toggle (only when secondaryAxisKeys is non-empty). */
+  showSecondary: boolean;
   onChange: (partial: Partial<ReferenceLineSpec>) => void;
   onRemove: () => void;
 }) {
@@ -628,11 +707,20 @@ function ReferenceLineRow({
           onChange={(width) => onChange({ width })}
         />
       </div>
-      <CheckboxRow
-        label="Show label"
-        checked={line.showLabel ?? true}
-        onChange={(checked) => onChange({ showLabel: checked })}
-      />
+      <div className="flex items-center gap-3">
+        <CheckboxRow
+          label="Show label"
+          checked={line.showLabel ?? true}
+          onChange={(checked) => onChange({ showLabel: checked })}
+        />
+        {showSecondary && (
+          <CheckboxRow
+            label="Right axis"
+            checked={line.secondary ?? false}
+            onChange={(checked) => onChange({ secondary: checked || undefined })}
+          />
+        )}
+      </div>
     </div>
   );
 }
@@ -1045,8 +1133,8 @@ function AxisTitleField({
   onEdit,
   onClear,
 }: {
-  /** "X" | "Y" — used for placeholder + aria labels. */
-  axis: 'X' | 'Y';
+  /** "X" | "Y" | "Right (Y2)" — used for placeholder + aria labels. */
+  axis: string;
   plain: string;
   html: string | null | undefined;
   onPlainChange: (next: string | undefined) => void;
@@ -1110,7 +1198,13 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
 
   const [openSections, setOpenSections] = useState<ReadonlySet<string>>(() => new Set(['theme']));
   /** Which rich-text dialog is open (shared RichTextDialog instance). */
-  const [richTarget, setRichTarget] = useState<'inner' | 'x' | 'y' | null>(null);
+  const [richTarget, setRichTarget] = useState<'inner' | 'x' | 'y' | 'y2' | null>(null);
+  /** "Custom" chosen in the table page-size select before a number is typed. */
+  const [customPageSize, setCustomPageSize] = useState(false);
+  /** Values section: pattern editor (live preview) vs. the plain format input. */
+  const [customValueFormat, setCustomValueFormat] = useState(
+    () => format.valueFormat !== undefined && /[0#;"]/.test(format.valueFormat),
+  );
 
   const toggleSection = (id: string) =>
     setOpenSections((previous) => {
@@ -1136,6 +1230,37 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const supportsTooltip = spec.type !== 'kpi' && spec.type !== 'table';
   const tooltipEnabled = format.tooltip?.enabled ?? true;
   const activeTheme = format.theme ?? 'default';
+
+  // --- Secondary (right) value axis ---
+  // Cartesian combos only: pie/donut/kpi/table are axisless, scatter's two
+  // measures are its X/Y — none of them can host a second value axis.
+  const supportsSecondaryAxis = hasAxes && spec.type !== 'scatter';
+  const secondaryKeys = format.secondaryAxisKeys ?? [];
+  const hasSecondary = supportsSecondaryAxis && secondaryKeys.length > 0;
+  const setSecondaryKey = (key: string, secondary: boolean) => {
+    const next = secondary
+      ? secondaryKeys.includes(key)
+        ? secondaryKeys
+        : [...secondaryKeys, key]
+      : secondaryKeys.filter((existing) => existing !== key);
+    patch({ secondaryAxisKeys: next.length > 0 ? next : undefined });
+  };
+
+  /** Merge + prune table options; the object itself drops once fully default. */
+  const setTable = (partial: Partial<TableOptions>) => {
+    const merged = { ...format.table, ...partial };
+    const next: TableOptions = {};
+    if (merged.columnWidths && Object.keys(merged.columnWidths).length > 0) {
+      next.columnWidths = merged.columnWidths;
+    }
+    if (merged.columnOrder && merged.columnOrder.length > 0) next.columnOrder = merged.columnOrder;
+    if (merged.pinned !== undefined && merged.pinned > 0) next.pinned = merged.pinned;
+    if (merged.totals) next.totals = true;
+    if (merged.pageSize != null) next.pageSize = merged.pageSize;
+    if (merged.stripes) next.stripes = true;
+    if (merged.sortable === false) next.sortable = false;
+    patch({ table: Object.keys(next).length > 0 ? next : undefined });
+  };
 
   /** Merge + prune: drops every default-valued field, then the object itself. */
   const setContainer = (partial: Partial<ContainerStyle>) => {
@@ -1443,6 +1568,14 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           value={format.legendStyle}
           onChange={(next) => patch({ legendStyle: next })}
         />
+        <CheckboxRow
+          label="Hover highlighting"
+          checked={format.hoverHighlight ?? true}
+          onChange={(checked) => patch({ hoverHighlight: checked ? undefined : false })}
+        />
+        <p className="text-xs text-rcd-muted">
+          Hovering a data point spotlights it across the page.
+        </p>
       </CollapsibleSection>
 
       {hasAxes && (
@@ -1493,28 +1626,114 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               onChange={setValueAxisFormat}
             />
           )}
+          {supportsSecondaryAxis && (
+            <>
+              <h4 className={SUBHEAD_CLASS}>Value axes</h4>
+              {seriesKeys.length === 0 ? (
+                <p className="text-xs text-rcd-muted">
+                  Add measures to assign series to the left or right axis.
+                </p>
+              ) : (
+                seriesKeys.map((key) => {
+                  const onRight = secondaryKeys.includes(key);
+                  return (
+                    <div key={key} className="flex items-center gap-1.5">
+                      <span
+                        className="min-w-0 flex-1 truncate text-sm text-rcd-text-2"
+                        title={key}
+                      >
+                        {key}
+                      </span>
+                      <div
+                        role="group"
+                        aria-label={`Value axis for ${key}`}
+                        className="flex shrink-0 overflow-hidden rounded-md border border-rcd-border"
+                      >
+                        {(['Left', 'Right'] as const).map((side) => {
+                          const active = side === 'Right' ? onRight : !onRight;
+                          return (
+                            <button
+                              key={side}
+                              type="button"
+                              aria-pressed={active}
+                              aria-label={`${key} on the ${side.toLowerCase()} axis`}
+                              className={`px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                                active
+                                  ? 'bg-rcd-accent text-white'
+                                  : 'text-rcd-text-2 hover:bg-black/5 dark:hover:bg-white/10'
+                              }`}
+                              onClick={() => setSecondaryKey(key, side === 'Right')}
+                            >
+                              {side}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              {hasSecondary && (
+                <>
+                  <AxisFormatEditor
+                    label="Right axis format"
+                    value={format.y2AxisFormat}
+                    onChange={(next) => patch({ y2AxisFormat: next })}
+                  />
+                  <AxisTitleField
+                    axis="Right (Y2)"
+                    plain={format.y2AxisLabel ?? ''}
+                    html={format.y2AxisLabelHtml}
+                    onPlainChange={(next) => patch({ y2AxisLabel: next })}
+                    onEdit={() => setRichTarget('y2')}
+                    onClear={() => patch({ y2AxisLabelHtml: undefined })}
+                  />
+                </>
+              )}
+            </>
+          )}
           {spec.query.axis?.dateBucket && (
-            <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
-              Date labels
-              <RcdSelect
-                aria-label="Date label format"
-                value={format.dateFormat ?? 'auto'}
+            <>
+              <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+                Date labels
+                <RcdSelect
+                  aria-label="Date label format"
+                  value={format.dateFormat ?? 'auto'}
+                  onChange={(event) =>
+                    patch({
+                      dateFormat:
+                        event.target.value === 'auto'
+                          ? undefined
+                          : (event.target.value as DateFormatPreset),
+                    })
+                  }
+                >
+                  {DATE_FORMAT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              </label>
+              <RcdInput
+                className="min-w-0 font-mono"
+                value={format.dateFormatPattern ?? ''}
+                placeholder="Custom mask, e.g. MMM yyyy"
+                aria-label="Custom date mask"
                 onChange={(event) =>
-                  patch({
-                    dateFormat:
-                      event.target.value === 'auto'
-                        ? undefined
-                        : (event.target.value as DateFormatPreset),
-                  })
+                  patch({ dateFormatPattern: event.target.value || undefined })
                 }
-              >
-                {DATE_FORMAT_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </RcdSelect>
-            </label>
+              />
+              {Boolean(format.dateFormatPattern) && (
+                <p className="font-mono text-xs text-rcd-muted">
+                  Today → {safeDatePattern(new Date(), format.dateFormatPattern ?? '')}
+                </p>
+              )}
+              <p className="text-xs text-rcd-muted">
+                Mask overrides the preset. Tokens: yyyy yy MMMM MMM MM M dd d EEEE EEE Qq HH mm —
+                literals in quotes.
+              </p>
+            </>
           )}
         </CollapsibleSection>
       )}
@@ -1683,16 +1902,127 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           checked={format.showDataLabels ?? false}
           onChange={(checked) => patch({ showDataLabels: checked })}
         />
-        <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+        <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
           Value format
-          <RcdInput
-            value={format.valueFormat ?? ''}
-            placeholder="e.g. $ or % or #"
-            aria-label="Value format"
-            onChange={(event) => patch({ valueFormat: event.target.value || undefined })}
-          />
-        </label>
+          {customValueFormat ? (
+            <NumberPatternField
+              label="Value format"
+              value={format.valueFormat ?? ''}
+              onChange={(next) => patch({ valueFormat: next || undefined })}
+            />
+          ) : (
+            <RcdInput
+              value={format.valueFormat ?? ''}
+              placeholder="e.g. $ or % or #"
+              aria-label="Value format"
+              onChange={(event) => patch({ valueFormat: event.target.value || undefined })}
+            />
+          )}
+        </div>
+        <CheckboxRow
+          label="Custom pattern"
+          checked={customValueFormat}
+          onChange={setCustomValueFormat}
+        />
       </CollapsibleSection>
+
+      {spec.type === 'table' && (
+        <CollapsibleSection title="Table" {...sectionProps('table')}>
+          <CheckboxRow
+            label="Totals row"
+            checked={format.table?.totals ?? false}
+            onChange={(checked) => setTable({ totals: checked || undefined })}
+          />
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Page size
+            <RcdSelect
+              aria-label="Table page size"
+              className="w-32 shrink-0"
+              value={
+                customPageSize ||
+                (format.table?.pageSize != null &&
+                  !TABLE_PAGE_SIZE_PRESETS.includes(format.table.pageSize))
+                  ? 'custom'
+                  : format.table?.pageSize == null
+                    ? ''
+                    : String(format.table.pageSize)
+              }
+              onChange={(event) => {
+                if (event.target.value === 'custom') {
+                  setCustomPageSize(true);
+                  return;
+                }
+                setCustomPageSize(false);
+                setTable({
+                  pageSize: event.target.value === '' ? undefined : Number(event.target.value),
+                });
+              }}
+            >
+              <option value="">None</option>
+              {TABLE_PAGE_SIZE_PRESETS.map((size) => (
+                <option key={size} value={String(size)}>
+                  {size}
+                </option>
+              ))}
+              <option value="custom">Custom…</option>
+            </RcdSelect>
+          </label>
+          {(customPageSize ||
+            (format.table?.pageSize != null &&
+              !TABLE_PAGE_SIZE_PRESETS.includes(format.table.pageSize))) && (
+            <NumberRow
+              label="Rows per page"
+              min={1}
+              max={10000}
+              placeholder="50"
+              value={format.table?.pageSize ?? undefined}
+              onChange={(next) => setTable({ pageSize: next })}
+            />
+          )}
+          <CheckboxRow
+            label="Stripes"
+            checked={format.table?.stripes ?? false}
+            onChange={(checked) => setTable({ stripes: checked || undefined })}
+          />
+          <CheckboxRow
+            label="Sortable"
+            checked={format.table?.sortable ?? true}
+            onChange={(checked) => setTable({ sortable: checked ? undefined : false })}
+          />
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Pinned columns
+            <RcdSelect
+              aria-label="Pinned columns"
+              className="w-32 shrink-0"
+              value={String(format.table?.pinned ?? 0)}
+              onChange={(event) =>
+                setTable({
+                  pinned: event.target.value === '0' ? undefined : Number(event.target.value),
+                })
+              }
+            >
+              {[0, 1, 2, 3, 4].map((count) => (
+                <option key={count} value={String(count)}>
+                  {count === 0 ? 'None' : count}
+                </option>
+              ))}
+            </RcdSelect>
+          </label>
+          {(Object.keys(format.table?.columnWidths ?? {}).length > 0 ||
+            (format.table?.columnOrder?.length ?? 0) > 0) && (
+            <button
+              type="button"
+              className={ADD_BUTTON_CLASS}
+              onClick={() => setTable({ columnWidths: undefined, columnOrder: undefined })}
+            >
+              Reset column layout
+            </button>
+          )}
+          <p className="text-xs text-rcd-muted">
+            Column widths and order are set by dragging directly on the table.
+          </p>
+        </CollapsibleSection>
+      )}
 
       <CollapsibleSection title="Analytics" {...sectionProps('analytics')}>
         {!hasAxes ? (
@@ -1707,6 +2037,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                 key={line.id}
                 line={line}
                 seriesKeys={seriesKeys}
+                showSecondary={hasSecondary}
                 onChange={(partial) => setReferenceLine(line.id, partial)}
                 onRemove={() => removeReferenceLine(line.id)}
               />
@@ -1852,19 +2183,24 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               ? 'Inner title'
               : richTarget === 'x'
                 ? 'X axis title'
-                : 'Y axis title'
+                : richTarget === 'y'
+                  ? 'Y axis title'
+                  : 'Right (Y2) axis title'
           }
           initialHtml={sanitizeRichHtml(
             (richTarget === 'inner'
               ? container?.innerTitleHtml
               : richTarget === 'x'
                 ? format.xAxisLabelHtml
-                : format.yAxisLabelHtml) ?? '',
+                : richTarget === 'y'
+                  ? format.yAxisLabelHtml
+                  : format.y2AxisLabelHtml) ?? '',
           )}
           onApply={(next) => {
             if (richTarget === 'inner') setContainer({ innerTitleHtml: next });
             else if (richTarget === 'x') patch({ xAxisLabelHtml: next });
-            else patch({ yAxisLabelHtml: next });
+            else if (richTarget === 'y') patch({ yAxisLabelHtml: next });
+            else patch({ y2AxisLabelHtml: next });
             setRichTarget(null);
           }}
           onCancel={() => setRichTarget(null)}

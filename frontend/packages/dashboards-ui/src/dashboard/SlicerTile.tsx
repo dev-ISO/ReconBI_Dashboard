@@ -9,10 +9,26 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { AlertTriangle, ChevronDown, RefreshCw, Search, X } from 'lucide-react';
-import type { FilterClause, FilterValue, SlicerTileSpec } from '@recon/dashboards-core';
+import {
+  slicerClauseOf,
+  slicerPresetOf,
+  type DashboardParameter,
+  type FilterClause,
+  type FilterValue,
+  type SlicerTileSpec,
+} from '@recon/dashboards-core';
 import { DistinctValueList } from '../chart-builder/DistinctValueList';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
-import { RcdButton, RcdIconButton, RcdInput, RcdSpinner } from '../primitives';
+import { RcdButton, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+import {
+  customPresetId,
+  parseCustomPreset,
+  relativePresetClause,
+  relativePresetLabel,
+  RELATIVE_DATE_PRESETS,
+  RELATIVE_UNITS,
+  type RelativeUnit,
+} from './relativeDate';
 import { SlicerConfigMenu } from './SlicerConfigMenu';
 import { TileFrame } from './TileFrame';
 
@@ -40,7 +56,10 @@ const keyOf = (value: FilterValue): string => `${typeof value}:${String(value)}`
  */
 export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: SlicerTileProps) {
   const runtime = useRuntime();
-  const clause = useDashboardState((state) => state.slicerValues[tileId] ?? null);
+  /** Raw runtime value: undefined = untouched, null = cleared, else selection. */
+  const value = useDashboardState((state) => state.slicerValues[tileId]);
+  const clause = slicerClauseOf(value);
+  const activePresetId = slicerPresetOf(value);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
 
   /** Frameless mode: no header bar; the label becomes an inline body caption. */
@@ -48,8 +67,69 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
   /** Compact mode: tighter paddings + smaller text on every variant. */
   const compact = spec.style?.compact === true;
 
-  const hasSelection = clause !== null && clause.values.length > 0;
   const setClause = (next: FilterClause | null) => runtime.dashboards.setSlicerValue(tileId, next);
+
+  /* --------------------------------------------------- field-param variant */
+
+  const parameters = useDashboardState((state) => state.current?.layout.parameters ?? null);
+  const parameterSelections = useDashboardState((state) => state.parameterSelections);
+  const parameter =
+    spec.variant === 'fieldParam' && spec.parameterId
+      ? (parameters ?? []).find((p) => p.id === spec.parameterId) ?? null
+      : null;
+  const paramDefaultIndex = parameter
+    ? Math.min(Math.max(parameter.defaultIndex ?? 0, 0), Math.max(parameter.options.length - 1, 0))
+    : 0;
+  const paramIndex = parameter
+    ? (parameterSelections[parameter.id] ?? paramDefaultIndex)
+    : 0;
+
+  /* -------------------------------------------------- relative-date variant */
+
+  /**
+   * The persisted default preset (spec.preset) applies once when the dashboard
+   * opens with this slicer untouched (value === undefined; an explicit clear
+   * stores null and must NOT resurrect the default).
+   */
+  const untouched = value === undefined;
+  useEffect(() => {
+    if (spec.variant !== 'relativeDate' || !untouched || !spec.preset) return;
+    const initial = relativePresetClause(spec.preset, spec.table, spec.column);
+    runtime.dashboards.setSlicerValue(
+      tileId,
+      initial === null ? null : { clause: initial, presetId: spec.preset },
+    );
+  }, [runtime, tileId, spec.variant, spec.preset, spec.table, spec.column, untouched]);
+
+  const pickRelativePreset = (presetId: string) => {
+    if (presetId === 'all') {
+      setClause(null);
+    } else {
+      runtime.dashboards.setSlicerValue(tileId, {
+        clause: relativePresetClause(presetId, spec.table, spec.column),
+        presetId,
+      });
+    }
+    // Edit mode also persists the choice so it survives reload for everyone.
+    if (editable && (spec.preset ?? null) !== (presetId === 'all' ? null : presetId)) {
+      runtime.dashboards.updateSlicer(tileId, {
+        preset: presetId === 'all' ? null : presetId,
+      });
+    }
+  };
+
+  const hasSelection =
+    spec.variant === 'fieldParam'
+      ? parameter !== null && paramIndex !== paramDefaultIndex
+      : clause !== null && clause.values.length > 0;
+
+  const clearSelection = () => {
+    if (spec.variant === 'fieldParam') {
+      if (parameter) runtime.dashboards.setParameterSelection(parameter.id, paramDefaultIndex);
+    } else {
+      setClause(null);
+    }
+  };
 
   const inSelected = clause?.operator === 'in' ? clause.values : [];
   const toggleInValue = (value: FilterValue) => {
@@ -64,7 +144,18 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
   };
 
   const body =
-    modelId === null ? (
+    // Field-param slicers drive a parameter selection — no model needed.
+    spec.variant === 'fieldParam' ? (
+      <FieldParamSlicer
+        spec={spec}
+        compact={compact}
+        parameter={parameter}
+        selectedIndex={paramIndex}
+        onPick={(index) => {
+          if (parameter) runtime.dashboards.setParameterSelection(parameter.id, index);
+        }}
+      />
+    ) : modelId === null ? (
       <div className="flex h-full items-center justify-center p-2 text-center text-sm text-rcd-muted">
         No model attached to this dashboard.
       </div>
@@ -117,6 +208,14 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         selected={inSelected}
         onToggle={toggleInValue}
       />
+    ) : spec.variant === 'relativeDate' ? (
+      <RelativeDateSlicer
+        spec={spec}
+        compact={compact}
+        activePresetId={activePresetId}
+        hasClause={clause !== null}
+        onPick={pickRelativePreset}
+      />
     ) : (
       <DateRangeSlicer spec={spec} compact={compact} clause={clause} onChange={setClause} />
     );
@@ -140,7 +239,7 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
           <RcdIconButton
             aria-label={`Clear ${spec.label} selection`}
             title="Clear selection"
-            onClick={() => setClause(null)}
+            onClick={clearSelection}
           >
             <X size={13} />
           </RcdIconButton>
@@ -165,7 +264,7 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
                 aria-label={`Clear ${spec.label} selection`}
                 title="Clear selection"
                 className="!p-0.5"
-                onClick={() => setClause(null)}
+                onClick={clearSelection}
               >
                 <X size={11} />
               </RcdIconButton>
@@ -754,6 +853,175 @@ function ButtonsSlicer({
           + more
         </span>
       )}
+    </div>
+  );
+}
+
+/**
+ * Relative-date presets: a dropdown of rolling/period presets plus a custom
+ * "Last N <unit>" row. Picking one compiles a fresh `between` clause from the
+ * current clock; the preset id rides the runtime slicer value so refresh ticks
+ * (and bookmark re-application) recompute dates instead of restoring stale
+ * ones. 'All time' clears the filter.
+ */
+function RelativeDateSlicer({
+  spec,
+  compact,
+  activePresetId,
+  hasClause,
+  onPick,
+}: {
+  spec: SlicerTileSpec;
+  compact: boolean;
+  /** Preset id riding the runtime value; null = none active. */
+  activePresetId: string | null;
+  hasClause: boolean;
+  onPick: (presetId: string) => void;
+}) {
+  const custom = activePresetId ? parseCustomPreset(activePresetId) : null;
+  const [customN, setCustomN] = useState(custom?.n ?? 30);
+  const [customUnit, setCustomUnit] = useState<RelativeUnit>(custom?.unit ?? 'day');
+
+  // The select shows 'custom' while a lastN preset is active.
+  const selectValue = custom !== null ? 'custom' : (activePresetId ?? (hasClause ? 'custom' : 'all'));
+
+  const applyCustom = (n: number, unit: RelativeUnit) => {
+    if (n > 0) onPick(customPresetId(n, unit));
+  };
+
+  const selectClasses = compact ? 'h-7 w-full text-xs' : 'w-full';
+
+  return (
+    <div className={compact ? 'flex max-w-[18rem] flex-col gap-1 p-0.5' : 'flex max-w-[18rem] flex-col gap-2 p-0.5'}>
+      <RcdSelect
+        aria-label={`${spec.label} preset`}
+        value={selectValue}
+        onChange={(event) => {
+          const next = event.target.value;
+          if (next === 'custom') applyCustom(customN, customUnit);
+          else onPick(next);
+        }}
+        className={selectClasses}
+        title={activePresetId ? relativePresetLabel(activePresetId) : undefined}
+      >
+        {RELATIVE_DATE_PRESETS.map((preset) => (
+          <option key={preset.id} value={preset.id}>
+            {preset.label}
+          </option>
+        ))}
+        <option value="custom">Custom…</option>
+      </RcdSelect>
+
+      {selectValue === 'custom' && (
+        <div className="flex items-center gap-1.5">
+          <span className={compact ? 'text-[11px] text-rcd-text-2' : 'text-xs text-rcd-text-2'}>
+            Last
+          </span>
+          <RcdInput
+            type="number"
+            min={1}
+            value={customN}
+            onChange={(event) => {
+              const n = Math.max(1, Math.trunc(Number(event.target.value) || 1));
+              setCustomN(n);
+              applyCustom(n, customUnit);
+            }}
+            aria-label={`${spec.label} custom window size`}
+            className={compact ? 'h-7 w-16 text-xs' : 'w-16'}
+          />
+          <RcdSelect
+            value={customUnit}
+            onChange={(event) => {
+              const unit = event.target.value as RelativeUnit;
+              setCustomUnit(unit);
+              applyCustom(customN, unit);
+            }}
+            aria-label={`${spec.label} custom window unit`}
+            className={compact ? 'h-7 min-w-0 flex-1 text-xs' : 'min-w-0 flex-1'}
+          >
+            {RELATIVE_UNITS.map((unit) => (
+              <option key={unit.value} value={unit.value}>
+                {unit.label}
+              </option>
+            ))}
+          </RcdSelect>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Field-parameter slicer body: the parameter's options as single-select pills
+ * (≤ 6 options) or a dropdown, driving the transient parameterSelections
+ * state. Charts bound to the parameter re-query on selection change (their
+ * cache key changes with the substituted axis/measure).
+ */
+function FieldParamSlicer({
+  spec,
+  compact,
+  parameter,
+  selectedIndex,
+  onPick,
+}: {
+  spec: SlicerTileSpec;
+  compact: boolean;
+  parameter: DashboardParameter | null;
+  selectedIndex: number;
+  onPick: (index: number) => void;
+}) {
+  if (parameter === null || parameter.options.length === 0) {
+    return (
+      <p className="p-2 text-xs text-rcd-muted">
+        {spec.parameterId
+          ? 'The field parameter behind this slicer no longer exists.'
+          : 'No field parameter is configured for this slicer.'}
+      </p>
+    );
+  }
+
+  if (parameter.options.length > 6) {
+    return (
+      <div className="max-w-[18rem] p-0.5">
+        <RcdSelect
+          aria-label={`${spec.label} selection`}
+          value={String(selectedIndex)}
+          onChange={(event) => onPick(Number(event.target.value))}
+          className={compact ? 'h-7 w-full text-xs' : 'w-full'}
+        >
+          {parameter.options.map((option, index) => (
+            <option key={index} value={String(index)}>
+              {option.label}
+            </option>
+          ))}
+        </RcdSelect>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-wrap content-start items-center gap-1.5 p-0.5">
+      {parameter.options.map((option, index) => {
+        const isActive = index === selectedIndex;
+        return (
+          <button
+            key={index}
+            type="button"
+            aria-pressed={isActive}
+            onClick={() => onPick(index)}
+            title={option.label}
+            className={`inline-flex max-w-full items-center truncate rounded-full border transition-colors ${
+              compact ? 'h-6 px-2.5 text-xs' : 'h-8 px-3 text-sm'
+            } ${
+              isActive
+                ? 'border-rcd-accent bg-rcd-accent font-medium text-white hover:opacity-90'
+                : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
+            }`}
+          >
+            <span className="truncate">{option.label}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }

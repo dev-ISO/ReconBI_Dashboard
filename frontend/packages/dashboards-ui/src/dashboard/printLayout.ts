@@ -5,6 +5,7 @@ import {
   isImageTile,
   isSlicerTile,
   isTextTile,
+  slicerClauseOf,
   type CrossFilter,
   type DashboardTile,
   type FilterClause,
@@ -125,7 +126,7 @@ export function filterSummaryFor(
   const parts: string[] = [];
   for (const tile of tiles) {
     if (!isSlicerTile(tile)) continue;
-    const clause = slicerValues[tile.id];
+    const clause = slicerClauseOf(slicerValues[tile.id]);
     if (!clause) continue;
     parts.push(`${tile.slicer.label}: ${describeClause(clause)}`);
   }

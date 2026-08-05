@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Copy, FileDown, Paintbrush, Pencil, Trash2, type LucideIcon } from 'lucide-react';
+import { BellPlus, Copy, FileDown, Paintbrush, Pencil, Trash2, type LucideIcon } from 'lucide-react';
 import { ConfirmDialog } from '../primitives';
 
 export interface ChartContextMenuProps {
@@ -14,6 +14,8 @@ export interface ChartContextMenuProps {
   onDuplicate: () => void;
   /** CSV export of the tile's CURRENT effective query; items hidden when absent. */
   onExport?: (mode: 'summarized' | 'underlying') => void;
+  /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
+  onSetAlert?: (() => void) | null;
   /** Called after the user confirms the destructive delete. */
   onDelete: () => void;
   onClose: () => void;
@@ -33,6 +35,7 @@ export function ChartContextMenu({
   onEditFields,
   onDuplicate,
   onExport,
+  onSetAlert = null,
   onDelete,
   onClose,
 }: ChartContextMenuProps) {
@@ -123,6 +126,19 @@ export function ChartContextMenu({
               label="Underlying rows (CSV)"
               onClick={() => {
                 onExport('underlying');
+                onClose();
+              }}
+            />
+          </>
+        )}
+        {onSetAlert && (
+          <>
+            <div className="my-1 border-t border-rcd-border" />
+            <MenuItem
+              icon={BellPlus}
+              label="Set alert on this measure…"
+              onClick={() => {
+                onSetAlert();
                 onClose();
               }}
             />

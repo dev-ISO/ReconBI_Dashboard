@@ -1,15 +1,25 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ArrowDown, ArrowUp, ChevronsDown } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowDown, ArrowUp, ChevronsDown, CornerUpLeft } from 'lucide-react';
 import {
   stableStringify,
+  toWireSpec,
   type ChartPointEvent,
   type ChartSpec,
+  type DashboardParameter,
   type DimensionRef,
   type FilterClause,
   type FilterValue,
+  type QueryResult,
+  type SortSpec,
 } from '@recon/dashboards-core';
-import { ChartTile, type ChartLegendSelectEvent } from '../chart/ChartTile';
+import {
+  ChartTile,
+  type ChartLegendSelectEvent,
+  type ChartTableLayoutPatch,
+  type ChartTableSort,
+} from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
+import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdIconButton } from '../primitives';
 import { TileFrame } from './TileFrame';
 
@@ -29,9 +39,40 @@ interface TileDrill {
 
 const DRILL_ROOT: TileDrill = { level: 0, path: [] };
 
+/** Transient interactive-table state (sort + page); resets with the query. */
+interface TileTableState {
+  sort: (ChartTableSort & { target: SortSpec['target'] }) | null;
+  page: number;
+}
+
+const TABLE_ROOT: TileTableState = { sort: null, page: 0 };
+
+/** Drill operations the point context menu drives (exposed via reportEffective). */
+export interface TileDrillApi {
+  /** True when the chart has a hierarchy and a deeper level exists. */
+  canDrillDeeper: boolean;
+  /** Current drill level (0 = the chart's own axis). */
+  level: number;
+  /** Drills into the clicked point's value (works with drill mode OFF). */
+  drillDownInto: (e: ChartPointEvent) => void;
+  drillUp: () => void;
+  /** Resets the whole drill state back to the original chart. */
+  resetDrill: () => void;
+}
+
+/** What a chart tile reports it is CURRENTLY showing (ref-style, every render). */
+export interface TileEffectiveState {
+  /** Effective (param-substituted + drilled) chart spec. */
+  chart: ChartSpec;
+  /** Dashboard-level filters merged into the tile's fetch. */
+  filters: FilterClause[];
+  /** Drill runtime for the point context menu; null = no hierarchy. */
+  drill: TileDrillApi | null;
+}
+
 export interface DashboardChartTileProps {
   tileId: string;
-  /** BASE chart spec from the layout doc (drill derivation happens here). */
+  /** BASE chart spec from the layout doc (param/drill derivation happens here). */
   chart: ChartSpec;
   modelId: number | null;
   editable: boolean;
@@ -65,22 +106,54 @@ export interface DashboardChartTileProps {
   onPointMenu?: (payload: { tileId: string; chart: ChartSpec; event: ChartPointEvent }) => void;
   /**
    * Ref-style report of what this tile is CURRENTLY showing (effective spec +
-   * filters) — the export menus build the exact wire spec from it.
+   * filters + drill runtime) — the export menus build the exact wire spec from
+   * it and the point context menu drives drill actions through it.
    */
-  reportEffective: (tileId: string, effective: { chart: ChartSpec; filters: FilterClause[] }) => void;
+  reportEffective: (tileId: string, effective: TileEffectiveState) => void;
 }
 
 /**
- * Chart tile with the drill-down runtime: keeps transient per-tile DrillState,
- * derives the effective query (axis swap + traversed-path eq filters) before
- * the wire spec is built, and renders the subtle Power BI-style drill controls
- * in the tile header (or the frameless hover strip). Fresh derived spec
- * objects per render are fine — ChartTile keys its fetch effect on the cache
- * key STRING, never on object identity.
+ * Substitutes field-parameter bindings into a chart's query: 'axis' replaces
+ * the axis dimension (incl. its dateBucket) with the parameter's selected
+ * option; 'measures' REPLACES the measure list with the selected measure.
+ * Runs BEFORE drill/filter derivation, so drills and cross-filters operate on
+ * the substituted dimension. Unbound charts pass through untouched.
+ */
+const applyParamBindings = (
+  chart: ChartSpec,
+  parameters: DashboardParameter[] | null,
+  selections: Record<string, number>,
+): ChartSpec => {
+  const bindings = chart.query.paramBindings;
+  if (!bindings || !parameters || parameters.length === 0) return chart;
+  const resolve = (id: string | null | undefined) => {
+    if (!id) return null;
+    const parameter = parameters.find((p) => p.id === id);
+    if (!parameter || parameter.options.length === 0) return null;
+    const raw = selections[parameter.id] ?? parameter.defaultIndex ?? 0;
+    const index = Math.min(Math.max(Math.trunc(raw), 0), parameter.options.length - 1);
+    return parameter.options[index] ?? null;
+  };
+  const axisOption = resolve(bindings.axis);
+  const measureOption = resolve(bindings.measures);
+  const axis = axisOption?.dimension ?? chart.query.axis;
+  const measures = measureOption?.measure ? [measureOption.measure] : chart.query.measures;
+  if (axis === chart.query.axis && measures === chart.query.measures) return chart;
+  return { ...chart, query: { ...chart.query, axis, measures } };
+};
+
+/**
+ * Chart tile with the dashboard runtime around ChartTile:
+ * - field-parameter substitution (axis/measures) BEFORE everything else;
+ * - transient per-tile drill state (axis swap + traversed-path eq filters);
+ * - hover cross-highlighting (source + receiver sides via the store);
+ * - interactive-table sort/page/totals/layout wiring.
+ * Fresh derived spec objects per render are fine — ChartTile keys its fetch
+ * effect on the cache key STRING, never on object identity.
  */
 export function DashboardChartTile({
   tileId,
-  chart,
+  chart: baseChart,
   modelId,
   editable,
   selected,
@@ -98,11 +171,22 @@ export function DashboardChartTile({
   onPointMenu,
   reportEffective,
 }: DashboardChartTileProps) {
+  const runtime = useRuntime();
   const [drill, setDrill] = useState<TileDrill>(DRILL_ROOT);
   const [drillMode, setDrillMode] = useState(false);
 
-  // Transient drill position resets whenever the chart's query changes (spec
-  // edits redefine the hierarchy); keyed on content, not object identity.
+  /* -------------------------------------------------- parameter substitution */
+
+  const parameters = useDashboardState((state) => state.current?.layout.parameters ?? null);
+  const parameterSelections = useDashboardState((state) => state.parameterSelections);
+  const chart = useMemo(
+    () => applyParamBindings(baseChart, parameters, parameterSelections),
+    [baseChart, parameters, parameterSelections],
+  );
+
+  // Transient drill position resets whenever the effective base query changes
+  // (spec edits redefine the hierarchy; a parameter switch swaps the axis);
+  // keyed on content, not object identity.
   const queryKey = useMemo(() => stableStringify(chart.query), [chart.query]);
   useEffect(() => {
     setDrill(DRILL_ROOT);
@@ -122,7 +206,7 @@ export function DashboardChartTile({
   // Effective query: level 0 is the base spec untouched; deeper levels swap
   // the axis to the level's dimension and append one eq/isNull clause per
   // FILTERED traversed step ("go to next level" slots contribute none).
-  const effectiveChart = useMemo<ChartSpec>(() => {
+  const drilledChart = useMemo<ChartSpec>(() => {
     if (!hasHierarchy || level === 0) return chart;
     const pathFilters: FilterClause[] = [];
     drill.path.slice(0, level).forEach((slot, i) => {
@@ -145,32 +229,31 @@ export function DashboardChartTile({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- dimensionAt/drillLevels derive from chart
   }, [chart, hasHierarchy, level, drill.path]);
 
-  // Ref-style report (assignment only, mirrors ChartTile's wireSpecRef): the
-  // export menus read the freshest effective spec without extra renders.
-  reportEffective(tileId, { chart: effectiveChart, filters });
-
   const canDrillDeeper = hasHierarchy && level < maxLevel;
 
-  const drillDown = (e: ChartPointEvent) => {
-    setDrill((prev) => {
-      const lvl = Math.min(prev.level, maxLevel);
-      if (lvl >= maxLevel) return prev;
-      return {
-        level: lvl + 1,
-        path: [
-          ...prev.path.slice(0, lvl),
-          { value: e.axisValue as FilterValue | null, label: e.axisLabel },
-        ],
-      };
-    });
-  };
+  const drillDown = useCallback(
+    (e: ChartPointEvent) => {
+      setDrill((prev) => {
+        const lvl = Math.min(prev.level, maxLevel);
+        if (lvl >= maxLevel) return prev;
+        return {
+          level: lvl + 1,
+          path: [
+            ...prev.path.slice(0, lvl),
+            { value: e.axisValue as FilterValue | null, label: e.axisLabel },
+          ],
+        };
+      });
+    },
+    [maxLevel],
+  );
 
-  const drillUp = () => {
+  const drillUp = useCallback(() => {
     setDrill((prev) => {
       const lvl = Math.min(prev.level, maxLevel);
       return lvl === 0 ? prev : { level: lvl - 1, path: prev.path.slice(0, lvl - 1) };
     });
-  };
+  }, [maxLevel]);
 
   /** "Go to next level": axis swaps, no path filter (a filterless slot). */
   const nextLevel = () => {
@@ -188,6 +271,267 @@ export function DashboardChartTile({
       return { level: target, path: prev.path.slice(0, target) };
     });
   };
+
+  /** Home: resets the whole drill state at once (back to the original chart). */
+  const resetDrill = useCallback(() => setDrill(DRILL_ROOT), []);
+
+  /* --------------------------------------------------- interactive table */
+
+  const isTable = chart.type === 'table';
+  const tableOptions = chart.format.table ?? null;
+  const pageSize = isTable && tableOptions?.pageSize != null && tableOptions.pageSize > 0
+    ? tableOptions.pageSize
+    : null;
+
+  const [tableState, setTableState] = useState<TileTableState>(TABLE_ROOT);
+  /** View-mode column width/order tweaks (edit mode persists to the doc). */
+  const [tableLayoutOverride, setTableLayoutOverride] = useState<ChartTableLayoutPatch | null>(null);
+
+  // Sort/page reset whenever the EFFECTIVE query identity changes — drill
+  // level/path, drillthrough/slicer/cross-filter clauses, parameter swaps.
+  const identityKey = useMemo(
+    () => stableStringify({ query: drilledChart.query, filters }),
+    [drilledChart.query, filters],
+  );
+  useEffect(() => {
+    setTableState(TABLE_ROOT);
+  }, [identityKey]);
+
+  /** Freshest rendered result (ref assignment from ChartTile — no re-renders). */
+  const lastResultRef = useRef<QueryResult | null>(null);
+  const handleResult = useCallback((result: QueryResult) => {
+    lastResultRef.current = result;
+  }, []);
+
+  /** Maps a result column NAME onto the effective spec's dimension/measure index. */
+  const sortTargetFor = (column: string): SortSpec['target'] | null => {
+    const columns = lastResultRef.current?.columns;
+    if (!columns) return null;
+    const dims = columns.filter((c) => c.role === 'dimension');
+    const measures = columns.filter((c) => c.role === 'measure');
+    const dimIndex = dims.findIndex((c) => c.name === column);
+    if (dimIndex !== -1) return { kind: 'dimension', index: dimIndex };
+    const measureIndex = measures.findIndex((c) => c.name === column);
+    if (measureIndex !== -1) return { kind: 'measure', index: measureIndex };
+    return null;
+  };
+
+  const handleTableSortChange = useCallback((sort: ChartTableSort | null) => {
+    setTableState((prev) => {
+      if (sort === null) return { ...prev, sort: null, page: 0 };
+      const target = sortTargetFor(sort.column);
+      if (target === null) return prev;
+      return { sort: { ...sort, target }, page: 0 };
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sortTargetFor reads a ref
+  }, []);
+
+  const handleTablePageChange = useCallback((page: number) => {
+    setTableState((prev) => ({ ...prev, page: Math.max(0, page) }));
+  }, []);
+
+  const handleTableLayoutChange = useCallback(
+    (patch: ChartTableLayoutPatch) => {
+      if (editable) {
+        // EDIT mode: persist into the BASE chart's format.table (dirties the doc).
+        const state = runtime.dashboards.store.getState();
+        const tile = (state.current?.layout.pages ?? [])
+          .flatMap((page) => page.tiles)
+          .find((t) => t.id === tileId);
+        if (!tile?.chart) return;
+        runtime.dashboards.updateChart(tileId, {
+          ...tile.chart,
+          format: {
+            ...tile.chart.format,
+            table: { ...tile.chart.format.table, ...patch },
+          },
+        });
+        return;
+      }
+      // View mode: transient personal tweak only.
+      setTableLayoutOverride((prev) => ({ ...prev, ...patch }));
+    },
+    [editable, runtime, tileId],
+  );
+
+  /**
+   * The spec ChartTile actually fetches/renders: the drilled chart plus the
+   * transient table sort (replacing spec.sort), page-size limit, and any
+   * view-mode column layout override. Non-table charts pass through.
+   */
+  const queryChart = useMemo<ChartSpec>(() => {
+    if (!isTable) return drilledChart;
+    const needsSort = tableState.sort !== null;
+    const needsLayout = tableLayoutOverride !== null;
+    if (!needsSort && !needsLayout && pageSize === null) return drilledChart;
+    return {
+      ...drilledChart,
+      query: {
+        ...drilledChart.query,
+        ...(needsSort
+          ? {
+              sort: [
+                { target: tableState.sort!.target, direction: tableState.sort!.direction },
+              ],
+            }
+          : {}),
+        ...(pageSize !== null ? { limit: pageSize } : {}),
+      },
+      ...(needsLayout
+        ? {
+            format: {
+              ...drilledChart.format,
+              table: { ...drilledChart.format.table, ...tableLayoutOverride },
+            },
+          }
+        : {}),
+    };
+  }, [isTable, drilledChart, tableState.sort, tableLayoutOverride, pageSize]);
+
+  /** Row offset for server-side table pagination (merged into the wire spec). */
+  const tableOffset = pageSize !== null ? tableState.page * pageSize : null;
+
+  /* ------------------------------------------------------------ totals row */
+
+  // Companion no-dimension query over the SAME measures + filters (incl. the
+  // drill path and every transient dashboard filter), through the query cache.
+  const totalsSpec = useMemo(() => {
+    if (!isTable || tableOptions?.totals !== true || modelId === null) return null;
+    if (drilledChart.query.measures.length === 0) return null;
+    return toWireSpec(
+      {
+        ...drilledChart,
+        query: {
+          ...drilledChart.query,
+          axis: null,
+          legend: null,
+          smallMultiples: null,
+          sort: [],
+          limit: null,
+        },
+      },
+      modelId,
+      filters,
+    );
+  }, [isTable, tableOptions?.totals, modelId, drilledChart, filters]);
+
+  const totalsKey = totalsSpec ? runtime.queries.keyFor(totalsSpec) : null;
+  const totalsEntry = useQueryCacheState((state) =>
+    totalsKey ? state.entries[totalsKey] : undefined,
+  );
+  const totalsSpecRef = useRef(totalsSpec);
+  totalsSpecRef.current = totalsSpec;
+
+  useEffect(() => {
+    if (!totalsKey) return;
+    const spec = totalsSpecRef.current;
+    if (!spec) return;
+    runtime.queries.run(spec).catch(() => {
+      // surfaced via the cache entry (totals simply stay absent on error)
+    });
+  }, [runtime, totalsKey, refreshKey]);
+
+  const totalsRow = useMemo<(number | null)[] | null>(() => {
+    if (!totalsSpec || totalsEntry?.status !== 'ok' || !totalsEntry.data) return null;
+    const result = totalsEntry.data;
+    const row = result.rows[0];
+    if (!row) return null;
+    return result.columns
+      .map((column, i) => ({ column, i }))
+      .filter(({ column }) => column.role === 'measure')
+      .map(({ i }) => {
+        const value = row[i];
+        return typeof value === 'number' ? value : null;
+      });
+  }, [totalsSpec, totalsEntry]);
+
+  /* ------------------------------------------------------- hover highlight */
+
+  const hoverEnabled = chart.format.hoverHighlight !== false;
+  const hoverHighlight = useDashboardState((state) => state.hoverHighlight);
+
+  // Fresh effective dims per render, read by stable callbacks through a ref.
+  const hoverDimsRef = useRef<{ chart: ChartSpec }>({ chart: drilledChart });
+  hoverDimsRef.current = { chart: drilledChart };
+
+  const handlePointHover = useCallback(
+    (e: ChartPointEvent | null) => {
+      const store = runtime.dashboards;
+      if (e === null) {
+        if (store.store.getState().hoverHighlight?.sourceTileId === tileId) {
+          store.setHoverHighlight(null);
+        }
+        return;
+      }
+      const effective = hoverDimsRef.current.chart;
+      const axis =
+        effective.type === 'pie' || effective.type === 'donut'
+          ? (effective.query.legend ?? effective.query.axis ?? null)
+          : (effective.query.axis ?? null);
+      const legend = effective.query.legend ?? null;
+      // Axis dimension by default; the legend dimension when the event only
+      // carries a legend identity (no axis on this chart).
+      let dimension = axis;
+      let raw = e.axisValue;
+      let label = e.axisLabel;
+      if (dimension === null && legend !== null && e.legendValue !== undefined) {
+        dimension = legend;
+        raw = e.legendValue;
+        label = e.legendLabel ?? String(e.legendValue);
+      }
+      if (dimension === null) return;
+      // The store no-ops on identical payloads, so hover jitter never storms
+      // subscribers (and hover can never trigger fetches or grid re-layout).
+      store.setHoverHighlight({
+        dimension: { table: dimension.table, column: dimension.column },
+        raw,
+        label,
+        sourceTileId: tileId,
+      });
+    },
+    [runtime, tileId],
+  );
+
+  // A hover raised by this tile clears when the tile unmounts (page switch is
+  // already handled by the store).
+  useEffect(
+    () => () => {
+      const store = runtime.dashboards;
+      if (store.store.getState().hoverHighlight?.sourceTileId === tileId) {
+        store.setHoverHighlight(null);
+      }
+    },
+    [runtime, tileId],
+  );
+
+  // Receiver side: dim non-matching categories while ANOTHER tile hovers a
+  // category whose dimension matches this chart's effective axis or legend.
+  const highlightCategory = useMemo(() => {
+    if (!hoverEnabled || hoverHighlight === null || hoverHighlight.sourceTileId === tileId) {
+      return null;
+    }
+    const { dimension } = hoverHighlight;
+    const matches = (dim: DimensionRef | null | undefined): boolean =>
+      dim != null && dim.table === dimension.table && dim.column === dimension.column;
+    return matches(drilledChart.query.axis) || matches(drilledChart.query.legend)
+      ? { label: hoverHighlight.label }
+      : null;
+  }, [hoverEnabled, hoverHighlight, tileId, drilledChart.query.axis, drilledChart.query.legend]);
+
+  /* -------------------------------------------------------------- reporting */
+
+  // Ref-style report (assignment only, mirrors ChartTile's wireSpecRef): the
+  // export menus read the freshest effective spec — and the point context menu
+  // the drill runtime — without extra renders.
+  reportEffective(tileId, {
+    chart: drilledChart,
+    filters,
+    drill: hasHierarchy
+      ? { canDrillDeeper, level, drillDownInto: drillDown, drillUp, resetDrill }
+      : null,
+  });
+
+  /* -------------------------------------------------------- drill controls */
 
   // Breadcrumb: one crumb per traversed level; filtered steps show the clicked
   // label, filterless steps show the level's dimension column. Clicking a
@@ -225,6 +569,16 @@ export function DashboardChartTile({
         </span>
       )}
       <span className="flex items-center gap-0.5">
+        {level > 0 && (
+          <RcdIconButton
+            aria-label="Back to original chart"
+            title="Back to original chart"
+            onClick={resetDrill}
+            className="!p-1"
+          >
+            <CornerUpLeft size={13} />
+          </RcdIconButton>
+        )}
         <RcdIconButton
           aria-label="Drill up"
           title="Drill up"
@@ -286,25 +640,38 @@ export function DashboardChartTile({
         ) : (
           <ChartTile
             refreshKey={refreshKey}
-            spec={effectiveChart}
+            spec={queryChart}
             modelId={modelId}
             filters={filters}
+            offset={tableOffset}
             // Drill mode owns clicks exclusively: on, clicks drill (never
             // cross-filter); off, clicks cross-filter exactly as before.
             onDatumClick={
-              drillMode ? undefined : (info) => onCrossFilter(effectiveChart, info)
+              drillMode ? undefined : (info) => onCrossFilter(drilledChart, info)
             }
             onPointClick={drillMode && canDrillDeeper ? drillDown : undefined}
             onPointContextMenu={
               onPointMenu
-                ? (event) => onPointMenu({ tileId, chart: effectiveChart, event })
+                ? (event) => onPointMenu({ tileId, chart: drilledChart, event })
                 : undefined
             }
             // Legend clicks are never drill clicks — they cross-filter (or
             // clear) regardless of drill mode.
-            onLegendSelect={(e) => onLegendSelect(effectiveChart, e)}
+            onLegendSelect={(e) => onLegendSelect(drilledChart, e)}
             selectedLegendLabel={selectedLegendLabel}
             activeCategory={activeCategoryLabel !== null ? { label: activeCategoryLabel } : null}
+            onPointHover={hoverEnabled ? handlePointHover : undefined}
+            highlightCategory={highlightCategory}
+            tableSort={tableState.sort}
+            onTableSortChange={
+              isTable && tableOptions?.sortable !== false ? handleTableSortChange : undefined
+            }
+            tablePage={tableState.page}
+            tablePageCount={null}
+            onTablePageChange={pageSize !== null ? handleTablePageChange : undefined}
+            totalsRow={totalsRow}
+            onTableLayoutChange={isTable ? handleTableLayoutChange : undefined}
+            onResult={handleResult}
           />
         )}
       </TileFrame>

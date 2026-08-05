@@ -31,6 +31,13 @@ export interface ChartSeries {
    * mode this is the legend half of the name; `label` holds the full combo.
    */
   legendLabel?: string;
+  /**
+   * DEFAULT display name of the measure behind this series (measure mode: the
+   * series itself; legend pivot: the pivoted measure; combo: the measure
+   * half). Secondary-axis assignment (format.secondaryAxisKeys) matches on it
+   * so listing a measure moves ALL its combo series to y2 at once.
+   */
+  measureLabel?: string;
 }
 
 export interface ShapedChartData {
@@ -89,7 +96,7 @@ const displayLabel = (defaultLabel: string, spec: ChartSpec): string =>
  */
 const categoryLabel = (value: CellValue, column: QueryColumn, spec: ChartSpec): string =>
   column.dateBucket !== null
-    ? formatDateLabel(value, column, spec.format.dateFormat)
+    ? formatDateLabel(value, column, spec.format.dateFormat, spec.format.dateFormatPattern)
     : formatCellValue(value, column);
 
 /**
@@ -112,6 +119,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
       label: displayLabel(column.label, spec),
       color: seriesColor(i, column.label, spec.format.colorOverrides, spec.format.theme),
       styleKey: column.label,
+      measureLabel: column.label,
     }));
 
     const data = result.rows.map((row) => {
@@ -189,6 +197,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
             styleKey: name,
             legendRaw: legendRawByLabel.get(value) ?? null,
             legendLabel: value,
+            measureLabel: measure.label,
           };
         }),
       )
@@ -199,6 +208,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
         styleKey: value,
         legendRaw: legendRawByLabel.get(value) ?? null,
         legendLabel: value,
+        measureLabel: pivotMeasures[0]?.label,
       }));
 
   return { data: [...byAxis.values()], series, axisKey: AXIS_KEY, hasLegend: true };

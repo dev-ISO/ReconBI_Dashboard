@@ -79,6 +79,11 @@ builder.Services.AddControllers()
         }
     });
 
+// Opt-in scheduling: subscriptions + data alerts evaluated once per minute.
+// With no Rcd:Email:Host configured this uses the FileEmailSink drop folder,
+// so snapshots/alerts are testable locally without SMTP.
+builder.Services.AddReconDashboardsScheduling(builder.Configuration);
+
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ICurrentUserProvider, DemoCurrentUserProvider>();
 // Row-level scoping demo: alice only ever sees Gulf Coast sites. FAIL CLOSED.

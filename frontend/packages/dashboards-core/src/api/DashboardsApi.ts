@@ -7,7 +7,17 @@ import type {
   DistinctValuesSpec,
   QueryResult,
 } from '../types/query';
-import type { DashboardDetail, DashboardLayoutDoc, DashboardSummary } from '../types/dashboard';
+import type {
+  AlertFiring,
+  AlertTestResult,
+  DashboardAlert,
+  DashboardDetail,
+  DashboardLayoutDoc,
+  DashboardSubscription,
+  DashboardSummary,
+  SaveAlertBody,
+  SaveSubscriptionBody,
+} from '../types/dashboard';
 
 export interface SaveModelBody {
   name: string;
@@ -143,5 +153,56 @@ export class DashboardsApi {
 
   duplicateDashboard(id: number): Promise<DashboardDetail> {
     return this.fetcher(this.url(`/dashboards/${id}/duplicate`), { method: 'POST' });
+  }
+
+  /* --------------------------------------------------- email subscriptions */
+
+  /** My subscriptions, optionally scoped to one dashboard. */
+  listSubscriptions(dashboardId?: number, signal?: AbortSignal): Promise<DashboardSubscription[]> {
+    const suffix = dashboardId === undefined ? '' : `?dashboardId=${dashboardId}`;
+    return this.fetcher(this.url(`/subscriptions${suffix}`), { signal });
+  }
+
+  createSubscription(body: SaveSubscriptionBody): Promise<DashboardSubscription> {
+    return this.fetcher(this.url('/subscriptions'), { method: 'POST', body });
+  }
+
+  updateSubscription(id: number, body: SaveSubscriptionBody): Promise<DashboardSubscription> {
+    return this.fetcher(this.url(`/subscriptions/${id}`), { method: 'PUT', body });
+  }
+
+  deleteSubscription(id: number): Promise<void> {
+    return this.fetcher(this.url(`/subscriptions/${id}`), { method: 'DELETE' });
+  }
+
+  /* -------------------------------------------------------- metric alerts */
+
+  /** My alerts, optionally scoped to one dashboard. */
+  listAlerts(dashboardId?: number, signal?: AbortSignal): Promise<DashboardAlert[]> {
+    const suffix = dashboardId === undefined ? '' : `?dashboardId=${dashboardId}`;
+    return this.fetcher(this.url(`/alerts${suffix}`), { signal });
+  }
+
+  createAlert(body: SaveAlertBody): Promise<DashboardAlert> {
+    return this.fetcher(this.url('/alerts'), { method: 'POST', body });
+  }
+
+  updateAlert(id: number, body: SaveAlertBody): Promise<DashboardAlert> {
+    return this.fetcher(this.url(`/alerts/${id}`), { method: 'PUT', body });
+  }
+
+  deleteAlert(id: number): Promise<void> {
+    return this.fetcher(this.url(`/alerts/${id}`), { method: 'DELETE' });
+  }
+
+  /** Evaluates a SAVED alert now: current value + whether it would fire. */
+  testAlert(id: number, signal?: AbortSignal): Promise<AlertTestResult> {
+    return this.fetcher(this.url(`/alerts/${id}/test`), { method: 'POST', signal });
+  }
+
+  /** Recent alert firings (badge/dropdown), optionally per dashboard. */
+  listRecentAlertFirings(dashboardId?: number, signal?: AbortSignal): Promise<AlertFiring[]> {
+    const suffix = dashboardId === undefined ? '' : `?dashboardId=${dashboardId}`;
+    return this.fetcher(this.url(`/alerts/recent-firings${suffix}`), { signal });
   }
 }

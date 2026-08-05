@@ -22,12 +22,23 @@ export type { QueryCacheEntry, QueryCacheState } from './state/queryCache';
 export { ModelStore } from './state/modelStore';
 export type { AsyncStatus, EditableModel, ModelStoreState, NewRelationshipInput } from './state/modelStore';
 export { DashboardStore } from './state/dashboardStore';
-export type { DashboardStoreState, FilterCardOverride, OpenDashboard } from './state/dashboardStore';
+export type {
+  DashboardStoreState,
+  FilterCardOverride,
+  HoverHighlight,
+  OpenDashboard,
+} from './state/dashboardStore';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime } from './state/createRuntime';
 
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
 export { sanitizeRichHtml } from './util/richText';
-export { formatCellValue, formatAxisValue, formatDateLabel } from './util/format';
+export {
+  formatCellValue,
+  formatAxisValue,
+  formatDateLabel,
+  formatNumberPattern,
+  formatDatePattern,
+} from './util/format';
 export { seriesColor, CATEGORICAL_SLOTS, CHART_THEMES } from './util/palette';

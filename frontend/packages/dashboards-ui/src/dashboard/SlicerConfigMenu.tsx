@@ -1,8 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { FilterX, Trash2 } from 'lucide-react';
 import type { SlicerTileSpec, SlicerVariant } from '@recon/dashboards-core';
-import { useRuntime } from '../provider/DashboardsProvider';
-import { ConfirmDialog, RcdInput } from '../primitives';
+import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
+import { ConfirmDialog, RcdInput, RcdSelect } from '../primitives';
 
 export interface SlicerConfigMenuProps {
   tileId: string;
@@ -24,6 +24,7 @@ const VARIANTS: { value: SlicerVariant; label: string }[] = [
   { value: 'dropdownMulti', label: 'Dropdown (multi-select)' },
   { value: 'buttons', label: 'Buttons' },
   { value: 'dateRange', label: 'Date range' },
+  { value: 'relativeDate', label: 'Relative date' },
 ];
 
 /**
@@ -42,6 +43,8 @@ export function SlicerConfigMenu({
   onClose,
 }: SlicerConfigMenuProps) {
   const runtime = useRuntime();
+  // Stable fallback — a fresh [] per snapshot would loop useSyncExternalStore.
+  const parameters = useDashboardState((state) => state.current?.layout.parameters) ?? [];
   const cardRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(position);
   const [labelDraft, setLabelDraft] = useState(spec.label);
@@ -142,22 +145,51 @@ export function SlicerConfigMenu({
       >
         {editable ? (
           <>
-            <SectionLabel>Variant</SectionLabel>
-            {VARIANTS.map((variant) => (
-              <label
-                key={variant.value}
-                className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-              >
-                <input
-                  type="radio"
-                  name={`rcd-slicer-variant-${tileId}`}
-                  className="accent-[var(--rcd-accent)]"
-                  checked={spec.variant === variant.value}
-                  onChange={() => setVariant(variant.value)}
-                />
-                {variant.label}
-              </label>
-            ))}
+            {spec.variant === 'fieldParam' ? (
+              // Field-param slicers have no column: instead of variant radios
+              // they pick WHICH dashboard parameter the tile drives.
+              <>
+                <SectionLabel>Parameter</SectionLabel>
+                <div className="px-3 pb-1">
+                  <RcdSelect
+                    aria-label="Field parameter"
+                    value={spec.parameterId ?? ''}
+                    onChange={(event) =>
+                      runtime.dashboards.updateSlicer(tileId, {
+                        parameterId: event.target.value || null,
+                      })
+                    }
+                    className="w-full"
+                  >
+                    <option value="">Choose a parameter…</option>
+                    {parameters.map((parameter) => (
+                      <option key={parameter.id} value={parameter.id}>
+                        {parameter.name}
+                      </option>
+                    ))}
+                  </RcdSelect>
+                </div>
+              </>
+            ) : (
+              <>
+                <SectionLabel>Variant</SectionLabel>
+                {VARIANTS.map((variant) => (
+                  <label
+                    key={variant.value}
+                    className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                  >
+                    <input
+                      type="radio"
+                      name={`rcd-slicer-variant-${tileId}`}
+                      className="accent-[var(--rcd-accent)]"
+                      checked={spec.variant === variant.value}
+                      onChange={() => setVariant(variant.value)}
+                    />
+                    {variant.label}
+                  </label>
+                ))}
+              </>
+            )}
 
             <Divider />
             <SectionLabel>Label</SectionLabel>
@@ -195,40 +227,44 @@ export function SlicerConfigMenu({
               Compact
             </label>
 
-            <Divider />
-            <SectionLabel>Applies to</SectionLabel>
-            <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
-              <input
-                type="checkbox"
-                className="accent-[var(--rcd-accent)]"
-                checked={allCharts}
-                onChange={toggleAllCharts}
-              />
-              All charts
-            </label>
-            {!allCharts && (
-              <div className="max-h-40 overflow-y-auto">
-                {chartTiles.length === 0 ? (
-                  <p className="px-3 py-1 text-xs text-rcd-muted">No charts on this dashboard.</p>
-                ) : (
-                  chartTiles.map((chart) => (
-                    <label
-                      key={chart.id}
-                      className="flex cursor-pointer items-center gap-2 py-1 pl-6 pr-3 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-                    >
-                      <input
-                        type="checkbox"
-                        className="accent-[var(--rcd-accent)]"
-                        checked={targets.includes(chart.id)}
-                        onChange={() => toggleTarget(chart.id)}
-                      />
-                      <span className="min-w-0 truncate" title={chart.title}>
-                        {chart.title}
-                      </span>
-                    </label>
-                  ))
+            {spec.variant !== 'fieldParam' && (
+              <>
+                <Divider />
+                <SectionLabel>Applies to</SectionLabel>
+                <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--rcd-accent)]"
+                    checked={allCharts}
+                    onChange={toggleAllCharts}
+                  />
+                  All charts
+                </label>
+                {!allCharts && (
+                  <div className="max-h-40 overflow-y-auto">
+                    {chartTiles.length === 0 ? (
+                      <p className="px-3 py-1 text-xs text-rcd-muted">No charts on this dashboard.</p>
+                    ) : (
+                      chartTiles.map((chart) => (
+                        <label
+                          key={chart.id}
+                          className="flex cursor-pointer items-center gap-2 py-1 pl-6 pr-3 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                        >
+                          <input
+                            type="checkbox"
+                            className="accent-[var(--rcd-accent)]"
+                            checked={targets.includes(chart.id)}
+                            onChange={() => toggleTarget(chart.id)}
+                          />
+                          <span className="min-w-0 truncate" title={chart.title}>
+                            {chart.title}
+                          </span>
+                        </label>
+                      ))
+                    )}
+                  </div>
                 )}
-              </div>
+              </>
             )}
           </>
         ) : (

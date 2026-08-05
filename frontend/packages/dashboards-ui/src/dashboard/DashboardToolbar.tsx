@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   BarChart3,
+  Bell,
   Bookmark,
   Check,
   ChevronDown,
   Filter,
   Image as ImageIcon,
+  Mail,
+  MoreHorizontal,
   MoreVertical,
   Pencil,
   Plus,
@@ -13,9 +16,12 @@ import {
   RefreshCw,
   Share2,
   SlidersHorizontal,
+  Smartphone,
   Trash2,
   Type,
+  Variable,
 } from 'lucide-react';
+import type { AlertFiring } from '@recon/dashboards-core';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdInput, RcdSelect } from '../primitives';
 
 /** Bookmark row data the toolbar menu needs (name + identity only). */
@@ -71,6 +77,15 @@ export interface DashboardToolbarProps {
   onUpdateBookmark?: (id: string) => void;
   onRenameBookmark?: (id: string, name: string) => void;
   onDeleteBookmark?: (id: string) => void;
+  /** Edit mode: opens the field-parameter manage dialog (Add ▾ menu item). */
+  onManageParameters?: () => void;
+  /** View mode (non-readonly): opens the Subscriptions dialog (⋯ menu). */
+  onSubscribe?: () => void;
+  /** Recent alert firings for the bell dropdown; undefined hides the bell. */
+  alertFirings?: AlertFiring[] | null;
+  /** Edit mode: mobile-layout canvas toggle (phone icon, pressed state). */
+  mobileLayoutOpen?: boolean;
+  onToggleMobileLayout?: () => void;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -115,6 +130,11 @@ export function DashboardToolbar({
   onUpdateBookmark,
   onRenameBookmark,
   onDeleteBookmark,
+  onManageParameters,
+  onSubscribe,
+  alertFirings,
+  mobileLayoutOpen = false,
+  onToggleMobileLayout,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -206,6 +226,12 @@ export function DashboardToolbar({
         </>
       )}
 
+      {alertFirings !== undefined && <AlertsBell firings={alertFirings ?? []} />}
+
+      {mode === 'view' && !readonly && onSubscribe && (
+        <OverflowMenu onSubscribe={onSubscribe} />
+      )}
+
       {mode === 'view'
         ? !readonly && (
             <RcdButton onClick={onEnterEdit}>
@@ -215,6 +241,17 @@ export function DashboardToolbar({
           )
         : !readonly && (
             <>
+              {onToggleMobileLayout && (
+                <RcdIconButton
+                  aria-label={mobileLayoutOpen ? 'Back to the desktop layout' : 'Edit the mobile layout'}
+                  title="Mobile layout"
+                  aria-pressed={mobileLayoutOpen}
+                  onClick={onToggleMobileLayout}
+                  className={mobileLayoutOpen ? 'bg-black/5 text-rcd-accent dark:bg-white/10' : ''}
+                >
+                  <Smartphone size={14} />
+                </RcdIconButton>
+              )}
               {onChangeRefreshSeconds && (
                 <RcdSelect
                   aria-label="Auto refresh interval"
@@ -239,6 +276,7 @@ export function DashboardToolbar({
                 onAddImage={onAddImage}
                 onAddSlicer={onAddSlicer}
                 addSlicerDisabled={addSlicerDisabled ?? false}
+                onManageParameters={onManageParameters}
               />
               <RcdButton onClick={handleDiscard} disabled={saving}>
                 Discard
@@ -292,6 +330,164 @@ function LastRefreshCaption({ at }: { at: Date }) {
     >
       {formatUpdated(at)}
     </span>
+  );
+}
+
+/** "3:41 PM" today, "Mon 3:41 PM" this week, else a short date. */
+const formatFiredAt = (iso: string): string => {
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return iso;
+  const ageMs = Date.now() - at.getTime();
+  const time = at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (ageMs < 86_400_000) return time;
+  if (ageMs < 7 * 86_400_000) {
+    return `${at.toLocaleDateString([], { weekday: 'short' })} ${time}`;
+  }
+  return at.toLocaleDateString([], { month: 'short', day: 'numeric' });
+};
+
+/**
+ * Alerts bell: badge shows the recent-firings count; the dropdown lists the
+ * firings (name, time, value vs threshold). Same card pattern as AddTileMenu
+ * (outside click / Escape closes, no portal — the toolbar is untransformed).
+ */
+function AlertsBell({ firings }: { firings: AlertFiring[] }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative shrink-0" ref={rootRef}>
+      <RcdIconButton
+        aria-label={
+          firings.length > 0 ? `Alerts (${firings.length} recent firings)` : 'Alerts (no recent firings)'
+        }
+        title="Alert firings"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={open ? 'bg-black/5 text-rcd-text dark:bg-white/10' : ''}
+      >
+        <Bell size={14} />
+      </RcdIconButton>
+      {firings.length > 0 && (
+        <span
+          aria-hidden
+          className="pointer-events-none absolute -right-0.5 -top-0.5 flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-[var(--rcd-status-warn)] px-1 text-[10px] font-semibold leading-none text-white"
+        >
+          {firings.length}
+        </span>
+      )}
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Recent alert firings"
+          className="absolute right-0 top-full z-40 mt-1 w-72 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        >
+          {firings.length === 0 ? (
+            <p className="px-3 py-1.5 text-xs text-rcd-muted">No recent alert firings.</p>
+          ) : (
+            firings.map((firing, index) => (
+              <div key={`${firing.alertId}-${firing.firedAtUtc}-${index}`} className="px-3 py-1.5">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="min-w-0 truncate text-sm text-rcd-text" title={firing.alertName}>
+                    {firing.alertName}
+                  </span>
+                  <span className="shrink-0 text-[11px] text-rcd-muted">
+                    {formatFiredAt(firing.firedAtUtc)}
+                  </span>
+                </div>
+                <p className="text-xs text-rcd-text-2">
+                  Value {firing.value === null ? 'n/a' : firing.value.toLocaleString()} (threshold{' '}
+                  {firing.threshold.toLocaleString()})
+                </p>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * View-mode overflow "⋯" menu: hosts the less-frequent actions so the toolbar
+ * stays uncrowded (currently just Subscribe). Same card pattern as AddTileMenu.
+ */
+function OverflowMenu({ onSubscribe }: { onSubscribe: () => void }) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative shrink-0" ref={rootRef}>
+      <RcdIconButton
+        aria-label="More actions"
+        title="More actions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={open ? 'bg-black/5 text-rcd-text dark:bg-white/10' : ''}
+      >
+        <MoreHorizontal size={14} />
+      </RcdIconButton>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="More actions"
+          className="absolute right-0 top-full z-40 mt-1 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setOpen(false);
+              onSubscribe();
+            }}
+            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+          >
+            <Mail size={14} />
+            Subscribe…
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -563,12 +759,14 @@ function AddTileMenu({
   onAddImage,
   onAddSlicer,
   addSlicerDisabled,
+  onManageParameters,
 }: {
   onAddChart: () => void;
   onAddText: () => void;
   onAddImage: () => void;
   onAddSlicer: () => void;
   addSlicerDisabled: boolean;
+  onManageParameters?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -635,6 +833,15 @@ function AddTileMenu({
             <SlidersHorizontal size={14} />
             Slicer
           </AddMenuItem>
+          {onManageParameters && (
+            <>
+              <div className="my-1 border-t border-rcd-border" />
+              <AddMenuItem onClick={() => pick(onManageParameters)}>
+                <Variable size={14} />
+                Field parameter…
+              </AddMenuItem>
+            </>
+          )}
         </div>
       )}
     </div>

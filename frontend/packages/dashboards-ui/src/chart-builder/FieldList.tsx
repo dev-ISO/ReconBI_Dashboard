@@ -8,6 +8,7 @@ import {
   Sigma,
   ToggleLeft,
   Type,
+  Variable,
 } from 'lucide-react';
 import {
   DATE_TABLE_COLUMNS,
@@ -19,12 +20,17 @@ import {
   type ModelDefinition,
   type ModelTable,
 } from '@recon/dashboards-core';
-import type { FieldDragData } from './wellConfig';
+import type { BuilderParameter, FieldDragData } from './wellConfig';
 
 export interface FieldListProps {
   model: ModelDefinition;
   /** Column metadata for the model's data source; measure-only fallback when null. */
   catalog: Catalog | null;
+  /**
+   * Dashboard field parameters (threaded by the dashboard runtime). Absent or
+   * empty hides the Parameters section — the standalone builder never gets it.
+   */
+  parameters?: BuilderParameter[];
   /** Click-to-add: the builder routes the entry to the most sensible well. */
   onAdd: (data: FieldDragData) => void;
   /** Funnel affordance on column rows: adds the column as a chart filter. */
@@ -51,7 +57,7 @@ const typeIcon = (type: ColumnType) => {
 };
 
 /** Model-scoped field pane: one section per model table and date table plus a Measures section. */
-export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps) {
+export function FieldList({ model, catalog, parameters, onAdd, onAddFilter }: FieldListProps) {
   const tables = model.tables.filter((table) => !table.hidden);
 
   return (
@@ -97,7 +103,41 @@ export function FieldList({ model, catalog, onAdd, onAddFilter }: FieldListProps
           />
         ))
       )}
+
+      {parameters !== undefined && parameters.length > 0 && (
+        <>
+          <SectionHeader icon={<Variable size={12} />} label="Parameters" />
+          {parameters.map((parameter) => (
+            <FieldEntry
+              key={parameter.id}
+              id={`parameter:${parameter.id}`}
+              data={{
+                kind: 'parameter',
+                parameterId: parameter.id,
+                name: parameter.name,
+                paramKind: parameter.kind,
+              }}
+              label={parameter.name}
+              icon={<Variable size={13} className="text-rcd-accent" />}
+              badge={<ParamKindBadge kind={parameter.kind} />}
+              onAdd={onAdd}
+            />
+          ))}
+        </>
+      )}
     </div>
+  );
+}
+
+/** Cosmetic suffix marking what a field parameter swaps: axis fields or measures. */
+function ParamKindBadge({ kind }: { kind: BuilderParameter['kind'] }) {
+  return (
+    <span
+      title={kind === 'dimension' ? 'Field parameter — binds to the axis' : 'Field parameter — binds to values'}
+      className="ml-auto shrink-0 rounded bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] px-1 text-[10px] font-medium leading-4 text-rcd-accent"
+    >
+      {kind === 'dimension' ? 'axis' : 'values'}
+    </span>
   );
 }
 

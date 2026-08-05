@@ -5,7 +5,7 @@ import {
   tableKey,
   type SlicerVariant,
 } from '@recon/dashboards-core';
-import { useModelState, useRuntime } from '../provider/DashboardsProvider';
+import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 
 export interface AddSlicerDialogProps {
@@ -21,6 +21,8 @@ const VARIANT_OPTIONS: { value: SlicerVariant; label: string }[] = [
   { value: 'dropdownMulti', label: 'Dropdown (multi-select)' },
   { value: 'buttons', label: 'Buttons' },
   { value: 'dateRange', label: 'Date range' },
+  { value: 'relativeDate', label: 'Relative date' },
+  { value: 'fieldParam', label: 'Field parameter' },
 ];
 
 /**
@@ -35,11 +37,15 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
   const catalog = useModelState((state) => state.catalog);
   const catalogStatus = useModelState((state) => state.catalogStatus);
 
+  // Stable fallback — a fresh [] per snapshot would loop useSyncExternalStore.
+  const parameters = useDashboardState((state) => state.current?.layout.parameters) ?? [];
+
   const [table, setTable] = useState('');
   const [column, setColumn] = useState('');
   const [label, setLabel] = useState('');
   const [labelTouched, setLabelTouched] = useState(false);
   const [variant, setVariant] = useState<SlicerVariant>('checklist');
+  const [parameterId, setParameterId] = useState('');
 
   useEffect(() => {
     if (!open) return;
@@ -48,6 +54,7 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     setLabel('');
     setLabelTouched(false);
     setVariant('checklist');
+    setParameterId('');
   }, [open]);
 
   const modelReady = openModel !== null && openModel.id === modelId;
@@ -61,7 +68,8 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     [modelReady, openModel],
   );
 
-  const wantTemporal = variant === 'dateRange';
+  const wantTemporal = variant === 'dateRange' || variant === 'relativeDate';
+  const isFieldParam = variant === 'fieldParam';
 
   const columns = useMemo(() => {
     if (!usableCatalog || !table) return [];
@@ -91,7 +99,8 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
   };
 
   const handleVariant = (next: SlicerVariant) => {
-    const temporalChanged = (next === 'dateRange') !== wantTemporal;
+    const temporalChanged =
+      (next === 'dateRange' || next === 'relativeDate') !== wantTemporal;
     setVariant(next);
     // The column list switches between text and date/timestamp columns; a
     // previously chosen column of the other kind is no longer valid.
@@ -101,11 +110,24 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
     }
   };
 
-  const canAdd = table !== '' && column !== '' && label.trim() !== '';
+  const handleParameter = (next: string) => {
+    setParameterId(next);
+    if (!labelTouched) {
+      setLabel(parameters.find((p) => p.id === next)?.name ?? '');
+    }
+  };
+
+  const canAdd = isFieldParam
+    ? parameterId !== '' && label.trim() !== ''
+    : table !== '' && column !== '' && label.trim() !== '';
 
   const handleAdd = () => {
     if (!canAdd) return;
-    runtime.dashboards.addSlicer({ table, column, label: label.trim(), variant });
+    if (isFieldParam) {
+      runtime.dashboards.addSlicer({ label: label.trim(), variant, parameterId });
+    } else {
+      runtime.dashboards.addSlicer({ table, column, label: label.trim(), variant });
+    }
     onClose();
   };
 
@@ -142,6 +164,29 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
               </RcdSelect>
             </label>
 
+            {isFieldParam && (
+              <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+                Parameter
+                <RcdSelect
+                  value={parameterId}
+                  onChange={(event) => handleParameter(event.target.value)}
+                >
+                  <option value="">Choose a field parameter…</option>
+                  {parameters.map((parameter) => (
+                    <option key={parameter.id} value={parameter.id}>
+                      {parameter.name}
+                    </option>
+                  ))}
+                </RcdSelect>
+                {parameters.length === 0 && (
+                  <span className="text-xs text-rcd-muted">
+                    No field parameters yet — create one via Add &gt; Field parameter…
+                  </span>
+                )}
+              </label>
+            )}
+
+            {!isFieldParam && (
             <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
               Table
               <RcdSelect value={table} onChange={(event) => handleTable(event.target.value)}>
@@ -156,7 +201,9 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
                 })}
               </RcdSelect>
             </label>
+            )}
 
+            {!isFieldParam && (
             <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
               Column
               <RcdSelect
@@ -181,11 +228,12 @@ export function AddSlicerDialog({ open, modelId, onClose }: AddSlicerDialogProps
               {table !== '' && usableCatalog !== null && columns.length === 0 && (
                 <span className="text-xs text-rcd-muted">
                   {wantTemporal
-                    ? 'This table has no date columns for a date-range slicer.'
+                    ? 'This table has no date columns for a date slicer.'
                     : 'This table has no text columns to slice by.'}
                 </span>
               )}
             </label>
+            )}
 
             <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
               Label

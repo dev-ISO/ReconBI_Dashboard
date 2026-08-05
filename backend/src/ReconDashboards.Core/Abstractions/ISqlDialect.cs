@@ -71,4 +71,11 @@ public interface ISqlDialect
 
     /// <summary>"LIMIT @p" / "FETCH FIRST @p ROWS ONLY" etc.</summary>
     string LimitClause(string parameterPlaceholder);
+
+    /// <summary>
+    /// "OFFSET @p" or the engine's equivalent. Emitted (after the limit clause)
+    /// only when the spec carries a positive offset; the value is always bound
+    /// as a parameter. Default suits Postgres/ANSI engines.
+    /// </summary>
+    string OffsetClause(string parameterPlaceholder) => $"OFFSET {parameterPlaceholder}";
 }

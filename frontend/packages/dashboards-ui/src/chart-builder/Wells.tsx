@@ -11,7 +11,7 @@ import {
 } from '@dnd-kit/core';
 import { SortableContext, arrayMove, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Check, Filter, GripVertical, Sigma, TrendingUp, X } from 'lucide-react';
+import { Check, Filter, GripVertical, Sigma, TrendingUp, Variable, X } from 'lucide-react';
 import {
   isTemporalType,
   type Aggregation,
@@ -29,6 +29,7 @@ import { RcdSelect } from '../primitives';
 import {
   aggregationOptionsFor,
   canAccept,
+  clearParamBinding,
   columnLabelOf,
   columnTypeOf,
   FILTERS_WELL,
@@ -36,6 +37,7 @@ import {
   measureLabel,
   supportsDrill,
   wellsFor,
+  type BuilderParameter,
   type FieldDragData,
   type WellDef,
 } from './wellConfig';
@@ -45,6 +47,8 @@ export interface WellsProps {
   query: ChartQuery;
   model: ModelDefinition;
   catalog: Catalog | null;
+  /** Dashboard field parameters; resolves binding chips' display names. */
+  parameters?: BuilderParameter[];
   onChange: (query: ChartQuery) => void;
   /** Opens the FilterEditor for an existing clause in query.filters. */
   onEditFilter: (index: number) => void;
@@ -169,7 +173,15 @@ const calcLabel = (calc: MeasureCalc, axisBucket: DateBucket | null): string =>
   calcMenuItems(axisBucket).find((item) => sameCalc(item.calc, calc))?.label ?? 'Quick calculation';
 
 /** Per-type wells (axis/legend/values/small multiples) plus the universal Filters well. */
-export function Wells({ chartType, query, model, catalog, onChange, onEditFilter }: WellsProps) {
+export function Wells({
+  chartType,
+  query,
+  model,
+  catalog,
+  parameters,
+  onChange,
+  onEditFilter,
+}: WellsProps) {
   const removeMeasure = (index: number) =>
     onChange({ ...query, measures: query.measures.filter((_, i) => i !== index) });
 
@@ -193,8 +205,25 @@ export function Wells({ chartType, query, model, catalog, onChange, onEditFilter
   const axisBucket = query.axis?.dateBucket ?? null;
   const hasAxis = query.axis != null;
 
+  const axisBinding = query.paramBindings?.axis ?? null;
+  const measuresBinding = query.paramBindings?.measures ?? null;
+  const parameterName = (id: string) =>
+    parameters?.find((parameter) => parameter.id === id)?.name ?? id;
+
   const renderWell = (def: WellDef) => {
     if (def.id === 'values') {
+      // A measure-parameter binding replaces the measure list display; removing
+      // the binding chip restores the (untouched) measures underneath.
+      if (measuresBinding != null) {
+        return (
+          <Well key={def.id} def={def} empty={false}>
+            <ParamBindingChip
+              name={parameterName(measuresBinding)}
+              onRemove={() => onChange(clearParamBinding(query, 'measures'))}
+            />
+          </Well>
+        );
+      }
       return (
         <Well key={def.id} def={def} empty={query.measures.length === 0}>
           {query.measures.map((measure, index) => (
@@ -215,6 +244,18 @@ export function Wells({ chartType, query, model, catalog, onChange, onEditFilter
     }
 
     if (def.id === 'axis' && supportsDrill(chartType)) {
+      // An axis binding shows INSTEAD of the axis/drill chips (and gates the
+      // drill-levels UI); removing it clears only the binding, not the axis.
+      if (axisBinding != null) {
+        return (
+          <Well key={def.id} def={def} empty={false}>
+            <ParamBindingChip
+              name={parameterName(axisBinding)}
+              onRemove={() => onChange(clearParamBinding(query, 'axis'))}
+            />
+          </Well>
+        );
+      }
       return (
         <Well key={def.id} def={def} empty={!query.axis}>
           {query.axis && (
@@ -470,6 +511,32 @@ function Chip({
       <button
         type="button"
         aria-label={`Remove ${label}`}
+        onClick={onRemove}
+        className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+      >
+        <X size={12} />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * Field-parameter binding chip: "⟨Param: …⟩". Shown instead of the well's
+ * normal chips while a binding is active; removing it clears only the binding
+ * (the underlying axis/measures are untouched and reappear).
+ */
+function ParamBindingChip({ name, onRemove }: { name: string; onRemove: () => void }) {
+  const label = `⟨Param: ${name}⟩`;
+  return (
+    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_8%,transparent)] px-2 py-1 text-xs text-rcd-text">
+      <Variable size={12} className="shrink-0 text-rcd-accent" />
+      <span className="min-w-0 flex-1 truncate font-medium" title={label}>
+        {label}
+      </span>
+      <button
+        type="button"
+        aria-label={`Remove parameter binding ${name}`}
+        title="Remove the parameter binding (keeps the fields underneath)"
         onClick={onRemove}
         className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
       >

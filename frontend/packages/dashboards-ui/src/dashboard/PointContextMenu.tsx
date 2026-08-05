@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { FileDown, Zap } from 'lucide-react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { ArrowDown, ArrowUp, BellPlus, CornerUpLeft, FileDown, Zap } from 'lucide-react';
 import type { FilterClause } from '@recon/dashboards-core';
 
 /** One candidate drillthrough page for the clicked point. */
@@ -14,6 +14,21 @@ export interface DrillthroughTarget {
   label: string;
 }
 
+/** Drill actions offered for the clicked point (charts with a hierarchy). */
+export interface PointDrillActions {
+  /** True when a deeper hierarchy level exists below the current one. */
+  canDrillDeeper: boolean;
+  /** Current drill level (0 = the chart's own axis). */
+  level: number;
+  /** Formatted label of the clicked point ("Drill down into <label>"). */
+  pointLabel: string;
+  /** Drills into the clicked value (even when the drill-mode toggle is OFF). */
+  onDrillDown: () => void;
+  onDrillUp: () => void;
+  /** Resets the whole drill state (back to the original chart). */
+  onDrillReset: () => void;
+}
+
 export interface PointContextMenuProps {
   /** Chart title (aria label). */
   title: string;
@@ -21,7 +36,11 @@ export interface PointContextMenuProps {
   position: { x: number; y: number };
   /** Drillthrough-enabled pages whose fields all match the chart's dimensions. */
   drillthroughTargets: DrillthroughTarget[];
+  /** Drill hierarchy actions for the clicked point; null = no hierarchy. */
+  drill?: PointDrillActions | null;
   onDrillthrough: (target: DrillthroughTarget) => void;
+  /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
+  onSetAlert?: (() => void) | null;
   onExport: (mode: 'summarized' | 'underlying') => void;
   onClose: () => void;
 }
@@ -37,7 +56,9 @@ export function PointContextMenu({
   title,
   position,
   drillthroughTargets,
+  drill = null,
   onDrillthrough,
+  onSetAlert = null,
   onExport,
   onClose,
 }: PointContextMenuProps) {
@@ -82,6 +103,50 @@ export function PointContextMenu({
       onContextMenu={(event) => event.preventDefault()}
       className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
     >
+      {drill && (drill.canDrillDeeper || drill.level > 0) && (
+        <>
+          <p className="px-3 pb-0.5 pt-1 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+            Drill
+          </p>
+          {drill.canDrillDeeper && (
+            <ActionItem
+              icon={<ArrowDown size={14} />}
+              onClick={() => {
+                drill.onDrillDown();
+                onClose();
+              }}
+            >
+              <span className="min-w-0 flex-1 truncate">
+                Drill down into <span className="font-medium">{drill.pointLabel}</span>
+              </span>
+            </ActionItem>
+          )}
+          {drill.level > 0 && (
+            <>
+              <ActionItem
+                icon={<ArrowUp size={14} />}
+                onClick={() => {
+                  drill.onDrillUp();
+                  onClose();
+                }}
+              >
+                Drill up
+              </ActionItem>
+              <ActionItem
+                icon={<CornerUpLeft size={14} />}
+                onClick={() => {
+                  drill.onDrillReset();
+                  onClose();
+                }}
+              >
+                Back to top
+              </ActionItem>
+            </>
+          )}
+          <div className="my-1 border-t border-rcd-border" />
+        </>
+      )}
+
       {drillthroughTargets.length > 0 && (
         <>
           <p className="px-3 pb-0.5 pt-1 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
@@ -125,7 +190,44 @@ export function PointContextMenu({
           onClose();
         }}
       />
+
+      {onSetAlert && (
+        <>
+          <div className="my-1 border-t border-rcd-border" />
+          <ActionItem
+            icon={<BellPlus size={14} />}
+            onClick={() => {
+              onSetAlert();
+              onClose();
+            }}
+          >
+            Set alert on this measure…
+          </ActionItem>
+        </>
+      )}
     </div>
+  );
+}
+
+function ActionItem({
+  icon,
+  onClick,
+  children,
+}: {
+  icon: ReactNode;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+    >
+      {icon}
+      {children}
+    </button>
   );
 }
 
