@@ -21,6 +21,13 @@ public sealed record QueryOutcome(
 
 public sealed record DistinctValuesResult(IReadOnlyList<object?> Values, bool HasMore);
 
+/// <summary>A query outcome destined for CSV download; ModelName feeds the filename.</summary>
+public sealed record ExportOutcome(
+    CompiledQuery Compiled,
+    IReadOnlyList<object?[]> Rows,
+    bool Truncated,
+    string ModelName);
+
 /// <summary>
 /// The single chokepoint every chart query flows through: model visibility →
 /// drift re-validation → join planning → row-filter collection (FAIL CLOSED) →
@@ -72,6 +79,83 @@ public sealed class ChartQueryService(
         }
 
         return await ExecuteAsync(spec, model, source, compiled, ct);
+    }
+
+    /// <summary>Default row cap for exports when the caller does not send one.</summary>
+    public const int DefaultExportRows = 10_000;
+
+    /// <summary>Hard ceiling for export row caps regardless of what the caller asks for.</summary>
+    public const int MaxExportRows = 100_000;
+
+    /// <summary>
+    /// CSV export twin of <see cref="RunAsync"/>. Summarized mode runs the
+    /// normal pipeline (calcs included); underlying mode selects the anchor
+    /// table's raw rows with the spec's filters. BOTH modes collect row filters
+    /// over the full join plan through the same fail-closed path as /query.
+    /// </summary>
+    public async Task<ServiceResult<ExportOutcome>> RunExportAsync(
+        ChartQuerySpec spec, ExportMode? mode, int? maxRows, ClaimsPrincipal principal, CancellationToken ct)
+    {
+        if (mode is null || !Enum.IsDefined(mode.Value))
+        {
+            return ServiceResult<ExportOutcome>.Fail(
+                ServiceErrorKind.BadRequest, "rcd.query.bad_export",
+                "Export mode must be 'summarized' or 'underlying'.");
+        }
+
+        var context = await LoadContextAsync(spec.ModelId, ct);
+        if (!context.Succeeded)
+        {
+            return ServiceResult<ExportOutcome>.Fail(context.Error!);
+        }
+
+        var (model, source, schema) = context.Value!;
+        var compiler = new QueryCompiler(
+            source.Dialect ?? throw new InvalidOperationException($"Data source '{source.Name}' has no SQL dialect."),
+            timeProvider);
+
+        var requestedCap = Math.Clamp(maxRows ?? DefaultExportRows, 1, MaxExportRows);
+
+        CompiledQuery compiled;
+        int rowCap;
+        try
+        {
+            if (mode == ExportMode.Summarized)
+            {
+                var prepared = compiler.Prepare(spec, model.Definition, schema, options.Limits);
+                var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
+                compiled = compiler.Emit(prepared, spec, rowFilters, options.Limits, source.Options);
+                // The normal query caps still bind; maxRows can only tighten them.
+                rowCap = Math.Min(requestedCap, Math.Min(options.Limits.MaxRows, source.Options.MaxRows));
+            }
+            else
+            {
+                var prepared = compiler.PrepareUnderlying(spec, model.Definition, schema, options.Limits);
+                var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
+                compiled = compiler.EmitUnderlying(prepared, rowFilters, requestedCap);
+                rowCap = requestedCap;
+            }
+        }
+        catch (QueryCompilationException ex)
+        {
+            return ServiceResult<ExportOutcome>.Fail(
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+        }
+        catch (RowFilterDeniedException ex)
+        {
+            return ServiceResult<ExportOutcome>.Fail(
+                ServiceErrorKind.Forbidden, "rcd.query.denied_by_scope", ex.Message);
+        }
+
+        var outcome = await ExecuteAsync(spec, model, source, compiled, ct, distinctLimit: rowCap);
+        if (!outcome.Succeeded)
+        {
+            return ServiceResult<ExportOutcome>.Fail(outcome.Error!);
+        }
+
+        var executed = outcome.Value!;
+        return ServiceResult<ExportOutcome>.Ok(
+            new ExportOutcome(executed.Compiled, executed.Rows, executed.Truncated, model.Name));
     }
 
     public async Task<ServiceResult<DistinctValuesResult>> GetDistinctValuesAsync(

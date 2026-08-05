@@ -1,18 +1,28 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   BarChart3,
+  Bookmark,
+  Check,
   ChevronDown,
   Filter,
   Image as ImageIcon,
+  MoreVertical,
   Pencil,
   Plus,
   Printer,
   RefreshCw,
   Share2,
   SlidersHorizontal,
+  Trash2,
   Type,
 } from 'lucide-react';
-import { ConfirmDialog, RcdButton, RcdIconButton, RcdSelect } from '../primitives';
+import { ConfirmDialog, RcdButton, RcdIconButton, RcdInput, RcdSelect } from '../primitives';
+
+/** Bookmark row data the toolbar menu needs (name + identity only). */
+export interface ToolbarBookmark {
+  id: string;
+  name: string;
+}
 
 export interface DashboardToolbarProps {
   name: string;
@@ -50,6 +60,17 @@ export interface DashboardToolbarProps {
   filtersOpen?: boolean;
   /** Enabled filter cards currently contributing clauses (badge count). */
   activeFilterCount?: number;
+  /** Saved bookmarks (menu hidden when absent AND management is off). */
+  bookmarks?: ToolbarBookmark[];
+  /** Bookmark whose applied state is still current (check mark). */
+  lastAppliedBookmarkId?: string | null;
+  /** Editors get add/update/rename/delete; viewers are apply-only. */
+  canManageBookmarks?: boolean;
+  onApplyBookmark?: (id: string) => void;
+  onAddBookmark?: (name: string) => void;
+  onUpdateBookmark?: (id: string) => void;
+  onRenameBookmark?: (id: string, name: string) => void;
+  onDeleteBookmark?: (id: string) => void;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -86,6 +107,14 @@ export function DashboardToolbar({
   onToggleFilters,
   filtersOpen = false,
   activeFilterCount = 0,
+  bookmarks = [],
+  lastAppliedBookmarkId = null,
+  canManageBookmarks = false,
+  onApplyBookmark,
+  onAddBookmark,
+  onUpdateBookmark,
+  onRenameBookmark,
+  onDeleteBookmark,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -115,6 +144,19 @@ export function DashboardToolbar({
         <span className="truncate text-xs text-[var(--rcd-status-critical)]" title={error}>
           {error}
         </span>
+      )}
+
+      {onApplyBookmark && (bookmarks.length > 0 || canManageBookmarks) && (
+        <BookmarksMenu
+          bookmarks={bookmarks}
+          lastAppliedId={lastAppliedBookmarkId}
+          canManage={canManageBookmarks}
+          onApply={onApplyBookmark}
+          onAdd={onAddBookmark}
+          onUpdate={onUpdateBookmark}
+          onRename={onRenameBookmark}
+          onDelete={onDeleteBookmark}
+        />
       )}
 
       {onToggleFilters && (
@@ -240,6 +282,261 @@ function LastRefreshCaption({ at }: { at: Date }) {
     >
       {formatUpdated(at)}
     </span>
+  );
+}
+
+/**
+ * The Bookmarks affordance: a bookmark icon button opening a menu card listing
+ * saved bookmarks (click = apply; a check marks the last-applied one until the
+ * view diverges). Editors additionally get a per-row kebab (update to current
+ * view / rename / delete) and a footer "add from current view"; viewers are
+ * apply-only. Same card pattern as AddTileMenu: outside click / Escape closes,
+ * no portal needed (the toolbar sits in untransformed flow).
+ */
+function BookmarksMenu({
+  bookmarks,
+  lastAppliedId,
+  canManage,
+  onApply,
+  onAdd,
+  onUpdate,
+  onRename,
+  onDelete,
+}: {
+  bookmarks: ToolbarBookmark[];
+  lastAppliedId: string | null;
+  canManage: boolean;
+  onApply: (id: string) => void;
+  onAdd?: (name: string) => void;
+  onUpdate?: (id: string) => void;
+  onRename?: (id: string, name: string) => void;
+  onDelete?: (id: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  /** Bookmark id whose row kebab menu is open. */
+  const [kebabFor, setKebabFor] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState<{ id: string; draft: string } | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [addName, setAddName] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState<ToolbarBookmark | null>(null);
+
+  // Close on outside click / Escape (suspended while the delete confirm owns
+  // the keyboard — it renders inside rootRef, so its clicks stay "inside").
+  useEffect(() => {
+    if (!open || confirmDelete !== null) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open, confirmDelete]);
+
+  // Transient row state resets whenever the card closes.
+  useEffect(() => {
+    if (open) return;
+    setKebabFor(null);
+    setRenaming(null);
+    setAdding(false);
+    setAddName('');
+  }, [open]);
+
+  const commitRename = () => {
+    if (!renaming) return;
+    const next = renaming.draft.trim();
+    if (next !== '') onRename?.(renaming.id, next);
+    setRenaming(null);
+  };
+
+  const commitAdd = () => {
+    const name = addName.trim();
+    if (name === '') return;
+    onAdd?.(name);
+    setAdding(false);
+    setAddName('');
+  };
+
+  return (
+    <div className="relative shrink-0" ref={rootRef}>
+      <RcdIconButton
+        aria-label="Bookmarks"
+        title="Bookmarks"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={open ? 'bg-black/5 text-rcd-text dark:bg-white/10' : ''}
+      >
+        <Bookmark size={14} />
+      </RcdIconButton>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="Bookmarks"
+          className="absolute right-0 top-full z-40 mt-1 w-60 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+        >
+          {bookmarks.length === 0 && (
+            <p className="px-3 py-1.5 text-xs text-rcd-muted">No bookmarks yet.</p>
+          )}
+
+          {bookmarks.map((bookmark) =>
+            renaming?.id === bookmark.id ? (
+              <div key={bookmark.id} className="px-2 py-1">
+                <RcdInput
+                  value={renaming.draft}
+                  onChange={(event) => setRenaming({ id: bookmark.id, draft: event.target.value })}
+                  onBlur={commitRename}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') commitRename();
+                    if (event.key === 'Escape') setRenaming(null);
+                  }}
+                  aria-label={`Rename bookmark ${bookmark.name}`}
+                  autoFocus
+                  onFocus={(event) => event.target.select()}
+                  className="w-full"
+                />
+              </div>
+            ) : (
+              <div key={bookmark.id} className="relative flex items-center pr-1">
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => {
+                    onApply(bookmark.id);
+                    setOpen(false);
+                  }}
+                  className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                >
+                  <span className="w-3.5 shrink-0">
+                    {lastAppliedId === bookmark.id && <Check size={14} className="text-rcd-accent" />}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate" title={bookmark.name}>
+                    {bookmark.name}
+                  </span>
+                </button>
+                {canManage && (
+                  <RcdIconButton
+                    aria-label={`Actions for bookmark ${bookmark.name}`}
+                    aria-haspopup="menu"
+                    aria-expanded={kebabFor === bookmark.id}
+                    onClick={() => setKebabFor((id) => (id === bookmark.id ? null : bookmark.id))}
+                  >
+                    <MoreVertical size={13} />
+                  </RcdIconButton>
+                )}
+                {kebabFor === bookmark.id && (
+                  <div
+                    role="menu"
+                    className="absolute right-1 top-full z-50 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
+                  >
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setKebabFor(null);
+                        onUpdate?.(bookmark.id);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                    >
+                      <RefreshCw size={13} />
+                      Update to current view
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setKebabFor(null);
+                        setRenaming({ id: bookmark.id, draft: bookmark.name });
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                    >
+                      <Pencil size={13} />
+                      Rename
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setKebabFor(null);
+                        setConfirmDelete(bookmark);
+                      }}
+                      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-[var(--rcd-status-critical)] hover:bg-black/5 dark:hover:bg-white/10"
+                    >
+                      <Trash2 size={13} />
+                      Delete
+                    </button>
+                  </div>
+                )}
+              </div>
+            ),
+          )}
+
+          {canManage && onAdd && (
+            <>
+              <div className="my-1 border-t border-rcd-border" />
+              {adding ? (
+                <div className="flex items-center gap-1.5 px-2 py-1">
+                  <RcdInput
+                    value={addName}
+                    onChange={(event) => setAddName(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') commitAdd();
+                      if (event.key === 'Escape') {
+                        setAdding(false);
+                        setAddName('');
+                      }
+                    }}
+                    placeholder="Bookmark name"
+                    aria-label="New bookmark name"
+                    autoFocus
+                    className="min-w-0 flex-1"
+                  />
+                  <RcdButton variant="primary" disabled={addName.trim() === ''} onClick={commitAdd}>
+                    Add
+                  </RcdButton>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  role="menuitem"
+                  onClick={() => setAdding(true)}
+                  className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                >
+                  <Plus size={14} />
+                  Add bookmark from current view
+                </button>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
+      <ConfirmDialog
+        title="Delete bookmark"
+        message={
+          confirmDelete
+            ? `Delete bookmark "${confirmDelete.name}"? Removed from the dashboard (kept until you save).`
+            : ''
+        }
+        confirmLabel="Delete"
+        danger
+        open={confirmDelete !== null}
+        onConfirm={() => {
+          if (confirmDelete) onDelete?.(confirmDelete.id);
+          setConfirmDelete(null);
+        }}
+        onCancel={() => setConfirmDelete(null)}
+      />
+    </div>
   );
 }
 

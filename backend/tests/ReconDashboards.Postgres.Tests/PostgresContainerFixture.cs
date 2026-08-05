@@ -53,6 +53,26 @@ public sealed class PostgresContainerFixture : IAsyncLifetime
 
         CREATE TABLE "Weird Name" ("Weird Col" text, plain int);
 
+        -- Known series with deliberate gaps for time-intelligence calc tests:
+        -- region A skips 2025-03 and 2026-03; region B stops after 2025-04.
+        CREATE TABLE monthly_sales (
+            id serial PRIMARY KEY,
+            sale_date date NOT NULL,
+            region text NOT NULL,
+            amount numeric(12,2) NOT NULL
+        );
+
+        INSERT INTO monthly_sales (sale_date, region, amount) VALUES
+            ('2025-01-15', 'A', 100),
+            ('2025-02-15', 'A', 200),
+            ('2025-04-15', 'A', 400),
+            ('2026-01-15', 'A', 150),
+            ('2026-02-15', 'A', 260),
+            ('2026-04-15', 'A', 480),
+            ('2025-01-20', 'B', 50),
+            ('2025-02-20', 'B', 60),
+            ('2025-04-20', 'B', 80);
+
         CREATE VIEW open_orders AS SELECT * FROM orders WHERE status = 'open';
 
         CREATE MATERIALIZED VIEW region_totals AS

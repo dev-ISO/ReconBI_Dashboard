@@ -31,6 +31,26 @@ public sealed class QueryController(
         return Ok(DtoMapping.ToQueryResponse(result.Value!, includeSql));
     }
 
+    /// <summary>
+    /// CSV export of a chart query — same auth policy, rate limiting, model
+    /// visibility, and row-level scoping as the query endpoint. "summarized"
+    /// streams the aggregated result; "underlying" streams the anchor table's
+    /// raw rows with the spec's filters applied. Truncation is signalled via
+    /// the X-Rcd-Truncated response header.
+    /// </summary>
+    [HttpPost("export")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> Export([FromBody] ExportRequest request, CancellationToken ct)
+    {
+        if (request.Spec is null)
+        {
+            return BadRequest();
+        }
+
+        var result = await queryService.RunExportAsync(request.Spec, request.Mode, request.MaxRows, User, ct);
+        return result.Succeeded ? new CsvExportResult(result.Value!) : FromError(result.Error!);
+    }
+
     /// <summary>Distinct values for slicer/filter dropdowns (searchable, capped).</summary>
     [HttpPost("values")]
     [RcdPolicySlot(RcdPolicySlot.View)]

@@ -171,6 +171,22 @@ export const filterCardClauses = (card: FilterCard): FilterClause[] => {
 export const filterCardIsActive = (card: FilterCard): boolean =>
   !card.disabled && filterCardClauses(card).length > 0;
 
+/** One field a drillthrough-enabled page requires from the source point. */
+export interface DrillthroughField {
+  table: string;
+  column: string;
+}
+
+/**
+ * Per-page drillthrough config (persisted). A page with `enabled` and at least
+ * one field is offered as a "Drill through" target from point context menus on
+ * OTHER pages whose chart query carries EVERY listed field as a dimension.
+ */
+export interface PageDrillthrough {
+  enabled: boolean;
+  fields: DrillthroughField[];
+}
+
 /** One tab of a multi-page dashboard; tiles live per page (ids stay unique across pages). */
 export interface DashboardPage {
   id: string;
@@ -178,6 +194,32 @@ export interface DashboardPage {
   /** Optional tab accent (fixed palette hex, persisted verbatim); null/absent = none. */
   color?: string | null;
   tiles: DashboardTile[];
+  /** Drillthrough target config; absent/null = page is not a drillthrough target. */
+  drillthrough?: PageDrillthrough | null;
+}
+
+/* ------------------------------------------------------------------ bookmarks
+ * Saved filter/page contexts (Power BI-style). Persisted in the layout doc;
+ * the CAPTURED state mirrors the runtime shapes (slicer selections + view-mode
+ * filter-card overrides) verbatim — both are already strictly serializable.
+ */
+
+/** Snapshot a bookmark restores: active page + full runtime filter context. */
+export interface BookmarkState {
+  pageId: string;
+  /** Slicer selections keyed by slicer tile id (SlicerValues snapshot). */
+  slicers: SlicerValues;
+  /**
+   * View-mode personal filter-card tweaks keyed by card id — structurally the
+   * store's FilterCardOverride (enable/disable + basic selections).
+   */
+  filterOverrides: Record<string, { disabled?: boolean; basicValues?: FilterValue[] | null }>;
+}
+
+export interface DashboardBookmark {
+  id: string;
+  name: string;
+  state: BookmarkState;
 }
 
 export interface DashboardLayoutDoc {
@@ -203,6 +245,11 @@ export interface DashboardLayoutDoc {
    * Absent on older docs = no cards; readers treat null/absent as empty.
    */
   filterCards?: FilterCard[] | null;
+  /**
+   * Saved bookmarks (v1-compatible evolution; the wire version stays 1).
+   * Absent on older docs = none; readers treat null/absent as empty.
+   */
+  bookmarks?: DashboardBookmark[] | null;
 }
 
 export const isSlicerTile = (
@@ -261,6 +308,23 @@ export interface CrossFilter {
   label: string;
   /** Plain formatted category label — the source chart's dimming key. */
   categoryLabel: string;
+}
+
+/**
+ * Transient drillthrough context raised by invoking "Drill through" from a
+ * point context menu. Runtime state only — NEVER serialized into the layout
+ * document; it resets whenever a dashboard opens/closes. Its filters apply to
+ * every chart tile on the TARGET page (same merge path as slicers).
+ */
+export interface DrillthroughState {
+  /** Page the drillthrough was invoked from ("← Back" returns here). */
+  sourcePageId: string;
+  /** Page the drillthrough landed on; all of its charts receive `filters`. */
+  targetPageId: string;
+  /** One eq clause per drillthrough field, built from the clicked point. */
+  filters: FilterClause[];
+  /** Human chip text, e.g. "Gulf Coast". */
+  label: string;
 }
 
 /** Slicer selections (null = no selection) keyed by slicer tile id. */

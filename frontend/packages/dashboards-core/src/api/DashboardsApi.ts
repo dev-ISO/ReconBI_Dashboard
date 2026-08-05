@@ -32,6 +32,20 @@ export interface ValidationOutcome {
   issues: { code: string; severity: string; message: string; path: string | null }[];
 }
 
+/** Body of POST /query/export. */
+export interface ExportQueryBody {
+  spec: ChartQuerySpec;
+  /** 'summarized' = the aggregated result grid; 'underlying' = matching source rows. */
+  mode: 'summarized' | 'underlying';
+  maxRows?: number;
+}
+
+export interface ExportCsvResult {
+  blob: Blob;
+  /** True when the server capped the row count (X-Rcd-Truncated header). */
+  truncated: boolean;
+}
+
 /** Typed client over the api/rcd/v1 surface. baseUrl has no trailing slash. */
 export class DashboardsApi {
   constructor(
@@ -90,6 +104,21 @@ export class DashboardsApi {
 
   getDistinctValues(spec: DistinctValuesSpec, signal?: AbortSignal): Promise<DistinctValuesResult> {
     return this.fetcher(this.url('/query/values'), { method: 'POST', body: spec, signal });
+  }
+
+  /**
+   * Downloads a query's data as CSV (text/csv attachment). Uses the fetcher's
+   * raw mode — same auth headers, same RcdApiError contract on non-2xx — and
+   * surfaces the X-Rcd-Truncated header as `truncated`.
+   */
+  async exportQueryCsv(body: ExportQueryBody, signal?: AbortSignal): Promise<ExportCsvResult> {
+    const response = await this.fetcher<Response>(this.url('/query/export'), {
+      method: 'POST',
+      body,
+      signal,
+      raw: true,
+    });
+    return { blob: await response.blob(), truncated: response.headers.get('X-Rcd-Truncated') !== null };
   }
 
   listDashboards(signal?: AbortSignal): Promise<DashboardSummary[]> {

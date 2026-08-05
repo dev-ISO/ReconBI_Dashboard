@@ -74,6 +74,21 @@ public sealed class PostgresSqlDialect : ISqlDialect
          FROM generate_series({startPlaceholder}::timestamp, {endPlaceholder}::timestamp, interval '1 day') AS d
          """;
 
+    /// <summary>date_trunc outputs are timestamps, so the series steps timestamps by whole buckets.</summary>
+    public string BucketSeries(DateBucket bucket, string startExpression, string endExpression)
+    {
+        var interval = bucket switch
+        {
+            DateBucket.Year => "1 year",
+            DateBucket.Quarter => "3 months",
+            DateBucket.Month => "1 month",
+            DateBucket.Week => "7 days",
+            DateBucket.Day => "1 day",
+            _ => throw new ArgumentOutOfRangeException(nameof(bucket)),
+        };
+        return $"generate_series({startExpression}, {endExpression}, interval '{interval}')";
+    }
+
     public string NullsLastSuffix => " NULLS LAST";
 
     public bool SupportsSelectAliasInOrderBy => true;

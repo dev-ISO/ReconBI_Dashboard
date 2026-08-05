@@ -20,8 +20,12 @@ public sealed record ResolvedMeasureExpression(
     IReadOnlyList<string> AggregateTableKeys,
     IReadOnlyDictionary<string, ResolvedMeasure> References);
 
-/// <summary>Expression is non-null for calculated measures; Aggregation/Column are then unused.</summary>
-public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null);
+/// <summary>
+/// Expression is non-null for calculated measures; Aggregation/Column are then
+/// unused. Calc is a post-aggregation window transform (running total, YTD,
+/// prior-period family) applied over the grouped result.
+/// </summary>
+public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null, MeasureCalcSpec? Calc = null);
 
 public sealed record ResolvedFilter(TableSchema Table, ColumnSchema Column, FilterOperator Operator, IReadOnlyList<JsonElement> Values);
 
@@ -29,6 +33,22 @@ public sealed record ResolvedFilter(TableSchema Table, ColumnSchema Column, Filt
 public sealed record PreparedQuery(
     IReadOnlyList<ResolvedDimension> Dimensions,
     IReadOnlyList<ResolvedMeasure> Measures,
+    IReadOnlyList<ResolvedFilter> Filters,
+    JoinPlan Plan,
+    DatabaseSchema Schema,
+    IReadOnlyList<DateTableDef>? DateTables = null)
+{
+    /// <summary>Date tables the join plan touches, in emission order.</summary>
+    public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+}
+
+/// <summary>
+/// Row-level ("underlying data") export: every physical column of the anchor
+/// table — the first measure's table — with the spec's filters applied through
+/// the usual join resolution, no aggregation.
+/// </summary>
+public sealed record PreparedUnderlyingQuery(
+    TableSchema Table,
     IReadOnlyList<ResolvedFilter> Filters,
     JoinPlan Plan,
     DatabaseSchema Schema,
@@ -92,6 +112,15 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var dimensions = spec.Dimensions.Select(d => ResolveDimension(d, model, schema)).ToArray();
         var measures = spec.Measures.Select(m => ResolveMeasure(m, model, schema)).ToArray();
         var filters = spec.Filters.Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)).ToArray();
+
+        for (var i = 0; i < spec.Measures.Count; i++)
+        {
+            if (spec.Measures[i].Calc is { } calc)
+            {
+                ValidateCalc(calc, dimensions, measures[i].Label);
+                measures[i] = measures[i] with { Calc = calc };
+            }
+        }
 
         var involved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var d in dimensions)
@@ -162,6 +191,70 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         return new PreparedDistinctQuery(
             table, column, spec.Search, filters, limit, plan, schema, CollectDateTables(model, plan));
+    }
+
+    /// <summary>
+    /// Prepares a row-level export: the anchor is the FIRST measure's table
+    /// (model measure -> its home table, inline measure -> its table), all of
+    /// its physical columns are selected, and the spec's filters join in
+    /// exactly like a chart query. Dimensions/sort/topN are ignored — this is
+    /// the data behind the chart, not the chart.
+    /// </summary>
+    public PreparedUnderlyingQuery PrepareUnderlying(
+        ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
+    {
+        if (spec.Measures.Count == 0)
+        {
+            throw new QueryCompilationException(
+                "QRY_NO_MEASURES", "An underlying-data export needs at least one measure to anchor the table.");
+        }
+
+        if (spec.Filters.Count > limits.MaxFilters)
+        {
+            throw new QueryCompilationException("QRY_TOO_MANY_FILTERS", $"At most {limits.MaxFilters} filters are allowed.");
+        }
+
+        schema = AugmentWithDateTables(model, schema);
+
+        var first = spec.Measures[0];
+        string anchorKey;
+        if (first.MeasureId is { } measureId)
+        {
+            var measure = model.Measures.FirstOrDefault(m => m.Id == measureId)
+                ?? throw new QueryCompilationException(
+                    "QRY_UNKNOWN_MEASURE", $"The model has no measure with id {measureId}.");
+            anchorKey = measure.Table;
+        }
+        else
+        {
+            anchorKey = first.Table
+                ?? throw new QueryCompilationException(
+                    "QRY_BAD_MEASURE", "An inline measure needs a table (or reference a model measure by id).");
+        }
+
+        if (!model.ContainsTable(anchorKey))
+        {
+            throw new QueryCompilationException("QRY_UNKNOWN_TABLE", $"Table '{anchorKey}' is not part of the model.");
+        }
+
+        var table = schema.FindTable(anchorKey)
+            ?? throw new QueryCompilationException(
+                "QRY_UNKNOWN_TABLE", $"Table '{anchorKey}' no longer exists in the data source.");
+
+        var filters = spec.Filters
+            .Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits))
+            .ToArray();
+
+        var involved = new HashSet<string>(StringComparer.Ordinal) { table.Key };
+        foreach (var f in filters)
+        {
+            involved.Add(f.Table.Key);
+        }
+
+        var active = model.Relationships.Where(r => r.IsActive).ToArray();
+        var plan = JoinPathResolver.Resolve(table.Key, involved, active, limits.MaxJoins);
+
+        return new PreparedUnderlyingQuery(table, filters, plan, schema, CollectDateTables(model, plan));
     }
 
     /// <summary>
@@ -257,7 +350,15 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         if (spec.TopN is { } topN)
         {
             return EmitTopN(
-                prepared, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings, calendarCtes);
+                prepared, spec, topN, dimensionExprs, selectItems, measureExprs, whereParts, effectiveLimit, bag, warnings, calendarCtes);
+        }
+
+        if (prepared.Measures.Any(m => m.Calc is not null))
+        {
+            var core = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
+            return EmitWithCalcs(
+                prepared, spec, [.. calendarCtes], core.ToString(),
+                includeIsTopN: false, orderByAxisOnly: false, effectiveLimit, bag, warnings);
         }
 
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
@@ -290,6 +391,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// </summary>
     private CompiledQuery EmitTopN(
         PreparedQuery prepared,
+        ChartQuerySpec spec,
         TopNSpec topN,
         IReadOnlyList<string> dimensionExprs,
         IReadOnlyList<string> selectItems,
@@ -316,6 +418,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var n = Math.Clamp(topN.N, 1, effectiveLimit);
         var plan = prepared.Plan;
         var rankAlias = dialect.QuoteIdentifier($"meas{topN.ByMeasureIndex}");
+        var hasCalc = prepared.Measures.Any(m => m.Calc is not null);
 
         if (!topN.IncludeOthers)
         {
@@ -328,6 +431,15 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 .Append(", ").Append(dimensionExprs[0]).Append(" ASC").Append(dialect.NullsLastSuffix);
             flat.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
+            if (hasCalc)
+            {
+                // Calcs apply over the Top-N output: the flat ranked+limited
+                // query becomes the base and windows run over those rows.
+                return EmitWithCalcs(
+                    prepared, spec, [.. calendarCtes], flat.ToString(),
+                    includeIsTopN: false, orderByAxisOnly: true, effectiveLimit, bag, warnings);
+            }
+
             return new CompiledQuery(
                 CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings);
         }
@@ -335,7 +447,6 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs);
 
         var nPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)n, NormalizedType.Integer));
-        var outerLimitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
 
         var dimAlias = dialect.QuoteIdentifier("dim0");
         var rnAlias = dialect.QuoteIdentifier("rn");
@@ -393,6 +504,32 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             outerItems.Add($"{expr} AS {measAlias}");
         }
 
+        var rankedBody = new StringBuilder();
+        rankedBody.Append("SELECT *, ROW_NUMBER() OVER (ORDER BY ")
+            .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix)
+            .Append(", ").Append(dimAlias).Append(" ASC").Append(dialect.NullsLastSuffix)
+            .Append(") AS ").Append(rnAlias);
+        rankedBody.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("base"));
+
+        var groupedCore = new StringBuilder();
+        groupedCore.Append("SELECT ").Append(string.Join(",\n       ", outerItems));
+        groupedCore.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("ranked"));
+        groupedCore.Append('\n').Append("GROUP BY 1, 2");
+
+        var baseCte = $"{dialect.QuoteIdentifier("base")} AS (\n{inner}\n)";
+        var rankedCte = $"{dialect.QuoteIdentifier("ranked")} AS (\n{rankedBody}\n)";
+
+        if (hasCalc)
+        {
+            // Calcs apply over the folded Top-N + Others rows; is_topn passes
+            // through so consumers can still tell the Others bucket apart.
+            return EmitWithCalcs(
+                prepared, spec, [.. calendarCtes, baseCte, rankedCte], groupedCore.ToString(),
+                includeIsTopN: true, orderByAxisOnly: true, effectiveLimit, bag, warnings);
+        }
+
+        var outerLimitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
+
         var sql = new StringBuilder();
         sql.Append("WITH ");
         foreach (var calendarCte in calendarCtes)
@@ -400,24 +537,184 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             sql.Append(calendarCte).Append(",\n");
         }
 
-        sql.Append(dialect.QuoteIdentifier("base")).Append(" AS (\n");
-        sql.Append(inner);
-        sql.Append("\n),\n");
-        sql.Append(dialect.QuoteIdentifier("ranked")).Append(" AS (\n");
-        sql.Append("SELECT *, ROW_NUMBER() OVER (ORDER BY ")
-            .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix)
-            .Append(", ").Append(dimAlias).Append(" ASC").Append(dialect.NullsLastSuffix)
-            .Append(") AS ").Append(rnAlias);
-        sql.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("base"));
-        sql.Append("\n)\n");
-        sql.Append("SELECT ").Append(string.Join(",\n       ", outerItems));
-        sql.Append('\n').Append("FROM ").Append(dialect.QuoteIdentifier("ranked"));
-        sql.Append('\n').Append("GROUP BY 1, 2");
+        sql.Append(baseCte).Append(",\n").Append(rankedCte).Append('\n');
+        sql.Append(groupedCore);
         sql.Append('\n').Append("ORDER BY ").Append(isTopAlias).Append(" DESC, ")
             .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix);
         sql.Append('\n').Append(dialect.LimitClause(outerLimitPlaceholder));
 
         return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings);
+    }
+
+    /// <summary>
+    /// Post-aggregation calc stage. The grouped statement (the aggregate core,
+    /// or the whole Top-N stage) becomes the "__rcd_base" CTE and calc measures
+    /// become window expressions over it: the FIRST dimension is the ordering
+    /// axis, every other dimension partitions (legend / small multiples).
+    /// When a bucket-relative kind (YTD or the prior-period family) rides a
+    /// date-bucketed axis the base is densified first: the full bucket series
+    /// between the observed min and max axis value is generated, CROSS JOINed
+    /// with the DISTINCT combinations of the other dimensions, and the base is
+    /// LEFT JOINed onto that grid — so LAG-by-rows equals LAG-by-bucket even
+    /// when buckets are missing. Gap rows are KEPT in the output (NULL raw
+    /// measures; running totals carry forward past them, changes against a gap
+    /// are NULL) so charts render gaps honestly. Base rows whose axis value is
+    /// NULL are dropped by densification — a NULL bucket has no axis position.
+    /// </summary>
+    private CompiledQuery EmitWithCalcs(
+        PreparedQuery prepared,
+        ChartQuerySpec spec,
+        List<string> leadingCtes,
+        string coreSql,
+        bool includeIsTopN,
+        bool orderByAxisOnly,
+        int effectiveLimit,
+        ParameterBag bag,
+        List<EngineWarning> warnings)
+    {
+        var baseAlias = dialect.QuoteIdentifier("__rcd_base");
+        var axisBucket = prepared.Dimensions.Count > 0 ? prepared.Dimensions[0].Spec.DateBucket : null;
+        var densify = axisBucket is not null
+            && prepared.Measures.Any(m => m.Calc is not null && m.Calc.Kind != MeasureCalcKind.RunningTotal);
+
+        var ctes = new List<string>(leadingCtes) { $"{baseAlias} AS (\n{coreSql}\n)" };
+
+        string DimAlias(int i) => dialect.QuoteIdentifier($"dim{i}");
+        string MeasAlias(int i) => dialect.QuoteIdentifier($"meas{i}");
+
+        string axisSource;
+        string[] dimRefs;
+        if (densify)
+        {
+            var axisAlias = dialect.QuoteIdentifier("__rcd_axis");
+            var series = dialect.BucketSeries(
+                axisBucket!.Value,
+                dialect.Aggregate(Aggregation.Min, DimAlias(0)),
+                dialect.Aggregate(Aggregation.Max, DimAlias(0)));
+            ctes.Add($"{axisAlias} AS (\nSELECT {series} AS {DimAlias(0)}\nFROM {baseAlias}\n)");
+
+            if (prepared.Dimensions.Count > 1)
+            {
+                var keysAlias = dialect.QuoteIdentifier("__rcd_keys");
+                var gridAlias = dialect.QuoteIdentifier("__rcd_grid");
+                var otherAliases = Enumerable.Range(1, prepared.Dimensions.Count - 1).Select(DimAlias).ToArray();
+                ctes.Add($"{keysAlias} AS (\nSELECT DISTINCT {string.Join(", ", otherAliases)}\nFROM {baseAlias}\n)");
+
+                var gridItems = new List<string> { $"{axisAlias}.{DimAlias(0)}" };
+                gridItems.AddRange(otherAliases.Select(a => $"{keysAlias}.{a}"));
+                ctes.Add(
+                    $"{gridAlias} AS (\nSELECT {string.Join(", ", gridItems)}\nFROM {axisAlias}\nCROSS JOIN {keysAlias}\n)");
+                axisSource = gridAlias;
+            }
+            else
+            {
+                axisSource = axisAlias;
+            }
+
+            dimRefs = [.. Enumerable.Range(0, prepared.Dimensions.Count).Select(i => $"{axisSource}.{DimAlias(i)}")];
+        }
+        else
+        {
+            axisSource = baseAlias;
+            dimRefs = [.. Enumerable.Range(0, prepared.Dimensions.Count).Select(DimAlias)];
+        }
+
+        var outerItems = new List<string>();
+        for (var i = 0; i < prepared.Dimensions.Count; i++)
+        {
+            outerItems.Add(densify ? $"{dimRefs[i]} AS {DimAlias(i)}" : dimRefs[i]);
+        }
+
+        if (includeIsTopN)
+        {
+            var isTopAlias = dialect.QuoteIdentifier("is_topn");
+            outerItems.Add(densify ? $"{baseAlias}.{isTopAlias} AS {isTopAlias}" : isTopAlias);
+        }
+
+        var axisRef = dimRefs[0];
+        var partition = dimRefs.Skip(1).ToArray();
+
+        for (var i = 0; i < prepared.Measures.Count; i++)
+        {
+            var measureRef = densify ? $"{baseAlias}.{MeasAlias(i)}" : MeasAlias(i);
+            outerItems.Add(prepared.Measures[i].Calc is { } calc
+                ? $"{CalcExpression(calc, measureRef, axisRef, partition, bag)} AS {MeasAlias(i)}"
+                : densify ? $"{measureRef} AS {MeasAlias(i)}" : measureRef);
+        }
+
+        var sql = new StringBuilder();
+        sql.Append("WITH ").Append(string.Join(",\n", ctes)).Append('\n');
+        sql.Append("SELECT ").Append(string.Join(",\n       ", outerItems));
+        sql.Append('\n').Append("FROM ").Append(axisSource);
+
+        if (densify)
+        {
+            var joinParts = new List<string> { $"{dimRefs[0]} = {baseAlias}.{DimAlias(0)}" };
+            for (var i = 1; i < prepared.Dimensions.Count; i++)
+            {
+                joinParts.Add($"{dimRefs[i]} IS NOT DISTINCT FROM {baseAlias}.{DimAlias(i)}");
+            }
+
+            sql.Append('\n').Append("LEFT JOIN ").Append(baseAlias)
+                .Append(" ON ").Append(string.Join(" AND ", joinParts));
+        }
+
+        List<string> orderParts = orderByAxisOnly
+            ? [$"{dimRefs[0]} ASC{dialect.NullsLastSuffix}"]
+            : BuildOrderBy(spec, prepared, dimRefs);
+        if (orderParts.Count > 0)
+        {
+            sql.Append('\n').Append("ORDER BY ").Append(string.Join(", ", orderParts));
+        }
+
+        var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(effectiveLimit + 1), NormalizedType.Integer));
+        sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+
+        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN), warnings);
+    }
+
+    /// <summary>
+    /// One calc measure's window expression over the grouped base rows.
+    /// Running total / YTD are frame-bound running SUMs (YTD additionally
+    /// partitions by the axis year); the prior-period family is LAG by
+    /// <see cref="MeasureCalcSpec.Offset"/> rows (offset bound as a parameter),
+    /// which equals "offset buckets back" thanks to densification. The % change
+    /// numerator is cast to decimal so integer measures never divide integrally.
+    /// </summary>
+    private string CalcExpression(
+        MeasureCalcSpec calc, string measureRef, string axisRef, IReadOnlyList<string> partitionExprs, ParameterBag bag)
+    {
+        string Over(bool runningFrame, bool ytdPartition)
+        {
+            var parts = new List<string>(partitionExprs);
+            if (ytdPartition)
+            {
+                parts.Add(dialect.DateTrunc(DateBucket.Year, axisRef));
+            }
+
+            var partitionClause = parts.Count > 0 ? $"PARTITION BY {string.Join(", ", parts)} " : "";
+            var frame = runningFrame ? " ROWS UNBOUNDED PRECEDING" : "";
+            return $"OVER ({partitionClause}ORDER BY {axisRef} ASC{dialect.NullsLastSuffix}{frame})";
+        }
+
+        switch (calc.Kind)
+        {
+            case MeasureCalcKind.RunningTotal:
+                return $"{dialect.Aggregate(Aggregation.Sum, measureRef)} {Over(runningFrame: true, ytdPartition: false)}";
+            case MeasureCalcKind.Ytd:
+                return $"{dialect.Aggregate(Aggregation.Sum, measureRef)} {Over(runningFrame: true, ytdPartition: true)}";
+        }
+
+        var offsetPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(calc.Offset ?? 1), NormalizedType.Integer));
+        var lag = $"LAG({measureRef}, CAST({offsetPlaceholder} AS integer)) {Over(runningFrame: false, ytdPartition: false)}";
+
+        return calc.Kind switch
+        {
+            MeasureCalcKind.PriorPeriod => lag,
+            MeasureCalcKind.PeriodChange => $"({measureRef} - {lag})",
+            MeasureCalcKind.PeriodChangePct => $"(CAST(({measureRef} - {lag}) AS decimal) / NULLIF({lag}, 0))",
+            _ => throw new InvalidOperationException($"Unknown calc kind {calc.Kind}."),
+        };
     }
 
     public CompiledQuery EmitDistinct(
@@ -464,6 +761,59 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             new ResultColumnPlan("value", prepared.Column.Name, ResultColumnRole.Dimension,
                 prepared.Column.Type, $"{prepared.Table.Key}.{prepared.Column.Name}", null, null),
         };
+
+        return new CompiledQuery(CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, columns, Warnings: []);
+    }
+
+    /// <summary>
+    /// Row-level export statement: every physical column of the anchor table,
+    /// filters + row filters ANDed in, no aggregation, ordered by the anchor's
+    /// first column for determinism, limited to maxRows + 1 (truncation probe).
+    /// </summary>
+    public CompiledQuery EmitUnderlying(
+        PreparedUnderlyingQuery prepared,
+        IReadOnlyDictionary<string, IReadOnlyList<RowFilter>> rowFiltersByTable,
+        int maxRows)
+    {
+        var bag = new ParameterBag();
+        var plan = prepared.Plan;
+        var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
+        var alias = plan.AliasByTable[prepared.Table.Key];
+
+        var selectItems = prepared.Table.Columns
+            .Select(c => QualifiedColumn(alias, c.Name))
+            .ToArray();
+
+        var whereParts = new List<string>();
+        foreach (var filter in prepared.Filters)
+        {
+            whereParts.Add(BuildPredicate(filter, plan, bag));
+        }
+
+        AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
+
+        var limitPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)(maxRows + 1), NormalizedType.Integer));
+
+        var sql = new StringBuilder();
+        sql.Append("SELECT ").Append(string.Join(",\n       ", selectItems));
+        sql.Append('\n').Append("FROM ").Append(FromClause(plan, prepared.Schema));
+        AppendJoins(sql, plan, prepared.Schema);
+
+        if (whereParts.Count > 0)
+        {
+            sql.Append('\n').Append("WHERE ").Append(string.Join("\n  AND ", whereParts));
+        }
+
+        sql.Append('\n').Append("ORDER BY ")
+            .Append(QualifiedColumn(alias, prepared.Table.Columns[0].Name))
+            .Append(" ASC").Append(dialect.NullsLastSuffix);
+        sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
+
+        var columns = prepared.Table.Columns
+            .Select(c => new ResultColumnPlan(
+                c.Name, c.Name, ResultColumnRole.Dimension, c.Type,
+                $"{prepared.Table.Key}.{c.Name}", DateBucket: null, FormatHint: null))
+            .ToArray();
 
         return new CompiledQuery(CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, columns, Warnings: []);
     }
@@ -775,6 +1125,42 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
 
         return new ResolvedFilter(table, column, op, values);
+    }
+
+    /// <summary>
+    /// Calc guards. Every kind orders over the FIRST dimension; the prior/change
+    /// family and YTD additionally need that axis to be date-bucketed so
+    /// "one bucket back" is well-defined. Offsets are clamped-by-rejection:
+    /// anything outside [1, 1000] is a client error, never silently adjusted.
+    /// </summary>
+    private static void ValidateCalc(MeasureCalcSpec calc, IReadOnlyList<ResolvedDimension> dimensions, string label)
+    {
+        if (!Enum.IsDefined(calc.Kind))
+        {
+            throw new QueryCompilationException(
+                "QRY_CALC_INVALID", $"Measure '{label}': unknown calculation kind.");
+        }
+
+        if (dimensions.Count == 0)
+        {
+            throw new QueryCompilationException(
+                "QRY_CALC_INVALID",
+                $"Measure '{label}': a {calc.Kind} calculation needs at least one dimension to order by.");
+        }
+
+        if (calc.Offset is { } offset && (offset < 1 || offset > 1000))
+        {
+            throw new QueryCompilationException(
+                "QRY_CALC_INVALID",
+                $"Measure '{label}': calculation offset must be between 1 and 1000, got {offset}.");
+        }
+
+        if (calc.Kind != MeasureCalcKind.RunningTotal && dimensions[0].Spec.DateBucket is null)
+        {
+            throw new QueryCompilationException(
+                "QRY_CALC_NEEDS_DATE_AXIS",
+                $"Measure '{label}': a {calc.Kind} calculation requires the first dimension to be a date-bucketed axis.");
+        }
     }
 
     private static bool IsAggregationCompatible(Aggregation aggregation, NormalizedType type)
@@ -1191,9 +1577,28 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                         or Aggregation.StdDev or Aggregation.Variance or Aggregation.Median
                         ? NormalizedType.Decimal
                         : m.Column?.Type ?? NormalizedType.Integer;
+            var label = m.Label;
+            var formatHint = m.FormatHint;
+            if (m.Calc is { } calc)
+            {
+                label += calc.Kind switch
+                {
+                    MeasureCalcKind.RunningTotal => " (running total)",
+                    MeasureCalcKind.Ytd => " (YTD)",
+                    MeasureCalcKind.PriorPeriod => " (prior)",
+                    MeasureCalcKind.PeriodChange => " (change)",
+                    _ => " (% change)",
+                };
+                if (calc.Kind == MeasureCalcKind.PeriodChangePct)
+                {
+                    type = NormalizedType.Decimal; // change / prior is a ratio
+                    formatHint = "percent";
+                }
+            }
+
             columns.Add(new ResultColumnPlan(
-                $"meas{i}", m.Label, ResultColumnRole.Measure, type,
-                m.Column is null ? null : $"{m.Table.Key}.{m.Column.Name}", null, m.FormatHint));
+                $"meas{i}", label, ResultColumnRole.Measure, type,
+                m.Column is null ? null : $"{m.Table.Key}.{m.Column.Name}", null, formatHint));
         }
 
         return columns;

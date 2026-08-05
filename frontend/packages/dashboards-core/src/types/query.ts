@@ -25,6 +25,24 @@ export interface DimensionRef {
   dateBucket?: DateBucket | null;
 }
 
+/**
+ * Time-intelligence transform applied AFTER aggregation via SQL window
+ * functions over the grouped result. 'runningTotal' works on any ordered
+ * axis; the rest require the FIRST dimension to be date-bucketed.
+ */
+export type MeasureCalcKind =
+  | 'runningTotal'
+  | 'ytd'
+  | 'priorPeriod' // value `offset` buckets back
+  | 'periodChange' // value minus prior
+  | 'periodChangePct'; // change as fraction of prior
+
+export interface MeasureCalc {
+  kind: MeasureCalcKind;
+  /** Buckets back for prior/change kinds (default 1; e.g. 12 = YoY on months). */
+  offset?: number | null;
+}
+
 /** Either a model measure reference or an inline aggregation — never both. */
 export interface MeasureRef {
   measureId?: string | null;
@@ -32,6 +50,7 @@ export interface MeasureRef {
   column?: string | null;
   aggregation?: Aggregation | null;
   alias?: string | null;
+  calc?: MeasureCalc | null;
 }
 
 export type FilterValue = string | number | boolean;

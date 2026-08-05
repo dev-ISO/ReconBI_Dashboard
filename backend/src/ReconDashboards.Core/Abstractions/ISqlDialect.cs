@@ -54,6 +54,16 @@ public interface ISqlDialect
     /// </summary>
     string CalendarTableSql(string startPlaceholder, string endPlaceholder);
 
+    /// <summary>
+    /// A set-returning expression producing every bucket start from
+    /// <paramref name="startExpression"/> to <paramref name="endExpression"/>
+    /// inclusive, stepping by one <paramref name="bucket"/> (e.g. Postgres
+    /// "generate_series(start, end, interval '1 month')"). Both bound
+    /// expressions are date_trunc outputs, never client input. Used to densify
+    /// date axes for window calcs so LAG-by-rows equals LAG-by-bucket.
+    /// </summary>
+    string BucketSeries(DateBucket bucket, string startExpression, string endExpression);
+
     /// <summary>" NULLS LAST" or an equivalent wrapping for engines without it.</summary>
     string NullsLastSuffix { get; }
 

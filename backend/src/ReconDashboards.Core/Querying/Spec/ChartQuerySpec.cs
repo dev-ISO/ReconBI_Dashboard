@@ -50,13 +50,34 @@ public enum SortTargetKind
 /// <summary>Table refs are canonical "schema.table" keys; columns are catalog names.</summary>
 public sealed record DimensionSpec(string Table, string Column, DateBucket? DateBucket);
 
+/// <summary>
+/// Time-intelligence transform applied AFTER aggregation via SQL window
+/// functions over the grouped result. RunningTotal works on any ordered axis;
+/// the other kinds require the FIRST dimension to be date-bucketed.
+/// Wire names: "runningTotal", "ytd", "priorPeriod", "periodChange",
+/// "periodChangePct".
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<MeasureCalcKind>))]
+public enum MeasureCalcKind
+{
+    RunningTotal,
+    Ytd,
+    PriorPeriod,
+    PeriodChange,
+    PeriodChangePct,
+}
+
+/// <summary>Offset = buckets back for the prior/change kinds (default 1; e.g. 12 = YoY on a month axis).</summary>
+public sealed record MeasureCalcSpec(MeasureCalcKind Kind, int? Offset = null);
+
 /// <summary>Either a model measure reference (MeasureId) or an inline aggregation — never both.</summary>
 public sealed record MeasureSpec(
     Guid? MeasureId,
     string? Table,
     string? Column,
     Aggregation? Aggregation,
-    string? Alias);
+    string? Alias,
+    MeasureCalcSpec? Calc = null);
 
 /// <summary>
 /// Values arrive as raw JSON and are converted server-side to the referenced
@@ -82,6 +103,17 @@ public sealed record ChartQuerySpec(
     IReadOnlyList<SortSpec> Sort,
     TopNSpec? TopN,
     int? Limit);
+
+/// <summary>
+/// CSV export mode: "summarized" runs the normal aggregate pipeline (including
+/// calcs); "underlying" exports row-level data from the first measure's table.
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<ExportMode>))]
+public enum ExportMode
+{
+    Summarized,
+    Underlying,
+}
 
 /// <summary>Feeds slicer dropdowns. Filters may span tables (cascading slicers).</summary>
 public sealed record DistinctValuesSpec(

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, LayoutDashboard, Plus, RefreshCw, X } from 'lucide-react';
 import {
   emptyChart,
   filterCardIsActive,
@@ -11,17 +11,18 @@ import {
   isTextTile,
   newId,
   toWireSpec,
+  type ChartPointEvent,
   type ChartSpec,
   type DashboardTile,
   type FilterClause,
 } from '@recon/dashboards-core';
 import { ChartBuilder } from '../chart-builder/ChartBuilder';
-import { ChartTile } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
 import { AddSlicerDialog } from './AddSlicerDialog';
 import { ChartContextMenu } from './ChartContextMenu';
+import { DashboardChartTile } from './DashboardChartTile';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
@@ -29,10 +30,10 @@ import { FiltersPane } from './FiltersPane';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
 import { PageTabs } from './PageTabs';
+import { PointContextMenu, type DrillthroughTarget } from './PointContextMenu';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
 import { SlicerTile } from './SlicerTile';
 import { TextTile } from './TextTile';
-import { TileFrame } from './TileFrame';
 
 export interface DashboardViewProps {
   dashboardId: number;
@@ -42,6 +43,12 @@ export interface DashboardViewProps {
 
 const messageOf = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+/** Filesystem-safe download name from a chart title. */
+const csvFileName = (title: string): string => {
+  const cleaned = title.replace(/[\\/:*?"<>|]/g, '_').trim();
+  return cleaned === '' ? 'chart' : cleaned;
+};
 
 const NO_FILTERS: FilterClause[] = [];
 
@@ -56,10 +63,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const storeError = useDashboardState((state) => state.error);
   const slicerValues = useDashboardState((state) => state.slicerValues);
   const crossFilter = useDashboardState((state) => state.crossFilter);
+  const drillthrough = useDashboardState((state) => state.drillthrough);
   const activePageId = useDashboardState((state) => state.activePageId);
   const selectedTileId = useDashboardState((state) => state.selectedTileId);
   const filterCards = useDashboardState((state) => state.current?.layout.filterCards ?? null);
   const filterCardOverrides = useDashboardState((state) => state.filterCardOverrides);
+  const bookmarks = useDashboardState((state) => state.current?.layout.bookmarks ?? null);
+  const lastAppliedBookmarkId = useDashboardState((state) => state.lastAppliedBookmarkId);
 
   const openModel = useModelState((state) => state.current);
   const catalog = useModelState((state) => state.catalog);
@@ -77,6 +87,15 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     tileId: string;
     position: { x: number; y: number };
   } | null>(null);
+  /** Point right-click menu (view mode): drillthrough targets + CSV export. */
+  const [pointMenu, setPointMenu] = useState<{
+    tileId: string;
+    /** EFFECTIVE (drill-derived) chart at the moment of the click. */
+    chart: ChartSpec;
+    event: ChartPointEvent;
+  } | null>(null);
+  /** Transient toolbar-area notice (export failures / truncation). */
+  const [notice, setNotice] = useState<string | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
   const [addImageOpen, setAddImageOpen] = useState(false);
   const [printConfigOpen, setPrintConfigOpen] = useState(false);
@@ -140,7 +159,30 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
     }
     return map;
-  }, [runtime, tiles, slicerValues, crossFilter, filterCards, filterCardOverrides, activePageId]);
+  }, [
+    runtime,
+    tiles,
+    slicerValues,
+    crossFilter,
+    drillthrough,
+    filterCards,
+    filterCardOverrides,
+    activePageId,
+  ]);
+
+  /**
+   * What each chart tile is CURRENTLY showing — the drill-derived effective
+   * spec + merged filters, reported by DashboardChartTile on every render
+   * (ref assignment, no re-renders). The export menus build the exact wire
+   * spec the tile's own fetch used from this.
+   */
+  const effectiveByTile = useRef(new Map<string, { chart: ChartSpec; filters: FilterClause[] }>());
+  const reportEffective = useCallback(
+    (tileId: string, effective: { chart: ChartSpec; filters: FilterClause[] }) => {
+      effectiveByTile.current.set(tileId, effective);
+    },
+    [],
+  );
 
   // Toolbar badge: enabled cards visible on this page currently contributing
   // at least one clause (visual cards of ANY chart on the page count — they
@@ -178,6 +220,110 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     },
     [runtime],
   );
+
+  // Transient notice auto-dismisses (manual x too).
+  useEffect(() => {
+    if (notice === null) return;
+    const timer = window.setTimeout(() => setNotice(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  /**
+   * CSV export of a chart tile's CURRENT effective query — drill position +
+   * slicers + filter cards + cross-filter + drillthrough, exactly what the
+   * tile is showing (the drill wrapper reports it; base spec as fallback).
+   * Downloads via an object-URL anchor; failures surface as the notice chip.
+   */
+  const exportChartCsv = useCallback(
+    async (tileId: string, mode: 'summarized' | 'underlying') => {
+      const state = runtime.dashboards.store.getState();
+      if (state.current?.modelId == null) return;
+      const effective = effectiveByTile.current.get(tileId);
+      const tile = (state.current.layout.pages ?? [])
+        .flatMap((page) => page.tiles)
+        .find((t) => t.id === tileId);
+      const chart = effective?.chart ?? (tile && isChartTile(tile) ? tile.chart : null);
+      if (!chart || !isRunnable(chart)) return;
+      const clauses = effective?.filters ?? runtime.dashboards.filtersForTile(tileId);
+      try {
+        const { blob, truncated } = await runtime.api.exportQueryCsv({
+          spec: toWireSpec(chart, state.current.modelId, clauses),
+          mode,
+        });
+        const url = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = url;
+        anchor.download = `${csvFileName(chart.title)}.csv`;
+        anchor.click();
+        URL.revokeObjectURL(url);
+        if (truncated) setNotice('Export truncated: the server capped the row count.');
+      } catch (error) {
+        setNotice(`Export failed: ${messageOf(error)}`);
+      }
+    },
+    [runtime],
+  );
+
+  /**
+   * Drillthrough candidates for the open point menu: every OTHER page with
+   * drillthrough enabled whose EVERY field matches a dimension of the clicked
+   * chart's EFFECTIVE query (axis post-drill, legend, small multiples by
+   * table+column). Items whose point lacks a field value render disabled.
+   */
+  const drillthroughTargets = useMemo<DrillthroughTarget[]>(() => {
+    if (!pointMenu) return [];
+    const { chart, event } = pointMenu;
+    const dims: { dim: typeof chart.query.axis; value: unknown; label: string | undefined }[] = [
+      { dim: chart.query.axis ?? null, value: event.axisValue, label: event.axisLabel },
+      { dim: chart.query.legend ?? null, value: event.legendValue, label: event.legendLabel },
+      {
+        dim: chart.query.smallMultiples ?? null,
+        value: event.smallMultipleValue,
+        label:
+          event.smallMultipleValue == null ? undefined : String(event.smallMultipleValue),
+      },
+    ];
+    const targets: DrillthroughTarget[] = [];
+    for (const page of pages) {
+      if (page.id === activePage?.id) continue;
+      const config = page.drillthrough;
+      if (!config?.enabled || config.fields.length === 0) continue;
+      let matchesAll = true;
+      let disabledReason: string | null = null;
+      const clauses: FilterClause[] = [];
+      const labels: string[] = [];
+      for (const field of config.fields) {
+        const hit = dims.find(
+          (d) => d.dim != null && d.dim.table === field.table && d.dim.column === field.column,
+        );
+        if (!hit) {
+          matchesAll = false;
+          break;
+        }
+        const value = hit.value;
+        if (value === undefined || value === null) {
+          disabledReason ??= `The clicked point has no ${field.column} value`;
+          continue;
+        }
+        clauses.push({
+          table: field.table,
+          column: field.column,
+          operator: 'eq',
+          values: [value as string | number | boolean],
+        });
+        labels.push(hit.label ?? String(value));
+      }
+      if (!matchesAll) continue;
+      targets.push({
+        pageId: page.id,
+        pageName: page.name,
+        disabledReason,
+        filters: clauses,
+        label: labels.join(' · ') || page.name,
+      });
+    }
+    return targets;
+  }, [pointMenu, pages, activePage]);
 
   /** Chart tiles by title for the slicer config menus' "Applies to" list. */
   const chartTileInfos = useMemo(
@@ -395,53 +541,35 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     const chart = tile.chart;
     // Edit-mode click selects the tile (drives the Filters pane's "On this
     // visual" section). View mode never selects — datum clicks there belong to
-    // cross-filtering alone. The subtle accent ring marks the selection.
+    // cross-filtering/drilling alone. DashboardChartTile owns the selection
+    // ring, the TileFrame chrome, and the transient drill-down runtime.
     return (
-      <div
-        className={`h-full rounded-lg ${
-          editable && selectedTileId === tile.id ? 'ring-2 ring-rcd-accent' : ''
-        }`}
-        onClick={editable ? () => runtime.dashboards.selectTile(tile.id) : undefined}
-      >
-        <TileFrame
-          title={chart.title}
-          editable={editable}
-          container={chart.format.container ?? null}
-          onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
-          onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
-          onDelete={() => runtime.dashboards.removeTile(tile.id)}
-          onContextMenu={
-            // Context card replaces the native menu in EDIT mode only; view
-            // mode keeps the browser's own right-click menu.
-            editable
-              ? (event) => {
-                  event.preventDefault();
-                  event.stopPropagation();
-                  setChartMenu({ tileId: tile.id, position: { x: event.clientX, y: event.clientY } });
-                }
-              : undefined
-          }
-        >
-          {modelId === null ? (
-            <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
-              No model attached to this dashboard.
-            </div>
-          ) : (
-            <ChartTile
-              key={`${refreshToken}:${tileRefreshTokens[tile.id] ?? 0}`}
-              spec={chart}
-              modelId={modelId}
-              filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
-              onDatumClick={(info) => handleDatumClick(tile.id, chart, info)}
-              activeCategory={
-                crossFilter && crossFilter.sourceTileId === tile.id
-                  ? { label: crossFilter.categoryLabel }
-                  : null
-              }
-            />
-          )}
-        </TileFrame>
-      </div>
+      <DashboardChartTile
+        tileId={tile.id}
+        chart={chart}
+        modelId={modelId}
+        editable={editable}
+        selected={selectedTileId === tile.id}
+        refreshKey={`${refreshToken}:${tileRefreshTokens[tile.id] ?? 0}`}
+        filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
+        activeCategoryLabel={
+          crossFilter && crossFilter.sourceTileId === tile.id ? crossFilter.categoryLabel : null
+        }
+        onSelect={() => runtime.dashboards.selectTile(tile.id)}
+        onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
+        onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
+        onDelete={() => runtime.dashboards.removeTile(tile.id)}
+        // Context card replaces the native menu in EDIT mode only; view mode
+        // gets the POINT context menu (drillthrough/export) on chart points.
+        onTileContextMenu={
+          editable
+            ? (position) => setChartMenu({ tileId: tile.id, position })
+            : undefined
+        }
+        onCrossFilter={(effectiveChart, info) => handleDatumClick(tile.id, effectiveChart, info)}
+        onPointMenu={editable ? undefined : setPointMenu}
+        reportEffective={reportEffective}
+      />
     );
   };
 
@@ -521,26 +649,75 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         onToggleFilters={() => setFiltersPaneOpen((open) => !open)}
         filtersOpen={filtersPaneOpen}
         activeFilterCount={activeFilterCount}
+        bookmarks={(bookmarks ?? []).map((b) => ({ id: b.id, name: b.name }))}
+        lastAppliedBookmarkId={lastAppliedBookmarkId}
+        canManageBookmarks={!readonly}
+        onApplyBookmark={(id) => runtime.dashboards.applyBookmark(id)}
+        onAddBookmark={(name) => void runtime.dashboards.addBookmark(name)}
+        onUpdateBookmark={(id) => runtime.dashboards.updateBookmark(id)}
+        onRenameBookmark={(id, name) => runtime.dashboards.renameBookmark(id, name)}
+        onDeleteBookmark={(id) => runtime.dashboards.deleteBookmark(id)}
       />
 
       {/* Flex row: grid area + (optional) right-docked Filters pane. */}
       <div className="relative flex min-h-0 flex-1">
-        {/* Cross-filter chip: floats under the toolbar in BOTH modes. */}
-        {crossFilter && (
-          <div className="absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
-            <span className="truncate">
-              Filtered by <span className="font-medium">{crossFilter.label}</span>
-            </span>
-            <button
-              type="button"
-              aria-label="Clear cross-filter"
-              onClick={() => runtime.dashboards.clearCrossFilter()}
-              className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-            >
-              <X size={12} />
-            </button>
-          </div>
-        )}
+        {/* Chip strip under the toolbar: drillthrough context (on its target
+            page), the cross-filter chip, and transient export notices. */}
+        <div className="pointer-events-none absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 flex-col items-center gap-1.5">
+          {drillthrough && drillthrough.targetPageId === activePage?.id && (
+            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-1 pr-1 text-xs text-rcd-text shadow-md">
+              <button
+                type="button"
+                onClick={() => runtime.dashboards.returnFromDrillthrough()}
+                className="flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+              >
+                <ArrowLeft size={12} />
+                Back
+              </button>
+              <span className="truncate">
+                Drillthrough: <span className="font-medium">{drillthrough.label}</span>
+              </span>
+              <button
+                type="button"
+                aria-label="Clear drillthrough filter"
+                onClick={() => runtime.dashboards.clearDrillthrough()}
+                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+          {notice && (
+            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
+              <AlertTriangle size={12} className="shrink-0 text-[var(--rcd-status-warn)]" />
+              <span className="truncate">{notice}</span>
+              <button
+                type="button"
+                aria-label="Dismiss notice"
+                onClick={() => setNotice(null)}
+                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+          {/* Cross-filter chip: floats under the toolbar in BOTH modes. */}
+          {crossFilter && (
+            <div className="pointer-events-auto flex max-w-full items-center gap-1.5 rounded-full border border-rcd-border bg-rcd-surface py-1 pl-3 pr-1 text-xs text-rcd-text shadow-md">
+              <span className="truncate">
+                Filtered by <span className="font-medium">{crossFilter.label}</span>
+              </span>
+              <button
+                type="button"
+                aria-label="Clear cross-filter"
+                onClick={() => runtime.dashboards.clearCrossFilter()}
+                className="shrink-0 rounded-full p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          )}
+        </div>
 
         <div className="h-full min-w-0 flex-1 overflow-auto p-3">
           {tiles.length === 0 ? (
@@ -612,8 +789,28 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
                 })
               }
               onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
+              onExport={(exportMode) => void exportChartCsv(chartMenuTile.id, exportMode)}
               onDelete={() => runtime.dashboards.removeTile(chartMenuTile.id)}
               onClose={() => setChartMenu(null)}
+            />
+          </div>,
+          document.body,
+        )}
+
+      {pointMenu &&
+        // Same portal doctrine as the edit-mode context card: past the
+        // transformed grid items so fixed coordinates resolve to the viewport.
+        createPortal(
+          <div className="rcd-root bg-transparent">
+            <PointContextMenu
+              title={pointMenu.chart.title}
+              position={{ x: pointMenu.event.clientX, y: pointMenu.event.clientY }}
+              drillthroughTargets={drillthroughTargets}
+              onDrillthrough={(target) =>
+                runtime.dashboards.startDrillthrough(target.pageId, target.filters, target.label)
+              }
+              onExport={(exportMode) => void exportChartCsv(pointMenu.tileId, exportMode)}
+              onClose={() => setPointMenu(null)}
             />
           </div>,
           document.body,
@@ -661,7 +858,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       {printOptions !== null && (
         <DashboardPrintView
           // The ACTIVE page prints; its name joins the header title once the
-          // dashboard actually has multiple pages.
+          // dashboard actually has multiple pages. Tiles print their BASE
+          // specs — transient per-tile drill state is deliberately ignored.
           title={
             pages.length > 1 && activePage ? `${current.name} — ${activePage.name}` : current.name
           }

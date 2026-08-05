@@ -9,7 +9,13 @@ export * from './types/dashboard';
 export { RcdApiError, createFetchFetcher } from './api/fetcher';
 export type { RcdFetcher, RcdRequestInit } from './api/fetcher';
 export { DashboardsApi } from './api/DashboardsApi';
-export type { SaveModelBody, SaveDashboardBody, ValidationOutcome } from './api/DashboardsApi';
+export type {
+  SaveModelBody,
+  SaveDashboardBody,
+  ValidationOutcome,
+  ExportQueryBody,
+  ExportCsvResult,
+} from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';
 export type { QueryCacheEntry, QueryCacheState } from './state/queryCache';

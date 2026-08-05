@@ -1,8 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowLeft, ArrowRight, Pencil, Plus, Trash2 } from 'lucide-react';
-import type { DashboardPage } from '@recon/dashboards-core';
-import { useRuntime } from '../provider/DashboardsProvider';
-import { ConfirmDialog } from '../primitives';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { ArrowLeft, ArrowRight, Pencil, Plus, Trash2, X } from 'lucide-react';
+import {
+  isQueryableType,
+  tableKey,
+  type DashboardPage,
+  type DrillthroughField,
+  type PageDrillthrough,
+} from '@recon/dashboards-core';
+import { useModelState, useRuntime } from '../provider/DashboardsProvider';
+import { ConfirmDialog, RcdButton, RcdInput, RcdSelect } from '../primitives';
 
 export interface PageTabsProps {
   pages: DashboardPage[];
@@ -242,7 +248,7 @@ function PageTabMenu({
       aria-label={`Options for page ${page.name}`}
       style={{ left: pos.x, top: pos.y }}
       onContextMenu={(event) => event.preventDefault()}
-      className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-xl"
+      className="fixed z-50 flex w-64 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-xl"
     >
       <MenuButton
         onClick={() => {
@@ -288,6 +294,9 @@ function PageTabMenu({
           None
         </button>
       </div>
+
+      <Divider />
+      <DrillthroughSection page={page} />
 
       <Divider />
       <MenuButton
@@ -354,4 +363,185 @@ function MenuButton({
 
 function Divider() {
   return <div className="my-1 border-t border-rcd-border" />;
+}
+
+/**
+ * "Drillthrough" subsection of the page-config card: enable toggle + the
+ * table/column fields a drillthrough into this page filters by. Fields are
+ * added via model-driven selects when the dashboard's model (and catalog) are
+ * loaded in the model store, with a free-text fallback otherwise. Edits go
+ * straight to the layout doc (dirty like any other page edit); the card stays
+ * open while editing and closes on outside click.
+ */
+function DrillthroughSection({ page }: { page: DashboardPage }) {
+  const runtime = useRuntime();
+  const openModel = useModelState((state) => state.current);
+  const catalog = useModelState((state) => state.catalog);
+
+  const config = page.drillthrough ?? null;
+  const enabled = config?.enabled ?? false;
+  const fields = config?.fields ?? [];
+
+  // Pending "add field" row (selects when the model is loaded, free text else).
+  const [pendingTable, setPendingTable] = useState('');
+  const [pendingColumn, setPendingColumn] = useState('');
+
+  const usableCatalog =
+    openModel !== null && catalog !== null && catalog.connection === openModel.dataSourceName
+      ? catalog
+      : null;
+
+  const tables = useMemo(
+    () => (openModel !== null ? openModel.definition.tables.filter((t) => !t.hidden) : []),
+    [openModel],
+  );
+  const modelDriven = tables.length > 0;
+
+  const columns = useMemo(() => {
+    if (!usableCatalog || pendingTable === '') return [];
+    const modelTable = tables.find((t) => tableKey(t.schema, t.name) === pendingTable);
+    const overrides = new Map((modelTable?.columns ?? []).map((c) => [c.name, c]));
+    return (usableCatalog.tables.find((t) => t.key === pendingTable)?.columns ?? [])
+      .filter((c) => isQueryableType(c.type) && !overrides.get(c.name)?.hidden)
+      .map((c) => ({ name: c.name, label: overrides.get(c.name)?.friendlyName ?? c.name }));
+  }, [usableCatalog, pendingTable, tables]);
+
+  const commit = (next: PageDrillthrough | null) =>
+    runtime.dashboards.setPageDrillthrough(page.id, next);
+
+  const toggleEnabled = () => {
+    if (enabled) commit(fields.length === 0 ? null : { enabled: false, fields });
+    else commit({ enabled: true, fields });
+  };
+
+  const addField = () => {
+    const table = pendingTable.trim();
+    const column = pendingColumn.trim();
+    if (table === '' || column === '') return;
+    if (fields.some((f) => f.table === table && f.column === column)) return;
+    commit({ enabled, fields: [...fields, { table, column }] });
+    setPendingTable('');
+    setPendingColumn('');
+  };
+
+  const removeField = (field: DrillthroughField) => {
+    commit({
+      enabled,
+      fields: fields.filter((f) => !(f.table === field.table && f.column === field.column)),
+    });
+  };
+
+  return (
+    <>
+      <p className="px-3 pb-0.5 pt-1.5 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+        Drillthrough
+      </p>
+      <div className="flex flex-col gap-1.5 px-3 pb-1.5">
+        <label className="flex items-center gap-2 text-sm text-rcd-text">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={toggleEnabled}
+            className="accent-[var(--rcd-accent)]"
+          />
+          Allow drill through to this page
+        </label>
+
+        {enabled && (
+          <>
+            {fields.map((field) => (
+              <div
+                key={`${field.table}.${field.column}`}
+                className="flex items-center gap-1.5 rounded border border-rcd-border px-2 py-1 text-xs text-rcd-text-2"
+              >
+                <span className="min-w-0 flex-1 truncate" title={`${field.table}.${field.column}`}>
+                  {field.table}.{field.column}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Remove drillthrough field ${field.table}.${field.column}`}
+                  onClick={() => removeField(field)}
+                  className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+            {fields.length === 0 && (
+              <p className="text-xs text-rcd-muted">Add the field(s) this page filters by.</p>
+            )}
+
+            {modelDriven ? (
+              <>
+                <RcdSelect
+                  aria-label="Drillthrough field table"
+                  value={pendingTable}
+                  onChange={(event) => {
+                    setPendingTable(event.target.value);
+                    setPendingColumn('');
+                  }}
+                >
+                  <option value="">Choose a table…</option>
+                  {tables.map((t) => {
+                    const key = tableKey(t.schema, t.name);
+                    return (
+                      <option key={key} value={key}>
+                        {t.friendlyName ?? t.name}
+                      </option>
+                    );
+                  })}
+                </RcdSelect>
+                <div className="flex items-center gap-1.5">
+                  <RcdSelect
+                    aria-label="Drillthrough field column"
+                    value={pendingColumn}
+                    onChange={(event) => setPendingColumn(event.target.value)}
+                    disabled={pendingTable === '' || usableCatalog === null}
+                    className="min-w-0 flex-1"
+                  >
+                    <option value="">Choose a column…</option>
+                    {columns.map((c) => (
+                      <option key={c.name} value={c.name}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </RcdSelect>
+                  <RcdButton
+                    disabled={pendingTable === '' || pendingColumn === ''}
+                    onClick={addField}
+                  >
+                    Add
+                  </RcdButton>
+                </div>
+              </>
+            ) : (
+              // No model/catalog reachable: free-text "schema.table" + column.
+              <div className="flex items-center gap-1.5">
+                <RcdInput
+                  aria-label="Drillthrough field table"
+                  value={pendingTable}
+                  onChange={(event) => setPendingTable(event.target.value)}
+                  placeholder="schema.table"
+                  className="min-w-0 flex-1"
+                />
+                <RcdInput
+                  aria-label="Drillthrough field column"
+                  value={pendingColumn}
+                  onChange={(event) => setPendingColumn(event.target.value)}
+                  placeholder="column"
+                  className="min-w-0 flex-1"
+                />
+                <RcdButton
+                  disabled={pendingTable.trim() === '' || pendingColumn.trim() === ''}
+                  onClick={addField}
+                >
+                  Add
+                </RcdButton>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </>
+  );
 }

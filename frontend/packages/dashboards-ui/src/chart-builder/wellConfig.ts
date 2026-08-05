@@ -18,7 +18,7 @@ import {
   type ModelDefinition,
 } from '@recon/dashboards-core';
 
-export type WellId = 'axis' | 'legend' | 'values' | 'filters';
+export type WellId = 'axis' | 'legend' | 'smallMultiples' | 'values' | 'filters';
 
 export interface WellDef {
   id: WellId;
@@ -31,6 +31,16 @@ export interface WellDef {
 }
 
 const AXIS: WellDef = { id: 'axis', label: 'Axis', capacity: 'one', hint: 'Drop a column' };
+/**
+ * Drill-capable axis: the first chip is the axis (level 0), every further
+ * dropped dimension appends to query.drillLevels below it.
+ */
+const DRILL_AXIS: WellDef = {
+  id: 'axis',
+  label: 'Axis / drill hierarchy',
+  capacity: 'many',
+  hint: 'Drop a column — more columns build a drill hierarchy',
+};
 const LEGEND: WellDef = {
   id: 'legend',
   label: 'Legend',
@@ -44,6 +54,13 @@ const VALUES: WellDef = {
   hint: 'Drop measures or columns',
 };
 
+const SMALL_MULTIPLES: WellDef = {
+  id: 'smallMultiples',
+  label: 'Small multiples',
+  capacity: 'one',
+  hint: 'Drop a column to split into panels',
+};
+
 /** The filters well is universal — rendered under Values for every chart type. */
 export const FILTERS_WELL: WellDef = {
   id: 'filters',
@@ -52,12 +69,13 @@ export const FILTERS_WELL: WellDef = {
   hint: 'Drop a column to filter by',
 };
 
-const CARTESIAN: readonly WellDef[] = [AXIS, LEGEND, VALUES];
+const CARTESIAN: readonly WellDef[] = [DRILL_AXIS, LEGEND, VALUES, SMALL_MULTIPLES];
 
 const STACKED: readonly WellDef[] = [
-  AXIS,
+  DRILL_AXIS,
   { ...LEGEND, hint: 'Drop a column to stack by (required)' },
   { ...VALUES, max: 1, hint: 'Drop one measure' },
+  SMALL_MULTIPLES,
 ];
 
 const RADIAL: readonly WellDef[] = [
@@ -90,6 +108,16 @@ export const wellsFor = (type: ChartType): readonly WellDef[] => WELL_CONFIG[typ
 
 const hasWell = (type: ChartType, id: WellId): boolean =>
   wellsFor(type).some((well) => well.id === id);
+
+/**
+ * Types whose axis well is the multi-level drill hierarchy. The table's "Rows"
+ * well stays single-chip — drill affordances are cartesian-only.
+ */
+export const supportsDrill = (type: ChartType): boolean =>
+  wellsFor(type).some((well) => well.id === 'axis' && well.capacity === 'many');
+
+export const supportsSmallMultiples = (type: ChartType): boolean =>
+  hasWell(type, 'smallMultiples');
 
 /** Columns can land in any well; the values well converts them to countDistinct. */
 export const acceptsDimension = (_well: WellId): boolean => true;
@@ -165,7 +193,27 @@ export const applyDrop = (
 
   if (data.kind !== 'column') return query;
   const ref = toDimension(data);
-  return well === 'axis' ? { ...query, axis: ref } : { ...query, legend: ref };
+
+  if (well === 'axis') {
+    // Drill-capable types append further dimensions below the axis (level 0);
+    // exact duplicates (same column AND bucket) are a no-op. Other types keep
+    // the classic replace-on-drop behavior.
+    if (supportsDrill(type) && query.axis) {
+      const levels = [query.axis, ...(query.drillLevels ?? [])];
+      const duplicate = levels.some(
+        (level) =>
+          level.table === ref.table &&
+          level.column === ref.column &&
+          (level.dateBucket ?? null) === (ref.dateBucket ?? null),
+      );
+      if (duplicate) return query;
+      return { ...query, drillLevels: [...(query.drillLevels ?? []), ref] };
+    }
+    return { ...query, axis: ref };
+  }
+
+  if (well === 'smallMultiples') return { ...query, smallMultiples: ref };
+  return { ...query, legend: ref };
 };
 
 /** Click-to-add routing: measures/numeric → values; temporal → axis; else first free dimension well. */
@@ -190,6 +238,12 @@ export const normalizeQueryForType = (type: ChartType, query: ChartQuery): Chart
   }
   if (!hasWell(type, 'axis') && next.axis) next = { ...next, axis: null };
   if (!hasWell(type, 'legend') && next.legend) next = { ...next, legend: null };
+  if (!supportsDrill(type) && next.drillLevels?.length) {
+    next = { ...next, drillLevels: undefined };
+  }
+  if (!supportsSmallMultiples(type) && next.smallMultiples) {
+    next = { ...next, smallMultiples: null };
+  }
   const max = wellsFor(type).find((w) => w.id === 'values')?.max;
   if (max !== undefined && next.measures.length > max) {
     next = { ...next, measures: next.measures.slice(0, max) };

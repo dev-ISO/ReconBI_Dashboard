@@ -1,8 +1,9 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
 import { AlertTriangle, BarChart3, RefreshCw } from 'lucide-react';
 import {
   isRunnable,
   toWireSpec,
+  type ChartPointEvent,
   type ChartSpec,
   type FilterClause,
   type QueryResult,
@@ -10,9 +11,22 @@ import {
 import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
 // Type-only import: erased at compile time, so the lazy chunk split survives.
-import type { ChartDatumClickInfo } from './ChartRenderer';
+import type { ChartDatumClickInfo, ChartRendererProps } from './ChartRenderer';
 
-const ChartRenderer = lazy(() => import('./ChartRenderer'));
+/**
+ * Point-level handlers the renderer exposes (agreed contract; typed here so
+ * this file compiles against it regardless of when the renderer props land —
+ * once ChartRendererProps carries them the intersection below is a no-op).
+ * The existing onDatumClick cross-filter callback keeps firing alongside.
+ */
+interface RendererPointHandlers {
+  onPointClick?: (e: ChartPointEvent) => void;
+  onPointContextMenu?: (e: ChartPointEvent) => void;
+}
+
+const ChartRenderer = lazy(() => import('./ChartRenderer')) as ComponentType<
+  ChartRendererProps & RendererPointHandlers
+>;
 
 export interface ChartTileProps {
   spec: ChartSpec;
@@ -23,6 +37,10 @@ export interface ChartTileProps {
   debounceMs?: number;
   /** Cross-filter click pass-through (see ChartRendererProps.onDatumClick). */
   onDatumClick?: (info: ChartDatumClickInfo) => void;
+  /** Point-level click pass-through (drill-down; fires alongside onDatumClick). */
+  onPointClick?: (e: ChartPointEvent) => void;
+  /** Point-level right-click pass-through (drillthrough/export menu). */
+  onPointContextMenu?: (e: ChartPointEvent) => void;
   /** Set while this tile is the active cross-filter SOURCE (dims non-matches). */
   activeCategory?: { label: string } | null;
 }
@@ -44,6 +62,8 @@ export function ChartTile({
   filters = EMPTY_FILTERS,
   debounceMs = 0,
   onDatumClick,
+  onPointClick,
+  onPointContextMenu,
   activeCategory = null,
 }: ChartTileProps) {
   const runtime = useRuntime();
@@ -109,6 +129,8 @@ export function ChartTile({
           spec={spec}
           result={result}
           onDatumClick={onDatumClick}
+          onPointClick={onPointClick}
+          onPointContextMenu={onPointContextMenu}
           activeCategory={activeCategory}
         />
       </Suspense>

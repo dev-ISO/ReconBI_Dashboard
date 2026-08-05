@@ -1,7 +1,15 @@
 // GUI-side chart configuration. Strictly serializable; fetched data NEVER
 // lives inside a spec. The query portion maps 1:1 onto the wire ChartQuerySpec
 // via toWireSpec.
-import type { ChartQuerySpec, DimensionRef, FilterClause, MeasureRef, SortSpec } from './query';
+import type {
+  CellValue,
+  ChartQuerySpec,
+  DimensionRef,
+  FilterClause,
+  FilterValue,
+  MeasureRef,
+  SortSpec,
+} from './query';
 
 export type ChartType =
   | 'column'
@@ -89,6 +97,94 @@ export interface TooltipStyle {
   showPercent?: boolean;
 }
 
+/** Horizontal/vertical guide drawn over cartesian charts. */
+export interface ReferenceLineSpec {
+  id: string;
+  /** 'constant' uses `value`; the rest are computed from the plotted series. */
+  kind: 'constant' | 'average' | 'median' | 'min' | 'max';
+  value?: number;
+  /** Series display-name key computed kinds read (default: first measure). */
+  measureKey?: string;
+  label?: string;
+  color?: string;
+  dash?: 'solid' | 'dashed' | 'dotted';
+  width?: number;
+  showLabel?: boolean;
+}
+
+/** Fitted overlay computed client-side from the plotted points. */
+export interface TrendlineSpec {
+  id: string;
+  kind: 'linear' | 'movingAverage';
+  /** Bucket window for movingAverage (default 3). */
+  window?: number;
+  /** Series display-name key (default: every visible series). */
+  seriesKey?: string;
+  color?: string;
+  dash?: 'solid' | 'dashed' | 'dotted';
+  width?: number;
+}
+
+export type ConditionalOp = 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'between';
+
+export interface ConditionalRule {
+  op: ConditionalOp;
+  value: number;
+  /** Upper bound for 'between'. */
+  value2?: number;
+  color: string;
+}
+
+/** Value-driven styling; rules evaluate in order, first match wins. */
+export interface ConditionalFormatSpec {
+  id: string;
+  /** Series display-name key the rules evaluate. */
+  measureKey: string;
+  /**
+   * cellBackground/cellText: table cells. dataBar: proportional bar behind the
+   * table cell. barFill: recolors single-series column/bar categories.
+   * kpi: colors the KPI value text.
+   */
+  style: 'cellBackground' | 'cellText' | 'dataBar' | 'barFill' | 'kpi';
+  rules: ConditionalRule[];
+  /** Bar color for 'dataBar' (rules may still recolor matching cells). */
+  dataBarColor?: string;
+}
+
+/** Small-multiples grid options (the split dimension lives on ChartQuery). */
+export interface SmallMultiplesFormat {
+  /** Panels per row; 'auto' fits to tile aspect (default). */
+  columns?: number | 'auto';
+  /** Cap on rendered panels, extra values dropped with a note (default 12). */
+  maxPanels?: number;
+  /** One shared y-domain across panels (default true). */
+  sharedY?: boolean;
+  showPanelTitles?: boolean;
+}
+
+/**
+ * Transient per-tile drill position — NEVER persisted in the layout doc.
+ * level 0 = the chart's own axis; path holds the clicked values that led here.
+ */
+export interface DrillState {
+  level: number;
+  path: { value: FilterValue; label: string }[];
+}
+
+/** Payload for point-level click / context-menu callbacks from the renderer. */
+export interface ChartPointEvent {
+  axisValue: CellValue;
+  axisLabel: string;
+  legendValue?: CellValue;
+  legendLabel?: string;
+  smallMultipleValue?: CellValue;
+  /** Series display-name key and value of the struck point, when known. */
+  measureKey?: string;
+  value?: number | null;
+  clientX: number;
+  clientY: number;
+}
+
 export interface ChartFormat {
   /** Predefined palette; per-series colorOverrides still win. */
   theme?: ChartThemeName;
@@ -105,6 +201,14 @@ export interface ChartFormat {
   legendInteractive?: boolean;
   /** Per-tile live refresh in seconds (overrides dashboard refresh; null = off). */
   refreshSeconds?: number | null;
+  /** Guide lines drawn over cartesian charts (constant/average/median/min/max). */
+  referenceLines?: ReferenceLineSpec[];
+  /** Linear / moving-average overlays (line, area, column, scatter). */
+  trendlines?: TrendlineSpec[];
+  /** Value-driven cell/bar/KPI styling rules. */
+  conditionalFormats?: ConditionalFormatSpec[];
+  /** Grid options when query.smallMultiples is set. */
+  smallMultiples?: SmallMultiplesFormat;
   /**
    * Per-series hex overrides keyed by series name; default palette otherwise.
    * When colorByCategory is active (single-series column/bar) the keys are
@@ -146,8 +250,16 @@ export interface ChartFormat {
 export interface ChartQuery {
   /** Category axis (or rows for table). */
   axis?: DimensionRef | null;
+  /**
+   * Drill hierarchy BELOW the axis (axis is level 0). Runtime drill position
+   * is transient DrillState; the tile derives the effective axis + path
+   * filters before building the wire spec.
+   */
+  drillLevels?: DimensionRef[];
   /** Series split (legend). */
   legend?: DimensionRef | null;
+  /** Panel-per-value split (column/bar/line/area); rendered as a grid. */
+  smallMultiples?: DimensionRef | null;
   measures: MeasureRef[];
   filters: FilterClause[];
   sort?: SortSpec[];
@@ -176,9 +288,11 @@ export const toWireSpec = (
   modelId: number,
   extraFilters: FilterClause[] = [],
 ): ChartQuerySpec => {
+  // Order matters downstream: [axis, legend?, smallMultiples?].
   const dimensions: DimensionRef[] = [];
   if (chart.query.axis) dimensions.push(chart.query.axis);
   if (chart.query.legend) dimensions.push(chart.query.legend);
+  if (chart.query.smallMultiples) dimensions.push(chart.query.smallMultiples);
 
   return {
     modelId,

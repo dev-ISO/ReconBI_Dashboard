@@ -221,19 +221,24 @@ export function TileFrame({
         </div>
       )}
 
-      {hideHeader && editable && (
+      {hideHeader && (editable || headerExtra) && (
         <>
           {/* Slim hover drag strip: always in the DOM (react-grid-layout binds
               by class), revealed on tile hover. Sits above the body so grabbing
               the top edge always moves the tile. */}
-          <div
-            className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-lg border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
-            title={`Drag to move ${title}`}
-          >
-            <GripHorizontal size={12} className="text-rcd-muted" />
-          </div>
-          {/* Floating kebab, above the drag strip so it stays clickable. */}
-          <div className="absolute right-1 top-1 z-20 rounded-md bg-rcd-surface opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+          {editable && (
+            <div
+              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-lg border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
+              title={`Drag to move ${title}`}
+            >
+              <GripHorizontal size={12} className="text-rcd-muted" />
+            </div>
+          )}
+          {/* Floating header extras + kebab, above the drag strip so they stay
+              clickable. Frameless tiles keep their header-area controls (e.g.
+              drill buttons) in this same hover strip in BOTH modes. */}
+          <div className="absolute right-1 top-1 z-20 flex items-center gap-0.5 rounded-md bg-rcd-surface opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+            {headerExtra}
             {kebab}
           </div>
         </>

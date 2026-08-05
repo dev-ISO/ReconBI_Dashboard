@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { Copy, Paintbrush, Pencil, Trash2, type LucideIcon } from 'lucide-react';
+import { Copy, FileDown, Paintbrush, Pencil, Trash2, type LucideIcon } from 'lucide-react';
 import { ConfirmDialog } from '../primitives';
 
 export interface ChartContextMenuProps {
@@ -12,6 +12,8 @@ export interface ChartContextMenuProps {
   /** Opens the builder dialog on the Fields tab. */
   onEditFields: () => void;
   onDuplicate: () => void;
+  /** CSV export of the tile's CURRENT effective query; items hidden when absent. */
+  onExport?: (mode: 'summarized' | 'underlying') => void;
   /** Called after the user confirms the destructive delete. */
   onDelete: () => void;
   onClose: () => void;
@@ -30,6 +32,7 @@ export function ChartContextMenu({
   onFormat,
   onEditFields,
   onDuplicate,
+  onExport,
   onDelete,
   onClose,
 }: ChartContextMenuProps) {
@@ -101,6 +104,30 @@ export function ChartContextMenu({
             onClose();
           }}
         />
+        {onExport && (
+          <>
+            <div className="my-1 border-t border-rcd-border" />
+            <p className="px-3 pb-0.5 pt-1 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+              Export data
+            </p>
+            <MenuItem
+              icon={FileDown}
+              label="Summarized (CSV)"
+              onClick={() => {
+                onExport('summarized');
+                onClose();
+              }}
+            />
+            <MenuItem
+              icon={FileDown}
+              label="Underlying rows (CSV)"
+              onClick={() => {
+                onExport('underlying');
+                onClose();
+              }}
+            />
+          </>
+        )}
         <div className="my-1 border-t border-rcd-border" />
         <MenuItem icon={Trash2} label="Delete" danger onClick={() => setConfirmDelete(true)} />
       </div>

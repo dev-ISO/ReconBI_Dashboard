@@ -18,6 +18,12 @@ export interface ChartSeries {
    * recharts dataKey (column NAME in measure mode) and can differ from it.
    */
   styleKey: string;
+  /**
+   * RAW (pre-format) legend cell backing this series in legend-pivot mode, so
+   * point events can carry an exact filterable value. Undefined in measure
+   * mode (the series is a measure, not a legend value).
+   */
+  legendRaw?: CellValue;
 }
 
 export interface ShapedChartData {
@@ -25,6 +31,8 @@ export interface ShapedChartData {
   data: Record<string, CellValue>[];
   series: ChartSeries[];
   axisKey: string;
+  /** True when series came from a legend dimension (vs one per measure). */
+  hasLegend: boolean;
 }
 
 const AXIS_KEY = '__axis';
@@ -88,7 +96,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
       return item;
     });
 
-    return { data, series, axisKey: AXIS_KEY };
+    return { data, series, axisKey: AXIS_KEY, hasLegend: false };
   }
 
   // Legend pivot: axis x legend -> value of the FIRST measure.
@@ -99,11 +107,15 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
 
   const byAxis = new Map<string, Record<string, CellValue>>();
   const legendValues: string[] = [];
+  const legendRawByLabel = new Map<string, CellValue>();
 
   for (const row of result.rows) {
     const axisLabel = axisColumn ? categoryLabel(row[axisIndex] ?? null, axisColumn, spec) : '';
     const legendLabel = formatCellValue(row[legendIndex] ?? null, legendColumn);
-    if (!legendValues.includes(legendLabel)) legendValues.push(legendLabel);
+    if (!legendValues.includes(legendLabel)) {
+      legendValues.push(legendLabel);
+      legendRawByLabel.set(legendLabel, row[legendIndex] ?? null);
+    }
 
     let item = byAxis.get(axisLabel);
     if (!item) {
@@ -121,9 +133,10 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
     label: displayLabel(value, spec),
     color: seriesColor(i, value, spec.format.colorOverrides, spec.format.theme),
     styleKey: value,
+    legendRaw: legendRawByLabel.get(value) ?? null,
   }));
 
-  return { data: [...byAxis.values()], series, axisKey: AXIS_KEY };
+  return { data: [...byAxis.values()], series, axisKey: AXIS_KEY, hasLegend: true };
 }
 
 export interface PieSlice {
@@ -178,6 +191,8 @@ export interface ScatterSeries {
   label: string;
   color: string;
   points: ScatterPoint[];
+  /** RAW (pre-format) split-dimension cell; null when there is no split. */
+  raw: CellValue;
 }
 
 export interface ShapedScatterData {
@@ -209,7 +224,7 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
   const splitColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
   const splitIndex = splitColumn ? result.columns.indexOf(splitColumn) : -1;
 
-  const bySeries = new Map<string, ScatterPoint[]>();
+  const bySeries = new Map<string, { points: ScatterPoint[]; raw: CellValue }>();
   const droppedKeys = new Set<string>();
 
   for (const row of result.rows) {
@@ -218,26 +233,73 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
     if (x === null || y === null) continue;
 
     const key = splitColumn ? formatCellValue(row[splitIndex] ?? null, splitColumn) : '__all';
-    let points = bySeries.get(key);
-    if (!points) {
+    let bucket = bySeries.get(key);
+    if (!bucket) {
       if (bySeries.size >= SCATTER_SERIES_CAP) {
         droppedKeys.add(key);
         continue;
       }
-      points = [];
-      bySeries.set(key, points);
+      bucket = { points: [], raw: splitColumn ? (row[splitIndex] ?? null) : null };
+      bySeries.set(key, bucket);
     }
-    points.push({ x, y });
+    bucket.points.push({ x, y });
   }
 
-  const series: ScatterSeries[] = [...bySeries.entries()].map(([key, points], i) => ({
+  const series: ScatterSeries[] = [...bySeries.entries()].map(([key, bucket], i) => ({
     key,
     label: displayLabel(splitColumn ? key : 'All points', spec),
     color: seriesColor(i, key, spec.format.colorOverrides, spec.format.theme),
-    points,
+    points: bucket.points,
+    raw: bucket.raw,
   }));
 
   return { series, xColumn, yColumn, droppedSeries: droppedKeys.size };
+}
+
+export interface SmallMultiplePanel {
+  /** RAW small-multiples dimension cell (panel identity for events/filters). */
+  value: CellValue;
+  /** Formatted panel caption. */
+  title: string;
+  /** The wire result minus the SM column, rows filtered to this panel. */
+  result: QueryResult;
+}
+
+/**
+ * Partitions a result on the small-multiples dimension. Per the wire contract
+ * dimensions arrive ordered [axis, legend?, smallMultiples?], so the SM column
+ * is the dimension column at ordinal (axis?1:0)+(legend?1:0). Returns null
+ * when the spec has no SM dimension or the result doesn't carry it (e.g. a
+ * stale cache entry) — callers then render the normal single chart. Panel
+ * order follows first appearance in row order (the engine's sort).
+ */
+export function splitSmallMultiples(
+  result: QueryResult,
+  spec: ChartSpec,
+): SmallMultiplePanel[] | null {
+  if (!spec.query.smallMultiples) return null;
+  const dimensionColumns = result.columns.filter((c) => c.role === 'dimension');
+  const smOrdinal = (spec.query.axis ? 1 : 0) + (spec.query.legend ? 1 : 0);
+  const smColumn = dimensionColumns[smOrdinal];
+  if (!smColumn) return null;
+  const smIndex = result.columns.indexOf(smColumn);
+
+  const strippedColumns = result.columns.filter((_, i) => i !== smIndex);
+  const panels = new Map<string, SmallMultiplePanel>();
+  for (const row of result.rows) {
+    const title = formatCellValue(row[smIndex] ?? null, smColumn);
+    let panel = panels.get(title);
+    if (!panel) {
+      panel = {
+        value: row[smIndex] ?? null,
+        title,
+        result: { columns: strippedColumns, rows: [], meta: result.meta },
+      };
+      panels.set(title, panel);
+    }
+    panel.result.rows.push(row.filter((_, i) => i !== smIndex));
+  }
+  return [...panels.values()];
 }
 
 const toNumber = (value: CellValue): number | null => {

@@ -129,6 +129,8 @@ export function PrintSheets({
       );
     }
     if (!isChartTile(tile)) return null;
+    // Print renders the BASE chart spec: transient per-tile drill state lives
+    // in the on-screen DashboardChartTile and is deliberately ignored here.
     return (
       <PrintTileBox title={tile.chart.title}>
         {modelId === null ? (

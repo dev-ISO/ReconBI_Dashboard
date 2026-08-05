@@ -141,7 +141,10 @@ public sealed class FixedSchemaIntrospector(DatabaseSchema schema) : ISchemaIntr
     public Task<DatabaseSchema> IntrospectAsync(CancellationToken cancellationToken) => Task.FromResult(schema);
 }
 
-/// <summary>Returns canned rows and captures the last compiled query for assertions.</summary>
+/// <summary>
+/// Returns canned rows (settable per test; honors MaxRows like the real
+/// executor, reporting truncation) and captures the last compiled query.
+/// </summary>
 public sealed class RecordingQueryExecutor : IQueryExecutor
 {
     public static readonly IReadOnlyList<object?[]> CannedRows =
@@ -158,13 +161,18 @@ public sealed class RecordingQueryExecutor : IQueryExecutor
 
     public ExecutionOptions? LastOptions { get; private set; }
 
+    /// <summary>Rows the next execution returns. Reset to <see cref="CannedRows"/> after use.</summary>
+    public IReadOnlyList<object?[]> Rows { get; set; } = CannedRows;
+
     public Task<ExecutedQuery> ExecuteAsync(
         CompiledQuery query, ExecutionOptions options, CancellationToken cancellationToken)
     {
         LastQuery = query;
         LastOptions = options;
         Interlocked.Increment(ref _executionCount);
-        return Task.FromResult(new ExecutedQuery(CannedRows, Truncated: false, ElapsedMs: 3));
+        var truncated = Rows.Count > options.MaxRows;
+        var rows = truncated ? Rows.Take(options.MaxRows).ToArray() : Rows;
+        return Task.FromResult(new ExecutedQuery(rows, truncated, ElapsedMs: 3));
     }
 }
 

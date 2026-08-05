@@ -6,6 +6,13 @@ export interface RcdRequestInit {
   method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
+  /**
+   * Resolve with the RAW 2xx Response (T = Response) instead of parsed JSON —
+   * used for non-JSON payloads (CSV export downloads). Error handling is
+   * unchanged: non-2xx still throws RcdApiError. Host-adapted fetchers that
+   * pre-date this flag simply need to return the Response untouched when set.
+   */
+  raw?: boolean;
 }
 
 export type RcdFetcher = <T>(path: string, init?: RcdRequestInit) => Promise<T>;
@@ -58,6 +65,7 @@ export const createFetchFetcher =
       throw new RcdApiError(detail, response.status, errorCode, issues);
     }
 
+    if (init?.raw) return response as unknown as T;
     if (response.status === 204) return undefined as T;
     return (await response.json()) as T;
   };

@@ -8,10 +8,13 @@ import {
   type CrossFilter,
   type DashboardDetail,
   type DashboardLayoutDoc,
+  type DashboardBookmark,
   type DashboardPage,
   type DashboardSummary,
   type DashboardTile,
+  type DrillthroughState,
   type FilterCard,
+  type PageDrillthrough,
   type ImageTileSpec,
   type SlicerTileSpec,
   type SlicerValues,
@@ -56,6 +59,18 @@ export interface DashboardStoreState {
   /** Transient click-to-highlight filter; NOT persisted; reset on page switch. */
   crossFilter: CrossFilter | null;
   /**
+   * Transient drillthrough context (set by invoking "Drill through" from a
+   * point menu). NEVER persisted; its filters reach every chart tile on the
+   * TARGET page via filtersForTile. Survives page switches so revisiting the
+   * target page keeps its context until explicitly cleared.
+   */
+  drillthrough: DrillthroughState | null;
+  /**
+   * Bookmark whose applied state is still current — shows a check in the
+   * Bookmarks menu; cleared by any slicer/filter/page change. Runtime only.
+   */
+  lastAppliedBookmarkId: string | null;
+  /**
    * View-mode personal tweaks to filter cards (enable/disable + basic
    * selections), keyed by card id. NEVER persisted — viewers adjust filters
    * without editing the dashboard (Power BI-like). Cleared on open/close and
@@ -83,6 +98,8 @@ const initialState: DashboardStoreState = {
   selectedTileId: null,
   slicerValues: {},
   crossFilter: null,
+  drillthrough: null,
+  lastAppliedBookmarkId: null,
   filterCardOverrides: {},
   saveStatus: 'idle',
   error: null,
@@ -150,6 +167,8 @@ export class DashboardStore {
       selectedTileId: null,
       slicerValues: {},
       crossFilter: null,
+      drillthrough: null,
+      lastAppliedBookmarkId: null,
       filterCardOverrides: {},
       saveStatus: 'idle',
       error: null,
@@ -196,6 +215,9 @@ export class DashboardStore {
       draftBackup: null,
       selectedTileId: null,
       crossFilter: null,
+      // The restore may drop pages/bookmarks these transients reference.
+      drillthrough: null,
+      lastAppliedBookmarkId: null,
       // Pages added during the edit vanish with the restore — fall back to a
       // page that exists in the backup when the active one is among them.
       ...(backup
@@ -363,7 +385,11 @@ export class DashboardStore {
   }
 
   setSlicerValue(slicerId: string, clause: FilterClause | null): void {
-    this.set({ slicerValues: { ...this.state.slicerValues, [slicerId]: clause } });
+    // Any slicer change diverges from the last-applied bookmark's snapshot.
+    this.set({
+      slicerValues: { ...this.state.slicerValues, [slicerId]: clause },
+      lastAppliedBookmarkId: null,
+    });
   }
 
   /* -------------------------------------------------------- text/image tiles */
@@ -495,6 +521,13 @@ export class DashboardStore {
         Object.entries(this.state.slicerValues).filter(([id]) => !removedIds.has(id)),
       ),
       crossFilter: cross && removedIds.has(cross.sourceTileId) ? null : cross,
+      // Drillthrough context tied to the removed page (either end) is orphaned.
+      drillthrough:
+        this.state.drillthrough &&
+        (this.state.drillthrough.sourcePageId === pageId ||
+          this.state.drillthrough.targetPageId === pageId)
+          ? null
+          : this.state.drillthrough,
       selectedTileId: selected !== null && removedIds.has(selected) ? null : selected,
     });
   }
@@ -508,7 +541,30 @@ export class DashboardStore {
     if (pageId === this.state.activePageId) return;
     const current = this.state.current;
     if (!current || !pagesOf(current.layout).some((p) => p.id === pageId)) return;
-    this.set({ activePageId: pageId, crossFilter: null, selectedTileId: null });
+    // Page changes diverge from the last-applied bookmark (it captures pageId).
+    this.set({
+      activePageId: pageId,
+      crossFilter: null,
+      selectedTileId: null,
+      lastAppliedBookmarkId: null,
+    });
+  }
+
+  /** Sets or clears a page's drillthrough target config (persisted with the doc). */
+  setPageDrillthrough(pageId: string, drillthrough: PageDrillthrough | null): void {
+    const current = this.state.current;
+    if (!current) return;
+    const page = pagesOf(current.layout).find((p) => p.id === pageId);
+    if (!page) return;
+    if (stableStringify(page.drillthrough ?? null) === stableStringify(drillthrough)) return;
+    this.mutatePages((pages) =>
+      pages.map((p) => {
+        if (p.id !== pageId) return p;
+        if (drillthrough !== null) return { ...p, drillthrough };
+        const { drillthrough: _removed, ...rest } = p;
+        return rest;
+      }),
+    );
   }
 
   /** Reorders a page one slot left/right (tab drag-free reordering). */
@@ -566,10 +622,15 @@ export class DashboardStore {
         ...(patch.disabled !== undefined ? { disabled: patch.disabled } : {}),
         ...(patch.basicValues !== undefined ? { basicValues: patch.basicValues } : {}),
       };
-      this.set({ filterCardOverrides: { ...this.state.filterCardOverrides, [id]: override } });
+      // Filter tweaks diverge from the last-applied bookmark's snapshot.
+      this.set({
+        filterCardOverrides: { ...this.state.filterCardOverrides, [id]: override },
+        lastAppliedBookmarkId: null,
+      });
       return;
     }
     this.mutateFilterCards((cards) => cards.map((c) => (c.id === id ? { ...c, ...patch, id } : c)));
+    this.set({ lastAppliedBookmarkId: null });
   }
 
   /** Removes a card (and any transient override riding on it). */
@@ -685,9 +746,140 @@ export class DashboardStore {
         (effective.scope === 'visual' && effective.targetTileId === tileId);
       if (applies) clauses.push(...filterCardClauses(effective));
     }
+    // Transient drillthrough context: every chart tile on the TARGET page
+    // receives its clauses (same merge path as slicers/cards — nothing new for
+    // ChartTile to learn about).
+    const drillthrough = this.state.drillthrough;
+    if (drillthrough && page !== undefined && page.id === drillthrough.targetPageId) {
+      clauses.push(...drillthrough.filters);
+    }
     const cross = this.state.crossFilter;
     if (cross && cross.sourceTileId !== tileId) clauses.push(cross.clause);
     return clauses;
+  }
+
+  /* ------------------------------------------------------------ drillthrough */
+
+  /**
+   * Activates a drillthrough: switches to the target page and stores the
+   * transient context (source page for "← Back", eq clauses from the clicked
+   * point). Never persisted.
+   */
+  startDrillthrough(targetPageId: string, filters: FilterClause[], label: string): void {
+    const current = this.state.current;
+    if (!current || !pagesOf(current.layout).some((p) => p.id === targetPageId)) return;
+    const sourcePageId = this.state.activePageId ?? targetPageId;
+    if (targetPageId === sourcePageId) return;
+    this.set({
+      activePageId: targetPageId,
+      drillthrough: { sourcePageId, targetPageId, filters: [...filters], label },
+      crossFilter: null,
+      selectedTileId: null,
+      lastAppliedBookmarkId: null,
+    });
+  }
+
+  /** Clears the drillthrough context, staying on the current page. */
+  clearDrillthrough(): void {
+    if (this.state.drillthrough !== null) this.set({ drillthrough: null });
+  }
+
+  /** "← Back": returns to the page the drillthrough came from and clears it. */
+  returnFromDrillthrough(): void {
+    const drillthrough = this.state.drillthrough;
+    if (!drillthrough) return;
+    const current = this.state.current;
+    const sourceExists =
+      current !== null && pagesOf(current.layout).some((p) => p.id === drillthrough.sourcePageId);
+    this.set({
+      drillthrough: null,
+      ...(sourceExists
+        ? {
+            activePageId: drillthrough.sourcePageId,
+            crossFilter: null,
+            selectedTileId: null,
+          }
+        : {}),
+    });
+  }
+
+  /* -------------------------------------------------------------- bookmarks */
+
+  /** Current page + runtime filter context, cloned for safe doc storage. */
+  private captureBookmarkState(): DashboardBookmark['state'] | null {
+    const pageId = this.state.activePageId;
+    if (pageId === null) return null;
+    return {
+      pageId,
+      slicers: structuredClone(this.state.slicerValues),
+      filterOverrides: structuredClone(this.state.filterCardOverrides),
+    };
+  }
+
+  private mutateBookmarks(mutate: (bookmarks: DashboardBookmark[]) => DashboardBookmark[]): void {
+    this.mutateLayout((layout) => ({ ...layout, bookmarks: mutate(layout.bookmarks ?? []) }));
+  }
+
+  /**
+   * Adds a bookmark capturing the CURRENT view (active page, slicer
+   * selections, view-mode filter-card overrides). Dirties the doc like any
+   * other layout edit — Save persists it. Returns the new id (null when no
+   * dashboard is open).
+   */
+  addBookmark(name: string): string | null {
+    const trimmed = name.trim();
+    const state = this.captureBookmarkState();
+    if (trimmed === '' || state === null) return null;
+    const id = newId();
+    this.mutateBookmarks((bookmarks) => [...bookmarks, { id, name: trimmed, state }]);
+    // A freshly captured bookmark IS the current view.
+    this.set({ lastAppliedBookmarkId: id });
+    return id;
+  }
+
+  /** Restores a bookmark's page + filter context (cross-filter resets). */
+  applyBookmark(id: string): void {
+    const current = this.state.current;
+    if (!current) return;
+    const bookmark = (current.layout.bookmarks ?? []).find((b) => b.id === id);
+    if (!bookmark) return;
+    const pageExists = pagesOf(current.layout).some((p) => p.id === bookmark.state.pageId);
+    this.set({
+      ...(pageExists ? { activePageId: bookmark.state.pageId } : {}),
+      slicerValues: structuredClone(bookmark.state.slicers),
+      filterCardOverrides: structuredClone(bookmark.state.filterOverrides),
+      // A bookmark restores its FULL captured filter context — transient
+      // cross-filter/drillthrough state would pollute it.
+      crossFilter: null,
+      drillthrough: null,
+      selectedTileId: null,
+      lastAppliedBookmarkId: id,
+    });
+  }
+
+  /** Overwrites a bookmark's captured state with the current view. */
+  updateBookmark(id: string): void {
+    const state = this.captureBookmarkState();
+    if (state === null) return;
+    this.mutateBookmarks((bookmarks) =>
+      bookmarks.map((b) => (b.id === id ? { ...b, state } : b)),
+    );
+    this.set({ lastAppliedBookmarkId: id });
+  }
+
+  renameBookmark(id: string, name: string): void {
+    const trimmed = name.trim();
+    if (trimmed === '') return;
+    const bookmark = (this.state.current?.layout.bookmarks ?? []).find((b) => b.id === id);
+    if (!bookmark || bookmark.name === trimmed) return;
+    this.mutateBookmarks((bookmarks) =>
+      bookmarks.map((b) => (b.id === id ? { ...b, name: trimmed } : b)),
+    );
+  }
+
+  deleteBookmark(id: string): void {
+    this.mutateBookmarks((bookmarks) => bookmarks.filter((b) => b.id !== id));
+    if (this.state.lastAppliedBookmarkId === id) this.set({ lastAppliedBookmarkId: null });
   }
 
   /** View-mode auto-refresh interval (persisted with the layout on save). */

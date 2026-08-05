@@ -1,19 +1,26 @@
 import { useRef, useState, type ReactNode } from 'react';
-import { ChevronDown, ChevronRight, X } from 'lucide-react';
+import { ChevronDown, ChevronRight, ChevronUp, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
   CHART_THEMES,
+  newId,
   sanitizeRichHtml,
   type AxisValueFormat,
   type ChartFormat,
   type ChartSpec,
   type ChartThemeName,
   type ChartType,
+  type ConditionalFormatSpec,
+  type ConditionalOp,
+  type ConditionalRule,
   type ContainerStyle,
   type DateFormatPreset,
+  type ReferenceLineSpec,
   type SeriesLineStyle,
+  type SmallMultiplesFormat,
   type TextStyle,
   type TooltipStyle,
+  type TrendlineSpec,
 } from '@recon/dashboards-core';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 
@@ -414,6 +421,461 @@ function AxisFormatEditor({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Analytics / conditional formatting editors
+// ---------------------------------------------------------------------------
+
+const COLOR_INPUT_CLASS =
+  'h-6 w-8 shrink-0 cursor-pointer rounded border border-rcd-border bg-transparent p-0';
+
+/** Grow-to-fit numeric input for rule/constant values (decimals allowed). */
+const FLEX_NUMBER_INPUT_CLASS =
+  'min-w-0 flex-1 rounded-md border border-rcd-border bg-rcd-surface px-1.5 py-1 text-sm text-rcd-text outline-none focus:border-rcd-accent';
+
+const ADD_BUTTON_CLASS =
+  'self-start rounded-md border border-rcd-border bg-rcd-surface px-2 py-1 text-xs font-medium text-rcd-text hover:bg-black/5 dark:hover:bg-white/10';
+
+const parseNumberOr = (raw: string): number | undefined => {
+  if (raw.trim() === '') return undefined;
+  const parsed = Number(raw);
+  return Number.isNaN(parsed) ? undefined : parsed;
+};
+
+const REFERENCE_KIND_OPTIONS: ReadonlyArray<{ value: ReferenceLineSpec['kind']; label: string }> = [
+  { value: 'constant', label: 'Constant' },
+  { value: 'average', label: 'Average' },
+  { value: 'median', label: 'Median' },
+  { value: 'min', label: 'Min' },
+  { value: 'max', label: 'Max' },
+];
+
+const CONDITIONAL_OP_OPTIONS: ReadonlyArray<{ value: ConditionalOp; label: string }> = [
+  { value: 'gt', label: '>' },
+  { value: 'gte', label: '≥' },
+  { value: 'lt', label: '<' },
+  { value: 'lte', label: '≤' },
+  { value: 'eq', label: '=' },
+  { value: 'between', label: 'between' },
+];
+
+const CONDITIONAL_STYLE_LABELS: Record<ConditionalFormatSpec['style'], string> = {
+  cellBackground: 'Cell background',
+  cellText: 'Cell text',
+  dataBar: 'Data bar',
+  barFill: 'Bar fill',
+  kpi: 'KPI value',
+};
+
+/** Styles a conditional format may target for the given chart type (invalid hidden). */
+const conditionalStylesFor = (type: ChartType): ConditionalFormatSpec['style'][] => {
+  if (type === 'table') return ['cellBackground', 'cellText', 'dataBar'];
+  if (type === 'column' || type === 'bar') return ['barFill'];
+  if (type === 'kpi') return ['kpi'];
+  return [];
+};
+
+/** Compact solid/dashed/dotted select; 'solid' clears back to the default. */
+function DashSelect({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: 'solid' | 'dashed' | 'dotted' | undefined;
+  onChange: (next: 'dashed' | 'dotted' | undefined) => void;
+}) {
+  return (
+    <RcdSelect
+      aria-label={label}
+      className="w-20 shrink-0"
+      value={value ?? 'solid'}
+      onChange={(event) =>
+        onChange(
+          event.target.value === 'solid' ? undefined : (event.target.value as 'dashed' | 'dotted'),
+        )
+      }
+    >
+      <option value="solid">Solid</option>
+      <option value="dashed">Dashed</option>
+      <option value="dotted">Dotted</option>
+    </RcdSelect>
+  );
+}
+
+/** Clamped 1-4 stroke-width input shared by the analytics rows. */
+function StrokeWidthInput({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: number | undefined;
+  onChange: (next: number | undefined) => void;
+}) {
+  return (
+    <input
+      type="number"
+      min={1}
+      max={4}
+      aria-label={label}
+      title="Line width (px)"
+      placeholder="1"
+      className={NUMBER_INPUT_CLASS}
+      value={value ?? ''}
+      onChange={(event) => {
+        const parsed = parseNumberOr(event.target.value);
+        onChange(parsed === undefined ? undefined : Math.min(4, Math.max(1, Math.trunc(parsed))));
+      }}
+    />
+  );
+}
+
+function ReferenceLineRow({
+  line,
+  seriesKeys,
+  onChange,
+  onRemove,
+}: {
+  line: ReferenceLineSpec;
+  seriesKeys: string[];
+  onChange: (partial: Partial<ReferenceLineSpec>) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+      <div className="flex items-center gap-1.5">
+        <RcdSelect
+          aria-label="Reference line kind"
+          className="w-24 shrink-0"
+          value={line.kind}
+          onChange={(event) =>
+            onChange({ kind: event.target.value as ReferenceLineSpec['kind'] })
+          }
+        >
+          {REFERENCE_KIND_OPTIONS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </RcdSelect>
+        {line.kind === 'constant' ? (
+          <input
+            type="number"
+            step="any"
+            aria-label="Reference line value"
+            placeholder="Value"
+            className={FLEX_NUMBER_INPUT_CLASS}
+            value={line.value ?? ''}
+            onChange={(event) => onChange({ value: parseNumberOr(event.target.value) })}
+          />
+        ) : (
+          <RcdSelect
+            aria-label="Reference line measure"
+            className="min-w-0 flex-1"
+            value={line.measureKey ?? ''}
+            onChange={(event) => onChange({ measureKey: event.target.value || undefined })}
+          >
+            <option value="">First measure</option>
+            {seriesKeys.map((key) => (
+              <option key={key} value={key}>
+                {key}
+              </option>
+            ))}
+          </RcdSelect>
+        )}
+        <button
+          type="button"
+          aria-label="Delete reference line"
+          className={RESET_BUTTON_CLASS}
+          onClick={onRemove}
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <RcdInput
+          className="min-w-0 flex-1"
+          placeholder="Label"
+          aria-label="Reference line label"
+          value={line.label ?? ''}
+          onChange={(event) => onChange({ label: event.target.value || undefined })}
+        />
+        <input
+          type="color"
+          aria-label="Reference line color"
+          className={COLOR_INPUT_CLASS}
+          value={line.color ?? DEFAULT_SWATCH}
+          onChange={(event) => onChange({ color: event.target.value })}
+        />
+        <DashSelect
+          label="Reference line style"
+          value={line.dash}
+          onChange={(dash) => onChange({ dash })}
+        />
+        <StrokeWidthInput
+          label="Reference line width"
+          value={line.width}
+          onChange={(width) => onChange({ width })}
+        />
+      </div>
+      <CheckboxRow
+        label="Show label"
+        checked={line.showLabel ?? true}
+        onChange={(checked) => onChange({ showLabel: checked })}
+      />
+    </div>
+  );
+}
+
+function TrendlineRow({
+  line,
+  seriesKeys,
+  onChange,
+  onRemove,
+}: {
+  line: TrendlineSpec;
+  seriesKeys: string[];
+  onChange: (partial: Partial<TrendlineSpec>) => void;
+  onRemove: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+      <div className="flex items-center gap-1.5">
+        <RcdSelect
+          aria-label="Trendline kind"
+          className="w-fit shrink-0"
+          value={line.kind}
+          onChange={(event) => onChange({ kind: event.target.value as TrendlineSpec['kind'] })}
+        >
+          <option value="linear">Linear</option>
+          <option value="movingAverage">Moving average</option>
+        </RcdSelect>
+        {line.kind === 'movingAverage' && (
+          <input
+            type="number"
+            min={2}
+            max={52}
+            aria-label="Moving average window"
+            title="Window (buckets)"
+            placeholder="3"
+            className={NUMBER_INPUT_CLASS}
+            value={line.window ?? ''}
+            onChange={(event) => {
+              const parsed = parseNumberOr(event.target.value);
+              onChange({
+                window:
+                  parsed === undefined ? undefined : Math.min(52, Math.max(2, Math.trunc(parsed))),
+              });
+            }}
+          />
+        )}
+        <span className="min-w-0 flex-1" />
+        <button
+          type="button"
+          aria-label="Delete trendline"
+          className={RESET_BUTTON_CLASS}
+          onClick={onRemove}
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+      <div className="flex items-center gap-1.5">
+        <RcdSelect
+          aria-label="Trendline series"
+          className="min-w-0 flex-1"
+          value={line.seriesKey ?? ''}
+          onChange={(event) => onChange({ seriesKey: event.target.value || undefined })}
+        >
+          <option value="">All series</option>
+          {seriesKeys.map((key) => (
+            <option key={key} value={key}>
+              {key}
+            </option>
+          ))}
+        </RcdSelect>
+        <input
+          type="color"
+          aria-label="Trendline color"
+          className={COLOR_INPUT_CLASS}
+          value={line.color ?? DEFAULT_SWATCH}
+          onChange={(event) => onChange({ color: event.target.value })}
+        />
+        <DashSelect label="Trendline style" value={line.dash} onChange={(dash) => onChange({ dash })} />
+        <StrokeWidthInput
+          label="Trendline width"
+          value={line.width}
+          onChange={(width) => onChange({ width })}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ConditionalFormatCard({
+  item,
+  styleOptions,
+  seriesKeys,
+  onChange,
+  onRemove,
+}: {
+  item: ConditionalFormatSpec;
+  styleOptions: ConditionalFormatSpec['style'][];
+  seriesKeys: string[];
+  onChange: (partial: Partial<ConditionalFormatSpec>) => void;
+  onRemove: () => void;
+}) {
+  const measureOptions =
+    item.measureKey && !seriesKeys.includes(item.measureKey)
+      ? [item.measureKey, ...seriesKeys]
+      : seriesKeys;
+  const styles = styleOptions.includes(item.style) ? styleOptions : [item.style, ...styleOptions];
+
+  const setRule = (index: number, partial: Partial<ConditionalRule>) =>
+    onChange({
+      rules: item.rules.map((rule, i) => (i === index ? { ...rule, ...partial } : rule)),
+    });
+
+  const removeRule = (index: number) =>
+    onChange({ rules: item.rules.filter((_, i) => i !== index) });
+
+  const moveRule = (index: number, direction: -1 | 1) => {
+    const target = index + direction;
+    if (target < 0 || target >= item.rules.length) return;
+    const next = [...item.rules];
+    const [moved] = next.splice(index, 1);
+    if (!moved) return;
+    next.splice(target, 0, moved);
+    onChange({ rules: next });
+  };
+
+  const addRule = () =>
+    onChange({ rules: [...item.rules, { op: 'gt', value: 0, color: DEFAULT_SWATCH }] });
+
+  return (
+    <div className="flex flex-col gap-1.5 rounded-md border border-rcd-border p-1.5">
+      <div className="flex items-center gap-1.5">
+        <RcdSelect
+          aria-label="Conditional format measure"
+          className="min-w-0 flex-1"
+          value={item.measureKey}
+          onChange={(event) => onChange({ measureKey: event.target.value })}
+        >
+          {item.measureKey === '' && <option value="">Select measure…</option>}
+          {measureOptions.map((key) => (
+            <option key={key} value={key}>
+              {key}
+            </option>
+          ))}
+        </RcdSelect>
+        <RcdSelect
+          aria-label="Conditional format style"
+          className="w-fit shrink-0"
+          value={item.style}
+          onChange={(event) =>
+            onChange({ style: event.target.value as ConditionalFormatSpec['style'] })
+          }
+        >
+          {styles.map((style) => (
+            <option key={style} value={style}>
+              {CONDITIONAL_STYLE_LABELS[style]}
+            </option>
+          ))}
+        </RcdSelect>
+        <button
+          type="button"
+          aria-label="Delete conditional format"
+          className={RESET_BUTTON_CLASS}
+          onClick={onRemove}
+        >
+          <Trash2 size={12} />
+        </button>
+      </div>
+      {item.style === 'dataBar' && (
+        <ColorRow
+          label="Data bar color"
+          value={item.dataBarColor}
+          fallback={DEFAULT_SWATCH}
+          onChange={(next) => onChange({ dataBarColor: next })}
+        />
+      )}
+      <h4 className="text-xs font-medium text-rcd-muted">Rules</h4>
+      {item.rules.map((rule, index) => (
+        <div key={index} className="flex items-center gap-1.5">
+          <RcdSelect
+            aria-label={`Rule ${index + 1} operator`}
+            className="w-fit shrink-0"
+            value={rule.op}
+            onChange={(event) => setRule(index, { op: event.target.value as ConditionalOp })}
+          >
+            {CONDITIONAL_OP_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </RcdSelect>
+          <input
+            type="number"
+            step="any"
+            aria-label={`Rule ${index + 1} value`}
+            placeholder="Value"
+            className={FLEX_NUMBER_INPUT_CLASS}
+            value={rule.value}
+            onChange={(event) => setRule(index, { value: parseNumberOr(event.target.value) ?? 0 })}
+          />
+          {rule.op === 'between' && (
+            <input
+              type="number"
+              step="any"
+              aria-label={`Rule ${index + 1} upper value`}
+              placeholder="and"
+              className={FLEX_NUMBER_INPUT_CLASS}
+              value={rule.value2 ?? ''}
+              onChange={(event) => setRule(index, { value2: parseNumberOr(event.target.value) })}
+            />
+          )}
+          <input
+            type="color"
+            aria-label={`Rule ${index + 1} color`}
+            className={COLOR_INPUT_CLASS}
+            value={rule.color}
+            onChange={(event) => setRule(index, { color: event.target.value })}
+          />
+          <button
+            type="button"
+            aria-label={`Move rule ${index + 1} up`}
+            disabled={index === 0}
+            className={`${RESET_BUTTON_CLASS} disabled:opacity-30`}
+            onClick={() => moveRule(index, -1)}
+          >
+            <ChevronUp size={12} />
+          </button>
+          <button
+            type="button"
+            aria-label={`Move rule ${index + 1} down`}
+            disabled={index === item.rules.length - 1}
+            className={`${RESET_BUTTON_CLASS} disabled:opacity-30`}
+            onClick={() => moveRule(index, 1)}
+          >
+            <ChevronDown size={12} />
+          </button>
+          <button
+            type="button"
+            aria-label={`Delete rule ${index + 1}`}
+            className={RESET_BUTTON_CLASS}
+            onClick={() => removeRule(index)}
+          >
+            <Trash2 size={12} />
+          </button>
+        </div>
+      ))}
+      <button type="button" className={ADD_BUTTON_CLASS} onClick={addRule}>
+        + Add rule
+      </button>
+      <p className="text-xs text-rcd-muted">Rules run top-to-bottom; the first match wins.</p>
+    </div>
+  );
+}
+
 /**
  * Minimal self-contained rich-text editor for the tile's inner title:
  * contentEditable plus a B/I/U/size/color toolbar driven by the legacy
@@ -649,6 +1111,72 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const valueAxisFormat = horizontal ? format.xAxisFormat : format.yAxisFormat;
   const setValueAxisFormat = (next: AxisValueFormat | undefined) =>
     patch(horizontal ? { xAxisFormat: next } : { yAxisFormat: next });
+
+  // --- Analytics (reference lines + trendlines) ---
+  const setReferenceLine = (id: string, partial: Partial<ReferenceLineSpec>) =>
+    patch({
+      referenceLines: format.referenceLines?.map((line) =>
+        line.id === id ? { ...line, ...partial } : line,
+      ),
+    });
+  const removeReferenceLine = (id: string) => {
+    const next = (format.referenceLines ?? []).filter((line) => line.id !== id);
+    patch({ referenceLines: next.length > 0 ? next : undefined });
+  };
+  const addReferenceLine = () =>
+    patch({
+      referenceLines: [...(format.referenceLines ?? []), { id: newId(), kind: 'average' as const }],
+    });
+
+  const setTrendline = (id: string, partial: Partial<TrendlineSpec>) =>
+    patch({
+      trendlines: format.trendlines?.map((line) =>
+        line.id === id ? { ...line, ...partial } : line,
+      ),
+    });
+  const removeTrendline = (id: string) => {
+    const next = (format.trendlines ?? []).filter((line) => line.id !== id);
+    patch({ trendlines: next.length > 0 ? next : undefined });
+  };
+  const addTrendline = () =>
+    patch({ trendlines: [...(format.trendlines ?? []), { id: newId(), kind: 'linear' as const }] });
+
+  // --- Conditional formatting ---
+  const conditionalStyles = conditionalStylesFor(spec.type);
+  const setConditionalFormat = (id: string, partial: Partial<ConditionalFormatSpec>) =>
+    patch({
+      conditionalFormats: format.conditionalFormats?.map((item) =>
+        item.id === id ? { ...item, ...partial } : item,
+      ),
+    });
+  const removeConditionalFormat = (id: string) => {
+    const next = (format.conditionalFormats ?? []).filter((item) => item.id !== id);
+    patch({ conditionalFormats: next.length > 0 ? next : undefined });
+  };
+  const addConditionalFormat = () =>
+    patch({
+      conditionalFormats: [
+        ...(format.conditionalFormats ?? []),
+        {
+          id: newId(),
+          measureKey: seriesKeys[0] ?? '',
+          style: conditionalStyles[0] ?? 'cellBackground',
+          rules: [{ op: 'gt' as const, value: 0, color: DEFAULT_SWATCH }],
+        },
+      ],
+    });
+
+  // --- Small multiples (grid options; the split dimension lives on the query) ---
+  const hasSmallMultiples = spec.query.smallMultiples != null;
+  const setSmallMultiples = (partial: Partial<SmallMultiplesFormat>) => {
+    const merged = { ...format.smallMultiples, ...partial };
+    const next: SmallMultiplesFormat = {};
+    if (merged.columns !== undefined && merged.columns !== 'auto') next.columns = merged.columns;
+    if (merged.maxPanels !== undefined) next.maxPanels = merged.maxPanels;
+    if (merged.sharedY === false) next.sharedY = false;
+    if (merged.showPanelTitles === false) next.showPanelTitles = false;
+    patch({ smallMultiples: Object.keys(next).length > 0 ? next : undefined });
+  };
 
   return (
     <div className="flex flex-col gap-2">
@@ -1049,6 +1577,130 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             onChange={(event) => patch({ valueFormat: event.target.value || undefined })}
           />
         </label>
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Analytics" {...sectionProps('analytics')}>
+        {!hasAxes ? (
+          <p className="text-xs text-rcd-muted">
+            Reference lines and trendlines apply to cartesian charts only.
+          </p>
+        ) : (
+          <>
+            <h4 className="text-xs font-medium text-rcd-muted">Reference lines</h4>
+            {(format.referenceLines ?? []).map((line) => (
+              <ReferenceLineRow
+                key={line.id}
+                line={line}
+                seriesKeys={seriesKeys}
+                onChange={(partial) => setReferenceLine(line.id, partial)}
+                onRemove={() => removeReferenceLine(line.id)}
+              />
+            ))}
+            <button type="button" className={ADD_BUTTON_CLASS} onClick={addReferenceLine}>
+              + Add reference line
+            </button>
+            <h4 className="text-xs font-medium text-rcd-muted">Trendlines</h4>
+            {(format.trendlines ?? []).map((line) => (
+              <TrendlineRow
+                key={line.id}
+                line={line}
+                seriesKeys={seriesKeys}
+                onChange={(partial) => setTrendline(line.id, partial)}
+                onRemove={() => removeTrendline(line.id)}
+              />
+            ))}
+            <button type="button" className={ADD_BUTTON_CLASS} onClick={addTrendline}>
+              + Add trendline
+            </button>
+          </>
+        )}
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Conditional formatting" {...sectionProps('conditional')}>
+        {conditionalStyles.length === 0 ? (
+          <p className="text-xs text-rcd-muted">
+            Conditional formatting applies to table, column/bar, and KPI charts.
+          </p>
+        ) : (
+          <>
+            {(format.conditionalFormats ?? []).map((item) => (
+              <ConditionalFormatCard
+                key={item.id}
+                item={item}
+                styleOptions={conditionalStyles}
+                seriesKeys={seriesKeys}
+                onChange={(partial) => setConditionalFormat(item.id, partial)}
+                onRemove={() => removeConditionalFormat(item.id)}
+              />
+            ))}
+            <button type="button" className={ADD_BUTTON_CLASS} onClick={addConditionalFormat}>
+              + Add conditional format
+            </button>
+            {(spec.type === 'column' || spec.type === 'bar') && (
+              <p className="text-xs text-rcd-muted">
+                Bar fill recolors categories when a single series renders.
+              </p>
+            )}
+          </>
+        )}
+      </CollapsibleSection>
+
+      <CollapsibleSection title="Small multiples" {...sectionProps('smallMultiples')}>
+        {!hasSmallMultiples ? (
+          <p className="text-xs text-rcd-muted">
+            Add a field to the Small multiples well to configure the panel grid.
+          </p>
+        ) : (
+          <>
+            <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+              Columns
+              <RcdSelect
+                aria-label="Small multiples columns"
+                value={
+                  format.smallMultiples?.columns === undefined
+                    ? 'auto'
+                    : String(format.smallMultiples.columns)
+                }
+                onChange={(event) =>
+                  setSmallMultiples({
+                    columns:
+                      event.target.value === 'auto' ? undefined : Number(event.target.value),
+                  })
+                }
+              >
+                <option value="auto">Auto</option>
+                {[1, 2, 3, 4, 5, 6].map((count) => (
+                  <option key={count} value={String(count)}>
+                    {count}
+                  </option>
+                ))}
+              </RcdSelect>
+            </label>
+            <NumberRow
+              label="Max panels"
+              min={1}
+              max={48}
+              placeholder="12"
+              value={format.smallMultiples?.maxPanels}
+              onChange={(next) => setSmallMultiples({ maxPanels: next })}
+            />
+            <CheckboxRow
+              label="Shared Y axis"
+              checked={format.smallMultiples?.sharedY ?? true}
+              onChange={(checked) => setSmallMultiples({ sharedY: checked ? undefined : false })}
+            />
+            <CheckboxRow
+              label="Panel titles"
+              checked={format.smallMultiples?.showPanelTitles ?? true}
+              onChange={(checked) =>
+                setSmallMultiples({ showPanelTitles: checked ? undefined : false })
+              }
+            />
+            <p className="text-xs text-rcd-muted">
+              Extra panels beyond the cap are dropped with a note on the chart.
+            </p>
+          </>
+        )}
       </CollapsibleSection>
 
       <CollapsibleSection title="Live update" {...sectionProps('refresh')}>
