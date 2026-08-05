@@ -25,7 +25,18 @@
 # small multiples, conditional formats (barFill / dataBar / cellBackground),
 # a drillthrough target page and dashboard bookmarks. Idempotent via
 # deterministic ids: re-runs PUT the same doc onto the same dashboard.
-param([string]$BaseUrl = 'http://localhost:5040', [switch]$Restyle, [switch]$Showcase)
+#
+# -Full: creates FIVE dense, corporate-grade shared dashboards (owner carol),
+# each 3 pages: Executive Overview, Operations Command Center, Cost & Vendor
+# Management, Workforce & Productivity, Asset Reliability. Additively appends
+# a few measures to the two existing models (Open Rate / Closed Orders /
+# Critical Backlog; Pass Count / Pass Rate), creates one new shared model
+# "Workforce" (employees->sites ACTIVE so headcount rolls up correctly), and
+# derives every conditional-format / reference-line threshold from live
+# queries. Idempotent via deterministic md5 ids + name-matched re-PUT; then
+# verifies by GETting each dashboard back and running every chart tile's wire
+# query (params resolved to their default option).
+param([string]$BaseUrl = 'http://localhost:5040', [switch]$Restyle, [switch]$Showcase, [switch]$Full)
 
 $ErrorActionPreference = 'Stop'
 $failures = 0
@@ -899,6 +910,1274 @@ if ($Showcase) {
         exit 1
     }
     Write-Host "`nAll showcase checks passed." -ForegroundColor Green
+    exit 0
+}
+
+# ===========================================================================
+# FULL PHASE (-Full): FIVE dense, corporate-grade shared dashboards (owner
+# carol), each with >= 3 fully-built pages. Requires the plain seed phase to
+# have run (models 'Maintenance Operations' + 'Inspections'). Additive only:
+# appends a few measures to the two existing models, creates one new shared
+# model 'Workforce', and creates/updates ONLY the five -Full dashboards.
+# Idempotent via deterministic md5 ids + name-matched re-PUT.
+# ===========================================================================
+if ($Full) {
+
+    Write-Host "`nFull: fetching models"
+    $maintModel = GetModelByName 'Maintenance Operations'
+    $inspModel = GetModelByName 'Inspections'
+
+    # Deterministic guid from a stable key (idempotent ids across re-runs).
+    function DetId([string]$Key) {
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        try {
+            [guid]::new($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("rcd-full:$Key"))).ToString()
+        } finally { $md5.Dispose() }
+    }
+
+    # ------------------------------------------------- additive model measures
+    # Appends missing-by-name measures to an existing model via PUT (never
+    # removes or rewrites anything already there). Returns the fresh model.
+    function EnsureModelMeasures($Model, [object[]]$Wanted) {
+        $have = @($Model.definition.measures | ForEach-Object { $_.name })
+        $missing = @($Wanted | Where-Object { $have -notcontains $_.name })
+        if ($missing.Count -eq 0) {
+            Write-Host "  SKIP  model '$($Model.name)' already has the -Full measures" -ForegroundColor Yellow
+            return $Model
+        }
+        $definition = $Model.definition | ConvertTo-Json -Depth 24 | ConvertFrom-Json -AsHashtable
+        $definition.measures = @($definition.measures) + $missing
+        $body = @{
+            name = $Model.name; description = $Model.description; dataSourceName = $Model.dataSourceName
+            definition = $definition; isShared = $Model.isShared; expectedUpdatedAtUtc = $Model.updatedAtUtc
+        } | ConvertTo-Json -Depth 24
+        $updated = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rcd/v1/models/$($Model.id)" `
+            -Headers $headers -ContentType 'application/json' -Body $body
+        Write-Host "  UPDATE  model '$($Model.name)': added $(($missing | ForEach-Object { $_.name }) -join ', ')" -ForegroundColor Yellow
+        return $updated
+    }
+
+    $maintModel = EnsureModelMeasures $maintModel @(
+        @{ id = NewId; name = 'Open Rate'; table = 'public.work_orders'; aggregation = 'sum'
+           expression = '1.0 * [Open Orders] / [Work Orders]'; formatHint = 'percent' }
+        @{ id = NewId; name = 'Closed Orders'; table = 'public.work_orders'; aggregation = 'count'
+           filters = @(@{ table = 'public.work_orders'; column = 'status'; operator = 'eq'; values = @('closed') }) }
+        @{ id = NewId; name = 'Critical Backlog'; table = 'public.work_orders'; aggregation = 'count'
+           filters = @(
+               @{ table = 'public.work_orders'; column = 'priority'; operator = 'eq'; values = @('critical') }
+               @{ table = 'public.work_orders'; column = 'status'; operator = 'in'; values = @('open', 'in_progress') }
+           ) }
+    )
+    $inspModel = EnsureModelMeasures $inspModel @(
+        @{ id = NewId; name = 'Pass Count'; table = 'public.inspections'; aggregation = 'count'
+           filters = @(@{ table = 'public.inspections'; column = 'result'; operator = 'eq'; values = @('pass') }) }
+        @{ id = NewId; name = 'Pass Rate'; table = 'public.inspections'; aggregation = 'sum'
+           expression = '1.0 * [Pass Count] / [Inspection Count]'; formatHint = 'percent' }
+    )
+
+    # ------------------------------------------------------- Workforce model
+    # employees.site_id is ACTIVE here (it is inactive in Maintenance
+    # Operations), so headcount and orders roll up to the employee's home
+    # site/region - the semantics a workforce dashboard needs.
+    function EnsureFullModel([string]$Name, [hashtable]$Definition, [string]$Description) {
+        $existing = Invoke-RestMethod -Uri "$BaseUrl/api/rcd/v1/models" -Headers $headers |
+            ForEach-Object { $_ } |
+            Where-Object { $_.name -eq $Name } | Select-Object -First 1
+        if ($existing) {
+            Write-Host "  SKIP  model '$Name' already exists (id $($existing.id))" -ForegroundColor Yellow
+            return Invoke-RestMethod -Uri "$BaseUrl/api/rcd/v1/models/$($existing.id)" -Headers $headers
+        }
+        $body = @{
+            name = $Name; description = $Description; dataSourceName = 'demo'
+            definition = $Definition; isShared = $true
+        } | ConvertTo-Json -Depth 16
+        $model = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/models" `
+            -Headers $headers -ContentType 'application/json' -Body $body -StatusCodeVariable status
+        Assert ($status -eq 201 -and $model.id -gt 0) "model '$Name' created with 201 (id $($model.id))"
+        return $model
+    }
+
+    Write-Host "`nFull: model 'Workforce'"
+    $wfModel = EnsureFullModel 'Workforce' @{
+        version = 1
+        tables = @(
+            @{ schema = 'public'; name = 'sites'; position = @{ x = 40; y = 40 } }
+            @{ schema = 'public'; name = 'employees'; position = @{ x = 320; y = 40 } }
+            @{ schema = 'public'; name = 'work_orders'; position = @{ x = 600; y = 40 } }
+        )
+        relationships = @(
+            @{ id = NewId; fromTable = 'public.employees'; fromColumn = 'site_id'; toTable = 'public.sites'; toColumn = 'id'; cardinality = 'manyToOne'; isActive = $true; source = 'fk' }
+            @{ id = NewId; fromTable = 'public.work_orders'; fromColumn = 'assigned_to'; toTable = 'public.employees'; toColumn = 'id'; cardinality = 'manyToOne'; isActive = $true; source = 'fk' }
+        )
+        measures = @(
+            @{ id = NewId; name = 'Labor Hours'; table = 'public.work_orders'; aggregation = 'sum'; column = 'labor_hours' }
+            @{ id = NewId; name = 'Work Orders'; table = 'public.work_orders'; aggregation = 'count' }
+            @{ id = NewId; name = 'Open Orders'; table = 'public.work_orders'; aggregation = 'count'
+               filters = @(@{ table = 'public.work_orders'; column = 'status'; operator = 'in'; values = @('open', 'in_progress') }) }
+            @{ id = NewId; name = 'Closed Orders'; table = 'public.work_orders'; aggregation = 'count'
+               filters = @(@{ table = 'public.work_orders'; column = 'status'; operator = 'eq'; values = @('closed') }) }
+            @{ id = NewId; name = 'Headcount'; table = 'public.employees'; aggregation = 'countDistinct'; column = 'id' }
+            @{ id = NewId; name = 'Total Cost'; table = 'public.work_orders'; aggregation = 'sum'; column = 'total_cost'; formatHint = 'currency' }
+            @{ id = NewId; name = 'Avg Hours per Order'; table = 'public.work_orders'; aggregation = 'sum'
+               expression = 'SUM(public.work_orders.labor_hours) / COUNT(*)' }
+        )
+    } 'Workload, labor and assignments rolled up to each employee''s home site (employees->sites active).'
+
+    # ----------------------------------------------------------- measure ids
+    $mTotalCost = MeasureId $maintModel 'Total Cost'
+    $mLaborHours = MeasureId $maintModel 'Labor Hours'
+    $mWorkOrders = MeasureId $maintModel 'Work Orders'
+    $mOpenOrders = MeasureId $maintModel 'Open Orders'
+    $mAvgCost = MeasureId $maintModel 'Avg Cost per Order'
+    $mPartsSpend = MeasureId $maintModel 'Parts Spend'
+    $mOpenRate = MeasureId $maintModel 'Open Rate'
+    $mClosedOrders = MeasureId $maintModel 'Closed Orders'
+    $mCriticalBacklog = MeasureId $maintModel 'Critical Backlog'
+    $iInspCount = MeasureId $inspModel 'Inspection Count'
+    $iFailCount = MeasureId $inspModel 'Fail Count'
+    $iPassRate = MeasureId $inspModel 'Pass Rate'
+    $iLaborHours = MeasureId $inspModel 'Total Labor Hours'
+    $wLabor = MeasureId $wfModel 'Labor Hours'
+    $wOrders = MeasureId $wfModel 'Work Orders'
+    $wOpen = MeasureId $wfModel 'Open Orders'
+    $wClosed = MeasureId $wfModel 'Closed Orders'
+    $wHead = MeasureId $wfModel 'Headcount'
+    $wCost = MeasureId $wfModel 'Total Cost'
+    $wAvgHours = MeasureId $wfModel 'Avg Hours per Order'
+
+    # ------------------------------------------------ data-derived thresholds
+    # Every budget line / RAG cutoff / KPI target comes from a live query so
+    # the conditional rules actually split colors on the real data.
+    Write-Host "`nFull: deriving thresholds from live data"
+    function Tercile([double[]]$Sorted, [int]$Which) { $Sorted[[int][math]::Floor($Which * $Sorted.Count / 3)] }
+
+    # /query is rate-limited (token bucket, QueriesPerMinutePerUser). The -Full
+    # verification fires ~115 queries, so wait out 503s instead of failing.
+    function PostQueryBody([string]$Body) {
+        for ($attempt = 1; $attempt -le 36; $attempt++) {
+            try {
+                return Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/query" `
+                    -Headers $headers -ContentType 'application/json' -Body $Body
+            } catch {
+                $code = 0
+                if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                if ($code -eq 503 -and $attempt -lt 36) { Start-Sleep -Seconds 5; continue }
+                throw
+            }
+        }
+    }
+    function RunQueryF([hashtable]$Spec) { PostQueryBody ($Spec | ConvertTo-Json -Depth 12) }
+    function Scalar([int]$ModelId, [hashtable]$Measure) {
+        [double]((RunQueryF @{ modelId = $ModelId; dimensions = @(); measures = @($Measure); filters = @(); sort = @() }).rows[0][0])
+    }
+
+    $siteRows = (RunQueryF @{
+        modelId = $maintModel.id
+        dimensions = @(@{ table = 'public.sites'; column = 'name' })
+        measures = @(@{ measureId = $mTotalCost }, @{ measureId = $mAvgCost })
+        filters = @(); sort = @()
+    }).rows
+    $siteCosts = @($siteRows | ForEach-Object { [double]$_[1] })
+    $siteAvgs = @($siteRows | ForEach-Object { [double]$_[2] } | Sort-Object)
+    $budget = [math]::Round((($siteCosts | Measure-Object -Average).Average) / 1000) * 1000
+    $avgCostHigh = [math]::Round((Tercile $siteAvgs 2))
+
+    $openNow = Scalar $maintModel.id @{ measureId = $mOpenOrders }
+    $rateNow = Scalar $maintModel.id @{ measureId = $mOpenRate }
+    $openTarget = [math]::Round($openNow * 1.2)
+    $rateTarget = [math]::Round($rateNow * 1.15, 3)
+
+    $qtyRows = (RunQueryF @{
+        modelId = $maintModel.id
+        dimensions = @(@{ table = 'public.parts'; column = 'description' })
+        measures = @(@{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Qty Used' })
+        filters = @(); sort = @()
+    }).rows
+    $qtys = @($qtyRows | ForEach-Object { [double]$_[1] } | Sort-Object)
+    $qtyLow = [math]::Round((Tercile $qtys 1))
+    $qtyHigh = [math]::Round((Tercile $qtys 2))
+
+    $wlRows = (RunQueryF @{
+        modelId = $wfModel.id
+        dimensions = @(@{ table = 'public.employees'; column = 'name' })
+        measures = @(@{ measureId = $wOrders }); filters = @(); sort = @()
+    }).rows
+    $wlHigh = [math]::Ceiling(((@($wlRows | ForEach-Object { [double]$_[1] }) | Measure-Object -Average).Average))
+
+    $prRows = (RunQueryF @{
+        modelId = $inspModel.id
+        dimensions = @(@{ table = 'public.technicians'; column = 'name' })
+        measures = @(@{ measureId = $iPassRate }); filters = @(); sort = @()
+    }).rows
+    $prs = @($prRows | ForEach-Object { [double]$_[1] } | Sort-Object)
+    $prLow = [math]::Round((Tercile $prs 1), 3)
+    $prHigh = [math]::Round((Tercile $prs 2), 3)
+    $passRateAll = Scalar $inspModel.id @{ measureId = $iPassRate }
+    $passTarget = [math]::Round($passRateAll * 0.95, 3)
+    $failsAll = Scalar $inspModel.id @{ measureId = $iFailCount }
+    $failTarget = [math]::Round($failsAll * 0.5)
+
+    Write-Host ("  Budget {0}; avg-cost watch {1}; open target {2}; open-rate target {3}" -f $budget, $avgCostHigh, $openTarget, $rateTarget)
+    Write-Host ("  Qty RAG {0}/{1}; workload high {2}; pass-rate RAG {3}/{4}; pass target {5}; fail target {6}" -f $qtyLow, $qtyHigh, $wlHigh, $prLow, $prHigh, $passTarget, $failTarget)
+
+    # ------------------------------------------------------------ tile helpers
+    $red = '#dc2626'; $green = '#16a34a'
+    function ChartTile([string]$Key, [string]$Type, [string]$Title, [hashtable]$Layout, [hashtable]$Query, [hashtable]$Format) {
+        @{
+            id = DetId "tile-$Key"; kind = 'chart'; layout = $Layout
+            chart = @{ id = DetId "chart-$Key"; type = $Type; title = $Title; query = $Query; format = $Format }
+        }
+    }
+    # Frameless accent-bordered KPI card with a rich inner title.
+    function KpiCard([string]$Key, [string]$Title, [string]$Sub, [int]$X, [int]$Y, [string]$Accent, [hashtable]$Query, [hashtable]$Format = @{}) {
+        $fmt = @{} + $Format
+        $fmt.container = @{
+            hideHeader = $true; borderColor = $Accent; borderWidth = 1; borderRadius = 12; shadow = 'sm'
+            innerTitleHtml = ('<p><b>{0}</b> <span style="color:#64748b">{1}</span></p>' -f $Title, $Sub)
+        }
+        ChartTile $Key 'kpi' $Title @{ x = $X; y = $Y; w = 6; h = 4 } $Query $fmt
+    }
+    function TextTile([string]$Key, [hashtable]$Layout, [string]$Html, [string]$Background = $null) {
+        $text = @{ html = $Html; align = 'left' }
+        if ($Background) { $text.background = $Background }
+        @{ id = DetId "tile-$Key"; kind = 'text'; layout = $Layout; text = $text }
+    }
+    function SlicerTile([string]$Key, [hashtable]$Layout, [hashtable]$Slicer) {
+        @{ id = DetId "tile-$Key"; kind = 'slicer'; layout = $Layout; slicer = $Slicer }
+    }
+    # Frameless hero container with a rich inner title.
+    function HeroTitle([string]$Title, [string]$Sub) {
+        @{
+            hideHeader = $true
+            innerTitleHtml = ('<p><b>{0}</b> <span style="color:#64748b">&mdash; {1}</span></p>' -f $Title, $Sub)
+        }
+    }
+
+    # --------------------------------------------------------- shared literals
+    $dRegion = @{ table = 'public.sites'; column = 'region' }
+    $dSite = @{ table = 'public.sites'; column = 'name' }
+    $dPriority = @{ table = 'public.work_orders'; column = 'priority' }
+    $dStatus = @{ table = 'public.work_orders'; column = 'status' }
+    $dMonth = @{ table = 'public.work_orders'; column = 'opened_on'; dateBucket = 'month' }
+    $dYear = @{ table = 'public.work_orders'; column = 'opened_on'; dateBucket = 'year' }
+    $dQuarter = @{ table = 'public.work_orders'; column = 'opened_on'; dateBucket = 'quarter' }
+    $dVendor = @{ table = 'public.vendors'; column = 'name' }
+    $dVendorRegion = @{ table = 'public.vendors'; column = 'region' }
+    $dCategory = @{ table = 'public.parts'; column = 'category' }
+    $dPartDesc = @{ table = 'public.parts'; column = 'description' }
+    $dValveType = @{ table = 'public.valves'; column = 'valve_type' }
+    $dEmployee = @{ table = 'public.employees'; column = 'name' }
+    $dEmpTitle = @{ table = 'public.employees'; column = 'title' }
+    $dIMonth = @{ table = 'public.inspections'; column = 'inspected_on'; dateBucket = 'month' }
+    $dIResult = @{ table = 'public.inspections'; column = 'result' }
+    $dTech = @{ table = 'public.technicians'; column = 'name' }
+    $dInstallYear = @{ table = 'public.valves'; column = 'install_date'; dateBucket = 'year' }
+    $dInstallMonth = @{ table = 'public.valves'; column = 'install_date'; dateBucket = 'month' }
+
+    $priorityLabels = @{ critical = 'Critical'; high = 'High'; medium = 'Medium'; low = 'Low' }
+    $statusLabels = @{ open = 'Open'; in_progress = 'In progress'; closed = 'Closed'; cancelled = 'Cancelled' }
+    $resultLabels = @{ pass = 'Pass'; fail = 'Fail'; adjusted = 'Adjusted' }
+    $thisYear = (Get-Date).Year
+    $lastYear = $thisYear - 1
+
+    # ------------------------------------------------------ create-or-update
+    function EnsureFullDashboard([string]$Name, [int]$ModelId, [hashtable]$Layout, [string]$Description) {
+        $existing = Invoke-RestMethod -Uri "$BaseUrl/api/rcd/v1/dashboards" -Headers $headers |
+            ForEach-Object { $_ } |
+            Where-Object { $_.name -eq $Name } | Select-Object -First 1
+        if ($existing) {
+            $detail = Invoke-RestMethod -Uri "$BaseUrl/api/rcd/v1/dashboards/$($existing.id)" -Headers $headers
+            $saved = PutDashboard $detail $Layout
+            Write-Host "  UPDATE  dashboard '$Name' re-saved (id $($saved.id))" -ForegroundColor Yellow
+            return $saved
+        }
+        $body = @{
+            name = $Name; description = $Description; modelId = $ModelId; isShared = $true; layout = $Layout
+        } | ConvertTo-Json -Depth 24
+        $dash = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/dashboards" `
+            -Headers $headers -ContentType 'application/json' -Body $body -StatusCodeVariable status
+        Assert ($status -eq 201 -and $dash.id -gt 0) "dashboard '$Name' created with 201 (id $($dash.id))"
+        return $dash
+    }
+
+    # =======================================================================
+    # DASHBOARD 1: Executive Overview (Maintenance Operations, ocean #1868ae)
+    # =======================================================================
+    Write-Host "`nFull: Executive Overview"
+    $oc = '#1868ae'
+
+    $d1p1 = @(
+        (KpiCard 'd1-k-ytd' 'Cost YTD' "$thisYear to date" 0 0 $oc @{
+            axis = $dMonth
+            measures = @(@{ measureId = $mTotalCost; calc = @{ kind = 'ytd' } })
+            filters = @()
+            sort = @(@{ target = @{ kind = 'dimension'; index = 0 }; direction = 'desc' }); limit = 1
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost (YTD)' = 'year-to-date spend' } })
+        (KpiCard 'd1-k-orders' 'Work Orders' 'all time' 6 0 $oc @{
+            measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders logged' } })
+        (KpiCard 'd1-k-openrate' 'Open %' 'share still open' 12 0 $oc @{
+            measures = @(@{ measureId = $mOpenRate }); filters = @()
+        } @{ valueFormat = '0.0%'; seriesLabels = @{ 'Open Rate' = 'open + in progress' } })
+        (KpiCard 'd1-k-avg' 'Avg Cost / Order' 'blended' 18 0 $oc @{
+            measures = @(@{ measureId = $mAvgCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Avg Cost per Order' = 'per work order' } })
+        (SlicerTile 'd1-sl-region' @{ x = 0; y = 4; w = 8; h = 4 } @{
+            table = 'public.sites'; column = 'region'; label = 'Region'; variant = 'checklist'; style = @{ compact = $true } })
+        (SlicerTile 'd1-sl-priority' @{ x = 8; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'priority'; label = 'Priority'; variant = 'buttons'; style = @{ compact = $true } })
+        (SlicerTile 'd1-sl-opened' @{ x = 16; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'opened_on'; label = 'Opened'; variant = 'dateRange' })
+        (ChartTile 'd1-hero' 'line' 'Cost Trend & Cumulative Spend' @{ x = 0; y = 8; w = 16; h = 9 } @{
+            axis = $dMonth
+            measures = @(
+                @{ measureId = $mTotalCost }
+                @{ measureId = $mTotalCost; calc = @{ kind = 'runningTotal' } }
+            )
+            filters = @()
+        } @{
+            theme = 'ocean'; dateFormat = 'monthYear'; valueFormat = '$#,0'
+            yAxisFormat = @{ kind = 'compact' }; y2AxisFormat = @{ kind = 'compact' }; y2AxisLabel = 'Cumulative'
+            secondaryAxisKeys = @('Total Cost (running total)')
+            seriesLabels = @{ 'Total Cost' = 'Monthly spend'; 'Total Cost (running total)' = 'Cumulative spend' }
+            lineStyles = @{
+                'Total Cost' = @{ dash = 'solid'; width = 3 }
+                'Total Cost (running total)' = @{ dash = 'dashed'; width = 2 }
+            }
+            referenceLines = @(@{ id = DetId 'd1-ref-avg'; kind = 'average'; measureKey = 'Total Cost'
+                                  label = 'Monthly average'; color = '#f2542d'; dash = 'dashed'; showLabel = $true })
+            trendlines = @(@{ id = DetId 'd1-trend'; kind = 'linear'; seriesKey = 'Total Cost'
+                              color = '#7cd0d8'; dash = 'dotted'; width = 2 })
+            tooltip = @{ accentBorder = $true }
+            container = HeroTitle 'Cost trend' 'monthly spend, cumulative total (right axis), average and linear trend'
+        })
+        (ChartTile 'd1-donut' 'donut' 'Spend by Region' @{ x = 16; y = 8; w = 8; h = 9 } @{
+            legend = $dRegion; measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{
+            theme = 'ocean'; legendPosition = 'bottom'
+            tooltip = @{ showPercent = $true; accentBorder = $true }
+            container = @{ shadow = 'md'; borderRadius = 16 }
+        })
+        (ChartTile 'd1-sites' 'table' 'Top Sites by Spend' @{ x = 0; y = 17; w = 12; h = 9 } @{
+            axis = $dSite
+            measures = @(
+                @{ table = 'public.sites'; column = 'region'; aggregation = 'min'; alias = 'Region' }
+                @{ measureId = $mTotalCost }
+                @{ measureId = $mAvgCost }
+            )
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 1 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            conditionalFormats = @(@{ id = DetId 'd1-cf-databar'; measureKey = 'Total Cost'; style = 'dataBar'
+                                      dataBarColor = '#1868ae'; rules = @() })
+            table = @{ stripes = $true; density = 'normal' }
+        })
+        (ChartTile 'd1-mix' 'stackedColumn' 'Priority Mix by Region' @{ x = 12; y = 17; w = 12; h = 9 } @{
+            axis = $dRegion; legend = $dPriority; measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{
+            theme = 'ocean'; legendPosition = 'bottom'; legendInteractive = $true
+            tooltip = @{ showPercent = $true }; seriesLabels = $priorityLabels
+        })
+    )
+
+    $d1p2 = @(
+        (KpiCard 'd1-k2-cy' "Cost $thisYear" 'year to date' 0 0 $oc @{
+            measures = @(@{ measureId = $mTotalCost })
+            filters = @(@{ table = 'public.work_orders'; column = 'opened_on'; operator = 'gte'; values = @("$thisYear-01-01") })
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = "Jan-today $thisYear" } })
+        (KpiCard 'd1-k2-ly' "Cost $lastYear" 'full year' 6 0 $oc @{
+            measures = @(@{ measureId = $mTotalCost })
+            filters = @(@{ table = 'public.work_orders'; column = 'opened_on'; operator = 'between'; values = @("$lastYear-01-01", "$lastYear-12-31") })
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = "full year $lastYear" } })
+        (KpiCard 'd1-k2-yoy' 'YoY Change' 'latest month vs prior year' 12 0 $oc @{
+            axis = $dMonth
+            measures = @(@{ measureId = $mTotalCost; calc = @{ kind = 'periodChangePct'; offset = 12 } })
+            filters = @()
+            sort = @(@{ target = @{ kind = 'dimension'; index = 0 }; direction = 'desc' }); limit = 1
+        } @{
+            valueFormat = '0.0%'; seriesLabels = @{ 'Total Cost (% change)' = 'cost vs prior year' }
+            conditionalFormats = @(@{ id = DetId 'd1-cf-yoy'; measureKey = 'Total Cost (% change)'; style = 'kpi'
+                                      rules = @(@{ op = 'gt'; value = 0; color = $red }, @{ op = 'lte'; value = 0; color = $green }) })
+        })
+        (KpiCard 'd1-k2-orders' "Orders $thisYear" 'year to date' 18 0 $oc @{
+            measures = @(@{ measureId = $mWorkOrders })
+            filters = @(@{ table = 'public.work_orders'; column = 'opened_on'; operator = 'gte'; values = @("$thisYear-01-01") })
+        } @{ seriesLabels = @{ 'Work Orders' = 'opened this year' } })
+        (ChartTile 'd1-yoy' 'line' 'Year-over-Year Cost Change' @{ x = 0; y = 4; w = 24; h = 8 } @{
+            axis = $dMonth
+            measures = @(@{ measureId = $mTotalCost; calc = @{ kind = 'periodChangePct'; offset = 12 } })
+            filters = @()
+        } @{
+            theme = 'ocean'; dateFormat = 'monthYear'; valueFormat = '0.0%'
+            yAxisFormat = @{ kind = 'percent'; decimals = 0 }
+            seriesLabels = @{ 'Total Cost (% change)' = 'YoY change in monthly spend' }
+            lineStyles = @{ 'Total Cost (% change)' = @{ dash = 'solid'; width = 2 } }
+            referenceLines = @(@{ id = DetId 'd1-ref-zero'; kind = 'constant'; value = 0
+                                  label = 'No change'; color = '#64748b'; dash = 'dotted'; showLabel = $true })
+            container = HeroTitle 'Growth' 'monthly spend vs the same month a year earlier (12-month offset)'
+        })
+        (ChartTile 'd1-smallmult' 'line' 'Monthly Cost by Region' @{ x = 0; y = 12; w = 12; h = 9 } @{
+            axis = $dMonth; smallMultiples = $dRegion
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{
+            theme = 'ocean'; dateFormat = 'monthYear'; valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            smallMultiples = @{ columns = 2; sharedY = $true; showPanelTitles = $true }
+            container = HeroTitle 'Seasonality by region' 'one panel per region, shared y-axis'
+        })
+        (ChartTile 'd1-drill' 'column' 'Cost by Year (drill: Quarter, Month)' @{ x = 12; y = 12; w = 12; h = 9 } @{
+            axis = $dYear; drillLevels = @($dQuarter, $dMonth)
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{
+            theme = 'ocean'; colorByCategory = $true; showDataLabels = $true; valueFormat = '$#,0'
+            yAxisFormat = @{ kind = 'compact' }; dateFormat = 'year'
+        })
+    )
+
+    $d1p3 = @(
+        (TextTile 'd1-p3-note' @{ x = 0; y = 0; w = 24; h = 2 } '<p><b>Drillthrough target.</b> <span style="color:#64748b">Right-click a region on any other page and choose Drill through &rarr; Regional Deep Dive; every tile below then filters to that region.</span></p>' '#eff6ff')
+        (KpiCard 'd1-k3-cost' 'Total Cost' 'in scope' 0 2 $oc @{
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'maintenance spend' } })
+        (KpiCard 'd1-k3-orders' 'Work Orders' 'in scope' 6 2 $oc @{
+            measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders logged' } })
+        (KpiCard 'd1-k3-open' 'Open Orders' 'in scope' 12 2 $oc @{
+            measures = @(@{ measureId = $mOpenOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Open Orders' = 'open + in progress' } })
+        (KpiCard 'd1-k3-labor' 'Labor Hours' 'in scope' 18 2 $oc @{
+            measures = @(@{ measureId = $mLaborHours }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'hours booked' } })
+        (ChartTile 'd1-p3-table' 'table' 'Sites in Scope' @{ x = 0; y = 6; w = 12; h = 9 } @{
+            axis = $dSite
+            measures = @(@{ measureId = $mTotalCost }, @{ measureId = $mAvgCost })
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            conditionalFormats = @(@{ id = DetId 'd1-cf-databar2'; measureKey = 'Total Cost'; style = 'dataBar'
+                                      dataBarColor = '#1868ae'; rules = @() })
+            table = @{ stripes = $true }
+        })
+        (ChartTile 'd1-p3-mix' 'donut' 'Priority Mix' @{ x = 12; y = 6; w = 12; h = 9 } @{
+            legend = $dPriority; measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{
+            theme = 'ocean'; legendPosition = 'right'
+            tooltip = @{ showPercent = $true }; seriesLabels = $priorityLabels
+        })
+        (ChartTile 'd1-p3-trend' 'area' 'Monthly Spend' @{ x = 0; y = 15; w = 24; h = 8 } @{
+            axis = $dMonth; measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{
+            theme = 'ocean'; dateFormat = 'monthYear'; valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            trendlines = @(@{ id = DetId 'd1-trend-ma'; kind = 'movingAverage'; window = 3; seriesKey = 'Total Cost'
+                              color = '#0e4d92'; dash = 'dashed'; width = 2 })
+            container = HeroTitle 'Monthly spend' '3-month moving average overlay'
+        })
+    )
+
+    # Per-page phone layouts: KPIs first, hero next, slicers folded to the end.
+    function D1Mobile([string[]]$OrderKeys, [string]$HeroKey) {
+        $mobile = @{ order = @($OrderKeys | ForEach-Object { DetId "tile-$_" }); heights = @{} }
+        if ($HeroKey) { $mobile.heights[(DetId "tile-$HeroKey")] = 340 }
+        $mobile
+    }
+    $d1Pages = @(
+        @{ id = DetId 'd1-page-1'; name = 'Company Pulse'; color = '#1868ae'; tiles = $d1p1
+           mobileLayout = (D1Mobile @('d1-k-ytd', 'd1-k-orders', 'd1-k-openrate', 'd1-k-avg', 'd1-hero', 'd1-donut', 'd1-sites', 'd1-mix', 'd1-sl-region', 'd1-sl-priority', 'd1-sl-opened') 'd1-hero') }
+        @{ id = DetId 'd1-page-2'; name = 'Growth & Seasonality'; color = '#26a5b8'; tiles = $d1p2
+           mobileLayout = (D1Mobile @('d1-k2-cy', 'd1-k2-ly', 'd1-k2-yoy', 'd1-k2-orders', 'd1-yoy', 'd1-smallmult', 'd1-drill') 'd1-yoy') }
+        @{ id = DetId 'd1-page-3'; name = 'Regional Deep Dive'; color = '#0e4d92'; tiles = $d1p3
+           drillthrough = @{ enabled = $true; fields = @(@{ table = 'public.sites'; column = 'region' }) }
+           mobileLayout = (D1Mobile @('d1-k3-cost', 'd1-k3-orders', 'd1-k3-open', 'd1-k3-labor', 'd1-p3-trend', 'd1-p3-table', 'd1-p3-mix', 'd1-p3-note') 'd1-p3-trend') }
+    )
+    $d1Gulf = @{}
+    $d1Gulf[(DetId 'tile-d1-sl-region')] = @{ table = 'public.sites'; column = 'region'; operator = 'in'; values = @('Gulf Coast') }
+    $d1Layout = @{
+        version = 1; tiles = @(); slicers = @()
+        pages = $d1Pages
+        bookmarks = @(
+            @{ id = DetId 'd1-bm-pulse'; name = 'Exec: company pulse'
+               state = @{ pageId = DetId 'd1-page-1'; slicers = @{}; filterOverrides = @{} } }
+            @{ id = DetId 'd1-bm-gulf'; name = 'Focus: Gulf Coast'
+               state = @{ pageId = DetId 'd1-page-1'; slicers = $d1Gulf; filterOverrides = @{} } }
+            @{ id = DetId 'd1-bm-growth'; name = 'Growth & seasonality'
+               state = @{ pageId = DetId 'd1-page-2'; slicers = @{}; filterOverrides = @{} } }
+        )
+    }
+    $d1 = EnsureFullDashboard 'Executive Overview' $maintModel.id $d1Layout `
+        'C-suite view of maintenance spend: pulse KPIs, growth and seasonality, and a regional drillthrough deep dive.'
+
+    # =======================================================================
+    # DASHBOARD 2: Operations Command Center (Maintenance Operations, sunset)
+    # =======================================================================
+    Write-Host "`nFull: Operations Command Center"
+    $su = '#f2542d'
+
+    $d2p1 = @(
+        (KpiCard 'd2-k-open' 'Open Orders' "target &le; $openTarget" 0 0 $su @{
+            measures = @(@{ measureId = $mOpenOrders }); filters = @()
+        } @{
+            seriesLabels = @{ 'Open Orders' = 'open + in progress' }
+            conditionalFormats = @(@{ id = DetId 'd2-cf-open'; measureKey = 'Open Orders'; style = 'kpi'
+                                      rules = @(@{ op = 'gt'; value = $openTarget; color = $red }, @{ op = 'lte'; value = $openTarget; color = $green }) })
+        })
+        (KpiCard 'd2-k-crit' 'Critical Backlog' 'critical, still open' 6 0 $su @{
+            measures = @(@{ measureId = $mCriticalBacklog }); filters = @()
+        } @{
+            seriesLabels = @{ 'Critical Backlog' = 'needs attention' }
+            conditionalFormats = @(@{ id = DetId 'd2-cf-crit'; measureKey = 'Critical Backlog'; style = 'kpi'
+                                      rules = @(@{ op = 'gt'; value = 0; color = $red }, @{ op = 'lte'; value = 0; color = $green }) })
+        })
+        (KpiCard 'd2-k-rate' 'Open %' "target &le; $($rateTarget * 100)%" 12 0 $su @{
+            measures = @(@{ measureId = $mOpenRate }); filters = @()
+        } @{
+            valueFormat = '0.0%'; seriesLabels = @{ 'Open Rate' = 'share of all orders' }
+            conditionalFormats = @(@{ id = DetId 'd2-cf-rate'; measureKey = 'Open Rate'; style = 'kpi'
+                                      rules = @(@{ op = 'gt'; value = $rateTarget; color = $red }, @{ op = 'lte'; value = $rateTarget; color = $green }) })
+        })
+        (KpiCard 'd2-k-avg' 'Avg Cost / Order' 'blended' 18 0 $su @{
+            measures = @(@{ measureId = $mAvgCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Avg Cost per Order' = 'per work order' } })
+        (SlicerTile 'd2-sl-window' @{ x = 0; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'opened_on'; label = 'Opened window'
+            variant = 'relativeDate'; preset = 'last90d'; style = @{ compact = $true } })
+        (SlicerTile 'd2-sl-status' @{ x = 8; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'status'; label = 'Status'; variant = 'buttons'; style = @{ compact = $true } })
+        (SlicerTile 'd2-sl-region' @{ x = 16; y = 4; w = 8; h = 4 } @{
+            table = 'public.sites'; column = 'region'; label = 'Region'; variant = 'dropdownMulti'; style = @{ compact = $true } })
+        (ChartTile 'd2-live' 'column' 'Open Orders by Site (live)' @{ x = 0; y = 8; w = 12; h = 9 } @{
+            axis = $dSite; measures = @(@{ measureId = $mOpenOrders }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            theme = 'sunset'; colorByCategory = $true; showDataLabels = $true; refreshSeconds = 30
+            container = HeroTitle 'Open orders by site' 'auto-refreshes every 30 seconds'
+        })
+        (ChartTile 'd2-priostack' 'stackedColumn' 'Monthly Orders by Priority' @{ x = 12; y = 8; w = 12; h = 9 } @{
+            axis = $dMonth; legend = $dPriority; measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{
+            theme = 'sunset'; legendInteractive = $true; legendMode = 'crossFilter'; legendPosition = 'bottom'
+            dateFormat = 'monthYear'; tooltip = @{ showPercent = $true; accentBorder = $true }
+            seriesLabels = $priorityLabels
+        })
+    )
+
+    $d2p2 = @(
+        (KpiCard 'd2-k2-cost' 'Total Cost' 'in scope' 0 0 $su @{
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'maintenance spend' } })
+        (KpiCard 'd2-k2-orders' 'Work Orders' 'in scope' 6 0 $su @{
+            measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders logged' } })
+        (KpiCard 'd2-k2-closed' 'Closed Orders' 'completed' 12 0 $su @{
+            measures = @(@{ measureId = $mClosedOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Closed Orders' = 'status = closed' } })
+        (KpiCard 'd2-k2-labor' 'Labor Hours' 'booked' 18 0 $su @{
+            measures = @(@{ measureId = $mLaborHours }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'across all orders' } })
+        (SlicerTile 'd2-sl-site' @{ x = 0; y = 4; w = 12; h = 4 } @{
+            table = 'public.sites'; column = 'name'; label = 'Site'; variant = 'dropdownMulti'; style = @{ compact = $true } })
+        (SlicerTile 'd2-sl-priority' @{ x = 12; y = 4; w = 12; h = 4 } @{
+            table = 'public.work_orders'; column = 'priority'; label = 'Priority'; variant = 'buttons'; style = @{ compact = $true } })
+        (ChartTile 'd2-drill' 'column' 'Cost by Region (drill: Site)' @{ x = 0; y = 8; w = 12; h = 9 } @{
+            axis = $dRegion; drillLevels = @($dSite)
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{
+            theme = 'sunset'; colorByCategory = $true; showDataLabels = $true; valueFormat = '$#,0'
+            yAxisFormat = @{ kind = 'compact' }
+            container = HeroTitle 'Cost by region' 'drill down into individual sites'
+        })
+        (ChartTile 'd2-budget' 'column' 'Site Spend vs Budget' @{ x = 12; y = 8; w = 12; h = 9 } @{
+            axis = $dSite; measures = @(@{ measureId = $mTotalCost }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            referenceLines = @(@{ id = DetId 'd2-ref-budget'; kind = 'constant'; value = $budget
+                                  label = 'Budget'; color = '#111827'; dash = 'dashed'; showLabel = $true })
+            conditionalFormats = @(@{ id = DetId 'd2-cf-budget'; measureKey = 'Total Cost'; style = 'barFill'
+                                      rules = @(@{ op = 'gt'; value = $budget; color = $red }, @{ op = 'lte'; value = $budget; color = $green }) })
+        })
+        (ChartTile 'd2-statusmix' 'stackedColumn' 'Status Mix by Site' @{ x = 0; y = 17; w = 24; h = 8 } @{
+            axis = $dSite; legend = $dStatus; measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{
+            theme = 'sunset'; legendInteractive = $true; legendMode = 'isolate'; legendPosition = 'bottom'
+            tooltip = @{ showPercent = $true }; seriesLabels = $statusLabels
+        })
+    )
+
+    $d2p3 = @(
+        (TextTile 'd2-p3-note' @{ x = 0; y = 0; w = 24; h = 2 } '<p><b>Drillthrough target on Site + Status.</b> <span style="color:#64748b">Right-click a segment on Status Mix by Site and choose Drill through &rarr; Order Details to land here filtered to that site and status.</span></p>' '#fff7ed')
+        (KpiCard 'd2-k3-orders' 'Work Orders' 'in scope' 0 2 $su @{
+            measures = @(@{ measureId = $mWorkOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders in view' } })
+        (KpiCard 'd2-k3-open' 'Open Orders' 'in scope' 6 2 $su @{
+            measures = @(@{ measureId = $mOpenOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Open Orders' = 'open + in progress' } })
+        (KpiCard 'd2-k3-cost' 'Total Cost' 'in scope' 12 2 $su @{
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'maintenance spend' } })
+        (KpiCard 'd2-k3-parts' 'Parts Used' 'units consumed' 18 2 $su @{
+            measures = @(@{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Parts Used' })
+            filters = @()
+        } @{ seriesLabels = @{ 'Parts Used' = 'part units' } })
+        (ChartTile 'd2-orders' 'table' 'Work Order Register' @{ x = 0; y = 6; w = 24; h = 12 } @{
+            axis = @{ table = 'public.work_orders'; column = 'id' }
+            measures = @(
+                @{ table = 'public.work_orders'; column = 'opened_on'; aggregation = 'min'; alias = 'Opened' }
+                @{ table = 'public.sites'; column = 'name'; aggregation = 'min'; alias = 'Site' }
+                @{ table = 'public.employees'; column = 'name'; aggregation = 'min'; alias = 'Assigned To' }
+                @{ table = 'public.work_orders'; column = 'priority'; aggregation = 'min'; alias = 'Priority' }
+                @{ table = 'public.work_orders'; column = 'status'; aggregation = 'min'; alias = 'Status' }
+                @{ measureId = $mTotalCost }
+            )
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            table = @{ borders = 'grid'; density = 'compact'; pageSize = 50; totals = $true
+                       pinned = 1; filterable = $true; stripes = $true; headerBold = $true }
+        })
+    )
+
+    $d2Last30 = @{}
+    $d2Last30[(DetId 'tile-d2-sl-window')] = @{ clause = $null; presetId = 'last30d' }
+    $d2Active = @{}
+    $d2Active[(DetId 'tile-d2-sl-status')] = @{ table = 'public.work_orders'; column = 'status'; operator = 'in'; values = @('open', 'in_progress') }
+    $d2Layout = @{
+        version = 1; tiles = @(); slicers = @()
+        pages = @(
+            @{ id = DetId 'd2-page-1'; name = 'Live Backlog'; color = '#f2542d'; tiles = $d2p1 }
+            @{ id = DetId 'd2-page-2'; name = 'Site Performance'; color = '#f9a03f'; tiles = $d2p2 }
+            @{ id = DetId 'd2-page-3'; name = 'Order Details'; color = '#d81159'; tiles = $d2p3
+               drillthrough = @{ enabled = $true; fields = @(
+                   @{ table = 'public.sites'; column = 'name' }
+                   @{ table = 'public.work_orders'; column = 'status' }
+               ) } }
+        )
+        bookmarks = @(
+            @{ id = DetId 'd2-bm-30d'; name = 'Live: last 30 days'
+               state = @{ pageId = DetId 'd2-page-1'; slicers = $d2Last30; filterOverrides = @{} } }
+            @{ id = DetId 'd2-bm-backlog'; name = 'Backlog only'
+               state = @{ pageId = DetId 'd2-page-1'; slicers = $d2Active; filterOverrides = @{} } }
+            @{ id = DetId 'd2-bm-sites'; name = 'Site performance'
+               state = @{ pageId = DetId 'd2-page-2'; slicers = @{}; filterOverrides = @{} } }
+        )
+    }
+    $d2 = EnsureFullDashboard 'Operations Command Center' $maintModel.id $d2Layout `
+        'Daily ops console: live backlog with targets, site performance vs budget, and a drillthrough work-order register.'
+
+    # =======================================================================
+    # DASHBOARD 3: Cost & Vendor Management (Maintenance Operations, berry)
+    # =======================================================================
+    Write-Host "`nFull: Cost & Vendor Management"
+    $be = '#7b2cbf'
+    $paramLens = DetId 'd3-param-lens'
+
+    $d3p1 = @(
+        (KpiCard 'd3-k-cost' 'Total Cost' 'all maintenance' 0 0 $be @{
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'labor + parts' } })
+        (KpiCard 'd3-k-parts' 'Parts Spend' 'line cost' 6 0 $be @{
+            measures = @(@{ measureId = $mPartsSpend }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Parts Spend' = 'consumed parts' } })
+        (KpiCard 'd3-k-qty' 'Parts Used' 'units consumed' 12 0 $be @{
+            measures = @(@{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Parts Used' })
+            filters = @()
+        } @{ seriesLabels = @{ 'Parts Used' = 'part units' } })
+        (KpiCard 'd3-k-avg' 'Avg Cost / Order' 'blended' 18 0 $be @{
+            measures = @(@{ measureId = $mAvgCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Avg Cost per Order' = 'per work order' } })
+        (SlicerTile 'd3-sl-lens' @{ x = 0; y = 4; w = 8; h = 4 } @{
+            table = ''; column = ''; label = 'Spend lens'; variant = 'fieldParam'
+            parameterId = $paramLens; style = @{ compact = $true } })
+        (SlicerTile 'd3-sl-region' @{ x = 8; y = 4; w = 8; h = 4 } @{
+            table = 'public.sites'; column = 'region'; label = 'Region'; variant = 'dropdownMulti'; style = @{ compact = $true } })
+        (SlicerTile 'd3-sl-opened' @{ x = 16; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'opened_on'; label = 'Opened'; variant = 'dateRange' })
+        (ChartTile 'd3-lens' 'column' 'Parts Spend by Lens' @{ x = 0; y = 8; w = 12; h = 9 } @{
+            axis = $dRegion
+            paramBindings = @{ axis = $paramLens }
+            measures = @(@{ measureId = $mPartsSpend }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            theme = 'berry'; colorByCategory = $true; showDataLabels = $true; valueFormat = '$#,0'
+            yAxisFormat = @{ kind = 'compact' }
+            container = HeroTitle 'Parts spend' 'switch the axis with the Spend lens field parameter'
+        })
+        (ChartTile 'd3-vendors' 'bar' 'Vendor Spend Ranking' @{ x = 12; y = 8; w = 12; h = 9 } @{
+            axis = $dVendor; measures = @(@{ measureId = $mPartsSpend }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' }); limit = 10
+        } @{
+            theme = 'berry'; showDataLabels = $true; valueFormat = '$#,0'; xAxisFormat = @{ kind = 'compact' }
+        })
+        (ChartTile 'd3-trend' 'line' 'Maintenance vs Parts Spend' @{ x = 0; y = 17; w = 24; h = 8 } @{
+            axis = $dMonth
+            measures = @(@{ measureId = $mTotalCost }, @{ measureId = $mPartsSpend }); filters = @()
+        } @{
+            theme = 'berry'; dateFormat = 'monthYear'; valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            seriesLabels = @{ 'Total Cost' = 'Total maintenance spend'; 'Parts Spend' = 'Parts line cost' }
+            lineStyles = @{
+                'Total Cost' = @{ dash = 'solid'; width = 3 }
+                'Parts Spend' = @{ dash = 'dashed'; width = 2 }
+            }
+            trendlines = @(@{ id = DetId 'd3-ma'; kind = 'movingAverage'; window = 3; seriesKey = 'Parts Spend'
+                              color = '#5a189a'; dash = 'dotted'; width = 2 })
+            container = HeroTitle 'Spend trend' 'parts cost inside total maintenance spend, 3-month moving average'
+        })
+    )
+
+    $d3p2 = @(
+        (KpiCard 'd3-k2-parts' 'Parts Spend' 'line cost' 0 0 $be @{
+            measures = @(@{ measureId = $mPartsSpend }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Parts Spend' = 'consumed parts' } })
+        (KpiCard 'd3-k2-qty' 'Qty Used' 'units' 6 0 $be @{
+            measures = @(@{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Qty Used' })
+            filters = @()
+        } @{ seriesLabels = @{ 'Qty Used' = 'part units' } })
+        (KpiCard 'd3-k2-skus' 'Distinct Parts' 'SKUs consumed' 12 0 $be @{
+            measures = @(@{ table = 'public.work_order_parts'; column = 'part_id'; aggregation = 'countDistinct'; alias = 'Distinct Parts' })
+            filters = @()
+        } @{ seriesLabels = @{ 'Distinct Parts' = 'unique SKUs' } })
+        (KpiCard 'd3-k2-rating' 'Avg Vendor Rating' 'out of 5' 18 0 $be @{
+            measures = @(@{ table = 'public.vendors'; column = 'rating'; aggregation = 'avg'; alias = 'Avg Vendor Rating' })
+            filters = @()
+        } @{ valueFormat = '0.0'; seriesLabels = @{ 'Avg Vendor Rating' = 'supplier quality' } })
+        (ChartTile 'd3-partstable' 'table' 'Part Consumption' @{ x = 0; y = 4; w = 14; h = 10 } @{
+            axis = $dPartDesc
+            measures = @(
+                @{ table = 'public.parts'; column = 'category'; aggregation = 'min'; alias = 'Category' }
+                @{ measureId = $mPartsSpend }
+                @{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Qty Used' }
+            )
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 1 }; direction = 'desc' }); limit = 20
+        } @{
+            legendStyle = @{ bold = $true }
+            conditionalFormats = @(
+                @{ id = DetId 'd3-cf-databar'; measureKey = 'Parts Spend'; style = 'dataBar'
+                   dataBarColor = '#7b2cbf'; rules = @() }
+                @{ id = DetId 'd3-cf-qty'; measureKey = 'Qty Used'; style = 'cellBackground'
+                   rules = @(
+                       @{ op = 'lt'; value = $qtyLow; color = '#bbf7d0' }
+                       @{ op = 'lt'; value = $qtyHigh; color = '#fde68a' }
+                       @{ op = 'gte'; value = $qtyHigh; color = '#fecaca' }
+                   ) }
+            )
+            table = @{ density = 'compact'; stripes = $true; borders = 'rows'; filterable = $true }
+        })
+        (ChartTile 'd3-catmix' 'stackedColumn' 'Category Mix by Region' @{ x = 14; y = 4; w = 10; h = 10 } @{
+            axis = $dRegion; legend = $dCategory; measures = @(@{ measureId = $mPartsSpend }); filters = @()
+        } @{
+            theme = 'berry'; legendPosition = 'bottom'; legendInteractive = $true
+            tooltip = @{ showPercent = $true }; valueFormat = '$#,0'
+        })
+        (ChartTile 'd3-catshare' 'donut' 'Spend Share by Category' @{ x = 0; y = 14; w = 10; h = 8 } @{
+            legend = $dCategory; measures = @(@{ measureId = $mPartsSpend }); filters = @()
+        } @{
+            theme = 'berry'; legendPosition = 'right'; tooltip = @{ showPercent = $true }
+        })
+        (ChartTile 'd3-vregion' 'column' 'Vendor Region: Spend & Rating' @{ x = 10; y = 14; w = 14; h = 8 } @{
+            axis = $dVendorRegion
+            measures = @(
+                @{ measureId = $mPartsSpend }
+                @{ table = 'public.vendors'; column = 'rating'; aggregation = 'avg'; alias = 'Avg Rating' }
+            )
+            filters = @()
+        } @{
+            theme = 'berry'; valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            secondaryAxisKeys = @('Avg Rating'); y2AxisFormat = @{ kind = 'number'; decimals = 1 }; y2AxisLabel = 'Avg rating'
+            seriesLabels = @{ 'Parts Spend' = 'Spend'; 'Avg Rating' = 'Vendor rating (right axis)' }
+        })
+    )
+
+    $d3p3 = @(
+        (KpiCard 'd3-k3-avg' 'Avg Cost / Order' "watch &gt; `$$avgCostHigh" 0 0 $be @{
+            measures = @(@{ measureId = $mAvgCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Avg Cost per Order' = 'per work order' } })
+        (KpiCard 'd3-k3-cost' 'Total Cost' 'all maintenance' 6 0 $be @{
+            measures = @(@{ measureId = $mTotalCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'labor + parts' } })
+        (KpiCard 'd3-k3-labor' 'Labor Hours' 'booked' 12 0 $be @{
+            measures = @(@{ measureId = $mLaborHours }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'across all orders' } })
+        (KpiCard 'd3-k3-rate' 'Open %' 'share still open' 18 0 $be @{
+            measures = @(@{ measureId = $mOpenRate }); filters = @()
+        } @{ valueFormat = '0.0%'; seriesLabels = @{ 'Open Rate' = 'open + in progress' } })
+        (ChartTile 'd3-scatter' 'scatter' 'Cost vs Labor by Site' @{ x = 0; y = 4; w = 14; h = 10 } @{
+            axis = $dSite; legend = $dValveType
+            measures = @(@{ measureId = $mTotalCost }, @{ measureId = $mLaborHours }); filters = @()
+        } @{
+            theme = 'berry'
+            xAxisFormat = @{ kind = 'compact' }
+            xAxisLabelHtml = '<b>Total cost</b> <span style="color:#64748b">(USD)</span>'
+            yAxisLabelHtml = '<b>Labor</b> <span style="color:#64748b">(hours)</span>'
+            trendlines = @(@{ id = DetId 'd3-lin'; kind = 'linear'; color = '#5a189a'; dash = 'dotted'; width = 2 })
+            container = HeroTitle 'Cost vs labor' 'each point is a site x valve type; linear fit overlaid'
+        })
+        (ChartTile 'd3-threshold' 'column' 'Avg Cost per Order by Site' @{ x = 14; y = 4; w = 10; h = 10 } @{
+            axis = $dSite; measures = @(@{ measureId = $mAvgCost }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            valueFormat = '$#,0'
+            referenceLines = @(@{ id = DetId 'd3-ref-thr'; kind = 'constant'; value = $avgCostHigh
+                                  label = 'Watch threshold'; color = '#111827'; dash = 'dashed'; showLabel = $true })
+            conditionalFormats = @(@{ id = DetId 'd3-cf-thr'; measureKey = 'Avg Cost per Order'; style = 'barFill'
+                                      rules = @(@{ op = 'gt'; value = $avgCostHigh; color = $red }, @{ op = 'lte'; value = $avgCostHigh; color = $green }) })
+        })
+    )
+
+    $d3West = @{}
+    $d3West[(DetId 'tile-d3-sl-region')] = @{ table = 'public.sites'; column = 'region'; operator = 'in'; values = @('West') }
+    $d3Layout = @{
+        version = 1; tiles = @(); slicers = @()
+        pages = @(
+            @{ id = DetId 'd3-page-1'; name = 'Spend Overview'; color = '#7b2cbf'; tiles = $d3p1 }
+            @{ id = DetId 'd3-page-2'; name = 'Parts & Inventory'; color = '#9d4edd'; tiles = $d3p2 }
+            @{ id = DetId 'd3-page-3'; name = 'Cost Drivers'; color = '#5a189a'; tiles = $d3p3 }
+        )
+        parameters = @(
+            @{
+                id = $paramLens; name = 'Spend Lens'; kind = 'dimension'; defaultIndex = 0
+                options = @(
+                    @{ label = 'Region'; dimension = $dRegion }
+                    @{ label = 'Vendor'; dimension = $dVendor }
+                    @{ label = 'Part Category'; dimension = $dCategory }
+                )
+            }
+        )
+        bookmarks = @(
+            @{ id = DetId 'd3-bm-spend'; name = 'Spend overview'
+               state = @{ pageId = DetId 'd3-page-1'; slicers = @{}; filterOverrides = @{} } }
+            @{ id = DetId 'd3-bm-west'; name = 'West region spend'
+               state = @{ pageId = DetId 'd3-page-1'; slicers = $d3West; filterOverrides = @{} } }
+            @{ id = DetId 'd3-bm-drivers'; name = 'Cost drivers'
+               state = @{ pageId = DetId 'd3-page-3'; slicers = @{}; filterOverrides = @{} } }
+        )
+    }
+    $d3 = EnsureFullDashboard 'Cost & Vendor Management' $maintModel.id $d3Layout `
+        'Procurement view: parts spend through a switchable field-parameter lens, vendor ranking, inventory RAG and cost-driver analytics.'
+
+    # =======================================================================
+    # DASHBOARD 4: Workforce & Productivity (Workforce model, forest)
+    # =======================================================================
+    Write-Host "`nFull: Workforce & Productivity"
+    $fo = '#2d6a4f'
+
+    $d4p1 = @(
+        (KpiCard 'd4-k-head' 'Headcount' 'maintenance staff' 0 0 $fo @{
+            measures = @(@{ measureId = $wHead }); filters = @()
+        } @{ seriesLabels = @{ 'Headcount' = 'technicians & planners' } })
+        (KpiCard 'd4-k-orders' 'Work Orders' 'assigned' 6 0 $fo @{
+            measures = @(@{ measureId = $wOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders assigned' } })
+        (KpiCard 'd4-k-labor' 'Labor Hours' 'booked' 12 0 $fo @{
+            measures = @(@{ measureId = $wLabor }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'across the team' } })
+        (KpiCard 'd4-k-avghrs' 'Avg Hours / Order' 'effort per job' 18 0 $fo @{
+            measures = @(@{ measureId = $wAvgHours }); filters = @()
+        } @{ valueFormat = '0.0'; seriesLabels = @{ 'Avg Hours per Order' = 'hours per order' } })
+        (SlicerTile 'd4-sl-region' @{ x = 0; y = 4; w = 8; h = 4 } @{
+            table = 'public.sites'; column = 'region'; label = 'Home region'; variant = 'checklist'; style = @{ compact = $true } })
+        (SlicerTile 'd4-sl-title' @{ x = 8; y = 4; w = 8; h = 4 } @{
+            table = 'public.employees'; column = 'title'; label = 'Role'; variant = 'dropdownMulti'; style = @{ compact = $true } })
+        (SlicerTile 'd4-sl-priority' @{ x = 16; y = 4; w = 8; h = 4 } @{
+            table = 'public.work_orders'; column = 'priority'; label = 'Priority'; variant = 'buttons'; style = @{ compact = $true } })
+        (ChartTile 'd4-workload' 'bar' 'Orders by Employee (Top 15)' @{ x = 0; y = 8; w = 12; h = 10 } @{
+            axis = $dEmployee; measures = @(@{ measureId = $wOrders }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' }); limit = 15
+        } @{
+            theme = 'forest'; showDataLabels = $true
+            conditionalFormats = @(@{ id = DetId 'd4-cf-wl'; measureKey = 'Work Orders'; style = 'barFill'
+                                      rules = @(@{ op = 'gt'; value = $wlHigh; color = '#1b4332' }, @{ op = 'lte'; value = $wlHigh; color = '#74c69d' }) })
+            container = HeroTitle 'Workload' ('dark bars carry more than the team average of {0} orders' -f $wlHigh)
+        })
+        (ChartTile 'd4-labor' 'line' 'Monthly Labor Hours' @{ x = 12; y = 8; w = 12; h = 10 } @{
+            axis = $dMonth; measures = @(@{ measureId = $wLabor }); filters = @()
+        } @{
+            theme = 'forest'; dateFormat = 'monthYear'
+            seriesLabels = @{ 'Labor Hours' = 'Hours booked' }
+            lineStyles = @{ 'Labor Hours' = @{ dash = 'solid'; width = 3 } }
+            trendlines = @(@{ id = DetId 'd4-ma'; kind = 'movingAverage'; window = 3; seriesKey = 'Labor Hours'
+                              color = '#1b4332'; dash = 'dashed'; width = 2 })
+            container = HeroTitle 'Labor trend' '3-month moving average overlay'
+        })
+    )
+
+    $d4p2 = @(
+        (KpiCard 'd4-k2-open' 'Open Orders' 'in flight' 0 0 $fo @{
+            measures = @(@{ measureId = $wOpen }); filters = @()
+        } @{ seriesLabels = @{ 'Open Orders' = 'open + in progress' } })
+        (KpiCard 'd4-k2-closed' 'Closed Orders' 'completed' 6 0 $fo @{
+            measures = @(@{ measureId = $wClosed }); filters = @()
+        } @{ seriesLabels = @{ 'Closed Orders' = 'status = closed' } })
+        (KpiCard 'd4-k2-cost' 'Total Cost' 'of assigned work' 12 0 $fo @{
+            measures = @(@{ measureId = $wCost }); filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Total Cost' = 'assigned orders' } })
+        (KpiCard 'd4-k2-labor' 'Labor Hours' 'booked' 18 0 $fo @{
+            measures = @(@{ measureId = $wLabor }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'across the team' } })
+        (SlicerTile 'd4-sl2-priority' @{ x = 0; y = 4; w = 12; h = 4 } @{
+            table = 'public.work_orders'; column = 'priority'; label = 'Priority'; variant = 'buttons'; style = @{ compact = $true } })
+        (SlicerTile 'd4-sl2-status' @{ x = 12; y = 4; w = 12; h = 4 } @{
+            table = 'public.work_orders'; column = 'status'; label = 'Status'; variant = 'buttons'; style = @{ compact = $true } })
+        (ChartTile 'd4-rolestack' 'stackedColumn' 'Order Status by Role' @{ x = 0; y = 8; w = 14; h = 10 } @{
+            axis = $dEmpTitle; legend = $dStatus; measures = @(@{ measureId = $wOrders }); filters = @()
+        } @{
+            theme = 'forest'; legendInteractive = $true; legendMode = 'isolate'; legendPosition = 'bottom'
+            tooltip = @{ showPercent = $true }; seriesLabels = $statusLabels
+        })
+        (ChartTile 'd4-smallmult' 'line' 'Monthly Orders by Region' @{ x = 14; y = 8; w = 10; h = 10 } @{
+            axis = $dMonth; smallMultiples = $dRegion
+            measures = @(@{ measureId = $wOrders }); filters = @()
+        } @{
+            theme = 'forest'; dateFormat = 'monthShort'
+            smallMultiples = @{ columns = 2; sharedY = $true; showPanelTitles = $true; maxPanels = 4 }
+            container = HeroTitle 'Regional cadence' 'orders per month by home region'
+        })
+    )
+
+    $d4p3 = @(
+        (TextTile 'd4-p3-note' @{ x = 0; y = 0; w = 24; h = 2 } '<p><b>Drillthrough target on Employee.</b> <span style="color:#64748b">Right-click a bar on Orders by Employee and choose Drill through &rarr; Assignments to see that person''s book of work.</span></p>' '#ecfdf5')
+        (KpiCard 'd4-k3-orders' 'Work Orders' 'in scope' 0 2 $fo @{
+            measures = @(@{ measureId = $wOrders }); filters = @()
+        } @{ seriesLabels = @{ 'Work Orders' = 'orders assigned' } })
+        (KpiCard 'd4-k3-open' 'Open Orders' 'in scope' 6 2 $fo @{
+            measures = @(@{ measureId = $wOpen }); filters = @()
+        } @{ seriesLabels = @{ 'Open Orders' = 'open + in progress' } })
+        (KpiCard 'd4-k3-labor' 'Labor Hours' 'in scope' 12 2 $fo @{
+            measures = @(@{ measureId = $wLabor }); filters = @()
+        } @{ seriesLabels = @{ 'Labor Hours' = 'hours booked' } })
+        (KpiCard 'd4-k3-head' 'Headcount' 'in scope' 18 2 $fo @{
+            measures = @(@{ measureId = $wHead }); filters = @()
+        } @{ seriesLabels = @{ 'Headcount' = 'people' } })
+        (ChartTile 'd4-roster' 'table' 'Assignment Roster' @{ x = 0; y = 6; w = 24; h = 12 } @{
+            axis = $dEmployee
+            measures = @(
+                @{ table = 'public.employees'; column = 'title'; aggregation = 'min'; alias = 'Role' }
+                @{ table = 'public.sites'; column = 'name'; aggregation = 'min'; alias = 'Home Site' }
+                @{ measureId = $wOrders }
+                @{ measureId = $wOpen }
+                @{ measureId = $wLabor }
+                @{ measureId = $wCost }
+            )
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 2 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            conditionalFormats = @(@{ id = DetId 'd4-cf-databar'; measureKey = 'Work Orders'; style = 'dataBar'
+                                      dataBarColor = '#2d6a4f'; rules = @() })
+            table = @{ borders = 'grid'; density = 'compact'; pageSize = 25; totals = $true
+                       pinned = 1; filterable = $true; stripes = $true }
+        })
+    )
+
+    $d4Critical = @{}
+    $d4Critical[(DetId 'tile-d4-sl2-priority')] = @{ table = 'public.work_orders'; column = 'priority'; operator = 'in'; values = @('critical') }
+    $d4Layout = @{
+        version = 1; tiles = @(); slicers = @()
+        pages = @(
+            @{ id = DetId 'd4-page-1'; name = 'Team Overview'; color = '#2d6a4f'; tiles = $d4p1 }
+            @{ id = DetId 'd4-page-2'; name = 'Utilization'; color = '#40916c'; tiles = $d4p2 }
+            @{ id = DetId 'd4-page-3'; name = 'Assignments'; color = '#1b4332'; tiles = $d4p3
+               drillthrough = @{ enabled = $true; fields = @(@{ table = 'public.employees'; column = 'name' }) } }
+        )
+        bookmarks = @(
+            @{ id = DetId 'd4-bm-team'; name = 'Team overview'
+               state = @{ pageId = DetId 'd4-page-1'; slicers = @{}; filterOverrides = @{} } }
+            @{ id = DetId 'd4-bm-crit'; name = 'Utilization: critical work'
+               state = @{ pageId = DetId 'd4-page-2'; slicers = $d4Critical; filterOverrides = @{} } }
+            @{ id = DetId 'd4-bm-roster'; name = 'Assignment roster'
+               state = @{ pageId = DetId 'd4-page-3'; slicers = @{}; filterOverrides = @{} } }
+        )
+    }
+    $d4 = EnsureFullDashboard 'Workforce & Productivity' $wfModel.id $d4Layout `
+        'People view on the Workforce model: headcount, workload balance, utilization by role and a per-employee assignment roster.'
+
+    # =======================================================================
+    # DASHBOARD 5: Asset Reliability (Inspections model, mono)
+    # =======================================================================
+    Write-Host "`nFull: Asset Reliability"
+    $sl = '#1f2937'
+
+    $d5p1 = @(
+        (KpiCard 'd5-k-pass' 'Pass Rate' "target &ge; $($passTarget * 100)%" 0 0 $sl @{
+            measures = @(@{ measureId = $iPassRate }); filters = @()
+        } @{
+            valueFormat = '0.0%'; seriesLabels = @{ 'Pass Rate' = 'fleet-wide' }
+            conditionalFormats = @(@{ id = DetId 'd5-cf-pass'; measureKey = 'Pass Rate'; style = 'kpi'
+                                      rules = @(@{ op = 'gte'; value = $passTarget; color = $green }, @{ op = 'lt'; value = $passTarget; color = $red }) })
+        })
+        (KpiCard 'd5-k-count' 'Inspections' 'all time' 6 0 $sl @{
+            measures = @(@{ measureId = $iInspCount }); filters = @()
+        } @{ seriesLabels = @{ 'Inspection Count' = 'tests performed' } })
+        (KpiCard 'd5-k-fail' 'Failures' 'result = fail' 12 0 $sl @{
+            measures = @(@{ measureId = $iFailCount }); filters = @()
+        } @{
+            seriesLabels = @{ 'Fail Count' = 'failed tests' }
+            conditionalFormats = @(@{ id = DetId 'd5-cf-fail'; measureKey = 'Fail Count'; style = 'kpi'
+                                      rules = @(@{ op = 'gt'; value = $failTarget; color = $red }, @{ op = 'lte'; value = $failTarget; color = $green }) })
+        })
+        (KpiCard 'd5-k-parts' 'Parts Cost' 'inspection consumables' 18 0 $sl @{
+            measures = @(@{ table = 'public.inspections'; column = 'parts_cost'; aggregation = 'sum'; alias = 'Parts Cost' })
+            filters = @()
+        } @{ valueFormat = '$#,0'; seriesLabels = @{ 'Parts Cost' = 'consumables' } })
+        (SlicerTile 'd5-sl-result' @{ x = 0; y = 4; w = 8; h = 4 } @{
+            table = 'public.inspections'; column = 'result'; label = 'Result'; variant = 'buttons'; style = @{ compact = $true } })
+        (SlicerTile 'd5-sl-region' @{ x = 8; y = 4; w = 8; h = 4 } @{
+            table = 'public.sites'; column = 'region'; label = 'Region'; variant = 'checklist'; style = @{ compact = $true } })
+        (SlicerTile 'd5-sl-date' @{ x = 16; y = 4; w = 8; h = 4 } @{
+            table = 'public.inspections'; column = 'inspected_on'; label = 'Inspected'; variant = 'dateRange' })
+        (ChartTile 'd5-trend' 'stackedColumn' 'Monthly Results' @{ x = 0; y = 8; w = 14; h = 9 } @{
+            axis = $dIMonth; legend = $dIResult; measures = @(@{ measureId = $iInspCount }); filters = @()
+        } @{
+            theme = 'mono'; legendInteractive = $true; legendPosition = 'bottom'; dateFormat = 'monthYear'
+            tooltip = @{ showPercent = $true }; seriesLabels = $resultLabels
+            colorOverrides = @{ pass = '#16a34a'; fail = '#dc2626'; adjusted = '#f59e0b' }
+            container = HeroTitle 'Monthly results' 'pass / adjusted / fail composition per month'
+        })
+        (ChartTile 'd5-league' 'table' 'Inspector League' @{ x = 14; y = 8; w = 10; h = 9 } @{
+            axis = $dTech
+            measures = @(@{ measureId = $iInspCount }, @{ measureId = $iPassRate }); filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            conditionalFormats = @(
+                @{ id = DetId 'd5-cf-bar'; measureKey = 'Inspection Count'; style = 'dataBar'
+                   dataBarColor = '#1f2937'; rules = @() }
+                @{ id = DetId 'd5-cf-rag'; measureKey = 'Pass Rate'; style = 'cellBackground'
+                   rules = @(
+                       @{ op = 'lt'; value = $prLow; color = '#fecaca' }
+                       @{ op = 'lt'; value = $prHigh; color = '#fde68a' }
+                       @{ op = 'gte'; value = $prHigh; color = '#bbf7d0' }
+                   ) }
+            )
+            table = @{ density = 'compact'; stripes = $true }
+        })
+    )
+
+    $d5p2 = @(
+        (KpiCard 'd5-k2-valves' 'Valve Fleet' 'relief valves' 0 0 $sl @{
+            measures = @(@{ table = 'public.valves'; column = 'id'; aggregation = 'countDistinct'; alias = 'Valves' })
+            filters = @()
+        } @{ seriesLabels = @{ 'Valves' = 'in service' } })
+        (KpiCard 'd5-k2-psi' 'Avg Set Pressure' 'psi' 6 0 $sl @{
+            measures = @(@{ table = 'public.valves'; column = 'set_pressure_psi'; aggregation = 'avg'; alias = 'Avg Set Pressure' })
+            filters = @()
+        } @{ valueFormat = '#,0'; seriesLabels = @{ 'Avg Set Pressure' = 'across the fleet' } })
+        (KpiCard 'd5-k2-count' 'Inspections' 'all time' 12 0 $sl @{
+            measures = @(@{ measureId = $iInspCount }); filters = @()
+        } @{ seriesLabels = @{ 'Inspection Count' = 'tests performed' } })
+        (KpiCard 'd5-k2-pass' 'Pass Rate' 'fleet-wide' 18 0 $sl @{
+            measures = @(@{ measureId = $iPassRate }); filters = @()
+        } @{ valueFormat = '0.0%'; seriesLabels = @{ 'Pass Rate' = 'share passing' } })
+        (ChartTile 'd5-fleet' 'stackedColumn' 'Fleet by Site & Type' @{ x = 0; y = 4; w = 8; h = 10 } @{
+            axis = $dSite; legend = $dValveType
+            measures = @(@{ table = 'public.valves'; column = 'id'; aggregation = 'countDistinct'; alias = 'Valves' })
+            filters = @()
+        } @{
+            theme = 'mono'; legendPosition = 'bottom'; tooltip = @{ showPercent = $true }
+        })
+        (ChartTile 'd5-scatter' 'scatter' 'Set Pressure vs Inspections' @{ x = 8; y = 4; w = 8; h = 10 } @{
+            axis = @{ table = 'public.valves'; column = 'tag' }; legend = $dValveType
+            measures = @(
+                @{ table = 'public.valves'; column = 'set_pressure_psi'; aggregation = 'avg'; alias = 'Set Pressure (psi)' }
+                @{ measureId = $iInspCount }
+            )
+            filters = @()
+        } @{
+            theme = 'mono'
+            container = HeroTitle 'Pressure vs attention' 'each point is a valve: x set pressure, y inspections'
+        })
+        (ChartTile 'd5-age' 'column' 'Valves by Install Year (drill: Month)' @{ x = 16; y = 4; w = 8; h = 10 } @{
+            axis = $dInstallYear; drillLevels = @($dInstallMonth)
+            measures = @(@{ table = 'public.valves'; column = 'id'; aggregation = 'countDistinct'; alias = 'Valves' })
+            filters = @()
+        } @{
+            theme = 'mono'; colorByCategory = $true; showDataLabels = $true; dateFormat = 'year'
+        })
+    )
+
+    $d5p3 = @(
+        (TextTile 'd5-p3-note' @{ x = 0; y = 0; w = 24; h = 2 } '<p><b>Drillthrough target on Inspector.</b> <span style="color:#64748b">Right-click a row in the Inspector League and choose Drill through &rarr; Findings to audit that inspector''s recent work.</span></p>' '#f8fafc')
+        (KpiCard 'd5-k3-count' 'Inspections' 'in scope' 0 2 $sl @{
+            measures = @(@{ measureId = $iInspCount }); filters = @()
+        } @{ seriesLabels = @{ 'Inspection Count' = 'tests performed' } })
+        (KpiCard 'd5-k3-fail' 'Failures' 'in scope' 6 2 $sl @{
+            measures = @(@{ measureId = $iFailCount }); filters = @()
+        } @{ seriesLabels = @{ 'Fail Count' = 'failed tests' } })
+        (KpiCard 'd5-k3-pass' 'Pass Rate' 'in scope' 12 2 $sl @{
+            measures = @(@{ measureId = $iPassRate }); filters = @()
+        } @{ valueFormat = '0.0%'; seriesLabels = @{ 'Pass Rate' = 'share passing' } })
+        (KpiCard 'd5-k3-labor' 'Labor Hours' 'inspection effort' 18 2 $sl @{
+            measures = @(@{ measureId = $iLaborHours }); filters = @()
+        } @{ seriesLabels = @{ 'Total Labor Hours' = 'hours booked' } })
+        (SlicerTile 'd5-sl3-date' @{ x = 0; y = 6; w = 12; h = 4 } @{
+            table = 'public.inspections'; column = 'inspected_on'; label = 'Inspected'; variant = 'dateRange' })
+        (SlicerTile 'd5-sl3-tech' @{ x = 12; y = 6; w = 12; h = 4 } @{
+            table = 'public.technicians'; column = 'name'; label = 'Inspector'; variant = 'dropdownMulti'; style = @{ compact = $true } })
+        (ChartTile 'd5-log' 'table' 'Inspection Log' @{ x = 0; y = 10; w = 24; h = 12 } @{
+            axis = @{ table = 'public.inspections'; column = 'id' }
+            measures = @(
+                @{ table = 'public.inspections'; column = 'inspected_on'; aggregation = 'min'; alias = 'Date' }
+                @{ table = 'public.technicians'; column = 'name'; aggregation = 'min'; alias = 'Inspector' }
+                @{ table = 'public.sites'; column = 'name'; aggregation = 'min'; alias = 'Site' }
+                @{ table = 'public.valves'; column = 'tag'; aggregation = 'min'; alias = 'Valve' }
+                @{ table = 'public.inspections'; column = 'result'; aggregation = 'min'; alias = 'Result' }
+                @{ table = 'public.inspections'; column = 'parts_cost'; aggregation = 'sum'; alias = 'Parts Cost' }
+            )
+            filters = @()
+            sort = @(@{ target = @{ kind = 'measure'; index = 0 }; direction = 'desc' })
+        } @{
+            legendStyle = @{ bold = $true }
+            table = @{ borders = 'grid'; density = 'compact'; pageSize = 50; totals = $true
+                       pinned = 1; filterable = $true; stripes = $true }
+        })
+    )
+
+    $d5Fails = @{}
+    $d5Fails[(DetId 'tile-d5-sl-result')] = @{ table = 'public.inspections'; column = 'result'; operator = 'in'; values = @('fail') }
+    $d5Layout = @{
+        version = 1; tiles = @(); slicers = @()
+        pages = @(
+            @{ id = DetId 'd5-page-1'; name = 'Inspection Health'; color = '#1f2937'; tiles = $d5p1 }
+            @{ id = DetId 'd5-page-2'; name = 'Valve Fleet'; color = '#4b5563'; tiles = $d5p2 }
+            @{ id = DetId 'd5-page-3'; name = 'Findings'; color = '#6b7280'; tiles = $d5p3
+               drillthrough = @{ enabled = $true; fields = @(@{ table = 'public.technicians'; column = 'name' }) } }
+        )
+        bookmarks = @(
+            @{ id = DetId 'd5-bm-health'; name = 'Inspection health'
+               state = @{ pageId = DetId 'd5-page-1'; slicers = @{}; filterOverrides = @{} } }
+            @{ id = DetId 'd5-bm-fails'; name = 'Failures only'
+               state = @{ pageId = DetId 'd5-page-1'; slicers = $d5Fails; filterOverrides = @{} } }
+            @{ id = DetId 'd5-bm-fleet'; name = 'Valve fleet'
+               state = @{ pageId = DetId 'd5-page-2'; slicers = @{}; filterOverrides = @{} } }
+        )
+    }
+    $d5 = EnsureFullDashboard 'Asset Reliability' $inspModel.id $d5Layout `
+        'Reliability engineering view of the valve fleet: pass-rate health, fleet composition and age, and an auditable findings log.'
+
+    # =======================================================================
+    # VERIFICATION: GET each dashboard back, check shape, then run EVERY chart
+    # tile's wire query (toWireSpec order [axis, legend?, smallMultiples?];
+    # paramBindings resolved to the parameter's default option).
+    # =======================================================================
+    $fullDashboards = @(
+        @{ Name = 'Executive Overview'; ModelId = $maintModel.id }
+        @{ Name = 'Operations Command Center'; ModelId = $maintModel.id }
+        @{ Name = 'Cost & Vendor Management'; ModelId = $maintModel.id }
+        @{ Name = 'Workforce & Productivity'; ModelId = $wfModel.id }
+        @{ Name = 'Asset Reliability'; ModelId = $inspModel.id }
+    )
+
+    function VerifyFullDashboard([string]$Name, [int]$ExpectedModelId) {
+        $doc = GetDashboardByName $Name
+        $pages = @($doc.layout.pages)
+        Write-Host "`nVerify: $Name (id $($doc.id))"
+        Assert ($doc.modelId -eq $ExpectedModelId) "$($Name): bound to the expected model"
+        Assert ($doc.isShared -and $doc.ownerIsMe) "$($Name): shared and owned by carol"
+        Assert ($pages.Count -ge 3) "$($Name): >= 3 pages (got $($pages.Count))"
+        Assert (((@($pages | ForEach-Object { $_.color })) | Select-Object -Unique).Count -eq $pages.Count) "$($Name): distinct page tab colors"
+        Assert (@($doc.layout.bookmarks).Count -ge 2) "$($Name): >= 2 bookmarks"
+        $parameters = @($doc.layout.parameters)
+        foreach ($page in $pages) {
+            $tiles = @($page.tiles)
+            Assert ($tiles.Count -ge 6) "$($Name) / $($page.name): >= 6 tiles (got $($tiles.Count))"
+            foreach ($tile in $tiles) {
+                if ($tile.kind -ne 'chart' -or -not $tile.chart) { continue }
+                $q = $tile.chart.query
+                $axis = $q.axis
+                $measures = @($q.measures)
+                if ($q.paramBindings) {
+                    if ($q.paramBindings.axis) {
+                        $p = $parameters | Where-Object { $_.id -eq $q.paramBindings.axis } | Select-Object -First 1
+                        if ($p) {
+                            $idx = if ($null -ne $p.defaultIndex) { [int]$p.defaultIndex } else { 0 }
+                            $axis = $p.options[$idx].dimension
+                        }
+                    }
+                    if ($q.paramBindings.measures) {
+                        $p = $parameters | Where-Object { $_.id -eq $q.paramBindings.measures } | Select-Object -First 1
+                        if ($p) {
+                            $idx = if ($null -ne $p.defaultIndex) { [int]$p.defaultIndex } else { 0 }
+                            $measures = @($p.options[$idx].measure)
+                        }
+                    }
+                }
+                $dims = @()
+                if ($axis) { $dims += $axis }
+                if ($q.legend) { $dims += $q.legend }
+                if ($q.smallMultiples) { $dims += $q.smallMultiples }
+                $spec = [ordered]@{
+                    modelId = $doc.modelId
+                    dimensions = $dims
+                    measures = $measures
+                    filters = @(); sort = @()
+                }
+                if ($q.filters) { $spec.filters = @($q.filters) }
+                if ($q.sort) { $spec.sort = @($q.sort) }
+                if ($null -ne $q.limit) { $spec.limit = $q.limit }
+                $label = "$($page.name) / $($tile.chart.title)"
+                try {
+                    $r = PostQueryBody ($spec | ConvertTo-Json -Depth 12)
+                    $n = @($r.rows).Count
+                    if ($n -ge 1) {
+                        Write-Host "  $([char]0x2713) $label ($n rows)" -ForegroundColor Green
+                    } else {
+                        Write-Host "  $([char]0x2717) $label (0 rows)" -ForegroundColor Red
+                        $script:failures++
+                    }
+                } catch {
+                    $detailMsg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+                    Write-Host "  $([char]0x2717) $label ($detailMsg)" -ForegroundColor Red
+                    $script:failures++
+                }
+            }
+        }
+        $doc
+    }
+
+    Write-Host "`nFull verification: persisted docs + wire queries"
+    $verified = @{}
+    foreach ($fd in $fullDashboards) { $verified[$fd.Name] = VerifyFullDashboard $fd.Name $fd.ModelId }
+
+    # Feature spot checks on the persisted docs.
+    Write-Host "`nFull verification: feature spot checks"
+    $vd1 = $verified['Executive Overview']; $vd2 = $verified['Operations Command Center']
+    $vd3 = $verified['Cost & Vendor Management']; $vd4 = $verified['Workforce & Productivity']
+    $vd5 = $verified['Asset Reliability']
+    $d1Hero = @(@($vd1.layout.pages)[0].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d1-hero') } | Select-Object -First 1
+    Assert (@($d1Hero.chart.format.secondaryAxisKeys).Count -eq 1) 'D1 hero: secondaryAxisKeys dual-axis persisted'
+    Assert (@($vd1.layout.pages | Where-Object { $_.mobileLayout }).Count -eq 3) 'D1: mobileLayout on all 3 pages'
+    Assert (@(@($vd1.layout.pages)[2].drillthrough.fields).Count -eq 1) 'D1: Regional Deep Dive drillthrough target'
+    $d2Window = @(@($vd2.layout.pages)[0].tiles) | Where-Object { $_.id -eq (DetId 'tile-d2-sl-window') } | Select-Object -First 1
+    Assert ($d2Window.slicer.variant -eq 'relativeDate' -and $d2Window.slicer.preset -eq 'last90d') 'D2: relativeDate slicer defaults to Last 90 days'
+    $d2Spot = @(@($vd2.layout.pages)[0].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d2-priostack') } | Select-Object -First 1
+    Assert ($d2Spot.chart.format.legendMode -eq 'crossFilter') 'D2: legendMode crossFilter persisted'
+    $d2Iso = @(@($vd2.layout.pages)[1].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d2-statusmix') } | Select-Object -First 1
+    Assert ($d2Iso.chart.format.legendMode -eq 'isolate') 'D2: legendMode isolate persisted'
+    Assert (@(@($vd2.layout.pages)[2].drillthrough.fields).Count -eq 2) 'D2: Order Details drillthrough on site + status'
+    Assert (@($vd3.layout.parameters).Count -eq 1) 'D3: field parameter persisted'
+    $d3Lens = @(@($vd3.layout.pages)[0].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d3-lens') } | Select-Object -First 1
+    Assert ($d3Lens.chart.query.paramBindings.axis -eq $paramLens) 'D3: chart bound to the Spend Lens parameter'
+    $d3Scatter = @(@($vd3.layout.pages)[2].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d3-scatter') } | Select-Object -First 1
+    Assert ([bool]$d3Scatter.chart.format.xAxisLabelHtml -and [bool]$d3Scatter.chart.format.yAxisLabelHtml) 'D3: rich-HTML axis titles on the scatter'
+    $d4Sm = @(@($vd4.layout.pages)[1].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d4-smallmult') } | Select-Object -First 1
+    Assert ($d4Sm.chart.query.smallMultiples.column -eq 'region') 'D4: small multiples split persisted'
+    $d5Age = @(@($vd5.layout.pages)[1].tiles) | Where-Object { $_.chart.id -eq (DetId 'chart-d5-age') } | Select-Object -First 1
+    Assert (@($d5Age.chart.query.drillLevels).Count -eq 1) 'D5: install-date year->month drill persisted'
+
+    # --- summary ---
+    Write-Host ''
+    Write-Host ('-' * 60)
+    foreach ($fd in $fullDashboards) {
+        $doc = $verified[$fd.Name]
+        $counts = (@($doc.layout.pages) | ForEach-Object { "$($_.name)=$(@($_.tiles).Count)" }) -join ', '
+        Write-Host ("Full: {0} (id {1}) - {2}" -f $fd.Name, $doc.id, $counts)
+    }
+    if ($failures -gt 0) {
+        Write-Host "`n$failures full-phase check(s) FAILED" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "`nAll full-phase checks passed." -ForegroundColor Green
     exit 0
 }
 
