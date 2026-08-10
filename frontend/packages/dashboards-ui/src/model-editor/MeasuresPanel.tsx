@@ -614,7 +614,7 @@ export function MeasuresPanel() {
           ) : (
             <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-3 pb-3">
               {groups.map((group) => (
-                <div key={group.folder || ' ungrouped'} className="flex flex-col gap-1">
+                <div key={group.folder || '__ungrouped'} className="flex flex-col gap-1">
                   {/* A single implicit group needs no header. */}
                   {(group.folder !== '' || groups.length > 1) && (
                     <span className="px-0.5 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">

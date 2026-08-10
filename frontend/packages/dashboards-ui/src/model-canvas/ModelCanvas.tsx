@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -334,12 +335,31 @@ export function ModelCanvas({
     nodes,
   ]);
 
-  const handleNodesChange = useCallback((changes: NodeChange<TableNodeType>[]) => {
-    setNodes((current) => applyNodeChanges(changes, current));
+  /**
+   * Clicking an SVG edge leaves focus on <body> (browsers don't focus SVG on
+   * click), so the wrapper's onKeyDown would never fire. Pull focus into the
+   * canvas on selection — but only when it isn't already inside (React Flow
+   * focuses nodes natively; don't steal that).
+   */
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const focusCanvas = useCallback(() => {
+    const wrapper = wrapperRef.current;
+    if (wrapper && !wrapper.contains(document.activeElement)) {
+      wrapper.focus({ preventScroll: true });
+    }
   }, []);
+
+  const handleNodesChange = useCallback(
+    (changes: NodeChange<TableNodeType>[]) => {
+      if (changes.some((c) => c.type === 'select' && c.selected)) focusCanvas();
+      setNodes((current) => applyNodeChanges(changes, current));
+    },
+    [focusCanvas],
+  );
 
   /** Mirror React Flow's edge selection changes into our own selection state. */
   const handleEdgesChange = useCallback((changes: EdgeChange<ModelCanvasEdge>[]) => {
+    if (changes.some((c) => c.type === 'select' && c.selected)) focusCanvas();
     setSelectedEdgeIds((current) => {
       let next: Set<string> | null = null;
       for (const change of changes) {
@@ -526,7 +546,10 @@ export function ModelCanvas({
 
   return (
     <div
-      className="rcd-model-canvas h-full w-full"
+      ref={wrapperRef}
+      // Programmatically focusable (focusCanvas) without joining tab order.
+      tabIndex={-1}
+      className="rcd-model-canvas h-full w-full outline-none"
       onKeyDown={handleCanvasKeyDown}
       // Native browser menu is suppressed everywhere inside the canvas; our
       // node/edge handlers open the custom card instead.
