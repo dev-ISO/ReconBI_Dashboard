@@ -6,10 +6,12 @@ import {
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
+  type RefObject,
 } from 'react';
 import {
   Area,
   Bar,
+  Brush,
   CartesianGrid,
   Cell,
   ComposedChart,
@@ -19,6 +21,7 @@ import {
   Line,
   Pie,
   PieChart,
+  ReferenceArea,
   ReferenceLine,
   ResponsiveContainer,
   Scatter,
@@ -63,13 +66,20 @@ import {
   buildTrendlines,
   conditionalColor,
   linearFitSegment,
+  numberExtent,
+  paddedNiceDomain,
   referenceLineValue,
+  resolveAxisScale,
   seriesValues,
   sharedValueDomain,
+  valueExtent,
+  type ResolvedAxisScale,
   type TrendlineOverlay,
 } from './analytics';
+import { AxisFitTick, resolveLabelFit } from './axisFit';
 import { textStyleToCss } from './textStyle';
 import { TableChart, type TableColumnFilter } from './TableChart';
+import './chart.css';
 
 export type {
   TableColumnFilter,
@@ -84,6 +94,31 @@ export interface ChartDatumClickInfo {
   value: CellValue;
   /** Formatted display label of the clicked category. */
   label: string;
+}
+
+/**
+ * The data point(s) currently driving THIS chart's own active cross-filter
+ * (echoed back by the consumer so the source chart can emphasize them).
+ * Matching is by FORMATTED label (ChartDatumClickInfo.label /
+ * ChartPointEvent.axisLabel / legendLabel); a stringified RAW cell also
+ * matches, so consumers may echo either form.
+ */
+export interface ChartSelection {
+  /** Selected category (axis value); null/undefined = no category facet. */
+  category?: string | null;
+  /** Selected legend value; null/undefined = no legend facet. */
+  legendValue?: string | null;
+}
+
+/**
+ * Drag-selected span of a bucketed DATE axis (zoom.dragAction 'crossFilter').
+ * fromRaw/toRaw are the RAW axis bucket cells of the span's edge buckets —
+ * the same raw values point events carry, NOT display labels — inclusive of
+ * both edges.
+ */
+export interface ChartAxisRangeSelection {
+  fromRaw: unknown;
+  toRaw: unknown;
 }
 
 export interface ChartRendererProps {
@@ -117,6 +152,25 @@ export interface ChartRendererProps {
    * stacked charts skip dimming (a category there spans several marks).
    */
   activeCategory?: { label: string } | null;
+  /**
+   * The data point(s) currently driving this chart's own active cross-filter.
+   * While non-null (and format.selectionHighlight !== false) matching data
+   * points render emphasized — full opacity plus a subtle accent ring — and
+   * everything else dims to ~0.35, the same dim the hover highlight uses, so
+   * the two read as one system (selection wins over hover while both are
+   * present). Covers column/bar (vertical + horizontal, stacked, multi-
+   * series), pie/donut slices, line/area (enlarged dots on the selected
+   * category; legendValue dims the other series) and scatter groups.
+   */
+  selection?: ChartSelection | null;
+  /**
+   * Axis range-select hook: fires when format.zoom.dragAction ===
+   * 'crossFilter' and the user drag-selects a span of a bucketed DATE axis
+   * (requires zoom.dragZoom). The view also zooms to the span, so the source
+   * chart shows the selection it just emitted. Non-date axes fall back to a
+   * plain view zoom and never fire this.
+   */
+  onAxisRangeSelect?: (range: ChartAxisRangeSelection) => void;
   /**
    * Legend cross-filter hook (format.legendMode === 'crossFilter'): clicking a
    * legend item fires with the RAW legend-dimension cell (pie: the slice's
@@ -213,6 +267,60 @@ const SM_MIN_LABEL_WIDTH = 160;
 
 /** Shared empty set: the "nothing hidden" value (also used when non-interactive). */
 const NO_HIDDEN: ReadonlySet<string> = new Set();
+
+/**
+ * Debounced ResizeObserver measurement of a container div — the shared
+ * pattern behind CenteredPieFrame, the small-multiples grid and the cartesian
+ * label-fit/zoom wrapper. Null until the first measure lands.
+ */
+function useDebouncedSize(
+  ref: RefObject<HTMLDivElement | null>,
+): { width: number; height: number } | null {
+  const [size, setSize] = useState<{ width: number; height: number } | null>(null);
+  useEffect(() => {
+    const node = ref.current;
+    if (!node) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const measure = () => setSize({ width: node.clientWidth, height: node.clientHeight });
+    measure();
+    const observer = new ResizeObserver(() => {
+      clearTimeout(timer);
+      timer = setTimeout(measure, RESIZE_DEBOUNCE);
+    });
+    observer.observe(node);
+    return () => {
+      clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [ref]);
+  return size;
+}
+
+/**
+ * Does one ChartSelection facet (a formatted label — or a stringified raw
+ * cell) match this label/raw pair? Accepting either form keeps the renderer
+ * agnostic about which one the consumer chose to echo back.
+ */
+const selectionFacetMatches = (
+  facet: string,
+  label: string | undefined,
+  raw: CellValue | undefined,
+): boolean => facet === label || (raw != null && String(raw) === facet);
+
+/** Opacity every non-selected / non-highlighted mark dims to (one system). */
+const DIM_OPACITY = 0.35;
+
+/** Accent ring stroke marking the selected data point(s). */
+const SELECTION_STROKE = 'var(--rcd-accent-interactive)';
+
+/** Pixel threshold: a sub-4px drag counts as a click, never a zoom. */
+const DRAG_ZOOM_MIN_PX = 4;
+
+/** Wheel zoom never narrows the view below this many buckets. */
+const MIN_WHEEL_BUCKETS = 3;
+
+/** "No scale options" resolution: recharts defaults, nothing to warn about. */
+const NO_AXIS_SCALE: ResolvedAxisScale = { logFallback: false };
 
 /** Formats one measure value; seriesKey picks the column in measure-series mode. */
 type ValueFormatter = (value: unknown, seriesKey?: string) => string;
@@ -877,23 +985,7 @@ function themedTooltip(
  */
 function CenteredPieFrame({ legendRight, children }: { legendRight: boolean; children: ReactNode }) {
   const frameRef = useRef<HTMLDivElement>(null);
-  const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
-  useEffect(() => {
-    const node = frameRef.current;
-    if (!node) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const measure = () => setFrameSize({ width: node.clientWidth, height: node.clientHeight });
-    measure();
-    const observer = new ResizeObserver(() => {
-      clearTimeout(timer);
-      timer = setTimeout(measure, RESIZE_DEBOUNCE);
-    });
-    observer.observe(node);
-    return () => {
-      clearTimeout(timer);
-      observer.disconnect();
-    };
-  }, []);
+  const frameSize = useDebouncedSize(frameRef);
   const width =
     frameSize === null
       ? '100%'
@@ -992,6 +1084,10 @@ interface CartesianChartProps {
   onPointHover?: (e: ChartPointEvent | null) => void;
   activeCategory?: { label: string } | null;
   highlightCategory?: { label: string } | null;
+  /** Echo of this chart's own active cross-filter selection (see ChartRendererProps). */
+  selection?: ChartSelection | null;
+  /** Date-axis drag range select (zoom.dragAction 'crossFilter'). */
+  onAxisRangeSelect?: (range: ChartAxisRangeSelection) => void;
   /** Present when rendering as one small-multiples panel (no legend, tight axes). */
   panel?: PanelContext;
 }
@@ -1023,10 +1119,27 @@ function CartesianChart({
   onPointHover,
   activeCategory = null,
   highlightCategory = null,
+  selection = null,
+  onAxisRangeSelect,
   panel,
 }: CartesianChartProps) {
   const format = spec.format;
   const hidden = legend.hidden;
+  // Container measurement drives category-label fitting and wheel-zoom
+  // geometry; per-panel instances measure their own panel body.
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const wrapSize = useDebouncedSize(wrapRef);
+  // Transient zoom view window (indices into the plotted rows); NEVER
+  // persisted. Null = full extent.
+  const [viewWindow, setViewWindow] = useState<{ start: number; end: number } | null>(null);
+  // Live drag-select span (display-row indices) rendered as a ReferenceArea.
+  const [dragSpan, setDragSpan] = useState<{ startIdx: number; endIdx: number } | null>(null);
+  const dragRef = useRef<{ startIdx: number; startX: number; moved: boolean } | null>(null);
+  // A completed zoom drag must not double as a datum click: the flag is set on
+  // mouseup and cleared on the next macrotask, after the browser's click.
+  const suppressClickRef = useRef(false);
+  // Window geometry for the native (non-passive) wheel listener.
+  const wheelStateRef = useRef({ start: 0, end: 0, len: 0, axisLeft: 0, axisRight: 0 });
   const horizontal = spec.type === 'bar' || spec.type === 'stackedBar';
   const stacked = spec.type === 'stackedColumn' || spec.type === 'stackedBar';
   const isBars = spec.type !== 'line' && spec.type !== 'area';
@@ -1090,7 +1203,31 @@ function CartesianChart({
   const seriesDimmed = (s: ChartSeries): boolean =>
     highlightSeriesMode && !seriesMatchesHighlight(s);
 
-  const renderCells = colorByCategory || dimming || barFillActive || highlightCategoryMode;
+  // ---- selection highlight (this chart's own active cross-filter) ----------
+  // Matching points keep full opacity plus a subtle accent ring; everything
+  // else drops to the same 0.35 the hover dim uses, so hover and selection
+  // read as one system — and SELECTION WINS over hover while both are
+  // present. Unlike the legacy activeCategory dim, this path covers multi-
+  // series and stacked bars too (each matching segment rings individually).
+  const selectionOn =
+    format.selectionHighlight !== false &&
+    selection != null &&
+    (selection.category != null || selection.legendValue != null);
+  const selSeriesMatches = (s: ChartSeries): boolean =>
+    !selectionOn ||
+    selection?.legendValue == null ||
+    selectionFacetMatches(selection.legendValue, s.legendLabel ?? s.label, s.legendRaw);
+  const selRowMatches = (row: Record<string, CellValue>): boolean =>
+    !selectionOn ||
+    selection?.category == null ||
+    selectionFacetMatches(
+      selection.category,
+      String(row[shaped.axisKey] ?? ''),
+      row[RAW_AXIS_KEY],
+    );
+
+  const renderCells =
+    colorByCategory || dimming || barFillActive || highlightCategoryMode || (selectionOn && isBars);
 
   // Trendlines: column/stackedColumn/line/area only — horizontal bars would
   // need value-axis fitting and are skipped silently (as are pie/kpi/table).
@@ -1101,6 +1238,209 @@ function CartesianChart({
     trendSpecs.length > 0
       ? buildTrendlines(trendSpecs, visibleSeries, shaped.data)
       : { rows: shaped.data, overlays: [] as TrendlineOverlay[] };
+
+  // ---- zoom view window (format.zoom) --------------------------------------
+  // Cartesian MAIN charts only: small-multiple panels ignore zoom entirely (a
+  // grid of independently-zoomed panels would be incoherent), and horizontal
+  // bars keep their category axis on y, where none of the horizontal-span
+  // tools apply. The window is transient view state — never persisted.
+  const zoomOpts = format.zoom;
+  const zoomEligible = !panel && !horizontal && rows.length > 1;
+  const brushOn = zoomEligible && zoomOpts?.brush === true;
+  const dragZoomOn = zoomEligible && zoomOpts?.dragZoom === true;
+  const wheelOn = zoomEligible && zoomOpts?.wheel === true;
+  const zoomActive = brushOn || dragZoomOn || wheelOn;
+
+  // Reset the view whenever the data identity changes (new result, drill,
+  // slicer change) — a stale window over different rows would lie.
+  const dataIdentity = `${rows.length}|${String(rows[0]?.[RAW_AXIS_KEY] ?? '')}|${String(
+    rows[rows.length - 1]?.[RAW_AXIS_KEY] ?? '',
+  )}`;
+  useEffect(() => {
+    setViewWindow(null);
+  }, [dataIdentity]);
+
+  const lastRow = rows.length - 1;
+  const winStart = viewWindow ? Math.max(0, Math.min(viewWindow.start, lastRow)) : 0;
+  const winEnd = viewWindow ? Math.max(winStart, Math.min(viewWindow.end, lastRow)) : lastRow;
+  /**
+   * Rows the user actually SEES. With the brush enabled the chart keeps the
+   * FULL rows (the strip must show the whole extent) and recharts windows the
+   * plot from the controlled brush indices; otherwise we slice manually.
+   * Either way recharts renders — and indexes events/Cells against — exactly
+   * this slice, so every handler below addresses displayRows.
+   */
+  const displayRows = viewWindow ? rows.slice(winStart, winEnd + 1) : rows;
+  const chartRows = brushOn ? rows : displayRows;
+
+  // ---- axis scales (AxisScaleOptions) --------------------------------------
+  // Extents cover the VISIBLE series on each axis (so legend toggles re-fit
+  // like recharts' own auto domain) plus the trendline overlays fitted to
+  // them — a linear fit can poke past the data. Horizontal bars put the VALUE
+  // axis on x, so xAxisScale drives it there. sharedY small-multiple panels
+  // receive their (already scale-adjusted) domain from the grid instead.
+  const primaryKeys = visibleSeries
+    .filter((s) => !y2Keys.has(s.key))
+    .map((s) => s.key)
+    .concat(overlays.filter((o) => !y2Keys.has(o.source.key)).map((o) => o.dataKey));
+  const y2SeriesKeys = visibleSeries
+    .filter((s) => y2Keys.has(s.key))
+    .map((s) => s.key)
+    .concat(overlays.filter((o) => y2Keys.has(o.source.key)).map((o) => o.dataKey));
+  const valueScale = panel?.valueDomain
+    ? NO_AXIS_SCALE
+    : resolveAxisScale(
+        horizontal ? format.xAxisScale : format.yAxisScale,
+        valueExtent(rows, primaryKeys, stacked),
+      );
+  const y2Scale = hasSecondary
+    ? resolveAxisScale(format.y2AxisScale, valueExtent(rows, y2SeriesKeys, stacked))
+    : NO_AXIS_SCALE;
+  // Log fallback surfaces as a subtle in-chart note, never console spam.
+  const logNotes: string[] = [];
+  if (valueScale.logFallback) logNotes.push('Log axis needs positive values — kept linear');
+  if (y2Scale.logFallback) logNotes.push('Log right axis needs positive values — kept linear');
+
+  // ---- category label fit (format.xLabelFit) -------------------------------
+  // Vertical category axes only (the horizontal-bar category axis is the
+  // fixed-width y rail). Until the first container measure lands the axis
+  // keeps the classic thinned pattern, then re-renders fitted; the zoomed
+  // view re-fits for the labels actually shown.
+  const yAxisWidth = horizontal ? 110 : panel ? (panel.showYTicks ? 42 : 8) : 56;
+  const y2AxisWidth = hasSecondary ? (panel ? 8 : 56) : 0;
+  const xTicksVisible = !(panel && !panel.showXTicks);
+  const plotWidth = wrapSize ? Math.max(0, wrapSize.width - yAxisWidth - y2AxisWidth - 18) : null;
+  const labelFit =
+    !horizontal && xTicksVisible && plotWidth !== null && plotWidth > 0 && displayRows.length > 0
+      ? resolveLabelFit(
+          displayRows.map((row) => String(row[shaped.axisKey] ?? '')),
+          plotWidth / displayRows.length,
+          format.xLabelFit,
+        )
+      : null;
+  const fittedTicks = labelFit !== null && labelFit.mode !== 'thin';
+
+  // ---- drag zoom / drag range cross-filter ---------------------------------
+  const displayIndexFromState = (state: MouseHandlerDataParam): number | undefined => {
+    const raw = state.activeTooltipIndex;
+    const index = typeof raw === 'number' ? raw : raw != null ? Number(raw) : NaN;
+    return Number.isInteger(index) && index >= 0 && index < displayRows.length
+      ? index
+      : undefined;
+  };
+
+  const dragMouseDown = dragZoomOn
+    ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
+        if (event.button !== 0) return;
+        // The brush strip manages its own dragging.
+        if ((event.target as Element | null)?.closest?.('.recharts-brush')) return;
+        const idx = displayIndexFromState(state);
+        if (idx === undefined) return;
+        dragRef.current = { startIdx: idx, startX: event.clientX, moved: false };
+      }
+    : undefined;
+
+  const dragMouseMove = dragZoomOn
+    ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
+        const drag = dragRef.current;
+        if (!drag) return;
+        // Sub-threshold movement stays a click; no span, no zoom.
+        if (Math.abs(event.clientX - drag.startX) < DRAG_ZOOM_MIN_PX) return;
+        const idx = displayIndexFromState(state);
+        if (idx === undefined) return;
+        drag.moved = true;
+        setDragSpan({ startIdx: drag.startIdx, endIdx: idx });
+      }
+    : undefined;
+
+  const dragMouseUp = dragZoomOn
+    ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
+        const drag = dragRef.current;
+        dragRef.current = null;
+        const span = dragSpan;
+        setDragSpan(null);
+        if (!drag || !drag.moved) return;
+        if (Math.abs(event.clientX - drag.startX) < DRAG_ZOOM_MIN_PX) return;
+        const endIdx = displayIndexFromState(state) ?? span?.endIdx;
+        if (endIdx === undefined) return;
+        const i0 = Math.min(drag.startIdx, endIdx);
+        const i1 = Math.max(drag.startIdx, endIdx);
+        // Swallow the click the browser fires right after this mouseup so the
+        // drag can't double as a datum cross-filter click.
+        suppressClickRef.current = true;
+        setTimeout(() => {
+          suppressClickRef.current = false;
+        }, 0);
+        // dragAction 'crossFilter' on a bucketed DATE axis emits the RAW
+        // bucket cells of the span edges (inclusive) AND zooms the view, so
+        // the source chart shows the span it just pushed onto the page.
+        // Non-date axes fall back to the plain view zoom.
+        if (
+          zoomOpts?.dragAction === 'crossFilter' &&
+          shaped.axisIsDate &&
+          onAxisRangeSelect &&
+          displayRows[i0] &&
+          displayRows[i1]
+        ) {
+          onAxisRangeSelect({
+            fromRaw: displayRows[i0]![RAW_AXIS_KEY] ?? null,
+            toRaw: displayRows[i1]![RAW_AXIS_KEY] ?? null,
+          });
+        }
+        if (i1 > i0) setViewWindow({ start: winStart + i0, end: winStart + i1 });
+      }
+    : undefined;
+
+  // ---- wheel zoom ----------------------------------------------------------
+  // Geometry for the native listener (React wheel handlers are passive, so
+  // preventDefault needs a manual non-passive listener).
+  wheelStateRef.current = {
+    start: winStart,
+    end: winEnd,
+    len: rows.length,
+    axisLeft: yAxisWidth + 8,
+    axisRight: y2AxisWidth + 12,
+  };
+  useEffect(() => {
+    if (!wheelOn) return;
+    const node = wrapRef.current;
+    if (!node) return;
+    // Wheel rule (least-annoying): plain wheel zooms only while the chart is
+    // ALREADY zoomed in; ctrl/cmd+wheel always zooms. At full zoom-out a
+    // plain wheel scrolls the page normally, and zooming out past the full
+    // extent releases the wheel back to page scrolling.
+    const onWheel = (e: WheelEvent) => {
+      const st = wheelStateRef.current;
+      const zoomedIn = st.start > 0 || st.end < st.len - 1;
+      if (!e.ctrlKey && !e.metaKey && !zoomedIn) return;
+      e.preventDefault();
+      if (e.deltaY === 0) return;
+      const count = st.end - st.start + 1;
+      const zoomIn = e.deltaY < 0;
+      if (zoomIn && count <= MIN_WHEEL_BUCKETS) return;
+      const newCount = zoomIn
+        ? Math.max(MIN_WHEEL_BUCKETS, Math.floor(count * 0.8))
+        : Math.max(count + 1, Math.ceil(count * 1.25));
+      if (!zoomIn && newCount >= st.len) {
+        setViewWindow(null);
+        return;
+      }
+      // Zoom centred on the cursor: keep the bucket under the pointer at the
+      // same fractional position inside the new window.
+      const rect = node.getBoundingClientRect();
+      const plotLeft = rect.left + st.axisLeft;
+      const plotW = Math.max(1, rect.width - st.axisLeft - st.axisRight);
+      const f = Math.min(1, Math.max(0, (e.clientX - plotLeft) / plotW));
+      const anchor = st.start + Math.round(f * (count - 1));
+      const start = Math.min(
+        Math.max(0, anchor - Math.round(f * (newCount - 1))),
+        st.len - newCount,
+      );
+      setViewWindow({ start, end: start + newCount - 1 });
+    };
+    node.addEventListener('wheel', onWheel, { passive: false });
+    return () => node.removeEventListener('wheel', onWheel);
+  }, [wheelOn]);
 
   // ---- designed fills (shadcn look) ---------------------------------------
   // Bars are flat solid fills at full color (no gradient, no self-stroke);
@@ -1162,14 +1502,17 @@ function CartesianChart({
     clientY: e.clientY,
   });
 
-  // Recharts hands (barItem, index, event) — index addresses the plotted rows
-  // directly, which is sturdier across recharts versions than digging into
-  // payload. Cross-filter (onDatumClick) and the point event BOTH fire; the
-  // consumer decides what each means.
+  // Recharts hands (barItem, index, event) — index addresses the DISPLAYED
+  // rows (the zoom-window slice when one is active), which is sturdier across
+  // recharts versions than digging into payload. Cross-filter (onDatumClick)
+  // and the point event BOTH fire; the consumer decides what each means. A
+  // click landing right after a completed zoom drag is swallowed
+  // (suppressClickRef) so a drag never doubles as a datum click.
   const barClick = (series: ChartSeries) =>
     onDatumClick || onPointClick
       ? (_: unknown, index: number, event: ReactMouseEvent) => {
-          const row = rows[index];
+          if (suppressClickRef.current) return;
+          const row = displayRows[index];
           if (!row) return;
           onDatumClick?.({
             value: row[RAW_AXIS_KEY] ?? null,
@@ -1181,7 +1524,7 @@ function CartesianChart({
   const barContextMenu = (series: ChartSeries) =>
     onPointContextMenu
       ? (_: unknown, index: number, event: ReactMouseEvent) => {
-          const row = rows[index];
+          const row = displayRows[index];
           if (!row) return;
           event.preventDefault();
           onPointContextMenu(pointEvent(row, series, event));
@@ -1192,7 +1535,7 @@ function CartesianChart({
   const barHover = (series: ChartSeries) =>
     onPointHover
       ? (_: unknown, index: number, event: ReactMouseEvent) => {
-          const row = rows[index];
+          const row = displayRows[index];
           if (row) onPointHover(pointEvent(row, series, event));
         }
       : undefined;
@@ -1211,6 +1554,7 @@ function CartesianChart({
             strokeWidth={1}
             cursor="pointer"
             onClick={(_, event) => {
+              if (suppressClickRef.current) return;
               const row = dotProps.payload as Record<string, CellValue> | undefined;
               onPointClick(pointEvent(row, series, event));
             }}
@@ -1218,11 +1562,46 @@ function CartesianChart({
         )
       : undefined;
 
-  // Active hovered row from chart-level state (line/area handlers).
+  /**
+   * Persistent selection dot for line/area: the selected category renders an
+   * enlarged accent-ringed dot on every series matching the selection's
+   * legend facet; other points draw nothing. Recharts calls the renderer for
+   * EVERY point, so misses return an empty <g>.
+   */
+  const selectionDot = (series: ChartSeries) =>
+    selectionOn && selection?.category != null && selSeriesMatches(series)
+      ? // Loosely typed: recharts' per-point dot props type isn't exported;
+        // we only read cx/cy/payload/index.
+        (dotProps: unknown) => {
+          const p = dotProps as { cx?: number; cy?: number; payload?: unknown; index?: number };
+          const row = p.payload as Record<string, CellValue> | undefined;
+          const hit =
+            row !== undefined &&
+            typeof p.cx === 'number' &&
+            typeof p.cy === 'number' &&
+            selRowMatches(row);
+          return hit ? (
+            <Dot
+              key={`sel-${p.index ?? ''}`}
+              cx={p.cx}
+              cy={p.cy}
+              r={4.5}
+              fill={series.color}
+              stroke={SELECTION_STROKE}
+              strokeWidth={1.5}
+            />
+          ) : (
+            <g key={`sel-${p.index ?? ''}`} />
+          );
+        }
+      : false;
+
+  // Active hovered row from chart-level state (line/area handlers); indices
+  // address the displayed (zoom-windowed) rows.
   const rowFromChartState = (state: MouseHandlerDataParam) => {
     const raw = state.activeTooltipIndex;
     const index = typeof raw === 'number' ? raw : raw != null ? Number(raw) : NaN;
-    return Number.isInteger(index) ? rows[index] : undefined;
+    return Number.isInteger(index) ? displayRows[index] : undefined;
   };
 
   // Line/area context menu resolves the ACTIVE hovered category from the
@@ -1246,6 +1625,27 @@ function CartesianChart({
       ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
           const row = rowFromChartState(state);
           if (row) onPointHover(pointEvent(row, undefined, event));
+        }
+      : undefined;
+
+  // Chart-level mouse composition: hover tracking and drag-zoom share
+  // mousemove/leave; drag-zoom owns mousedown/up.
+  const handleChartMouseMove =
+    chartMouseMove || dragMouseMove
+      ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
+          dragMouseMove?.(state, event);
+          chartMouseMove?.(state, event);
+        }
+      : undefined;
+  const handleChartMouseLeave =
+    onPointHover || dragZoomOn
+      ? () => {
+          onPointHover?.(null);
+          if (dragZoomOn) {
+            // Leaving the plot mid-drag cancels the pending span.
+            dragRef.current = null;
+            setDragSpan(null);
+          }
         }
       : undefined;
 
@@ -1277,9 +1677,15 @@ function CartesianChart({
   });
 
   return (
+    <div
+      ref={wrapRef}
+      className="relative h-full w-full min-w-0"
+      // Double-click anywhere on the plot resets the zoom view to full.
+      onDoubleClick={zoomActive ? () => setViewWindow(null) : undefined}
+    >
     <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
       <ComposedChart
-        data={rows}
+        data={chartRows}
         layout={horizontal ? 'vertical' : 'horizontal'}
         margin={
           panel
@@ -1295,12 +1701,18 @@ function CartesianChart({
         // Slimmer default gaps between category slots (shadcn bars sit closer).
         barCategoryGap="20%"
         onContextMenu={chartContextMenu}
-        onMouseMove={chartMouseMove}
-        onMouseLeave={onPointHover ? () => onPointHover(null) : undefined}
+        onMouseDown={dragMouseDown}
+        onMouseMove={handleChartMouseMove}
+        onMouseUp={dragMouseUp}
+        onMouseLeave={handleChartMouseLeave}
       >
+        {/* format.gridX/gridY toggle each axis's lines. Defaults preserve the
+            long-standing look: lines from the VALUE axis on (horizontal rules
+            on vertical charts, vertical rules on horizontal bars), category-
+            axis lines off. */}
         <CartesianGrid
-          vertical={isBars ? horizontal : false}
-          horizontal={isBars ? !horizontal : true}
+          vertical={format.gridX ?? horizontal}
+          horizontal={format.gridY ?? !horizontal}
           stroke={GRID_STROKE}
         />
         {horizontal ? (
@@ -1311,7 +1723,8 @@ function CartesianChart({
             axisLine={false}
             tickMargin={panel ? 3 : TICK_MARGIN}
             tickFormatter={valueTickFormatter}
-            domain={panel?.valueDomain}
+            domain={panel?.valueDomain ?? valueScale.domain}
+            scale={valueScale.scale}
             // Axis TITLES stay on the single chart; panels are too small.
             // HTML titles render outside the plot instead (AxisTitleFrame).
             label={
@@ -1323,14 +1736,19 @@ function CartesianChart({
         ) : (
           <XAxis
             dataKey={shaped.axisKey}
-            tick={panel && !panel.showXTicks ? false : axisTickStyle}
+            tick={
+              !xTicksVisible ? false : fittedTicks && labelFit ? <AxisFitTick fit={labelFit} /> : axisTickStyle
+            }
             tickLine={false}
             axisLine={false}
             tickMargin={panel ? 3 : TICK_MARGIN}
-            // Dense category axes drop interior ticks instead of colliding;
-            // first/last stay so the extent is always readable.
-            interval="preserveStartEnd"
-            minTickGap={8}
+            // Fitted modes label EVERY bucket (rotating/wrapping as needed and
+            // reserving the height below); the unfitted fallback keeps the
+            // classic thinned pattern — interior ticks drop instead of
+            // colliding, first/last stay so the extent reads.
+            interval={fittedTicks ? 0 : 'preserveStartEnd'}
+            minTickGap={fittedTicks ? undefined : 8}
+            height={fittedTicks && labelFit ? labelFit.height : undefined}
             label={
               panel || htmlXTitle
                 ? undefined
@@ -1361,7 +1779,8 @@ function CartesianChart({
             tickMargin={panel ? 3 : TICK_MARGIN}
             width={panel ? (panel.showYTicks ? 42 : 8) : 56}
             tickFormatter={valueTickFormatter}
-            domain={panel?.valueDomain}
+            domain={panel?.valueDomain ?? valueScale.domain}
+            scale={valueScale.scale}
             label={
               panel || htmlYTitle
                 ? undefined
@@ -1384,6 +1803,8 @@ function CartesianChart({
             tickMargin={panel ? 3 : TICK_MARGIN}
             width={panel ? 8 : 56}
             tickFormatter={y2TickFormatter}
+            domain={y2Scale.domain}
+            scale={y2Scale.scale}
             label={
               panel || format.y2AxisLabelHtml
                 ? undefined
@@ -1415,7 +1836,15 @@ function CartesianChart({
                 // Flat solid fill, no self-stroke (shadcn bars); stacked
                 // segments keep the 2px surface gap between members.
                 fill={series.color}
-                fillOpacity={dimSeries ? 0.35 : undefined}
+                fillOpacity={
+                  selectionOn
+                    ? selSeriesMatches(series)
+                      ? undefined
+                      : DIM_OPACITY
+                    : dimSeries
+                      ? 0.35
+                      : undefined
+                }
                 stroke={stacked ? 'var(--rcd-surface)' : undefined}
                 strokeWidth={stacked ? 2 : 0}
                 stackId={stacked ? 'stack' : undefined}
@@ -1427,26 +1856,41 @@ function CartesianChart({
                 onMouseEnter={barHover(series)}
               >
                 {renderCells &&
-                  rows.map((row, dataIndex) => {
+                  displayRows.map((row, dataIndex) => {
                     const categoryLabel = String(row[shaped.axisKey] ?? '');
                     const resolved = resolveCellFill(series, row, dataIndex);
-                    // Opacity precedence: hover highlight (category mode)
-                    // beats the activeCategory cross-filter dim while
-                    // present; both dim NON-matching categories to 0.35.
+                    // Opacity precedence: an active SELECTION wins outright
+                    // (matching cells full + accent ring, the rest 0.35);
+                    // otherwise hover highlight (category mode) beats the
+                    // activeCategory cross-filter dim while present. All
+                    // three dim NON-matching categories to the same 0.35.
+                    const cellSelected =
+                      selectionOn && selRowMatches(row) && selSeriesMatches(series);
                     const dimmedByHighlight =
                       highlightCategoryMode &&
                       highlightCategory !== null &&
                       categoryLabel !== highlightCategory.label;
-                    const cellOpacity = dimmedByHighlight
-                      ? 0.35
-                      : dimming && activeCategory && categoryLabel !== activeCategory.label
+                    const cellOpacity = selectionOn
+                      ? cellSelected
+                        ? 1
+                        : DIM_OPACITY
+                      : dimmedByHighlight
                         ? 0.35
-                        : undefined;
+                        : dimming && activeCategory && categoryLabel !== activeCategory.label
+                          ? 0.35
+                          : undefined;
                     return (
                       <Cell
                         key={dataIndex}
                         fill={resolved}
-                        stroke={stacked ? 'var(--rcd-surface)' : undefined}
+                        stroke={
+                          cellSelected
+                            ? SELECTION_STROKE
+                            : stacked
+                              ? 'var(--rcd-surface)'
+                              : undefined
+                        }
+                        strokeWidth={cellSelected && !stacked ? 1.5 : undefined}
                         fillOpacity={cellOpacity}
                       />
                     );
@@ -1466,6 +1910,16 @@ function CartesianChart({
             );
           }
           const lineStyle = format.lineStyles?.[series.styleKey];
+          // Selection on line/area: series failing the legend facet dim to
+          // 0.35 (selection wins over the hover dim); series that match get
+          // an enlarged accent-ringed dot on the selected category.
+          const strokeDim = selectionOn
+            ? selSeriesMatches(series)
+              ? undefined
+              : DIM_OPACITY
+            : dimSeries
+              ? 0.35
+              : undefined;
           if (spec.type === 'line') {
             return (
               <Line
@@ -1475,10 +1929,10 @@ function CartesianChart({
                 dataKey={series.key}
                 name={series.label}
                 stroke={series.color}
-                strokeOpacity={dimSeries ? 0.35 : undefined}
+                strokeOpacity={strokeDim}
                 strokeWidth={lineStyle?.width ?? 2}
                 strokeDasharray={strokeDash(lineStyle)}
-                dot={false}
+                dot={selectionDot(series)}
                 activeDot={
                   clickableActiveDot(series) ?? {
                     r: 4,
@@ -1498,14 +1952,14 @@ function CartesianChart({
               dataKey={series.key}
               name={series.label}
               stroke={series.color}
-              strokeOpacity={dimSeries ? 0.35 : undefined}
+              strokeOpacity={strokeDim}
               strokeWidth={lineStyle?.width ?? 2}
               strokeDasharray={strokeDash(lineStyle)}
               // Soft solid area fill (~12% of the series color) under the
               // full-strength 2px stroke — the shadcn area treatment.
               fill={series.color}
-              fillOpacity={dimSeries ? 0.05 : 0.12}
-              dot={false}
+              fillOpacity={strokeDim !== undefined ? 0.05 : 0.12}
+              dot={selectionDot(series)}
               activeDot={
                 clickableActiveDot(series) ?? {
                   r: 4,
@@ -1540,8 +1994,53 @@ function CartesianChart({
           />
         ))}
         {referenceLines}
+        {dragSpan &&
+          (() => {
+            // Live drag-select feedback: a translucent accent span between
+            // the anchor and the current bucket (inclusive edges).
+            const a = Math.min(dragSpan.startIdx, dragSpan.endIdx);
+            const b = Math.max(dragSpan.startIdx, dragSpan.endIdx);
+            const x1 = displayRows[a]?.[shaped.axisKey];
+            const x2 = displayRows[b]?.[shaped.axisKey];
+            return x1 != null && x2 != null ? (
+              <ReferenceArea
+                x1={String(x1)}
+                x2={String(x2)}
+                fill={SELECTION_STROKE}
+                fillOpacity={0.08}
+                stroke={SELECTION_STROKE}
+                strokeOpacity={0.35}
+              />
+            ) : null;
+          })()}
+        {brushOn && (
+          <Brush
+            className="rcd-chart-brush"
+            dataKey={shaped.axisKey}
+            height={22}
+            travellerWidth={8}
+            stroke="var(--rcd-axis)"
+            fill="transparent"
+            startIndex={winStart}
+            endIndex={winEnd}
+            onChange={(range) => {
+              const start = range.startIndex ?? 0;
+              const end = range.endIndex ?? lastRow;
+              // Back at full extent = no window (so wheel releases scrolling).
+              setViewWindow(start <= 0 && end >= lastRow ? null : { start, end });
+            }}
+          />
+        )}
       </ComposedChart>
     </ResponsiveContainer>
+    {logNotes.length > 0 && (
+      // Console-free log-fallback marker: a subtle in-chart badge, styled
+      // like the small-multiples "+N more" note.
+      <div className="pointer-events-none absolute right-2 top-1 rounded border border-rcd-border bg-rcd-surface px-1.5 py-0.5 text-[10px] text-rcd-muted">
+        {logNotes.join(' · ')}
+      </div>
+    )}
+    </div>
   );
 }
 
@@ -1566,6 +2065,8 @@ interface SmallMultiplesChartProps {
   onPointHover?: (e: ChartPointEvent | null) => void;
   activeCategory?: { label: string } | null;
   highlightCategory?: { label: string } | null;
+  /** Selection highlight applies per panel; zoom/brush stay main-chart only. */
+  selection?: ChartSelection | null;
 }
 
 /**
@@ -1588,26 +2089,11 @@ function SmallMultiplesChart({
   onPointHover,
   activeCategory = null,
   highlightCategory = null,
+  selection = null,
 }: SmallMultiplesChartProps) {
   const hidden = legend.hidden;
   const frameRef = useRef<HTMLDivElement>(null);
-  const [frameSize, setFrameSize] = useState<{ width: number; height: number } | null>(null);
-  useEffect(() => {
-    const node = frameRef.current;
-    if (!node) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const measure = () => setFrameSize({ width: node.clientWidth, height: node.clientHeight });
-    measure();
-    const observer = new ResizeObserver(() => {
-      clearTimeout(timer);
-      timer = setTimeout(measure, RESIZE_DEBOUNCE);
-    });
-    observer.observe(node);
-    return () => {
-      clearTimeout(timer);
-      observer.disconnect();
-    };
-  }, []);
+  const frameSize = useDebouncedSize(frameRef);
 
   const format = spec.format;
   const sm = format.smallMultiples ?? {};
@@ -1649,12 +2135,28 @@ function SmallMultiplesChart({
   const visibleKeys = canonical.series
     .filter((s) => !hidden.has(s.key) && !y2Keys.has(s.key))
     .map((s) => s.key);
-  const valueDomain = sharedY
+  // Scale-aware shared domain: range 'auto'/'custom' drop the forced zero
+  // baseline before fitting/overriding; 'zero' (default) keeps the classic
+  // zero-anchored bounds. Log scales are ignored under sharedY (one shared
+  // linear domain beats per-panel log fallbacks) — a per-panel log axis is
+  // available by turning sharedY off.
+  const scaleOpts = horizontal ? format.xAxisScale : format.yAxisScale;
+  const scaleRange = scaleOpts?.range;
+  const fitsData = scaleRange === 'auto' || scaleRange === 'custom';
+  const sharedBase = sharedY
     ? sharedValueDomain(
         panelShaped.map((p) => p.shaped.data),
         visibleKeys,
         stacked,
+        !fitsData,
       )
+    : undefined;
+  const valueDomain: [number, number] | undefined = sharedBase
+    ? scaleRange === 'auto'
+      ? paddedNiceDomain(sharedBase[0], sharedBase[1])
+      : scaleRange === 'custom'
+        ? [scaleOpts?.min ?? sharedBase[0], scaleOpts?.max ?? sharedBase[1]]
+        : sharedBase
     : undefined;
 
   const columns =
@@ -1733,6 +2235,7 @@ function SmallMultiplesChart({
                   onPointHover={onPointHover}
                   activeCategory={activeCategory}
                   highlightCategory={highlightCategory}
+                  selection={selection}
                   panel={{
                     smallMultipleValue: panel.value,
                     showXTicks: !sharedY || bottomRow,
@@ -1774,6 +2277,8 @@ export default function ChartRenderer({
   onPointClick,
   onPointContextMenu,
   activeCategory = null,
+  selection = null,
+  onAxisRangeSelect,
   onLegendSelect,
   selectedLegendLabel = null,
   onPointHover,
@@ -1890,6 +2395,7 @@ export default function ChartRenderer({
               onPointHover={hover}
               activeCategory={activeCategory}
               highlightCategory={highlightCategory}
+              selection={selection}
             />
           </AxisTitleFrame>
         );
@@ -1907,6 +2413,8 @@ export default function ChartRenderer({
             onPointHover={hover}
             activeCategory={activeCategory}
             highlightCategory={highlightCategory}
+            selection={selection}
+            onAxisRangeSelect={onAxisRangeSelect}
           />
         </AxisTitleFrame>
       );
@@ -1977,6 +2485,19 @@ export default function ChartRenderer({
             if (slice) hover(pieEvent(slice, event));
           }
         : undefined;
+      // Selection highlight on slices: a slice's label is both its category
+      // and its legend identity, so either facet may name it. The selected
+      // slice keeps full opacity + an accent ring; the rest dim to 0.35.
+      const pieSelectionOn =
+        format.selectionHighlight !== false &&
+        selection != null &&
+        (selection.category != null || selection.legendValue != null);
+      const sliceSelected = (slice: PieSlice): boolean =>
+        pieSelectionOn &&
+        (selection?.category == null ||
+          selectionFacetMatches(selection.category, slice.label, slice.raw)) &&
+        (selection?.legendValue == null ||
+          selectionFacetMatches(selection.legendValue, slice.label, slice.raw));
       return (
         <CenteredPieFrame legendRight={showLegend && format.legendPosition === 'right'}>
           <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
@@ -2004,24 +2525,34 @@ export default function ChartRenderer({
                 onContextMenu={handleSliceContextMenu}
                 onMouseEnter={handleSliceHover}
               >
-                {visibleSlices.map((slice, i) => (
-                  <Cell
-                    key={`${i}-${slice.label}`}
-                    fill={slice.color}
-                    // Opacity precedence: isolate's hidden dim (strongest,
-                    // 0.15) > hover highlight > activeCategory cross-filter
-                    // dim — highlight wins over activeCategory while present.
-                    fillOpacity={
-                      dimHiddenSlices && hidden.has(slice.label)
-                        ? 0.15
-                        : highlightCategory && slice.label !== highlightCategory.label
-                          ? 0.35
-                          : activeCategory && slice.label !== activeCategory.label
-                            ? 0.35
-                            : undefined
-                    }
-                  />
-                ))}
+                {visibleSlices.map((slice, i) => {
+                  const selected = sliceSelected(slice);
+                  return (
+                    <Cell
+                      key={`${i}-${slice.label}`}
+                      fill={slice.color}
+                      stroke={selected ? SELECTION_STROKE : undefined}
+                      strokeWidth={selected ? 1.5 : undefined}
+                      // Opacity precedence: isolate's hidden dim (strongest,
+                      // 0.15) > selection (selected slice full + ring, rest
+                      // 0.35) > hover highlight > activeCategory cross-filter
+                      // dim — selection wins over hover while present.
+                      fillOpacity={
+                        dimHiddenSlices && hidden.has(slice.label)
+                          ? 0.15
+                          : pieSelectionOn
+                            ? selected
+                              ? 1
+                              : DIM_OPACITY
+                            : highlightCategory && slice.label !== highlightCategory.label
+                              ? 0.35
+                              : activeCategory && slice.label !== activeCategory.label
+                                ? 0.35
+                                : undefined
+                      }
+                    />
+                  );
+                })}
               </Pie>
               {spec.type === 'donut' && (
                 <DonutCenterTotal text={formatValue(visibleTotal)} />
@@ -2097,6 +2628,35 @@ export default function ChartRenderer({
       // meaning here, so stats run over ALL plotted points.
       const allY = scatter.series.flatMap((s) => s.points.map((p) => p.y));
       const yTickFormatter = axisTickFormatter(format.yAxisFormat);
+      // Axis scales: both scatter axes are numeric, so xAxisScale/yAxisScale
+      // both apply. 'auto' un-pins tiny-range clusters from the zero-based
+      // default; log falls back to linear (with an in-chart note) when the
+      // visible points cross <= 0.
+      const visiblePoints = visibleSeries.flatMap((s) => s.points);
+      const xScale = resolveAxisScale(
+        format.xAxisScale,
+        numberExtent(visiblePoints.map((p) => p.x)),
+      );
+      const yScale = resolveAxisScale(
+        format.yAxisScale,
+        numberExtent(visiblePoints.map((p) => p.y)),
+      );
+      const scatterLogNotes: string[] = [];
+      if (xScale.logFallback) scatterLogNotes.push('Log x axis needs positive values — kept linear');
+      if (yScale.logFallback) scatterLogNotes.push('Log y axis needs positive values — kept linear');
+      // Selection highlight: the split value IS the point identity here, so
+      // either selection facet may name a series; matching groups keep full
+      // opacity + an accent ring, the rest dim to the shared 0.35.
+      const scatterSelectionOn =
+        format.selectionHighlight !== false &&
+        selection != null &&
+        (selection.category != null || selection.legendValue != null);
+      const scatterSelected = (series: (typeof scatter.series)[number]): boolean =>
+        scatterSelectionOn &&
+        ((selection?.category != null &&
+          selectionFacetMatches(selection.category, series.label, series.raw)) ||
+          (selection?.legendValue != null &&
+            selectionFacetMatches(selection.legendValue, series.label, series.raw)));
       return (
         <AxisTitleFrame format={format}>
           <div className="relative h-full w-full min-w-0 overflow-hidden">
@@ -2105,7 +2665,13 @@ export default function ChartRenderer({
               margin={chartMargin(format, { bottom: !htmlXTitle, left: !htmlYTitle })}
               onMouseLeave={hover ? () => hover(null) : undefined}
             >
-              <CartesianGrid stroke={GRID_STROKE} />
+              {/* Scatter draws both rule sets by default (both axes are
+                  numeric value axes); gridX/gridY toggle each explicitly. */}
+              <CartesianGrid
+                vertical={format.gridX ?? true}
+                horizontal={format.gridY ?? true}
+                stroke={GRID_STROKE}
+              />
               <XAxis
                 type="number"
                 dataKey="x"
@@ -2115,6 +2681,8 @@ export default function ChartRenderer({
                 axisLine={false}
                 tickMargin={TICK_MARGIN}
                 tickFormatter={axisTickFormatter(format.xAxisFormat)}
+                domain={xScale.domain}
+                scale={xScale.scale}
                 label={
                   htmlXTitle
                     ? undefined
@@ -2131,6 +2699,8 @@ export default function ChartRenderer({
                 tickMargin={TICK_MARGIN}
                 width={64}
                 tickFormatter={yTickFormatter}
+                domain={yScale.domain}
+                scale={yScale.scale}
                 label={
                   htmlYTitle
                     ? undefined
@@ -2147,16 +2717,26 @@ export default function ChartRenderer({
                   fill={series.color}
                   // 70% points with a 1px surface ring keep overlapping dots
                   // legible; the hovered point pops to full strength/size.
-                  stroke="var(--rcd-surface)"
+                  stroke={
+                    scatterSelectionOn && scatterSelected(series)
+                      ? SELECTION_STROKE
+                      : 'var(--rcd-surface)'
+                  }
                   strokeWidth={1}
-                  // Highlight: the split value IS the series identity here,
-                  // so any label match dims the OTHER series' points.
+                  // Opacity: an active selection wins (matching group full +
+                  // accent ring, the rest 0.35); otherwise the hover
+                  // highlight dims the OTHER series' points — the split
+                  // value is the series identity for both.
                   fillOpacity={
-                    highlightCategory &&
-                    scatter.series.some((s) => s.label === highlightCategory.label) &&
-                    series.label !== highlightCategory.label
-                      ? 0.35
-                      : 0.7
+                    scatterSelectionOn
+                      ? scatterSelected(series)
+                        ? 1
+                        : DIM_OPACITY
+                      : highlightCategory &&
+                          scatter.series.some((s) => s.label === highlightCategory.label) &&
+                          series.label !== highlightCategory.label
+                        ? 0.35
+                        : 0.7
                   }
                   activeShape={{ size: 120, fillOpacity: 1 }}
                   isAnimationActive={false}
@@ -2208,6 +2788,13 @@ export default function ChartRenderer({
           {scatter.droppedSeries > 0 && (
             <div className="absolute right-2 top-1 rounded border border-rcd-border bg-rcd-surface px-1.5 py-0.5 text-[10px] text-rcd-muted">
               +{scatter.droppedSeries} more series not shown
+            </div>
+          )}
+          {scatterLogNotes.length > 0 && (
+            // Console-free log-fallback marker (left side: the right badge
+            // slot belongs to the dropped-series note).
+            <div className="pointer-events-none absolute left-2 top-1 rounded border border-rcd-border bg-rcd-surface px-1.5 py-0.5 text-[10px] text-rcd-muted">
+              {scatterLogNotes.join(' · ')}
             </div>
           )}
           </div>

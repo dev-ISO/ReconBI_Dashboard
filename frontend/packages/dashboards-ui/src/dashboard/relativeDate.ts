@@ -1,4 +1,4 @@
-import type { FilterClause } from '@recon/dashboards-core';
+import { inclusiveDateUpperBound, type ColumnType, type FilterClause } from '@recon/dashboards-core';
 
 /**
  * Relative-date slicer presets. A preset compiles to a `between` FilterClause
@@ -128,14 +128,26 @@ export const relativePresetRange = (
  * Compiles a preset to its wire clause against a date column; null for 'all'
  * (clears the filter). Callers re-invoke this on refresh ticks so rolling
  * windows stay anchored to "today".
+ *
+ * `columnType` is the catalog type of `column` (see `useColumnType`). Every
+ * preset's `end` is an INCLUSIVE day, so on a `timestamp` column the bare
+ * date would compare against that day's midnight and drop it from the window
+ * — "Last 7 days" would really mean the last 6 plus a sliver. Null/unknown
+ * keeps the bare date, which is the form a `date` column requires.
  */
 export const relativePresetClause = (
   presetId: string,
   table: string,
   column: string,
+  columnType?: ColumnType | null,
   now: Date = new Date(),
 ): FilterClause | null => {
   const range = relativePresetRange(presetId, now);
   if (range === null) return null;
-  return { table, column, operator: 'between', values: [range.start, range.end] };
+  return {
+    table,
+    column,
+    operator: 'between',
+    values: [range.start, inclusiveDateUpperBound(range.end, columnType)],
+  };
 };

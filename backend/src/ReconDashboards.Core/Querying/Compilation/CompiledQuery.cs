@@ -30,7 +30,14 @@ public sealed record CompiledQuery(
     string Sql,
     IReadOnlyList<QueryParameter> Parameters,
     IReadOnlyList<ResultColumnPlan> Columns,
-    IReadOnlyList<EngineWarning> Warnings);
+    IReadOnlyList<EngineWarning> Warnings,
+    /// <summary>
+    /// Requested row cap of the statement. The SQL asks for RowLimit + 1 (the
+    /// truncation probe); the query service trims the probe row back off and
+    /// reports Truncated. Null when the statement is structurally capped
+    /// (TopN+Others) or has its own probe accounting (distinct, underlying).
+    /// </summary>
+    int? RowLimit = null);
 
 /// <summary>
 /// Compilation failure with a stable code (QRY_DISCONNECTED,

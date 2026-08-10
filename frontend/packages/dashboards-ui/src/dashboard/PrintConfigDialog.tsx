@@ -14,6 +14,10 @@ export type PrintOrientation = 'landscape' | 'portrait';
 /** 'grid' preserves the dashboard geometry; 'sequential' = one tile per row. */
 export type PrintTileFlow = 'grid' | 'sequential';
 
+/** Where the composed content sits inside the printable area. */
+export type PrintAlignH = 'left' | 'center' | 'right';
+export type PrintAlignV = 'top' | 'middle' | 'bottom';
+
 export interface PrintOptions {
   paper: PrintPaper;
   orientation: PrintOrientation;
@@ -24,6 +28,15 @@ export interface PrintOptions {
    */
   scale: 'fit' | number;
   flow: PrintTileFlow;
+  /**
+   * Placement of the composed content inside the printable area. Horizontal
+   * only has slack when the content is narrower than the page (a dashboard
+   * that leaves grid columns empty, or a shrink-to-fit band); vertical has
+   * slack on any page the content does not fill. Defaults reproduce the
+   * historic top-left composition exactly.
+   */
+  alignH: PrintAlignH;
+  alignV: PrintAlignV;
   includeTitle: boolean;
   includeTimestamp: boolean;
   includeFilters: boolean;
@@ -34,6 +47,8 @@ const DEFAULT_OPTIONS: PrintOptions = {
   orientation: 'landscape',
   scale: 'fit',
   flow: 'grid',
+  alignH: 'left',
+  alignV: 'top',
   includeTitle: true,
   includeTimestamp: true,
   includeFilters: true,
@@ -66,6 +81,18 @@ const SCALE_OPTIONS: { value: string; label: string }[] = [
 const FLOW_OPTIONS: { value: PrintTileFlow; label: string }[] = [
   { value: 'grid', label: 'Grid (match dashboard layout)' },
   { value: 'sequential', label: 'Sequential (one tile per row)' },
+];
+
+const ALIGN_H_OPTIONS: { value: PrintAlignH; label: string }[] = [
+  { value: 'left', label: 'Left' },
+  { value: 'center', label: 'Center' },
+  { value: 'right', label: 'Right' },
+];
+
+const ALIGN_V_OPTIONS: { value: PrintAlignV; label: string }[] = [
+  { value: 'top', label: 'Top' },
+  { value: 'middle', label: 'Middle' },
+  { value: 'bottom', label: 'Bottom' },
 ];
 
 /** Thumbnail budget (px); the sheet is transform-scaled to fit inside it. */
@@ -225,6 +252,19 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
               </RcdSelect>
             </Field>
 
+            {/* Honest note where a "quality / DPI" control would otherwise go.
+                This pipeline is the browser's own print-to-PDF: charts are
+                SVG and text is text, so nothing here rasterizes and there is
+                no app-side render scale that changes output resolution.
+                Scale above is a real control (it changes how much content
+                fits per page); a DPI dropdown would be a placebo. */}
+            <p className="-mt-1 text-[11px] leading-4 text-rcd-muted">
+              Charts and text export as <span className="font-medium">vector</span> graphics — the
+              scale above changes how much fits on a page, not the resolution. Final DPI is
+              decided by the printer or the &ldquo;Save as PDF&rdquo; settings in your
+              browser&apos;s print dialog.
+            </p>
+
             <Field label="Tile flow">
               <RcdSelect
                 aria-label="Tile flow"
@@ -238,6 +278,38 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
                 ))}
               </RcdSelect>
             </Field>
+
+            <fieldset className="flex flex-col gap-2">
+              <legend className="mb-1 text-xs text-rcd-text-2">Content alignment</legend>
+              <div className="flex gap-2">
+                <Field label="Horizontal">
+                  <RcdSelect
+                    aria-label="Horizontal content alignment"
+                    value={draft.alignH}
+                    onChange={(event) => patch({ alignH: event.target.value as PrintAlignH })}
+                  >
+                    {ALIGN_H_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </RcdSelect>
+                </Field>
+                <Field label="Vertical">
+                  <RcdSelect
+                    aria-label="Vertical content alignment"
+                    value={draft.alignV}
+                    onChange={(event) => patch({ alignV: event.target.value as PrintAlignV })}
+                  >
+                    {ALIGN_V_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </RcdSelect>
+                </Field>
+              </div>
+            </fieldset>
           </div>
 
           <fieldset className="flex flex-col gap-1.5">
@@ -296,6 +368,12 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
           <p className="text-[11px] leading-4 text-rcd-muted">
             The preview uses the exact printed page geometry — what you see here is page 1 of the
             PDF.
+          </p>
+          {/* Browsers give web pages no way to preselect a destination: an app
+              "Printer" dropdown here could not do anything. Say so instead. */}
+          <p className="text-[11px] leading-4 text-rcd-muted">
+            Pick the printer (or <span className="font-medium">Save as PDF</span>) and its DPI in
+            the browser print dialog that opens next — browsers do not let a web page choose it.
           </p>
         </div>
       </div>

@@ -6,6 +6,7 @@ import {
   Check,
   ChevronDown,
   Filter,
+  Highlighter,
   Image as ImageIcon,
   Mail,
   MoreHorizontal,
@@ -86,6 +87,11 @@ export interface DashboardToolbarProps {
   /** Edit mode: mobile-layout canvas toggle (phone icon, pressed state). */
   mobileLayoutOpen?: boolean;
   onToggleMobileLayout?: () => void;
+  /**
+   * Edit mode: opens the cross-filter INDICATOR settings card, anchored under
+   * its button (dashboard chrome — deliberately not in the chart Format panel).
+   */
+  onConfigureFilterIndicator?: (position: { x: number; y: number }) => void;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -135,6 +141,7 @@ export function DashboardToolbar({
   alertFirings,
   mobileLayoutOpen = false,
   onToggleMobileLayout,
+  onConfigureFilterIndicator,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -250,6 +257,19 @@ export function DashboardToolbar({
                   className={mobileLayoutOpen ? 'bg-black/5 text-[var(--rcd-accent-interactive)] dark:bg-white/10' : ''}
                 >
                   <Smartphone size={14} />
+                </RcdIconButton>
+              )}
+              {onConfigureFilterIndicator && (
+                <RcdIconButton
+                  aria-label="Filter indicator settings"
+                  title="Filter indicator (how active filters are shown)"
+                  aria-haspopup="dialog"
+                  onClick={(event) => {
+                    const rect = event.currentTarget.getBoundingClientRect();
+                    onConfigureFilterIndicator({ x: rect.left, y: rect.bottom + 4 });
+                  }}
+                >
+                  <Highlighter size={14} />
                 </RcdIconButton>
               )}
               {onChangeRefreshSeconds && (

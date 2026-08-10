@@ -1,0 +1,57 @@
+/* Chart-scoped styles (imported by ChartRenderer). */
+
+/* BUG FIX — black selection rectangle: recharts' accessibility layer makes the
+   chart wrapper focusable (tabIndex 0), so clicking any cartesian chart painted
+   the browser's default focus outline as a hard black rectangle around the
+   plot. Suppress the ring for POINTER focus only (:focus without
+   :focus-visible); keyboard focus keeps a subtle token-colored ring so tab
+   navigation stays exactly as discoverable as before. */
+.rcd-root .recharts-wrapper:focus:not(:focus-visible),
+.rcd-root .recharts-wrapper svg:focus:not(:focus-visible),
+.rcd-root .recharts-wrapper .recharts-surface:focus:not(:focus-visible) {
+  outline: none;
+}
+
+/* Clicking a plot focuses an INNER recharts layer (e.g. g.recharts-zIndex-
+   layer_300), not the wrapper — Chrome paints `outline: auto` on it, which is
+   the black rectangle around the plot area. Inner elements never carry their
+   own focus ring (the wrapper's :focus-visible ring is the keyboard
+   affordance), so suppress unconditionally below the wrapper. */
+.rcd-root .recharts-wrapper *:focus {
+  outline: none;
+}
+
+.rcd-root .recharts-wrapper:focus-visible,
+.rcd-root .recharts-wrapper svg:focus-visible {
+  outline: 2px solid var(--rcd-accent-interactive);
+  outline-offset: -2px;
+  border-radius: 6px;
+}
+
+/* Zoom brush strip (format.zoom.brush): muted, rounded, token-colored so it
+   reads as part of the shadcn chart chrome rather than stock recharts blue.
+   rx is a presentation attribute, settable from CSS on SVG2 engines. */
+.rcd-root .rcd-chart-brush > rect {
+  stroke: var(--rcd-border);
+  fill: transparent;
+  rx: 4px;
+}
+
+.rcd-root .rcd-chart-brush .recharts-brush-slide {
+  fill: var(--rcd-accent-interactive);
+  fill-opacity: 0.14;
+  stroke: none;
+  rx: 3px;
+}
+
+.rcd-root .rcd-chart-brush .recharts-brush-traveller rect {
+  fill: var(--rcd-surface);
+  stroke: var(--rcd-axis);
+  rx: 2px;
+}
+
+.rcd-root .rcd-chart-brush .recharts-brush-texts text,
+.rcd-root .rcd-chart-brush text {
+  fill: var(--rcd-muted);
+  font-size: 10px;
+}

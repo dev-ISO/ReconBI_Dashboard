@@ -1,26 +1,29 @@
 import {
   lazy,
   Suspense,
+  useCallback,
   useEffect,
   useMemo,
   useState,
   type ComponentType,
 } from 'react';
-import { AlertTriangle, FileDown, RefreshCw } from 'lucide-react';
+import { AlertTriangle, FileDown, FileSpreadsheet, RefreshCw } from 'lucide-react';
 import {
-  formatCellValue,
+  downloadXlsx,
   RcdApiError,
   toWireSpec,
+  type CellValue,
   type ChartQuerySpec,
   type ChartSpec,
   type FilterClause,
+  type QueryColumn,
   type QueryResult,
   type UnderlyingQueryResult,
 } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
-// Type-only import (same doctrine as ChartTile): the lazy chunk split survives.
-import type { ChartRendererProps } from '../chart/ChartRenderer';
+// Type-only imports (same doctrine as ChartTile): the lazy chunk split survives.
+import type { ChartRendererProps, TableColumnFilter, TableSortState } from '../chart/ChartRenderer';
 import type { ChartHavingClause } from '../chart/ChartTile';
 
 const ChartRenderer = lazy(() => import('../chart/ChartRenderer')) as ComponentType<ChartRendererProps>;
@@ -65,7 +68,96 @@ const csvFileName = (title: string): string => {
   return cleaned === '' ? 'chart' : cleaned;
 };
 
-const NUMERIC_TYPES = new Set(['integer', 'decimal']);
+/* ------------------------------------------------ client-side filter/sort */
+
+/** Stable identity for a distinct cell value (mirrors TableChart.valueKey). */
+const valueKeyOf = (value: CellValue): string =>
+  value === null ? ' null' : `${typeof value}:${String(value)}`;
+
+/**
+ * Compiles one committed header-menu filter into a row predicate over the
+ * LOADED rows (these dialogs hold the whole fetched result, so filters run
+ * client-side — no requery). Value lists match by raw-value identity and
+ * honor the `inverted` (excluded-values) form; conditions compare
+ * numerically when both sides parse as numbers, textually otherwise.
+ */
+const buildMatcher = (
+  filter: TableColumnFilter,
+  columns: QueryColumn[],
+): ((row: CellValue[]) => boolean) | null => {
+  const index = columns.findIndex((c) => c.name === filter.column);
+  if (index === -1) return null;
+  if (filter.kind === 'values') {
+    const keys = new Set(filter.values.map(valueKeyOf));
+    const inverted = (filter as { inverted?: boolean }).inverted === true;
+    return (row) => keys.has(valueKeyOf(row[index] ?? null)) !== inverted;
+  }
+  const [a, b] = filter.values;
+  if (a === undefined) return null;
+  const text = (v: CellValue): string => (v === null ? '' : String(v)).toLowerCase();
+  switch (filter.operator) {
+    case 'contains':
+      return (row) => text(row[index] ?? null).includes(String(a).toLowerCase());
+    case 'startsWith':
+      return (row) => text(row[index] ?? null).startsWith(String(a).toLowerCase());
+    default:
+      break;
+  }
+  const compare = (v: CellValue): number | null => {
+    if (v === null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isNaN(n) ? null : n;
+  };
+  const na = Number(a);
+  const numeric = !Number.isNaN(na);
+  return (row) => {
+    const raw = row[index] ?? null;
+    if (filter.operator === 'eq' || filter.operator === 'neq') {
+      const equal = numeric
+        ? compare(raw) !== null && compare(raw) === na
+        : text(raw) === String(a).toLowerCase();
+      return filter.operator === 'eq' ? equal : !equal;
+    }
+    const n = compare(raw);
+    if (n === null || !numeric) return false;
+    switch (filter.operator) {
+      case 'gt':
+        return n > na;
+      case 'gte':
+        return n >= na;
+      case 'lt':
+        return n < na;
+      case 'lte':
+        return n <= na;
+      case 'between': {
+        const nb = Number(b);
+        return !Number.isNaN(nb) && n >= na && n <= nb;
+      }
+      default:
+        return true;
+    }
+  };
+};
+
+/** Ascending value order: numbers numerically, text by locale, blanks last. */
+const compareCells = (a: CellValue, b: CellValue): number => {
+  if (a === null) return b === null ? 0 : 1;
+  if (b === null) return -1;
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  return String(a).localeCompare(String(b));
+};
+
+/** Everything centered — the dialog's requested default for headers AND cells. */
+const centeredTable = (columns: QueryColumn[]) => ({
+  borders: 'rows' as const,
+  density: 'compact' as const,
+  stripes: true,
+  filterable: true,
+  sortable: true,
+  headerAlign: 'center' as const,
+  verticalAlign: 'middle' as const,
+  columnAlign: Object.fromEntries(columns.map((c) => [c.name, 'center' as const])),
+});
 
 export interface SeeDataDialogProps {
   request: SeeDataRequest | null;
@@ -79,9 +171,12 @@ export interface SeeDataDialogProps {
 
 /**
  * "See data" dialog (view mode): either the tile's current AGGREGATED result
- * rendered through the real table renderer (formatting comes free), or the
- * UNDERLYING source rows behind one clicked point (plain grid of raw columns).
- * Same draggable/resizable dialog pattern as the chart builder.
+ * or the UNDERLYING source rows behind one clicked point — both rendered
+ * through the real table renderer (formatting and the Excel-style header
+ * menus come free). Header + cells default to center/middle here (explicit
+ * user request for these dialogs). Filters and sorting run CLIENT-SIDE over
+ * the loaded rows and reset when the dialog closes. Same draggable/resizable
+ * dialog pattern as the chart builder.
  */
 export function SeeDataDialog({
   request,
@@ -93,6 +188,15 @@ export function SeeDataDialog({
   const runtime = useRuntime();
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [retryToken, setRetryToken] = useState(0);
+  /** Dialog-scoped Excel-style column filters + sort (client-side, transient). */
+  const [clientFilters, setClientFilters] = useState<TableColumnFilter[]>([]);
+  const [clientSort, setClientSort] = useState<TableSortState | null>(null);
+
+  // A new request (each open mints a fresh object) starts with a clean view.
+  useEffect(() => {
+    setClientFilters([]);
+    setClientSort(null);
+  }, [request]);
 
   useEffect(() => {
     if (!request) return;
@@ -134,49 +238,112 @@ export function SeeDataDialog({
     };
   }, [runtime, request, modelId, retryToken, onNotice]);
 
+  /** The loaded result as a renderer-ready QueryResult (underlying included). */
+  const baseResult = useMemo<QueryResult | null>(() => {
+    if (fetchState.status === 'aggregated') return fetchState.result;
+    if (fetchState.status === 'underlying') {
+      const { columns, rows, meta } = fetchState.result;
+      return { columns, rows, meta: { ...meta, elapsedMs: 0, warnings: [], sql: null } };
+    }
+    return null;
+  }, [fetchState]);
+
+  /** Loaded rows with the dialog's client-side filters + sort applied. */
+  const displayResult = useMemo<QueryResult | null>(() => {
+    if (!baseResult) return null;
+    let rows = baseResult.rows;
+    if (clientFilters.length > 0) {
+      const matchers = clientFilters
+        .map((filter) => buildMatcher(filter, baseResult.columns))
+        .filter((m): m is (row: CellValue[]) => boolean => m !== null);
+      if (matchers.length > 0) rows = rows.filter((row) => matchers.every((m) => m(row)));
+    }
+    if (clientSort !== null) {
+      const index = baseResult.columns.findIndex((c) => c.name === clientSort.column);
+      if (index !== -1) {
+        const sign = clientSort.direction === 'desc' ? -1 : 1;
+        rows = [...rows].sort(
+          (ra, rb) => sign * compareCells(ra[index] ?? null, rb[index] ?? null),
+        );
+      }
+    }
+    return rows === baseResult.rows ? baseResult : { ...baseResult, rows };
+  }, [baseResult, clientFilters, clientSort]);
+
+  /**
+   * Distinct values for a column's checklist, computed from the loaded rows
+   * under the OTHER columns' filters (Excel semantics), blanks last, capped
+   * at the renderer's 200-value note threshold.
+   */
+  const handleRequestColumnValues = useCallback(
+    async (column: string): Promise<CellValue[]> => {
+      if (!baseResult) return [];
+      const index = baseResult.columns.findIndex((c) => c.name === column);
+      if (index === -1) return [];
+      const matchers = clientFilters
+        .filter((f) => f.column !== column)
+        .map((filter) => buildMatcher(filter, baseResult.columns))
+        .filter((m): m is (row: CellValue[]) => boolean => m !== null);
+      const seen = new Map<string, CellValue>();
+      for (const row of baseResult.rows) {
+        if (!matchers.every((m) => m(row))) continue;
+        const value = row[index] ?? null;
+        const key = valueKeyOf(value);
+        if (!seen.has(key)) seen.set(key, value);
+      }
+      return [...seen.values()].sort(compareCells).slice(0, 200);
+    },
+    [baseResult, clientFilters],
+  );
+
   /**
    * Synthetic table spec over the SAME query: the real table renderer shows
-   * the aggregated result with the chart's value/date formatting riding along.
+   * the rows with the chart's value/date formatting riding along. Center/
+   * middle everywhere is the dialog default the user asked for (the usual
+   * numeric-right rule deliberately does not apply here).
    */
   const tableSpec = useMemo<ChartSpec | null>(() => {
-    if (request?.kind !== 'aggregated') return null;
-    const { chart } = request;
-    return {
-      id: `${chart.id}::see-data`,
-      type: 'table',
-      title: chart.title,
-      query: chart.query,
-      format: {
-        theme: chart.format.theme,
-        valueFormat: chart.format.valueFormat,
-        dateFormat: chart.format.dateFormat,
-        dateFormatPattern: chart.format.dateFormatPattern,
-        seriesLabels: chart.format.seriesLabels,
-        table: {
-          borders: 'rows',
-          density: 'compact',
-          stripes: true,
-          filterable: false,
-          sortable: false,
+    if (!request || !baseResult) return null;
+    if (request.kind === 'aggregated') {
+      const { chart } = request;
+      return {
+        id: `${chart.id}::see-data`,
+        type: 'table',
+        title: chart.title,
+        query: chart.query,
+        format: {
+          theme: chart.format.theme,
+          valueFormat: chart.format.valueFormat,
+          dateFormat: chart.format.dateFormat,
+          dateFormatPattern: chart.format.dateFormatPattern,
+          seriesLabels: chart.format.seriesLabels,
+          table: centeredTable(baseResult.columns),
         },
-      },
+      };
+    }
+    return {
+      id: `${request.tileId}::see-records`,
+      type: 'table',
+      title: request.title,
+      query: { measures: [], filters: [] },
+      format: { table: centeredTable(baseResult.columns) },
     };
-  }, [request]);
+  }, [request, baseResult]);
 
   if (!request) return null;
 
-  const rowCount =
-    fetchState.status === 'aggregated'
-      ? fetchState.result.rows.length
-      : fetchState.status === 'underlying'
-        ? fetchState.result.rows.length
-        : null;
+  const totalCount = baseResult?.rows.length ?? null;
+  const shownCount = displayResult?.rows.length ?? null;
+  const filtered = totalCount !== null && shownCount !== null && shownCount < totalCount;
 
   const baseTitle =
     request.kind === 'aggregated'
       ? request.chart.title
       : `${request.title} — ${request.contextLabel}`;
-  const dialogTitle = rowCount === null ? baseTitle : `${baseTitle} · ${rowCount} rows`;
+  const dialogTitle =
+    totalCount === null
+      ? baseTitle
+      : `${baseTitle} · ${filtered ? `${shownCount} of ${totalCount}` : totalCount} rows`;
 
   const truncated =
     (fetchState.status === 'underlying' && fetchState.result.meta.truncated) ||
@@ -201,6 +368,27 @@ export function SeeDataDialog({
     }
   };
 
+  /** XLSX of exactly what the dialog shows (client filters + sort applied). */
+  const exportXlsx = () => {
+    if (!displayResult) return;
+    const seriesLabels =
+      request.kind === 'aggregated' ? request.chart.format.seriesLabels : undefined;
+    try {
+      downloadXlsx(csvFileName(baseTitle), {
+        sheetName: request.kind === 'aggregated' ? 'Data' : 'Records',
+        columns: displayResult.columns.map((column) => ({
+          name:
+            column.role === 'measure'
+              ? (seriesLabels?.[column.label] ?? column.label)
+              : column.label,
+        })),
+        rows: displayResult.rows,
+      });
+    } catch (error) {
+      onNotice(`Export failed: ${messageOf(error)}`);
+    }
+  };
+
   return (
     <RcdDialog
       title={dialogTitle}
@@ -213,7 +401,7 @@ export function SeeDataDialog({
         <>
           {truncated && (
             <span className="mr-auto self-center text-xs text-rcd-muted">
-              Showing the first {rowCount} rows (server cap) — export for the full set.
+              Showing the first {totalCount} rows (server cap) — export for the full set.
             </span>
           )}
           <RcdButton
@@ -226,6 +414,10 @@ export function SeeDataDialog({
           >
             <FileDown size={14} />
             Export CSV
+          </RcdButton>
+          <RcdButton disabled={displayResult === null} onClick={exportXlsx}>
+            <FileSpreadsheet size={14} />
+            Export XLSX
           </RcdButton>
           <RcdButton variant="primary" onClick={onClose}>
             Close
@@ -251,7 +443,7 @@ export function SeeDataDialog({
           </div>
         )}
 
-        {fetchState.status === 'aggregated' && tableSpec && (
+        {displayResult && tableSpec && (
           <Suspense
             fallback={
               <div className="flex h-full items-center justify-center">
@@ -259,61 +451,26 @@ export function SeeDataDialog({
               </div>
             }
           >
-            <ChartRenderer spec={tableSpec} result={fetchState.result} />
+            {baseResult && baseResult.rows.length === 0 ? (
+              <div className="flex h-full items-center justify-center text-sm text-rcd-muted">
+                {request.kind === 'underlying'
+                  ? 'No underlying records match this point.'
+                  : 'No rows.'}
+              </div>
+            ) : (
+              <ChartRenderer
+                spec={tableSpec}
+                result={displayResult}
+                tableSort={clientSort}
+                onTableSortChange={setClientSort}
+                tableFilters={clientFilters}
+                onTableFilterChange={setClientFilters}
+                onRequestColumnValues={handleRequestColumnValues}
+              />
+            )}
           </Suspense>
-        )}
-
-        {fetchState.status === 'underlying' && (
-          <UnderlyingGrid result={fetchState.result} />
         )}
       </div>
     </RcdDialog>
-  );
-}
-
-/** Plain scrollable grid of the raw underlying columns (sticky header). */
-function UnderlyingGrid({ result }: { result: UnderlyingQueryResult }) {
-  if (result.rows.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center text-sm text-rcd-muted">
-        No underlying records match this point.
-      </div>
-    );
-  }
-  return (
-    <div className="h-full overflow-auto rounded-md border border-rcd-border">
-      <table className="w-full border-collapse text-xs">
-        <thead className="sticky top-0 z-10 bg-rcd-surface">
-          <tr>
-            {result.columns.map((column) => (
-              <th
-                key={column.name}
-                className={`whitespace-nowrap border-b border-rcd-border px-2.5 py-1.5 font-semibold text-rcd-text-2 ${
-                  NUMERIC_TYPES.has(column.type) ? 'text-right' : 'text-left'
-                }`}
-              >
-                {column.label}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {result.rows.map((row, rowIndex) => (
-            <tr key={rowIndex} className="border-b border-rcd-grid-line last:border-b-0">
-              {result.columns.map((column, columnIndex) => (
-                <td
-                  key={column.name}
-                  className={`whitespace-nowrap px-2.5 py-1 text-rcd-text ${
-                    NUMERIC_TYPES.has(column.type) ? 'text-right tabular-nums' : 'text-left'
-                  }`}
-                >
-                  {formatCellValue(row[columnIndex] ?? null, column)}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   );
 }

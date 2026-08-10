@@ -7,11 +7,14 @@ import {
   formatNumberPattern,
   newId,
   sanitizeRichHtml,
+  type AxisLabelFit,
+  type AxisScaleOptions,
   type AxisValueFormat,
   type ChartFormat,
   type ChartSpec,
   type ChartThemeName,
   type ChartType,
+  type ChartZoomOptions,
   type ConditionalFormatSpec,
   type ConditionalOp,
   type ConditionalRule,
@@ -25,6 +28,7 @@ import {
   type TooltipStyle,
   type TrendlineSpec,
 } from '@recon/dashboards-core';
+import { supportsSmallMultiples } from '../chart-builder/wellConfig';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 
 export interface FormatPanelProps {
@@ -36,6 +40,20 @@ export interface FormatPanelProps {
 
 /** Chart types with no cartesian axes; the Axes section hides for them. */
 const AXISLESS_TYPES: ReadonlyArray<ChartType> = ['pie', 'donut', 'kpi', 'table'];
+
+/**
+ * The category-axis cartesian family (ChartRenderer's CartesianChart path).
+ * Scatter is cartesian too but shapes its own numeric x/y — gate scatter
+ * behavior explicitly where it differs.
+ */
+const CARTESIAN_TYPES: ReadonlyArray<ChartType> = [
+  'column',
+  'bar',
+  'stackedColumn',
+  'stackedBar',
+  'line',
+  'area',
+];
 
 /** Types whose value axis is X (horizontal orientation). */
 const HORIZONTAL_TYPES: ReadonlyArray<ChartType> = ['bar', 'stackedBar'];
@@ -556,6 +574,111 @@ function AxisFormatEditor({
   );
 }
 
+/** Drops every default-valued AxisScaleOptions field; undefined once all-default. */
+const pruneAxisScale = (merged: AxisScaleOptions): AxisScaleOptions | undefined => {
+  const next: AxisScaleOptions = {};
+  const range = merged.range ?? 'zero';
+  if (range !== 'zero') next.range = range;
+  if (range === 'custom') {
+    if (merged.min != null) next.min = merged.min;
+    if (merged.max != null) next.max = merged.max;
+  }
+  if (merged.log) next.log = true;
+  return Object.keys(next).length > 0 ? next : undefined;
+};
+
+/**
+ * Value-axis scale editor (AxisScaleOptions): range select, custom min/max
+ * (blank side = auto), log toggle. "Start at zero" is the renderer default,
+ * so a fully-default value emits undefined and the spec stays minimal.
+ */
+function AxisScaleEditor({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: AxisScaleOptions | undefined;
+  onChange: (next: AxisScaleOptions | undefined) => void;
+}) {
+  const range = value?.range ?? 'zero';
+  const set = (partial: Partial<AxisScaleOptions>) =>
+    onChange(pruneAxisScale({ ...value, ...partial }));
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-1.5">
+        <span className="min-w-0 flex-1 truncate text-sm text-rcd-text-2" title={label}>
+          {label}
+        </span>
+        <RcdSelect
+          aria-label={`${label} range`}
+          className="w-32 shrink-0"
+          value={range}
+          onChange={(event) =>
+            set({ range: event.target.value as NonNullable<AxisScaleOptions['range']> })
+          }
+        >
+          <option value="zero">Start at zero</option>
+          <option value="auto">Fit to data</option>
+          <option value="custom">Custom…</option>
+        </RcdSelect>
+      </div>
+      {range === 'custom' && (
+        <div className="flex items-center gap-1.5">
+          <input
+            type="number"
+            step="any"
+            aria-label={`${label} minimum`}
+            placeholder="Min (auto)"
+            className={FLEX_NUMBER_INPUT_CLASS}
+            value={value?.min ?? ''}
+            onChange={(event) => set({ min: parseNumberOr(event.target.value) ?? null })}
+          />
+          <input
+            type="number"
+            step="any"
+            aria-label={`${label} maximum`}
+            placeholder="Max (auto)"
+            className={FLEX_NUMBER_INPUT_CLASS}
+            value={value?.max ?? ''}
+            onChange={(event) => set({ max: parseNumberOr(event.target.value) ?? null })}
+          />
+        </div>
+      )}
+      <CheckboxRow
+        label="Log scale"
+        checked={value?.log ?? false}
+        onChange={(checked) => set({ log: checked || undefined })}
+      />
+      {value?.log && (
+        <p className="text-xs text-rcd-muted">
+          Log needs all-positive values — the chart keeps a linear axis (with a note) when
+          data touches zero or below.
+        </p>
+      )}
+    </div>
+  );
+}
+
+const LABEL_FIT_OPTIONS: ReadonlyArray<{
+  value: NonNullable<AxisLabelFit['mode']>;
+  label: string;
+}> = [
+  { value: 'auto', label: 'Auto' },
+  { value: 'horizontal', label: 'Horizontal' },
+  { value: 'angled', label: 'Angled' },
+  { value: 'vertical', label: 'Vertical' },
+  { value: 'wrap', label: 'Wrap' },
+];
+
+/** Helper captions for the drag-select action modes (Zoom & pan section). */
+const DRAG_ACTION_CAPTIONS: Record<'view' | 'crossFilter', string> = {
+  view: 'Drag-selecting a span zooms this chart only.',
+  crossFilter:
+    'On a date axis the selected span also cross-filters every tile on the page; other axes just zoom.',
+};
+
 // ---------------------------------------------------------------------------
 // Analytics / conditional formatting editors
 // ---------------------------------------------------------------------------
@@ -774,14 +897,21 @@ function ReferenceLineRow({
 function TrendlineRow({
   line,
   seriesKeys,
+  linearOnly,
   onChange,
   onRemove,
 }: {
   line: TrendlineSpec;
   seriesKeys: string[];
+  /** Scatter draws linear fits only; hide the moving-average option there. */
+  linearOnly?: boolean;
   onChange: (partial: Partial<TrendlineSpec>) => void;
   onRemove: () => void;
 }) {
+  // A stale movingAverage spec on a linear-only chart keeps its option
+  // visible (so the select reflects the truth) but is skipped by the
+  // renderer until switched to Linear.
+  const showMovingAverage = !linearOnly || line.kind === 'movingAverage';
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-rcd-border p-2">
       <div className="flex items-center gap-1.5">
@@ -792,7 +922,7 @@ function TrendlineRow({
           onChange={(event) => onChange({ kind: event.target.value as TrendlineSpec['kind'] })}
         >
           <option value="linear">Linear</option>
-          <option value="movingAverage">Moving average</option>
+          {showMovingAverage && <option value="movingAverage">Moving average</option>}
         </RcdSelect>
         {line.kind === 'movingAverage' && (
           <input
@@ -1277,10 +1407,37 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const tooltipEnabled = format.tooltip?.enabled ?? true;
   const activeTheme = format.theme ?? 'default';
 
+  // --- Section applicability -----------------------------------------------
+  // Derived from what ChartRenderer/TableChart actually CONSUME per type, so
+  // the panel never shows a section (or control) the chart would ignore —
+  // and never hides one it honors.
+  const isCartesian = CARTESIAN_TYPES.includes(spec.type);
+  const isScatter = spec.type === 'scatter';
+  const isPieType = spec.type === 'pie' || spec.type === 'donut';
+  const isTable = spec.type === 'table';
+  /** Palette consumers (seriesColor/slice colors). KPI/table color via rules only. */
+  const showThemeSection = isCartesian || isScatter || isPieType;
+  /** Types that render a legend. Table's legendStyle/hoverHighlight uses live in its own section. */
+  const showLegendSection = isCartesian || isScatter || isPieType;
+  /** Zoom tools exist on vertical category-axis charts only (renderer: !horizontal, scatter has none). */
+  const showZoomSection = isCartesian && !horizontal;
+  /** Table cells format via measure hints; format.valueFormat/showDataLabels are ignored there. */
+  const showValuesSection = !isTable;
+  /** Series color swatches; KPI/table consume seriesLabels (names) only. */
+  const showSeriesColors = isCartesian || isScatter || isPieType;
+  const showSmallMultiplesSection = supportsSmallMultiples(spec.type);
+  /** Clicked-point emphasis: cartesian marks, slices and scatter groups. */
+  const showSelectionHighlight = isCartesian || isScatter || isPieType;
+  // Renderer gridline defaults: lines from the VALUE axis on, category-axis
+  // lines off; scatter (two value axes) draws both rule sets.
+  const gridXDefault = isScatter ? true : horizontal;
+  const gridYDefault = isScatter ? true : !horizontal;
+
   // --- Secondary (right) value axis ---
-  // Cartesian combos only: pie/donut/kpi/table are axisless, scatter's two
-  // measures are its X/Y — none of them can host a second value axis.
-  const supportsSecondaryAxis = hasAxes && spec.type !== 'scatter';
+  // Vertical cartesian combos only: pie/donut/kpi/table are axisless,
+  // scatter's two measures are its X/Y, and horizontal bars put the value
+  // axis on X — the renderer ignores secondaryAxisKeys for all of them.
+  const supportsSecondaryAxis = hasAxes && !horizontal && spec.type !== 'scatter';
   const secondaryKeys = format.secondaryAxisKeys ?? [];
   const hasSecondary = supportsSecondaryAxis && secondaryKeys.length > 0;
   const setSecondaryKey = (key: string, secondary: boolean) => {
@@ -1312,7 +1469,16 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.columnAlign && Object.keys(merged.columnAlign).length > 0) {
       next.columnAlign = merged.columnAlign;
     }
-    if (merged.verticalAlign === 'top') next.verticalAlign = 'top';
+    if (merged.verticalAlign === 'top' || merged.verticalAlign === 'bottom') {
+      next.verticalAlign = merged.verticalAlign;
+    }
+    if (merged.columnVerticalAlign && Object.keys(merged.columnVerticalAlign).length > 0) {
+      next.columnVerticalAlign = merged.columnVerticalAlign;
+    }
+    if (merged.wrapText) next.wrapText = true;
+    if (merged.pageSizeOptions && merged.pageSizeOptions.length > 0) {
+      next.pageSizeOptions = merged.pageSizeOptions;
+    }
     if (merged.borders !== undefined && merged.borders !== 'rows') next.borders = merged.borders;
     if (merged.borderColor != null) next.borderColor = merged.borderColor;
     if (merged.headerBackground != null) next.headerBackground = merged.headerBackground;
@@ -1329,6 +1495,52 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (align) next[key] = align;
     else delete next[key];
     setTable({ columnAlign: next });
+  };
+
+  /** Auto (undefined) falls back to the table-wide vertical align. */
+  const setColumnVerticalAlign = (key: string, align: 'top' | 'middle' | 'bottom' | undefined) => {
+    const next = { ...format.table?.columnVerticalAlign };
+    if (align) next[key] = align;
+    else delete next[key];
+    setTable({ columnVerticalAlign: next });
+  };
+
+  /**
+   * Viewer page-size choices: free-typed comma list, committed live as parsed
+   * positive integers; the raw text lives in a draft so "1" → "10" edits don't
+   * fight the reformat (which happens on blur).
+   */
+  const [pageSizeOptionsText, setPageSizeOptionsText] = useState<string | null>(null);
+  const pageSizeOptionsDisplay =
+    pageSizeOptionsText ?? (format.table?.pageSizeOptions ?? []).join(', ');
+  const commitPageSizeOptions = (raw: string) => {
+    const parsed = raw
+      .split(/[,\s]+/)
+      .filter((token) => token !== '')
+      .map(Number)
+      .filter((n) => Number.isInteger(n) && n > 0);
+    const unique = [...new Set(parsed)];
+    setTable({ pageSizeOptions: unique.length > 0 ? unique : undefined });
+  };
+
+  /** Merge + prune zoom tools; dragAction only matters while drag-zoom is on. */
+  const setZoom = (partial: Partial<ChartZoomOptions>) => {
+    const merged = { ...format.zoom, ...partial };
+    const next: ChartZoomOptions = {};
+    if (merged.brush) next.brush = true;
+    if (merged.dragZoom) next.dragZoom = true;
+    if (merged.dragZoom && merged.dragAction === 'crossFilter') next.dragAction = 'crossFilter';
+    if (merged.wheel) next.wheel = true;
+    patch({ zoom: Object.keys(next).length > 0 ? next : undefined });
+  };
+
+  /** Merge + prune label fit ('auto' + default wrap lines = no object). */
+  const setLabelFit = (partial: Partial<AxisLabelFit>) => {
+    const merged = { ...format.xLabelFit, ...partial };
+    const next: AxisLabelFit = {};
+    if (merged.mode !== undefined && merged.mode !== 'auto') next.mode = merged.mode;
+    if (next.mode === 'wrap' && merged.wrapLines !== undefined) next.wrapLines = merged.wrapLines;
+    patch({ xLabelFit: Object.keys(next).length > 0 ? next : undefined });
   };
 
   // Table result columns for the per-column alignment editor. columnAlign is
@@ -1485,6 +1697,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
 
   return (
     <div className="flex flex-col gap-2">
+      {showThemeSection && (
       <CollapsibleSection title="Theme" {...sectionProps('theme')}>
         <div className="grid grid-cols-2 gap-1.5">
           {THEME_OPTIONS.map(({ name, label, colors }) => {
@@ -1520,6 +1733,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           Per-series color overrides below still win over the theme.
         </p>
       </CollapsibleSection>
+      )}
 
       <CollapsibleSection title="Container" {...sectionProps('container')}>
         <CheckboxRow
@@ -1607,6 +1821,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         </p>
       </CollapsibleSection>
 
+      {showLegendSection && (
       <CollapsibleSection title="Legend" {...sectionProps('legend')}>
         <CheckboxRow
           label="Show legend"
@@ -1672,7 +1887,23 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         <p className="text-xs text-rcd-muted">
           Hovering a data point spotlights it across the page.
         </p>
+        {showSelectionHighlight && (
+          <>
+            <CheckboxRow
+              label="Highlight clicked points"
+              checked={format.selectionHighlight ?? true}
+              onChange={(checked) =>
+                patch({ selectionHighlight: checked ? undefined : false })
+              }
+            />
+            <p className="text-xs text-rcd-muted">
+              While a clicked point cross-filters the page, it stays emphasized on this chart
+              and everything else dims.
+            </p>
+          </>
+        )}
       </CollapsibleSection>
+      )}
 
       {hasAxes && (
         <CollapsibleSection title="Axes" {...sectionProps('axes')}>
@@ -1831,6 +2062,164 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               </p>
             </>
           )}
+
+          <h4 className={SUBHEAD_CLASS}>Gridlines</h4>
+          <CheckboxRow
+            label="Vertical lines (X ticks)"
+            checked={format.gridX ?? gridXDefault}
+            onChange={(checked) => patch({ gridX: checked === gridXDefault ? undefined : checked })}
+          />
+          <CheckboxRow
+            label="Horizontal lines (Y ticks)"
+            checked={format.gridY ?? gridYDefault}
+            onChange={(checked) => patch({ gridY: checked === gridYDefault ? undefined : checked })}
+          />
+          <p className="text-xs text-rcd-muted">
+            {isScatter
+              ? 'Scatter draws both sets by default (both axes carry values).'
+              : 'By default only the value axis draws gridlines.'}
+          </p>
+
+          <h4 className={SUBHEAD_CLASS}>Scale</h4>
+          {isScatter ? (
+            <>
+              <AxisScaleEditor
+                label="X axis"
+                value={format.xAxisScale}
+                onChange={(next) => patch({ xAxisScale: next })}
+              />
+              <AxisScaleEditor
+                label="Y axis"
+                value={format.yAxisScale}
+                onChange={(next) => patch({ yAxisScale: next })}
+              />
+            </>
+          ) : (
+            <AxisScaleEditor
+              label={horizontal ? 'Value (X) axis' : 'Value (Y) axis'}
+              value={horizontal ? format.xAxisScale : format.yAxisScale}
+              onChange={(next) => patch(horizontal ? { xAxisScale: next } : { yAxisScale: next })}
+            />
+          )}
+          {hasSecondary && (
+            <AxisScaleEditor
+              label="Right axis"
+              value={format.y2AxisScale}
+              onChange={(next) => patch({ y2AxisScale: next })}
+            />
+          )}
+          <p className="text-xs text-rcd-muted">
+            Fit to data un-pins the axis from zero — useful for tightly clustered values.
+          </p>
+
+          {isCartesian && !horizontal && (
+            <>
+              <h4 className={SUBHEAD_CLASS}>Category labels</h4>
+              <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+                Label fit
+                <RcdSelect
+                  aria-label="Category label fit"
+                  className="w-32 shrink-0"
+                  value={format.xLabelFit?.mode ?? 'auto'}
+                  onChange={(event) =>
+                    setLabelFit({
+                      mode: event.target.value as NonNullable<AxisLabelFit['mode']>,
+                    })
+                  }
+                >
+                  {LABEL_FIT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              </label>
+              {format.xLabelFit?.mode === 'wrap' && (
+                <NumberRow
+                  label="Wrap lines"
+                  min={1}
+                  max={6}
+                  placeholder="2"
+                  value={format.xLabelFit?.wrapLines}
+                  onChange={(next) => setLabelFit({ wrapLines: next })}
+                />
+              )}
+              <p className="text-xs text-rcd-muted">
+                Auto measures the labels and escalates horizontal → angled → vertical so every
+                bucket stays labeled; Wrap breaks on spaces.
+              </p>
+            </>
+          )}
+
+          {isCartesian && (
+            <>
+              <CheckboxRow
+                label="Trim empty edge periods"
+                checked={format.trimEmptyEdges ?? false}
+                onChange={(checked) => patch({ trimEmptyEdges: checked || undefined })}
+              />
+              <p className="text-xs text-rcd-muted">
+                Drops leading/trailing categories where every series is blank — e.g. the warm-up
+                months of a period-over-period calc. Gaps in the middle stay.
+              </p>
+            </>
+          )}
+        </CollapsibleSection>
+      )}
+
+      {showZoomSection && (
+        <CollapsibleSection title="Zoom & pan" {...sectionProps('zoom')}>
+          <CheckboxRow
+            label="Brush strip"
+            checked={format.zoom?.brush ?? false}
+            onChange={(checked) => setZoom({ brush: checked || undefined })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Mini strip below the plot: drag to window the view, drag its edges to pan.
+          </p>
+          <CheckboxRow
+            label="Drag to zoom"
+            checked={format.zoom?.dragZoom ?? false}
+            onChange={(checked) => setZoom({ dragZoom: checked || undefined })}
+          />
+          {(format.zoom?.dragZoom ?? false) && (
+            <>
+              <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+                Drag action
+                <RcdSelect
+                  aria-label="Drag-select action"
+                  className="w-36 shrink-0"
+                  value={format.zoom?.dragAction ?? 'view'}
+                  onChange={(event) =>
+                    setZoom({
+                      dragAction:
+                        event.target.value === 'crossFilter' ? 'crossFilter' : undefined,
+                    })
+                  }
+                >
+                  <option value="view">Zoom view only</option>
+                  <option value="crossFilter">Cross-filter page</option>
+                </RcdSelect>
+              </label>
+              <p className="text-xs text-rcd-muted">
+                {DRAG_ACTION_CAPTIONS[format.zoom?.dragAction ?? 'view']}
+              </p>
+            </>
+          )}
+          <CheckboxRow
+            label="Wheel zoom"
+            checked={format.zoom?.wheel ?? false}
+            onChange={(checked) => setZoom({ wheel: checked || undefined })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Ctrl/Cmd + wheel zooms at the cursor; a plain wheel zooms only while already zoomed
+            in. Double-click resets any zoom.
+          </p>
+          {hasSmallMultiples && (
+            <p className="text-xs text-rcd-muted">
+              Small-multiple panels ignore zoom tools while the grid is active.
+            </p>
+          )}
         </CollapsibleSection>
       )}
 
@@ -1857,32 +2246,36 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
                 />
               </div>
             ))}
-            <h4 className={SUBHEAD_CLASS}>Colors</h4>
-            {seriesKeys.map((key) => {
-              const override = format.colorOverrides?.[key];
-              return (
-                <div key={key} className="flex items-center gap-2">
-                  <input
-                    type="color"
-                    aria-label={`Color for ${key}`}
-                    className={COLOR_INPUT_CLASS}
-                    value={override ?? DEFAULT_SWATCH}
-                    onChange={(event) => setOverride(key, event.target.value)}
-                  />
-                  <span className="min-w-0 flex-1 truncate text-sm text-rcd-text">{key}</span>
-                  {override && (
-                    <button
-                      type="button"
-                      aria-label={`Reset color for ${key}`}
-                      className={RESET_BUTTON_CLASS}
-                      onClick={() => clearOverride(key)}
-                    >
-                      <X size={12} />
-                    </button>
-                  )}
-                </div>
-              );
-            })}
+            {showSeriesColors && (
+              <>
+                <h4 className={SUBHEAD_CLASS}>Colors</h4>
+                {seriesKeys.map((key) => {
+                  const override = format.colorOverrides?.[key];
+                  return (
+                    <div key={key} className="flex items-center gap-2">
+                      <input
+                        type="color"
+                        aria-label={`Color for ${key}`}
+                        className={COLOR_INPUT_CLASS}
+                        value={override ?? DEFAULT_SWATCH}
+                        onChange={(event) => setOverride(key, event.target.value)}
+                      />
+                      <span className="min-w-0 flex-1 truncate text-sm text-rcd-text">{key}</span>
+                      {override && (
+                        <button
+                          type="button"
+                          aria-label={`Reset color for ${key}`}
+                          className={RESET_BUTTON_CLASS}
+                          onClick={() => clearOverride(key)}
+                        >
+                          <X size={12} />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </>
+            )}
           </>
         )}
         {(spec.type === 'column' || spec.type === 'bar') && (
@@ -1992,12 +2385,15 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         </CollapsibleSection>
       )}
 
+      {showValuesSection && (
       <CollapsibleSection title="Data labels & values" {...sectionProps('labels')}>
-        <CheckboxRow
-          label="Show value labels"
-          checked={format.showDataLabels ?? false}
-          onChange={(checked) => patch({ showDataLabels: checked })}
-        />
+        {isCartesian && (
+          <CheckboxRow
+            label="Show value labels"
+            checked={format.showDataLabels ?? false}
+            onChange={(checked) => patch({ showDataLabels: checked })}
+          />
+        )}
         <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
           Value format
           {customValueFormat ? (
@@ -2021,6 +2417,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           onChange={setCustomValueFormat}
         />
       </CollapsibleSection>
+      )}
 
       {spec.type === 'table' && (
         <CollapsibleSection title="Table" {...sectionProps('table')}>
@@ -2077,10 +2474,19 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             options={[
               { value: 'top', label: 'Top' },
               { value: 'middle', label: 'Middle' },
+              { value: 'bottom', label: 'Bottom' },
             ]}
             value={format.table?.verticalAlign ?? 'middle'}
             onChange={(next) => setTable({ verticalAlign: next })}
           />
+          <CheckboxRow
+            label="Wrap text"
+            checked={format.table?.wrapText ?? false}
+            onChange={(checked) => setTable({ wrapText: checked || undefined })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Cells wrap onto multiple lines and rows grow as needed; off truncates to one line.
+          </p>
 
           <h4 className={SUBHEAD_CLASS}>Header</h4>
           <SegmentedRow
@@ -2110,6 +2516,14 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             fallback={TEXT_SWATCH}
             onChange={(next) => setTable({ headerColor: next })}
           />
+          <TextStyleRow
+            label="Header font"
+            value={format.legendStyle}
+            onChange={(next) => patch({ legendStyle: next })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Size/bold/italic/color for the header row (the table reads the legend text style).
+          </p>
 
           <h4 className={SUBHEAD_CLASS}>Columns</h4>
           {tableColumns.length === 0 ? (
@@ -2134,6 +2548,26 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               ))}
               <p className="text-xs text-rcd-muted">
                 Auto aligns numbers right and text left.
+              </p>
+              <h4 className={SUBHEAD_CLASS}>Column vertical align</h4>
+              {tableColumns.map(({ key, label }) => (
+                <SegmentedRow
+                  key={key}
+                  label={label}
+                  options={[
+                    { value: 'auto', label: 'Auto' },
+                    { value: 'top', label: 'T' },
+                    { value: 'middle', label: 'M' },
+                    { value: 'bottom', label: 'B' },
+                  ]}
+                  value={format.table?.columnVerticalAlign?.[key] ?? 'auto'}
+                  onChange={(next) =>
+                    setColumnVerticalAlign(key, next === 'auto' ? undefined : next)
+                  }
+                />
+              ))}
+              <p className="text-xs text-rcd-muted">
+                Auto follows the table-wide vertical align above.
               </p>
             </>
           )}
@@ -2190,6 +2624,25 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               onChange={(next) => setTable({ pageSize: next })}
             />
           )}
+          <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
+            Viewer page-size choices
+            <RcdInput
+              className="min-w-0"
+              value={pageSizeOptionsDisplay}
+              placeholder="e.g. 10, 25, 50"
+              aria-label="Viewer page-size choices"
+              onChange={(event) => {
+                setPageSizeOptionsText(event.target.value);
+                commitPageSizeOptions(event.target.value);
+              }}
+              onBlur={() => setPageSizeOptionsText(null)}
+            />
+            <p className="text-xs text-rcd-muted">
+              Comma-separated row counts offered in the pager’s “Rows per page” picker (viewers
+              can also pick All). Leave blank to hide the picker; “Page size” above stays the
+              default.
+            </p>
+          </div>
           <CheckboxRow
             label="Stripes"
             checked={format.table?.stripes ?? false}
@@ -2207,6 +2660,15 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           />
           <p className="text-xs text-rcd-muted">
             Excel-style filter and sort menus in each column header.
+          </p>
+          <CheckboxRow
+            label="Hover highlighting"
+            checked={format.hoverHighlight ?? true}
+            onChange={(checked) => patch({ hoverHighlight: checked ? undefined : false })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Hovering a row spotlights its category across the page (and page hovers dim
+            non-matching rows here).
           </p>
           <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
             Pinned columns
@@ -2243,73 +2705,69 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         </CollapsibleSection>
       )}
 
+      {hasAxes && (
       <CollapsibleSection title="Analytics" {...sectionProps('analytics')}>
-        {!hasAxes ? (
+        <h4 className={SUBHEAD_CLASS}>Reference lines</h4>
+        {(format.referenceLines ?? []).map((line) => (
+          <ReferenceLineRow
+            key={line.id}
+            line={line}
+            seriesKeys={seriesKeys}
+            showSecondary={hasSecondary}
+            onChange={(partial) => setReferenceLine(line.id, partial)}
+            onRemove={() => removeReferenceLine(line.id)}
+          />
+        ))}
+        <button type="button" className={ADD_BUTTON_CLASS} onClick={addReferenceLine}>
+          + Add reference line
+        </button>
+        <h4 className={SUBHEAD_CLASS}>Trendlines</h4>
+        {(format.trendlines ?? []).map((line) => (
+          <TrendlineRow
+            key={line.id}
+            line={line}
+            seriesKeys={seriesKeys}
+            linearOnly={isScatter}
+            onChange={(partial) => setTrendline(line.id, partial)}
+            onRemove={() => removeTrendline(line.id)}
+          />
+        ))}
+        <button type="button" className={ADD_BUTTON_CLASS} onClick={addTrendline}>
+          + Add trendline
+        </button>
+        {isScatter && (
           <p className="text-xs text-rcd-muted">
-            Reference lines and trendlines apply to cartesian charts only.
+            On scatter, reference lines draw against the Y axis and trendlines are linear fits
+            (moving averages need an ordered category axis).
           </p>
-        ) : (
-          <>
-            <h4 className={SUBHEAD_CLASS}>Reference lines</h4>
-            {(format.referenceLines ?? []).map((line) => (
-              <ReferenceLineRow
-                key={line.id}
-                line={line}
-                seriesKeys={seriesKeys}
-                showSecondary={hasSecondary}
-                onChange={(partial) => setReferenceLine(line.id, partial)}
-                onRemove={() => removeReferenceLine(line.id)}
-              />
-            ))}
-            <button type="button" className={ADD_BUTTON_CLASS} onClick={addReferenceLine}>
-              + Add reference line
-            </button>
-            <h4 className={SUBHEAD_CLASS}>Trendlines</h4>
-            {(format.trendlines ?? []).map((line) => (
-              <TrendlineRow
-                key={line.id}
-                line={line}
-                seriesKeys={seriesKeys}
-                onChange={(partial) => setTrendline(line.id, partial)}
-                onRemove={() => removeTrendline(line.id)}
-              />
-            ))}
-            <button type="button" className={ADD_BUTTON_CLASS} onClick={addTrendline}>
-              + Add trendline
-            </button>
-          </>
         )}
       </CollapsibleSection>
+      )}
 
+      {conditionalStyles.length > 0 && (
       <CollapsibleSection title="Conditional formatting" {...sectionProps('conditional')}>
-        {conditionalStyles.length === 0 ? (
+        {(format.conditionalFormats ?? []).map((item) => (
+          <ConditionalFormatCard
+            key={item.id}
+            item={item}
+            styleOptions={conditionalStyles}
+            seriesKeys={seriesKeys}
+            onChange={(partial) => setConditionalFormat(item.id, partial)}
+            onRemove={() => removeConditionalFormat(item.id)}
+          />
+        ))}
+        <button type="button" className={ADD_BUTTON_CLASS} onClick={addConditionalFormat}>
+          + Add conditional format
+        </button>
+        {(spec.type === 'column' || spec.type === 'bar') && (
           <p className="text-xs text-rcd-muted">
-            Conditional formatting applies to table, column/bar, and KPI charts.
+            Bar fill recolors categories when a single series renders.
           </p>
-        ) : (
-          <>
-            {(format.conditionalFormats ?? []).map((item) => (
-              <ConditionalFormatCard
-                key={item.id}
-                item={item}
-                styleOptions={conditionalStyles}
-                seriesKeys={seriesKeys}
-                onChange={(partial) => setConditionalFormat(item.id, partial)}
-                onRemove={() => removeConditionalFormat(item.id)}
-              />
-            ))}
-            <button type="button" className={ADD_BUTTON_CLASS} onClick={addConditionalFormat}>
-              + Add conditional format
-            </button>
-            {(spec.type === 'column' || spec.type === 'bar') && (
-              <p className="text-xs text-rcd-muted">
-                Bar fill recolors categories when a single series renders.
-              </p>
-            )}
-          </>
         )}
       </CollapsibleSection>
+      )}
 
+      {showSmallMultiplesSection && (
       <CollapsibleSection title="Small multiples" {...sectionProps('smallMultiples')}>
         {!hasSmallMultiples ? (
           <p className="text-xs text-rcd-muted">
@@ -2368,6 +2826,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           </>
         )}
       </CollapsibleSection>
+      )}
 
       <CollapsibleSection title="Live update" {...sectionProps('refresh')}>
         <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">

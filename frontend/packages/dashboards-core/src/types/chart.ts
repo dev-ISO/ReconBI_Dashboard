@@ -97,7 +97,16 @@ export interface TableOptions {
    *  (defaults: measures right, text left). */
   columnAlign?: Record<string, 'left' | 'center' | 'right'>;
   /** Vertical cell alignment (default 'middle'). */
-  verticalAlign?: 'top' | 'middle';
+  verticalAlign?: 'top' | 'middle' | 'bottom';
+  /** Per-column vertical alignment overrides keyed by result column NAME. */
+  columnVerticalAlign?: Record<string, 'top' | 'middle' | 'bottom'>;
+  /** Wrap cell text onto multiple lines instead of truncating (default false). */
+  wrapText?: boolean;
+  /**
+   * Page-size choices shown to viewers in the pager (e.g. [10, 25, 50]);
+   * null/absent hides the picker. pageSize stays the author default.
+   */
+  pageSizeOptions?: number[] | null;
   /** Cell border style (default 'rows'). */
   borders?: 'none' | 'rows' | 'columns' | 'grid';
   borderColor?: string | null;
@@ -231,6 +240,44 @@ export interface ChartPointEvent {
   clientY: number;
 }
 
+/** Value-axis scale/range behavior (cartesian charts). */
+export interface AxisScaleOptions {
+  /**
+   * 'zero' anchors the axis at 0 (current default); 'auto' fits the plotted
+   * data with padded nice ticks (fixes tiny-range scatter clusters); 'custom'
+   * uses min/max (either may be null = that side auto).
+   */
+  range?: 'zero' | 'auto' | 'custom';
+  min?: number | null;
+  max?: number | null;
+  /** Log10 scale; renderer falls back to linear when data crosses <= 0. */
+  log?: boolean;
+}
+
+/** Category-axis label fitting (cartesian x axis). */
+export interface AxisLabelFit {
+  /** 'auto' measures widths and escalates horizontal -> angled -> vertical. */
+  mode?: 'auto' | 'horizontal' | 'angled' | 'vertical' | 'wrap';
+  /** Max lines for 'wrap' (default 2). */
+  wrapLines?: number;
+}
+
+/** Interactive view tools over cartesian charts (view-only unless noted). */
+export interface ChartZoomOptions {
+  /** Recharts brush strip below the plot: drag to window, drag edges to pan. */
+  brush?: boolean;
+  /** Drag a rectangle on the plot to zoom the view; double-click resets. */
+  dragZoom?: boolean;
+  /**
+   * What a drag-select does on a DATE axis: 'view' zooms visually only
+   * (default); 'crossFilter' also emits the selected date range as a page
+   * cross-filter, so the whole dashboard follows the selection.
+   */
+  dragAction?: 'view' | 'crossFilter';
+  /** Mouse-wheel zoom centred on the cursor (view-only; default false). */
+  wheel?: boolean;
+}
+
 export interface ChartFormat {
   /** Predefined palette; per-series colorOverrides still win. */
   theme?: ChartThemeName;
@@ -256,6 +303,30 @@ export interface ChartFormat {
   secondaryAxisKeys?: string[];
   /** This chart participates in page hover highlighting (default true). */
   hoverHighlight?: boolean;
+  /** Vertical gridlines from x-axis ticks (cartesian; default false). */
+  gridX?: boolean;
+  /** Horizontal gridlines from y-axis ticks (cartesian; default true). */
+  gridY?: boolean;
+  /** Numeric x-axis scale (scatter x / horizontal-bar value axis). */
+  xAxisScale?: AxisScaleOptions;
+  /** Primary value-axis scale. */
+  yAxisScale?: AxisScaleOptions;
+  /** Secondary (right) value-axis scale. */
+  y2AxisScale?: AxisScaleOptions;
+  /** Category-axis label fitting (default auto). */
+  xLabelFit?: AxisLabelFit;
+  /**
+   * Drop leading/trailing categories where EVERY series is null (e.g. the
+   * 12-month warm-up of a period-change calc); default false.
+   */
+  trimEmptyEdges?: boolean;
+  /** Interactive zoom/pan view tools (cartesian charts). */
+  zoom?: ChartZoomOptions;
+  /**
+   * Clicking a data point highlights it (and dims siblings) on THIS chart
+   * while its cross-filter is active; default true.
+   */
+  selectionHighlight?: boolean;
   /** Table-chart behavior/layout (sorting, paging, totals, columns). */
   table?: TableOptions;
   /** Per-series line style, keyed like colorOverrides (line/area charts). */

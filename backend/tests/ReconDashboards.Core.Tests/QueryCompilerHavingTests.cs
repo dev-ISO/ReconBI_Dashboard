@@ -325,6 +325,73 @@ LIMIT @p1
         AssertParam(compiled.Parameters[0], "p0", 100m, NormalizedType.Decimal);
     }
 
+    // ---------- membership (in / notIn) ----------
+
+    [Fact]
+    public void InBindsTheValueListAsOneDecimalArrayParameter()
+    {
+        var compiled = Compile(Spec([Having(HavingOperator.In, 5, 10, 17.5)]));
+
+        AssertSql("""
+SELECT "t1"."region" AS "dim0",
+       SUM("t0"."order_total") AS "meas0"
+FROM "public"."orders" AS "t0"
+LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
+GROUP BY "t1"."region"
+HAVING SUM("t0"."order_total") = ANY(@p0)
+ORDER BY "t1"."region" ASC NULLS LAST
+LIMIT @p1
+""", compiled);
+
+        Assert.Equal(2, compiled.Parameters.Count);
+        var list = compiled.Parameters[0];
+        Assert.Equal("p0", list.Name);
+        Assert.True(list.IsArray);
+        Assert.Equal(NormalizedType.Decimal, list.Type);
+        Assert.Equal(new object?[] { 5m, 10m, 17.5m }, list.Value);
+    }
+
+    [Fact]
+    public void NotInIsTheExactComplementAndKeepsNullAggregates()
+    {
+        var compiled = Compile(Spec([Having(HavingOperator.NotIn, 5, 10)]));
+
+        Assert.Contains(
+            "\nHAVING (SUM(\"t0\".\"order_total\") <> ALL(@p0) OR SUM(\"t0\".\"order_total\") IS NULL)\n",
+            compiled.Sql, StringComparison.Ordinal);
+        var list = compiled.Parameters[0];
+        Assert.True(list.IsArray);
+        Assert.Equal(new object?[] { 5m, 10m }, list.Value);
+    }
+
+    [Fact]
+    public void InWithASingleValueStillUsesTheMembershipShape()
+    {
+        var compiled = Compile(Spec([Having(HavingOperator.In, 42)]));
+
+        Assert.Contains(
+            "\nHAVING SUM(\"t0\".\"order_total\") = ANY(@p0)\n",
+            compiled.Sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void WireNamesInAndNotInDeserializeOntoTheEnum()
+    {
+        const string json = """
+            {"modelId":1,"dimensions":[],"measures":[],"filters":[],"sort":[],
+             "having":[{"measureIndex":0,"operator":"in","values":[1,2]},
+                       {"measureIndex":0,"operator":"notIn","values":[3]}]}
+            """;
+        var spec = JsonSerializer.Deserialize<ChartQuerySpec>(
+            json, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+
+        Assert.NotNull(spec?.Having);
+        Assert.Equal(HavingOperator.In, spec!.Having![0].Operator);
+        Assert.Equal([1d, 2d], spec.Having[0].Values);
+        Assert.Equal(HavingOperator.NotIn, spec.Having[1].Operator);
+        Assert.Equal([3d], spec.Having[1].Values);
+    }
+
     // ---------- validation ----------
 
     [Theory]
@@ -358,6 +425,36 @@ LIMIT @p1
         AssertCompilationError(
             "QRY_BAD_HAVING",
             Spec([new HavingSpec(0, HavingOperator.Eq, [])]));
+
+    [Theory]
+    [InlineData(HavingOperator.In)]
+    [InlineData(HavingOperator.NotIn)]
+    public void EmptyMembershipListsAreRejected(HavingOperator op) =>
+        AssertCompilationError(
+            "QRY_BAD_HAVING",
+            Spec([new HavingSpec(0, op, [])]));
+
+    [Fact]
+    public void MembershipListsPastMaxInValuesAreRejected() =>
+        AssertCompilationError(
+            "QRY_TOO_MANY_VALUES",
+            Spec([new HavingSpec(
+                0, HavingOperator.In,
+                [.. Enumerable.Range(0, new RcdLimits().MaxInValues + 1).Select(i => (double)i)])]));
+
+    [Fact]
+    public void MembershipListsUpToMaxInValuesCompile()
+    {
+        var values = Enumerable.Range(0, new RcdLimits().MaxInValues).Select(i => (double)i).ToArray();
+        var compiled = Compile(Spec([new HavingSpec(0, HavingOperator.In, values)]));
+        Assert.Contains("= ANY(", compiled.Sql, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NonFiniteMembershipValuesAreRejected() =>
+        AssertCompilationError(
+            "QRY_BAD_HAVING_VALUE",
+            Spec([new HavingSpec(0, HavingOperator.In, [1, double.NaN])]));
 
     [Theory]
     [InlineData(double.NaN)]

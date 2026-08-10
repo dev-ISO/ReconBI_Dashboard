@@ -1,4 +1,5 @@
 import type {
+  AxisScaleOptions,
   CellValue,
   ConditionalFormatSpec,
   ConditionalRule,
@@ -221,21 +222,159 @@ export function conditionalColor(
   return undefined;
 }
 
+// ---- axis scale resolution (AxisScaleOptions) ------------------------------
+
+/** 1-2-5 nice step targeting ~5 ticks over `span`. */
+const niceStep = (span: number): number => {
+  const raw = span / 5;
+  const mag = 10 ** Math.floor(Math.log10(Math.abs(raw) || 1));
+  const norm = raw / mag;
+  return (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+};
+
+/**
+ * 'auto'-range domain: the data extent padded ~5% each side, then snapped
+ * outward to a 1-2-5 nice step so ticks read clean. Padding never crosses zero
+ * artificially (an all-positive extent keeps a >= 0 floor, mirrored for
+ * all-negative), which keeps bar baselines honest when they're near zero.
+ */
+export function paddedNiceDomain(min: number, max: number): [number, number] {
+  if (min === max) {
+    const pad = Math.abs(min) * 0.05 || 1;
+    min -= pad;
+    max += pad;
+  }
+  const pad = (max - min) * 0.05;
+  let lo = min - pad;
+  let hi = max + pad;
+  if (min >= 0 && lo < 0) lo = 0;
+  if (max <= 0 && hi > 0) hi = 0;
+  const step = niceStep(hi - lo);
+  return [Math.floor(lo / step) * step, Math.ceil(hi / step) * step];
+}
+
+/**
+ * Min/max of the plotted values for one value axis. `stacked` bounds by the
+ * per-row positive/negative sums (what the bars actually reach; zero — the
+ * stack baseline — is always part of a stacked extent). Unlike
+ * sharedValueDomain, zero is NOT forced in otherwise: range-mode callers add
+ * the baseline themselves. Undefined when no numeric values exist.
+ */
+export function valueExtent(
+  rows: Record<string, CellValue>[],
+  keys: string[],
+  stacked: boolean,
+): [number, number] | undefined {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const row of rows) {
+    let pos = 0;
+    let neg = 0;
+    let rowSaw = false;
+    for (const key of keys) {
+      const v = row[key];
+      if (typeof v !== 'number' || !Number.isFinite(v)) continue;
+      rowSaw = true;
+      if (stacked) {
+        if (v >= 0) pos += v;
+        else neg += v;
+      } else {
+        if (v < min) min = v;
+        if (v > max) max = v;
+      }
+    }
+    if (stacked && rowSaw) {
+      if (pos > max) max = pos;
+      if (neg < min) min = neg;
+      if (min > 0) min = 0;
+      if (max < 0) max = 0;
+    }
+  }
+  return min <= max ? [min, max] : undefined;
+}
+
+/** Extent of a plain numeric array (scatter axes). */
+export function numberExtent(values: number[]): [number, number] | undefined {
+  let min = Number.POSITIVE_INFINITY;
+  let max = Number.NEGATIVE_INFINITY;
+  for (const v of values) {
+    if (!Number.isFinite(v)) continue;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  return min <= max ? [min, max] : undefined;
+}
+
+/** Recharts axis props derived from an AxisScaleOptions + the data extent. */
+export interface ResolvedAxisScale {
+  /** Recharts `domain` prop; undefined keeps the default [0, 'auto']. */
+  domain?: [number | string, number | string];
+  /** 'log' only when a log10 scale is safe for the data. */
+  scale?: 'log';
+  /**
+   * Log was requested but the data (or a custom min) crosses <= 0; the axis
+   * rendered linear instead and the chart should surface a subtle note.
+   */
+  logFallback: boolean;
+}
+
+/**
+ * Resolves AxisScaleOptions against the plotted extent:
+ * - 'zero' (default): recharts' stock [0, 'auto'] — today's behavior.
+ * - 'auto': paddedNiceDomain over the extent (fixes tiny-range clusters
+ *   pinned to a zero-based axis).
+ * - 'custom': explicit min/max; a null side stays 'auto' (data-fitted).
+ * - log: scale 'log' with an ['auto','auto'] domain (0 can never sit on a log
+ *   axis); when any plotted value or the custom min is <= 0 it falls back to
+ *   linear and flags logFallback for an in-chart note (no console spam).
+ */
+export function resolveAxisScale(
+  opts: AxisScaleOptions | undefined,
+  extent: [number, number] | undefined,
+): ResolvedAxisScale {
+  if (!opts) return { logFallback: false };
+  const range = opts.range ?? 'zero';
+  const domain: [number | string, number | string] | undefined =
+    range === 'custom'
+      ? [opts.min ?? 'auto', opts.max ?? 'auto']
+      : range === 'auto'
+        ? extent
+          ? paddedNiceDomain(extent[0], extent[1])
+          : ['auto', 'auto']
+        : undefined;
+  if (opts.log) {
+    const dataPositive = extent !== undefined && extent[0] > 0;
+    const minPositive = typeof opts.min !== 'number' || opts.min > 0;
+    if (dataPositive && minPositive) {
+      return {
+        scale: 'log',
+        domain: range === 'custom' ? domain : ['auto', 'auto'],
+        logFallback: false,
+      };
+    }
+    return { domain, logFallback: true };
+  }
+  return { domain, logFallback: false };
+}
+
 /**
  * Shared small-multiples value domain over every panel's shaped rows, from the
  * listed series keys only (callers pass the VISIBLE keys so legend toggles
  * re-scale exactly like a single chart). Stacked charts bound by the per-row
  * positive and negative sums; plain charts by individual values. Zero is
- * always included so panels keep the bar/area baseline. Undefined when no
- * numeric values exist.
+ * included by default so panels keep the bar/area baseline; `zeroBase: false`
+ * (yAxisScale range 'auto'/'custom') fits the raw extent instead — stacked
+ * charts still reach the zero stack baseline through their row sums.
+ * Undefined when no numeric values exist.
  */
 export function sharedValueDomain(
   panelRows: Record<string, CellValue>[][],
   seriesKeys: string[],
   stacked: boolean,
+  zeroBase = true,
 ): [number, number] | undefined {
-  let min = 0;
-  let max = 0;
+  let min = zeroBase ? 0 : Number.POSITIVE_INFINITY;
+  let max = zeroBase ? 0 : Number.NEGATIVE_INFINITY;
   let sawValue = false;
   for (const rows of panelRows) {
     for (const row of rows) {

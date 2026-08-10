@@ -65,6 +65,19 @@ const LIGHT_TOKENS = {
 
 const NO_FILTERS: FilterClause[] = [];
 
+/** PrintOptions alignment -> flex placement of the composed content. */
+const VERTICAL_ALIGN = {
+  top: 'flex-start',
+  middle: 'center',
+  bottom: 'flex-end',
+} as const;
+
+const HORIZONTAL_ALIGN = {
+  left: 'flex-start',
+  center: 'center',
+  right: 'flex-end',
+} as const;
+
 export interface PrintSheetsProps {
   title: string;
   tiles: DashboardTile[];
@@ -117,7 +130,8 @@ export function PrintSheets({
     if (isTextTile(tile)) {
       return (
         <div className="h-full w-full overflow-hidden p-1">
-          <TextTileContent spec={tile.text} />
+          {/* Paper cannot scroll: no auto-scroll, no reserved gutter. */}
+          <TextTileContent spec={tile.text} scroll={false} />
         </div>
       );
     }
@@ -177,13 +191,26 @@ export function PrintSheets({
             }}
           >
             <div
-              className="rcd-print-sheet-inner overflow-hidden"
-              style={{ width: geometry.contentWidthPx, height: geometry.contentHeightPx }}
+              className="rcd-print-sheet-inner flex flex-col overflow-hidden"
+              style={{
+                width: geometry.contentWidthPx,
+                height: geometry.contentHeightPx,
+                // Composed-content placement inside the printable area. The
+                // pagination math is unchanged (it measures from the top);
+                // this only distributes the leftover slack. In PRINT the sheet
+                // height goes auto, so DashboardPrintView injects a matching
+                // min-height whenever the vertical setting is not 'top'.
+                justifyContent: VERTICAL_ALIGN[options.alignV ?? 'top'],
+                alignItems: HORIZONTAL_ALIGN[options.alignH ?? 'left'],
+              }}
             >
               {pageIndex === 0 && layout.headerHeight > 0 && (
                 /* Fixed line heights + truncate: the header's height must match
                    headerHeightPx exactly or pagination drifts. */
-                <header className="mb-4 flex flex-col gap-1">
+                <header
+                  className="mb-4 flex w-full shrink-0 flex-col gap-1"
+                  style={{ textAlign: options.alignH ?? 'left' }}
+                >
                   {options.includeTitle && (
                     <h1 className="truncate text-xl font-semibold leading-7 text-rcd-text">
                       {title}
@@ -240,7 +267,7 @@ function BlockBox({
 }) {
   return (
     <div
-      className="overflow-hidden"
+      className="shrink-0 overflow-hidden"
       style={{ width: block.width, height: block.height, marginTop: block.marginTop }}
     >
       <div
@@ -318,15 +345,29 @@ export function DashboardPrintView({
     const geometry = pageGeometry(options.paper, options.orientation);
     const styleEl = document.createElement('style');
     styleEl.setAttribute('data-rcd-print', '');
+    // Vertical content alignment needs a page-tall box to distribute slack in,
+    // but the print rules deliberately let each sheet go height:auto (so a
+    // rounding hair can never spill onto a blank page). Re-establish the box
+    // as a MIN-height, one pixel shy of the @page content area, and only when
+    // the setting actually asks for it — 'top' stays byte-identical to before.
+    const contentHeightMm = geometry.paperHeightMm - 2 * PAGE_MARGIN_MM;
+    const alignV = options.alignV ?? 'top';
     styleEl.textContent = [
       `@page { size: ${geometry.paperWidthMm}mm ${geometry.paperHeightMm}mm; margin: ${PAGE_MARGIN_MM}mm; }`,
       '@media print {',
       `  html, body { width: ${geometry.contentWidthPx}px !important; height: auto !important; }`,
+      ...(alignV === 'top'
+        ? []
+        : [
+            '  body.rcd-printing .rcd-print-sheet-inner {',
+            `    min-height: calc(${contentHeightMm}mm - 1px) !important;`,
+            '  }',
+          ]),
       '}',
     ].join('\n');
     document.head.appendChild(styleEl);
     return () => styleEl.remove();
-  }, [options.paper, options.orientation]);
+  }, [options.paper, options.orientation, options.alignV]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

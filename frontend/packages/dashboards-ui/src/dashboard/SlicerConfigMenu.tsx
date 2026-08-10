@@ -1,8 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { FilterX, Trash2 } from 'lucide-react';
-import type { SlicerTileSpec, SlicerVariant } from '@recon/dashboards-core';
+import type {
+  DateRangeOptions,
+  SlicerTileSpec,
+  SlicerTileStyle,
+  SlicerVariant,
+} from '@recon/dashboards-core';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdInput, RcdSelect } from '../primitives';
+import { monthOf, todayDateOnly } from './SlicerCalendar';
 
 export interface SlicerConfigMenuProps {
   tileId: string;
@@ -17,6 +23,9 @@ export interface SlicerConfigMenuProps {
   position: { x: number; y: number };
   onClose: () => void;
 }
+
+/** yyyy-MM pin accepted by DateRangeOptions.initialMonth. */
+const MONTH_PIN = /^\d{4}-(0[1-9]|1[0-2])$/;
 
 const VARIANTS: { value: SlicerVariant; label: string }[] = [
   { value: 'checklist', label: 'Checklist' },
@@ -49,6 +58,13 @@ export function SlicerConfigMenu({
   const [pos, setPos] = useState(position);
   const [labelDraft, setLabelDraft] = useState(spec.label);
   const [confirmRemove, setConfirmRemove] = useState(false);
+  // Draft for the pinned "opens on" month (committed on blur/Enter if valid).
+  const [monthDraft, setMonthDraft] = useState(() => {
+    const configured = spec.dateRange?.initialMonth;
+    return typeof configured === 'string' && MONTH_PIN.test(configured)
+      ? configured
+      : monthOf(todayDateOnly());
+  });
 
   // Clamp to the viewport once the card has a measured size.
   useLayoutEffect(() => {
@@ -116,6 +132,7 @@ export function SlicerConfigMenu({
   };
 
   const style = spec.style ?? {};
+  const dateRange = spec.dateRange ?? {};
 
   /** Flips one visual-mode flag, preserving the other (style patches whole). */
   const toggleStyleFlag = (flag: 'hideHeader' | 'compact') => {
@@ -123,6 +140,27 @@ export function SlicerConfigMenu({
       style: { ...style, [flag]: !(style[flag] === true) },
     });
   };
+
+  /** Style patches replace the whole block — always spread the current one. */
+  const patchStyle = (patch: Partial<SlicerTileStyle>) => {
+    runtime.dashboards.updateSlicer(tileId, { style: { ...style, ...patch } });
+  };
+
+  /** Same for the dateRange block (picker/initialMonth/showAvailability). */
+  const patchDateRange = (patch: Partial<DateRangeOptions>) => {
+    runtime.dashboards.updateSlicer(tileId, { dateRange: { ...dateRange, ...patch } });
+  };
+
+  const initialMonth = dateRange.initialMonth ?? null;
+  const pinnedMonth = typeof initialMonth === 'string' && MONTH_PIN.test(initialMonth)
+    ? initialMonth
+    : null;
+  const initialMonthMode =
+    initialMonth === 'dataStart' || initialMonth === 'dataEnd'
+      ? initialMonth
+      : pinnedMonth !== null
+        ? 'pinned'
+        : 'current';
 
   const appliesToSummary = allCharts
     ? 'All charts'
@@ -227,6 +265,173 @@ export function SlicerConfigMenu({
               Compact
             </label>
 
+            {spec.variant === 'buttons' && (
+              <>
+                <Divider />
+                <SectionLabel>Buttons</SectionLabel>
+                <MenuRow label="Size">
+                  <RcdSelect
+                    aria-label="Button size"
+                    value={style.buttonSize ?? 'md'}
+                    onChange={(event) =>
+                      patchStyle({ buttonSize: event.target.value as SlicerTileStyle['buttonSize'] })
+                    }
+                    className="h-7 w-full text-xs"
+                  >
+                    <option value="sm">Small</option>
+                    <option value="md">Medium</option>
+                    <option value="lg">Large</option>
+                  </RcdSelect>
+                </MenuRow>
+                <MenuRow label="Columns">
+                  <RcdSelect
+                    aria-label="Button columns"
+                    value={
+                      typeof style.buttonColumns === 'number' && style.buttonColumns >= 1
+                        ? String(style.buttonColumns)
+                        : 'auto'
+                    }
+                    onChange={(event) =>
+                      patchStyle({
+                        buttonColumns:
+                          event.target.value === 'auto' ? null : Number(event.target.value),
+                      })
+                    }
+                    className="h-7 w-full text-xs"
+                  >
+                    <option value="auto">Auto (wrap)</option>
+                    {[1, 2, 3, 4, 5, 6].map((count) => (
+                      <option key={count} value={String(count)}>
+                        {count}
+                      </option>
+                    ))}
+                  </RcdSelect>
+                </MenuRow>
+                <MenuRow label="Align">
+                  <RcdSelect
+                    aria-label="Button horizontal alignment"
+                    value={style.buttonAlign ?? 'left'}
+                    onChange={(event) =>
+                      patchStyle({
+                        buttonAlign: event.target.value as SlicerTileStyle['buttonAlign'],
+                      })
+                    }
+                    className="h-7 w-full text-xs"
+                  >
+                    <option value="left">Left</option>
+                    <option value="center">Center</option>
+                    <option value="right">Right</option>
+                  </RcdSelect>
+                </MenuRow>
+                <MenuRow label="Vertical">
+                  <RcdSelect
+                    aria-label="Button vertical alignment"
+                    value={style.buttonVerticalAlign ?? 'top'}
+                    onChange={(event) =>
+                      patchStyle({
+                        buttonVerticalAlign: event.target
+                          .value as SlicerTileStyle['buttonVerticalAlign'],
+                      })
+                    }
+                    className="h-7 w-full text-xs"
+                  >
+                    <option value="top">Top</option>
+                    <option value="middle">Middle</option>
+                    <option value="bottom">Bottom</option>
+                  </RcdSelect>
+                </MenuRow>
+                <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--rcd-accent)]"
+                    checked={style.buttonFill === true}
+                    onChange={() => patchStyle({ buttonFill: !(style.buttonFill === true) })}
+                  />
+                  Stretch to fill width
+                </label>
+              </>
+            )}
+
+            {spec.variant === 'dateRange' && (
+              <>
+                <Divider />
+                <SectionLabel>Date range</SectionLabel>
+                <MenuRow label="Picker">
+                  <RcdSelect
+                    aria-label="Date picker style"
+                    value={dateRange.picker ?? 'native'}
+                    onChange={(event) =>
+                      patchDateRange({ picker: event.target.value as DateRangeOptions['picker'] })
+                    }
+                    className="h-7 w-full text-xs"
+                  >
+                    <option value="native">Native inputs</option>
+                    <option value="calendar">Calendar</option>
+                  </RcdSelect>
+                </MenuRow>
+                {dateRange.picker === 'calendar' && (
+                  <>
+                    <MenuRow label="Opens on">
+                      <RcdSelect
+                        aria-label="Calendar initial month"
+                        value={initialMonthMode}
+                        onChange={(event) => {
+                          const mode = event.target.value;
+                          patchDateRange({
+                            initialMonth:
+                              mode === 'current'
+                                ? null
+                                : mode === 'pinned'
+                                  ? (MONTH_PIN.test(monthDraft)
+                                      ? monthDraft
+                                      : monthOf(todayDateOnly()))
+                                  : (mode as 'dataStart' | 'dataEnd'),
+                          });
+                        }}
+                        className="h-7 w-full text-xs"
+                      >
+                        <option value="current">Current month</option>
+                        <option value="dataStart">First month with data</option>
+                        <option value="dataEnd">Last month with data</option>
+                        <option value="pinned">Specific month…</option>
+                      </RcdSelect>
+                    </MenuRow>
+                    {initialMonthMode === 'pinned' && (
+                      <div className="px-3 pb-1">
+                        <RcdInput
+                          value={monthDraft}
+                          placeholder="YYYY-MM"
+                          aria-label="Calendar initial month (YYYY-MM)"
+                          onChange={(event) => setMonthDraft(event.target.value)}
+                          onBlur={() => {
+                            if (MONTH_PIN.test(monthDraft)) patchDateRange({ initialMonth: monthDraft });
+                            else setMonthDraft(pinnedMonth ?? monthOf(todayDateOnly()));
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter' && MONTH_PIN.test(monthDraft)) {
+                              patchDateRange({ initialMonth: monthDraft });
+                            }
+                          }}
+                          className="h-7 w-full text-xs"
+                        />
+                      </div>
+                    )}
+                    <label className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+                      <input
+                        type="checkbox"
+                        className="accent-[var(--rcd-accent)]"
+                        checked={dateRange.showAvailability !== false}
+                        onChange={() =>
+                          patchDateRange({ showAvailability: !(dateRange.showAvailability !== false) })
+                        }
+                      />
+                      Mark days with data
+                    </label>
+                  </>
+                )}
+              </>
+            )}
+
             {spec.variant !== 'fieldParam' && (
               <>
                 <Divider />
@@ -327,4 +532,14 @@ function SectionLabel({ children }: { children: string }) {
 
 function Divider() {
   return <div className="my-1 border-t border-rcd-border" />;
+}
+
+/** Label + control row for the compact settings sections (buttons/date range). */
+function MenuRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-center gap-2 px-3 py-0.5">
+      <span className="w-16 shrink-0 text-sm text-rcd-text">{label}</span>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
 }

@@ -36,6 +36,57 @@ export interface SlicerTileStyle {
   hideHeader?: boolean;
   /** Tighter paddings + smaller text (dense dashboards). */
   compact?: boolean;
+  /** buttons variant: control size (default 'md'). */
+  buttonSize?: 'sm' | 'md' | 'lg';
+  /** buttons variant: stretch buttons to share the full tile width. */
+  buttonFill?: boolean;
+  /** buttons variant: horizontal placement of the button group (default left). */
+  buttonAlign?: 'left' | 'center' | 'right';
+  /** buttons variant: vertical placement inside the tile (default top). */
+  buttonVerticalAlign?: 'top' | 'middle' | 'bottom';
+  /** buttons variant: fixed column count; null/absent = natural wrap. */
+  buttonColumns?: number | null;
+}
+
+/** dateRange-variant behavior (absent fields keep the native pickers). */
+export interface DateRangeOptions {
+  /**
+   * 'native' = the browser date inputs (current look); 'calendar' = the
+   * custom popover calendar with data-availability marks.
+   */
+  picker?: 'native' | 'calendar';
+  /**
+   * Month the calendar opens on when nothing is selected: 'dataStart' /
+   * 'dataEnd' derive from the column's actual min/max; 'yyyy-MM' pins one.
+   */
+  initialMonth?: 'dataStart' | 'dataEnd' | string | null;
+  /**
+   * Mark days/months that actually contain data in the calendar picker
+   * (distinct-values query on the column; default true for 'calendar').
+   */
+  showAvailability?: boolean;
+}
+
+/**
+ * Look/placement of the active cross-filter indicator. Absent = the default
+ * pill. Dashboard-level (layout doc `filterIndicator`).
+ */
+export interface FilterIndicatorStyle {
+  /** Where the indicator docks over the dashboard (default 'top-center'). */
+  placement?: 'top-center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+  /**
+   * 'pill' = compact floating chip (old look, restyled); 'banner' = full-width
+   * accent bar listing every active filter; 'stack' = one chip per filter,
+   * stacked at the docked corner.
+   */
+  variant?: 'pill' | 'banner' | 'stack';
+  size?: 'sm' | 'md' | 'lg';
+  /** Fixed hexes; null/absent = theme accent styling. */
+  background?: string | null;
+  textColor?: string | null;
+  accentColor?: string | null;
+  /** Badge each tile the filter actually applies to (default true). */
+  badgeTiles?: boolean;
 }
 
 export interface SlicerTileSpec {
@@ -52,6 +103,8 @@ export interface SlicerTileSpec {
   style?: SlicerTileStyle;
   /** fieldParam variant: id of the DashboardParameter this slicer drives. */
   parameterId?: string | null;
+  /** dateRange variant behavior; absent = native inputs. */
+  dateRange?: DateRangeOptions;
   /**
    * relativeDate variant: persisted preset id (e.g. 'last30d', 'ytd',
    * 'lastN:6:month') applied when the dashboard opens with no runtime
@@ -300,6 +353,11 @@ export interface DashboardLayoutDoc {
   slicers: SlicerDef[];
   /** View-mode auto-refresh interval in seconds; null/absent = off. */
   refreshSeconds?: number | null;
+  /**
+   * Cross-filter indicator look/placement (v1-compatible evolution; absent =
+   * default pill).
+   */
+  filterIndicator?: FilterIndicatorStyle | null;
   /**
    * Multi-page dashboards (v1-compatible evolution; the wire version stays 1).
    * Absent on legacy docs — the open migration wraps `tiles` into a single

@@ -47,6 +47,12 @@ export interface ShapedChartData {
   axisKey: string;
   /** True when series came from a legend dimension (vs one per measure). */
   hasLegend: boolean;
+  /**
+   * True when the axis is a date-BUCKETED dimension — the axis kind the
+   * zoom.dragAction 'crossFilter' range-select is allowed to emit for (raw
+   * bucket cells are exact filterable date values there).
+   */
+  axisIsDate: boolean;
 }
 
 const AXIS_KEY = '__axis';
@@ -100,6 +106,28 @@ const categoryLabel = (value: CellValue, column: QueryColumn, spec: ChartSpec): 
     : formatCellValue(value, column);
 
 /**
+ * format.trimEmptyEdges: drops LEADING and TRAILING categories where every
+ * plotted series value is null (e.g. the 12-month warm-up of a period-change
+ * calc). Interior all-null categories stay — a mid-series gap is data, an
+ * empty edge is noise. Runs at shape time, so axis ticks, tooltips, zoom and
+ * brush indices all address the same trimmed rows. All-empty data returns
+ * unchanged (trimming everything would blank the axis too).
+ */
+const trimEmptyEdgeRows = (
+  data: Record<string, CellValue>[],
+  seriesKeys: string[],
+): Record<string, CellValue>[] => {
+  const isEmpty = (row: Record<string, CellValue>): boolean =>
+    seriesKeys.every((key) => row[key] == null);
+  let first = 0;
+  while (first < data.length && isEmpty(data[first]!)) first++;
+  if (first === data.length) return data;
+  let last = data.length - 1;
+  while (last > first && isEmpty(data[last]!)) last--;
+  return first === 0 && last === data.length - 1 ? data : data.slice(first, last + 1);
+};
+
+/**
  * Pivots the engine's columnar result into recharts-friendly rows.
  * With a legend dimension: one series per legend value (first measure) —
  * except line/area with MULTIPLE measures, which get one series per
@@ -112,6 +140,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
 
   const axisColumn = dimensionColumns[0];
   const axisIndex = axisColumn ? result.columns.indexOf(axisColumn) : -1;
+  const axisIsDate = Boolean(axisColumn && axisColumn.dateBucket !== null);
 
   if (!hasLegend) {
     const series: ChartSeries[] = measureColumns.map((column, i) => ({
@@ -133,7 +162,18 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
       return item;
     });
 
-    return { data, series, axisKey: AXIS_KEY, hasLegend: false };
+    return {
+      data: spec.format.trimEmptyEdges
+        ? trimEmptyEdgeRows(
+            data,
+            series.map((s) => s.key),
+          )
+        : data,
+      series,
+      axisKey: AXIS_KEY,
+      hasLegend: false,
+      axisIsDate,
+    };
   }
 
   // Legend pivot. line/area with SEVERAL measures keep them all: one series
@@ -211,7 +251,19 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
         measureLabel: pivotMeasures[0]?.label,
       }));
 
-  return { data: [...byAxis.values()], series, axisKey: AXIS_KEY, hasLegend: true };
+  const pivoted = [...byAxis.values()];
+  return {
+    data: spec.format.trimEmptyEdges
+      ? trimEmptyEdgeRows(
+          pivoted,
+          series.map((s) => s.key),
+        )
+      : pivoted,
+    series,
+    axisKey: AXIS_KEY,
+    hasLegend: true,
+    axisIsDate,
+  };
 }
 
 export interface PieSlice {

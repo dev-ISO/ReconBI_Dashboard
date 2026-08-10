@@ -135,7 +135,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             }
         }
 
-        ValidateHaving(spec.Having, measures);
+        ValidateHaving(spec.Having, measures, limits);
 
         var involved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var d in dimensions)
@@ -390,7 +390,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             var core = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
             return EmitWithCalcs(
                 prepared, spec, [.. calendarCtes], core.ToString(),
-                includeIsTopN: false, orderByAxisOnly: false, effectiveLimit, bag, warnings);
+                includeIsTopN: false, orderByAxisOnly: false, effectiveLimit, bag, warnings,
+                rowLimit: effectiveLimit);
         }
 
         var orderParts = BuildOrderBy(spec, prepared, dimensionExprs);
@@ -405,7 +406,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
         return new CompiledQuery(
-            CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, BuildColumnPlans(prepared), warnings);
+            CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, BuildColumnPlans(prepared), warnings,
+            RowLimit: effectiveLimit);
     }
 
     /// <summary>
@@ -476,13 +478,15 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 // Offset (like the outer limit) applies to the final select.
                 return EmitWithCalcs(
                     prepared, spec, [.. calendarCtes], flat.ToString(),
-                    includeIsTopN: false, orderByAxisOnly: true, effectiveLimit, bag, warnings);
+                    includeIsTopN: false, orderByAxisOnly: true, effectiveLimit, bag, warnings,
+                    rowLimit: n);
             }
 
             AppendOffset(flat, spec, bag);
 
             return new CompiledQuery(
-                CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings);
+                CalendarWithPrefix(calendarCtes) + flat, bag.Parameters, BuildColumnPlans(prepared), warnings,
+                RowLimit: n);
         }
 
         var inner = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
@@ -619,7 +623,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         bool orderByAxisOnly,
         int effectiveLimit,
         ParameterBag bag,
-        List<EngineWarning> warnings)
+        List<EngineWarning> warnings,
+        int? rowLimit = null)
     {
         var baseAlias = dialect.QuoteIdentifier("__rcd_base");
         var axisBucket = prepared.Dimensions.Count > 0 ? prepared.Dimensions[0].Spec.DateBucket : null;
@@ -733,7 +738,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
-        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN), warnings);
+        return new CompiledQuery(
+            sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN), warnings,
+            RowLimit: rowLimit);
     }
 
     /// <summary>
@@ -1291,11 +1298,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     /// <summary>
     /// Having guards. Each condition must target an existing measure, use a
-    /// known operator with the right value count (between = 2, others = 1),
-    /// and carry only finite numbers that a SQL numeric parameter can hold —
-    /// NaN/Infinity (QRY_BAD_HAVING_VALUE) never reach the parameter bag.
+    /// known operator with the right value count (between = 2, in/notIn =
+    /// 1..MaxInValues, others = 1), and carry only finite numbers that a SQL
+    /// numeric parameter can hold — NaN/Infinity (QRY_BAD_HAVING_VALUE) never
+    /// reach the parameter bag.
     /// </summary>
-    private static void ValidateHaving(IReadOnlyList<HavingSpec>? having, IReadOnlyList<ResolvedMeasure> measures)
+    private static void ValidateHaving(
+        IReadOnlyList<HavingSpec>? having, IReadOnlyList<ResolvedMeasure> measures, RcdLimits limits)
     {
         if (having is null)
         {
@@ -1325,13 +1334,32 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                     "QRY_BAD_HAVING", $"Having condition on measure '{label}': unknown operator.");
             }
 
-            var expected = condition.Operator == HavingOperator.Between ? 2 : 1;
             var count = condition.Values?.Count ?? 0;
-            if (count != expected)
+            if (condition.Operator is HavingOperator.In or HavingOperator.NotIn)
             {
-                throw new QueryCompilationException(
-                    "QRY_BAD_HAVING",
-                    $"Having condition on measure '{label}': operator {condition.Operator} expects {expected} value(s), got {count}.");
+                if (count == 0)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_HAVING",
+                        $"Having condition on measure '{label}': operator {condition.Operator} expects at least one value.");
+                }
+
+                if (count > limits.MaxInValues)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_TOO_MANY_VALUES",
+                        $"At most {limits.MaxInValues} values are allowed in one having {condition.Operator} condition.");
+                }
+            }
+            else
+            {
+                var expected = condition.Operator == HavingOperator.Between ? 2 : 1;
+                if (count != expected)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_HAVING",
+                        $"Having condition on measure '{label}': operator {condition.Operator} expects {expected} value(s), got {count}.");
+                }
             }
 
             foreach (var value in condition.Values!)
@@ -1452,6 +1480,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// HAVING per the SQL standard; any embedded measure-filter placeholders
     /// are reused, which binds the same value twice in text but adds no new
     /// parameter) and binds its threshold values as decimal parameters.
+    /// In/NotIn bind their value list through the dialect's set-membership
+    /// predicate; NotIn additionally keeps NULL aggregates (OR ... IS NULL) so
+    /// the pair are exact complements — see <see cref="HavingSpec"/>.
     /// </summary>
     private List<string> BuildHavingParts(
         IReadOnlyList<HavingSpec>? having, IReadOnlyList<string> measureExprs, ParameterBag bag)
@@ -1476,6 +1507,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             string Placeholder(int index) =>
                 dialect.ParameterPlaceholder(bag.Add((decimal)condition.Values[index], NormalizedType.Decimal));
 
+            string InList(bool negated) =>
+                dialect.InPredicate(
+                    expr,
+                    negated,
+                    condition.Values.Select(v => (object?)(decimal)v).ToArray(),
+                    NormalizedType.Decimal,
+                    bag);
+
             parts.Add(condition.Operator switch
             {
                 HavingOperator.Gt => $"{expr} > {Placeholder(0)}",
@@ -1485,6 +1524,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 HavingOperator.Eq => $"{expr} = {Placeholder(0)}",
                 HavingOperator.Neq => $"{expr} <> {Placeholder(0)}",
                 HavingOperator.Between => $"({expr} >= {Placeholder(0)} AND {expr} <= {Placeholder(1)})",
+                HavingOperator.In => InList(negated: false),
+                // Exact complement of In: NULL aggregates pass (SQL's NOT IN /
+                // <> ALL is null-excluding on its own).
+                HavingOperator.NotIn => $"({InList(negated: true)} OR {expr} IS NULL)",
                 _ => throw new QueryCompilationException(
                     "QRY_BAD_HAVING", "Having condition uses an unknown operator."),
             });

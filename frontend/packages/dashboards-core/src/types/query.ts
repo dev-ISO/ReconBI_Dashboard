@@ -79,11 +79,15 @@ export interface ChartQuerySpec {
   offset?: number | null;
   /**
    * Post-aggregation conditions (SQL HAVING) on measure values, ANDed.
-   * measureIndex targets spec.measures; 'between' takes two values.
+   * measureIndex targets spec.measures; 'between' takes two values; 'in' /
+   * 'notIn' take a 1..1000 value list ('in' keeps groups whose aggregate
+   * equals a listed value — NULL never matches; 'notIn' is its exact
+   * complement and KEEPS NULL aggregates, which is what lets a value
+   * checklist with "(Blanks)" checked compile to the negated form).
    */
   having?: {
     measureIndex: number;
-    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq' | 'between';
+    operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq' | 'between' | 'in' | 'notIn';
     values: number[];
   }[];
 }

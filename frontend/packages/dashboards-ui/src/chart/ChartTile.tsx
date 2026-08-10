@@ -72,6 +72,18 @@ interface RendererPointHandlers {
   onPointHover?: (e: ChartPointEvent | null) => void;
   /** Set while ANOTHER tile hovers a matching category (dims non-matches). */
   highlightCategory?: { label: string } | null;
+  /**
+   * Echo of THIS chart's own cross-filter source state (format.selectionHighlight):
+   * the clicked category and/or legend value stay marked while the page-wide
+   * filter is live. Null = this chart is not the source.
+   */
+  selection?: { category?: string | null; legendValue?: string | null } | null;
+  /**
+   * Date-axis drag selection (format.zoom.dragAction === 'crossFilter'): the
+   * RAW endpoints of the dragged range, for the consumer to turn into a
+   * page-wide cross-filter.
+   */
+  onAxisRangeSelect?: (range: { fromRaw: unknown; toRaw: unknown }) => void;
   /* ----- interactive table (format.table) ----- */
   tableSort?: ChartTableSort | null;
   onTableSortChange?: (sort: ChartTableSort | null) => void;
@@ -134,6 +146,10 @@ export interface ChartTileProps {
   onPointHover?: (e: ChartPointEvent | null) => void;
   /** Set while ANOTHER tile's hover matches this chart's category dimension. */
   highlightCategory?: { label: string } | null;
+  /** This tile's own cross-filter source selection (renderer marks/dims it). */
+  selection?: { category?: string | null; legendValue?: string | null } | null;
+  /** Date-axis drag range (format.zoom.dragAction 'crossFilter') pass-through. */
+  onAxisRangeSelect?: (range: { fromRaw: unknown; toRaw: unknown }) => void;
   /** Interactive-table sort state + change hook (format.table charts). */
   tableSort?: ChartTableSort | null;
   onTableSortChange?: (sort: ChartTableSort | null) => void;
@@ -187,6 +203,8 @@ export function ChartTile({
   activeCategory = null,
   onPointHover,
   highlightCategory = null,
+  selection = null,
+  onAxisRangeSelect,
   tableSort = null,
   onTableSortChange,
   tablePage = 0,
@@ -303,6 +321,8 @@ export function ChartTile({
             activeCategory={activeCategory}
             onPointHover={onPointHover}
             highlightCategory={highlightCategory}
+            selection={selection}
+            onAxisRangeSelect={onAxisRangeSelect}
             tableSort={tableSort}
             onTableSortChange={onTableSortChange}
             tablePage={tablePage}

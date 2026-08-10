@@ -95,7 +95,10 @@ public sealed record SortSpec(SortTarget Target, SortDirection Direction);
 
 public sealed record TopNSpec(int N, int ByMeasureIndex, bool IncludeOthers);
 
-/// <summary>Wire names: "gt", "gte", "lt", "lte", "eq", "neq", "between".</summary>
+/// <summary>
+/// Wire names: "gt", "gte", "lt", "lte", "eq", "neq", "between", "in",
+/// "notIn".
+/// </summary>
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<HavingOperator>))]
 public enum HavingOperator
 {
@@ -106,17 +109,25 @@ public enum HavingOperator
     Eq,
     Neq,
     Between,
+    In,
+    NotIn,
 }
 
 /// <summary>
 /// Post-aggregation condition (SQL HAVING) on the measure at
 /// <see cref="MeasureIndex"/> (into <see cref="ChartQuerySpec.Measures"/>).
 /// Conditions are ANDed. Between takes exactly two values (inclusive bounds);
-/// every other operator takes exactly one. The condition targets the RAW
-/// aggregated value of the measure — for a measure with a window
-/// <see cref="MeasureCalcSpec"/> the HAVING applies to the pre-calc base
-/// aggregate (window functions cannot appear in HAVING); for a calculated
-/// (expression) measure the whole expression is repeated in the HAVING clause.
+/// In/NotIn take one to <see cref="Options.RcdLimits.MaxInValues"/> values
+/// (QRY_BAD_HAVING on an empty list, QRY_TOO_MANY_VALUES past the cap);
+/// every other operator takes exactly one. In keeps exactly the groups whose
+/// aggregate equals a listed value (a NULL aggregate never matches); NotIn is
+/// its exact complement and therefore KEEPS groups with a NULL aggregate —
+/// the pair backs Excel-style value checklists where "(Blanks)" rides the
+/// negated form. The condition targets the RAW aggregated value of the
+/// measure — for a measure with a window <see cref="MeasureCalcSpec"/> the
+/// HAVING applies to the pre-calc base aggregate (window functions cannot
+/// appear in HAVING); for a calculated (expression) measure the whole
+/// expression is repeated in the HAVING clause.
 /// </summary>
 public sealed record HavingSpec(int MeasureIndex, HavingOperator Operator, IReadOnlyList<double> Values);
 

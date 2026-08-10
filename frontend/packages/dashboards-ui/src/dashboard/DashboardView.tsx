@@ -8,8 +8,10 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, ArrowLeft, Filter, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
 import {
+  crossFilterClauseFor,
+  dateRangeClauseFor,
   emptyChart,
   filterCardIsActive,
   isChartTile,
@@ -18,13 +20,17 @@ import {
   isSlicerTile,
   isTextTile,
   newId,
+  slicerClauseOf,
   slicerPresetOf,
   toWireSpec,
   type AlertFiring,
   type ChartPointEvent,
   type ChartSpec,
+  type CrossFilterClauseOptions,
   type DashboardTile,
+  type DimensionRef,
   type FilterClause,
+  type QueryColumn,
 } from '@recon/dashboards-core';
 import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuilder';
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
@@ -39,6 +45,13 @@ import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
 import { DashboardToolbar } from './DashboardToolbar';
 import { FieldParameterDialog } from './FieldParameterDialog';
+import {
+  FilterIndicator,
+  isBottomPlacement,
+  resolveIndicatorStyle,
+  type ActiveFilterEntry,
+} from './FilterIndicator';
+import { FilterIndicatorMenu } from './FilterIndicatorMenu';
 import { FiltersPane } from './FiltersPane';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
@@ -49,6 +62,8 @@ import {
   type DrillthroughTarget,
   type PointDrillActions,
 } from './PointContextMenu';
+import { resolveColumnType, useModelCatalog } from './columnType';
+import { describeClause } from './printLayout';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
 import { relativePresetClause } from './relativeDate';
 import { SeeDataDialog, type SeeDataRequest } from './SeeDataDialog';
@@ -120,6 +135,32 @@ function TransientChip({
   );
 }
 
+/**
+ * What the RESULT says about a clicked dimension. The result column is
+ * authoritative for both facts the clause builder needs: the catalog type
+ * (a `date` column rejects any time component; a `timestamp` one needs its
+ * upper bound at the last instant of the day) and the bucket the engine
+ * actually applied. Result columns arrive in wire dimension order
+ * [axis, legend, smallMultiples], the same order toWireSpec emits.
+ */
+const dimensionMeta = (
+  chart: ChartSpec,
+  dimension: DimensionRef,
+  columns: QueryColumn[] | null,
+): CrossFilterClauseOptions => {
+  const wire = [chart.query.axis, chart.query.legend, chart.query.smallMultiples].filter(
+    (dim): dim is DimensionRef => dim != null,
+  );
+  const index = wire.findIndex(
+    (dim) => dim.table === dimension.table && dim.column === dimension.column,
+  );
+  const column =
+    index === -1 ? undefined : (columns ?? []).filter((c) => c.role === 'dimension')[index];
+  return column === undefined
+    ? { dateBucket: dimension.dateBucket ?? null }
+    : { columnType: column.type, dateBucket: column.dateBucket ?? dimension.dateBucket ?? null };
+};
+
 /** Filesystem-safe download name from a chart title. */
 const csvFileName = (title: string): string => {
   const cleaned = title.replace(/[\\/:*?"<>|]/g, '_').trim();
@@ -145,11 +186,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const filterCards = useDashboardState((state) => state.current?.layout.filterCards ?? null);
   const filterCardOverrides = useDashboardState((state) => state.filterCardOverrides);
   const bookmarks = useDashboardState((state) => state.current?.layout.bookmarks ?? null);
+  const filterIndicatorStyle = useDashboardState(
+    (state) => state.current?.layout.filterIndicator ?? null,
+  );
   const lastAppliedBookmarkId = useDashboardState((state) => state.lastAppliedBookmarkId);
 
+  // The catalog itself is read through useModelCatalog (below), which applies
+  // the "is this THIS model's catalog?" guard in one place.
   const openModel = useModelState((state) => state.current);
-  const catalog = useModelState((state) => state.catalog);
-  const catalogStatus = useModelState((state) => state.catalogStatus);
 
   const [openError, setOpenError] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
@@ -200,6 +244,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [alertFirings, setAlertFirings] = useState<AlertFiring[] | null>(null);
   /** Edit mode: the canvas shows the phone-layout editor instead of the grid. */
   const [mobileEditOpen, setMobileEditOpen] = useState(false);
+  /** Edit mode: filter-indicator config card, anchored under its toolbar button. */
+  const [indicatorMenu, setIndicatorMenu] = useState<{ x: number; y: number } | null>(null);
 
   const openDashboard = useCallback(() => {
     setOpenError(null);
@@ -221,6 +267,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   }, [runtime, openDashboard]);
 
   const modelId = current?.id === dashboardId ? current.modelId : null;
+
+  /** This model's catalog, or null while it is loading/stale/failed. */
+  const modelCatalog = useModelCatalog(modelId);
 
   const loadModel = useCallback(() => {
     if (modelId === null) return;
@@ -289,23 +338,93 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     [runtime, filterCards, filterCardOverrides, activePage],
   );
 
+  /* ------------------------------------------------------ filter indicator */
+
+  const indicator = resolveIndicatorStyle(filterIndicatorStyle);
+
+  /**
+   * Every transient filter the indicator advertises: the active cross-filter
+   * plus each slicer selection on this page. Both are runtime-only state and
+   * both clear individually (each entry owns its own clear).
+   */
+  const filterEntries = useMemo<ActiveFilterEntry[]>(() => {
+    const entries: ActiveFilterEntry[] = [];
+    if (crossFilter) {
+      // CrossFilter.label is "<column>: <value>"; the value is carried
+      // verbatim as categoryLabel, so the field is everything before it.
+      const split = crossFilter.label.indexOf(': ');
+      entries.push({
+        id: 'crossFilter',
+        kind: 'crossFilter',
+        field: split === -1 ? 'Selection' : crossFilter.label.slice(0, split),
+        value: crossFilter.categoryLabel,
+        onClear: () => runtime.dashboards.clearCrossFilter(),
+      });
+    }
+    for (const tile of tiles) {
+      if (!isSlicerTile(tile)) continue;
+      const clause = slicerClauseOf(slicerValues[tile.id]);
+      if (clause === null) continue;
+      entries.push({
+        id: tile.id,
+        kind: 'slicer',
+        field: tile.slicer.label,
+        value: describeClause(clause),
+        onClear: () => runtime.dashboards.setSlicerValue(tile.id, null),
+      });
+    }
+    return entries;
+  }, [runtime, crossFilter, tiles, slicerValues]);
+
+  const clearAllFilters = useCallback(() => {
+    for (const entry of filterEntries) entry.onClear();
+  }, [filterEntries]);
+
+  /**
+   * Badge tooltip per chart tile: the filters that ACTUALLY reach it — the
+   * cross-filter (never on its own source tile) and any slicer whose
+   * "applies to" list covers it. Absent = no badge on that tile.
+   */
+  const badgeLabelByTile = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!indicator.badgeTiles) return map;
+    for (const tile of tiles) {
+      if (!isChartTile(tile)) continue;
+      const names: string[] = [];
+      if (crossFilter && crossFilter.sourceTileId !== tile.id) names.push(crossFilter.label);
+      for (const other of tiles) {
+        if (!isSlicerTile(other)) continue;
+        const targets = other.slicer.targets;
+        if (targets != null && !targets.includes(tile.id)) continue;
+        const clause = slicerClauseOf(slicerValues[other.id]);
+        if (clause === null) continue;
+        names.push(`${other.slicer.label}: ${describeClause(clause)}`);
+      }
+      if (names.length > 0) map.set(tile.id, names.join(' · '));
+    }
+    return map;
+  }, [indicator.badgeTiles, tiles, crossFilter, slicerValues]);
+
   // Cross-filter: the renderer reports raw value + label; THIS layer knows the
   // tile's query, so it maps the click onto the chart's category dimension —
   // axis for cartesian/table charts, legend for pie/donut (RADIAL wells keep
   // the slice dimension there; hand-built specs may still carry it in axis,
-  // hence the fallback). Null datum -> isNull clause. Same-datum clicks toggle
-  // off inside the store.
+  // hence the fallback). crossFilterClauseFor turns the raw cell into the
+  // clause: isNull for a blank, a DATE RANGE for a bucketed date dimension
+  // (never an eq on the bucket's start instant), eq otherwise. Same-datum
+  // clicks toggle off inside the store.
   const handleDatumClick = useCallback(
-    (tileId: string, chart: ChartSpec, info: ChartDatumClickInfo) => {
+    (tileId: string, chart: ChartSpec, info: ChartDatumClickInfo, columns: QueryColumn[] | null) => {
       const dimension =
         chart.type === 'pie' || chart.type === 'donut'
           ? (chart.query.legend ?? chart.query.axis ?? null)
           : (chart.query.axis ?? null);
       if (!dimension) return;
-      const clause: FilterClause =
-        info.value === null
-          ? { table: dimension.table, column: dimension.column, operator: 'isNull', values: [] }
-          : { table: dimension.table, column: dimension.column, operator: 'eq', values: [info.value] };
+      const clause = crossFilterClauseFor(
+        dimension,
+        info.value,
+        dimensionMeta(chart, dimension, columns),
+      );
       runtime.dashboards.setCrossFilter(
         tileId,
         clause,
@@ -316,13 +435,45 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     [runtime],
   );
 
+  /**
+   * Date-axis drag range (format.zoom.dragAction === 'crossFilter'): the same
+   * range-style clause a bucket click produces, spanning the dragged window
+   * and sourced from this tile (replacing any prior cross-filter it raised).
+   */
+  const handleAxisRangeCrossFilter = useCallback(
+    (
+      tileId: string,
+      chart: ChartSpec,
+      range: { fromRaw: unknown; toRaw: unknown },
+      columns: QueryColumn[] | null,
+    ) => {
+      const dimension = chart.query.axis ?? null;
+      if (!dimension) return;
+      const clause = dateRangeClauseFor(
+        dimension,
+        range.fromRaw,
+        range.toRaw,
+        dimensionMeta(chart, dimension, columns),
+      );
+      if (clause === null) return;
+      const label = `${clause.values[0] ?? ''} – ${String(clause.values[1] ?? '').slice(0, 10)}`;
+      runtime.dashboards.setCrossFilter(tileId, clause, `${dimension.column}: ${label}`, label);
+    },
+    [runtime],
+  );
+
   // Legend cross-filter (legendMode 'crossFilter'): the renderer reports the
   // clicked legend item's raw value + label (null = clear). The clause targets
   // the chart's LEGEND dimension and drives the same transient cross-filter
   // path as datum clicks — every other tile filters; the source tile shows
   // persistent legend emphasis (selectedLegendLabel) instead of dimming.
   const handleLegendSelect = useCallback(
-    (tileId: string, chart: ChartSpec, e: ChartLegendSelectEvent | null) => {
+    (
+      tileId: string,
+      chart: ChartSpec,
+      e: ChartLegendSelectEvent | null,
+      columns: QueryColumn[] | null,
+    ) => {
       if (e === null) {
         // The emitting chart cleared its selection; only ITS legend filter
         // clears (never someone else's active cross-filter).
@@ -334,10 +485,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       }
       const dimension = chart.query.legend ?? null;
       if (!dimension) return;
-      const clause: FilterClause =
-        e.raw === null || e.raw === ''
-          ? { table: dimension.table, column: dimension.column, operator: 'isNull', values: [] }
-          : { table: dimension.table, column: dimension.column, operator: 'eq', values: [e.raw] };
+      // Legend dimensions can be date-bucketed too (a "by year" legend), so the
+      // same range-vs-eq decision applies here.
+      const clause = crossFilterClauseFor(
+        dimension,
+        e.raw === '' ? null : e.raw,
+        dimensionMeta(chart, dimension, columns),
+      );
       runtime.dashboards.setCrossFilter(
         tileId,
         clause,
@@ -623,7 +777,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         if (!isSlicerTile(tile) || tile.slicer.variant !== 'relativeDate') continue;
         const presetId = slicerPresetOf(state.slicerValues[tile.id]);
         if (presetId === null) continue;
-        const clause = relativePresetClause(presetId, tile.slicer.table, tile.slicer.column);
+        const clause = relativePresetClause(
+          presetId,
+          tile.slicer.table,
+          tile.slicer.column,
+          resolveColumnType(modelCatalog, tile.slicer.table, tile.slicer.column),
+        );
         const current = state.slicerValues[tile.id];
         const currentClause =
           current != null && 'presetId' in current ? current.clause : null;
@@ -634,7 +793,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         );
       }
     }
-  }, [runtime]);
+  }, [runtime, modelCatalog]);
 
   // Auto-refresh: invalidate the shared query cache, then bump a token that
   // keys ChartTile — remounting refetches (brief skeleton) with fresh data.
@@ -899,8 +1058,17 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             ? (position) => setChartMenu({ tileId: tile.id, position })
             : undefined
         }
-        onCrossFilter={(effectiveChart, info) => handleDatumClick(tile.id, effectiveChart, info)}
-        onLegendSelect={(effectiveChart, e) => handleLegendSelect(tile.id, effectiveChart, e)}
+        filterBadgeLabel={badgeLabelByTile.get(tile.id) ?? null}
+        filterBadgeAccent={indicator.accentColor}
+        onCrossFilter={(effectiveChart, info, columns) =>
+          handleDatumClick(tile.id, effectiveChart, info, columns)
+        }
+        onLegendSelect={(effectiveChart, e, columns) =>
+          handleLegendSelect(tile.id, effectiveChart, e, columns)
+        }
+        onAxisRangeCrossFilter={(effectiveChart, range, columns) =>
+          handleAxisRangeCrossFilter(tile.id, effectiveChart, range, columns)
+        }
         onPointMenu={editable ? undefined : setPointMenu}
         // Whole-tile right-click (view mode): chart-level menu whenever the
         // click hit no chart point — every chart type incl. KPI gets a menu.
@@ -910,10 +1078,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     );
   };
 
-  const builderCatalog =
-    catalogStatus === 'ok' && catalog && openModel && catalog.connection === openModel.dataSourceName
-      ? catalog
-      : null;
+  // Same guard as modelCatalog (the builder only renders once openModel is
+  // this dashboard's model, so the extra id check cannot exclude anything).
+  const builderCatalog = modelCatalog;
 
   const builderBody = (() => {
     if (!builder) return null;
@@ -966,6 +1133,15 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   /** Chart tile the context card targets (undefined once the tile is gone). */
   const chartMenuTile = chartMenu ? tiles.find((t) => t.id === chartMenu.tileId) : undefined;
 
+  // Where the indicator renders: a banner leaves the tile area entirely (in
+  // flow, above or below the grid row); a top-center pill/stack joins the
+  // existing chip column so the two never stack on top of each other; every
+  // other placement floats on its own inside the grid row.
+  const hasActiveFilters = filterEntries.length > 0;
+  const bannerIndicator = hasActiveFilters && indicator.variant === 'banner';
+  const bannerAtBottom = isBottomPlacement(indicator.placement);
+  const inlineIndicator = hasActiveFilters && !bannerIndicator && indicator.placement === 'top-center';
+
   return (
     <div ref={rootRef} className="flex h-full min-h-0 flex-col bg-rcd-bg">
       <DashboardToolbar
@@ -1011,14 +1187,35 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         alertFirings={alertFirings ?? undefined}
         mobileLayoutOpen={mobileEditOpen}
         onToggleMobileLayout={() => setMobileEditOpen((open) => !open)}
+        onConfigureFilterIndicator={
+          editable ? (position) => setIndicatorMenu(position) : undefined
+        }
       />
+
+      {/* Banner indicator: in normal flow so it spans the full width and never
+          covers a tile (top edge here, bottom edge below the grid row). */}
+      {bannerIndicator && !bannerAtBottom && (
+        <FilterIndicator
+          entries={filterEntries}
+          style={filterIndicatorStyle}
+          onClearAll={clearAllFilters}
+        />
+      )}
 
       {/* Flex row: grid area + (optional) right-docked Filters pane. */}
       <div className="relative flex min-h-0 flex-1">
-        {/* Chip strip under the toolbar: drillthrough context (on its target
-            page), the cross-filter chip, and transient export notices — all on
-            the shared TransientChip style (icon + label + dismiss). */}
+        {/* Chip strip under the toolbar: the top-center filter indicator (so it
+            can never overlap the toolbar's refresh caption), the drillthrough
+            context on its target page, and transient export notices. */}
         <div className="pointer-events-none absolute left-1/2 top-2 z-20 flex max-w-[85%] -translate-x-1/2 flex-col items-center gap-1.5">
+          {inlineIndicator && (
+            <FilterIndicator
+              entries={filterEntries}
+              style={filterIndicatorStyle}
+              onClearAll={clearAllFilters}
+              inline
+            />
+          )}
           {drillthrough && drillthrough.targetPageId === activePage?.id && (
             <TransientChip
               icon={<Zap size={12} />}
@@ -1047,18 +1244,16 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               {notice}
             </TransientChip>
           )}
-          {/* Cross-filter chip: floats under the toolbar in BOTH modes; shows
-              legend selections and datum clicks identically. */}
-          {crossFilter && (
-            <TransientChip
-              icon={<Filter size={12} />}
-              dismissLabel="Clear cross-filter"
-              onDismiss={() => runtime.dashboards.clearCrossFilter()}
-            >
-              Filtered by <span className="font-medium">{crossFilter.label}</span>
-            </TransientChip>
-          )}
         </div>
+
+        {/* Floating (pill/stack) indicator docked anywhere but top-center. */}
+        {!bannerIndicator && !inlineIndicator && (
+          <FilterIndicator
+            entries={filterEntries}
+            style={filterIndicatorStyle}
+            onClearAll={clearAllFilters}
+          />
+        )}
 
         <div
           className={`h-full min-w-0 flex-1 overflow-auto ${
@@ -1131,6 +1326,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         )}
       </div>
 
+      {bannerIndicator && bannerAtBottom && (
+        <FilterIndicator
+          entries={filterEntries}
+          style={filterIndicatorStyle}
+          onClearAll={clearAllFilters}
+        />
+      )}
+
       {/* Excel-style page tabs, docked under the scroll area in BOTH modes. */}
       <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={editable} />
 
@@ -1168,6 +1371,20 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               }
               onDelete={() => runtime.dashboards.removeTile(chartMenuTile.id)}
               onClose={() => setChartMenu(null)}
+            />
+          </div>,
+          document.body,
+        )}
+
+      {indicatorMenu &&
+        editable &&
+        // Same portal doctrine as every other floating card in this view.
+        createPortal(
+          <div className="rcd-root bg-transparent">
+            <FilterIndicatorMenu
+              style={filterIndicatorStyle}
+              position={indicatorMenu}
+              onClose={() => setIndicatorMenu(null)}
             />
           </div>,
           document.body,

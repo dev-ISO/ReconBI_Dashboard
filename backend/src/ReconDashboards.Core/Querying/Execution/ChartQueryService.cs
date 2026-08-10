@@ -391,9 +391,20 @@ public sealed class ChartQueryService(
         try
         {
             var executed = await executor.ExecuteAsync(compiled, executionOptions, ct);
-            await AuditAsync(spec, model, source, compiled, executed.Rows.Count, executed.ElapsedMs, null, ct);
+            // The statement asks for RowLimit + 1 (truncation probe); trim the
+            // probe row back off so callers never see more rows than requested
+            // (pagination pages, TopN) and report the overflow as truncation.
+            var rows = executed.Rows;
+            var truncated = executed.Truncated;
+            if (compiled.RowLimit is int rowLimit && rows.Count > rowLimit)
+            {
+                rows = [.. rows.Take(rowLimit)];
+                truncated = true;
+            }
+
+            await AuditAsync(spec, model, source, compiled, rows.Count, executed.ElapsedMs, null, ct);
             return ServiceResult<QueryOutcome>.Ok(
-                new QueryOutcome(compiled, executed.Rows, executed.Truncated, executed.ElapsedMs));
+                new QueryOutcome(compiled, rows, truncated, executed.ElapsedMs));
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

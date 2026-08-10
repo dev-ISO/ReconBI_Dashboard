@@ -163,6 +163,46 @@ public sealed class HavingExecutionTests(PostgresContainerFixture fixture)
     }
 
     [Fact]
+    public async Task InKeepsExactlyTheListedGroupAggregates()
+    {
+        var executor = Executor();
+
+        var all = await executor.ExecuteAsync(Compile(having: null), Options, CancellationToken.None);
+        Assert.Equal(4, all.Rows.Count);
+
+        // Order totals are 0.25-multiples: the sums are exact in double, so
+        // membership equality against the decimal parameters is exact too.
+        var ordered = all.Rows.OrderBy(r => Convert.ToDouble(r[1]!)).ToArray();
+        var picked = new[] { Convert.ToDouble(ordered[0][1]!), Convert.ToDouble(ordered[2][1]!) };
+
+        var filtered = await executor.ExecuteAsync(
+            Compile([new HavingSpec(0, HavingOperator.In, picked)]), Options, CancellationToken.None);
+
+        Assert.Equal(2, filtered.Rows.Count);
+        Assert.Equal(
+            new[] { (string?)ordered[0][0], (string?)ordered[2][0] }.ToHashSet(),
+            filtered.Rows.Select(r => (string?)r[0]).ToHashSet());
+    }
+
+    [Fact]
+    public async Task NotInIsTheExactComplementOfIn()
+    {
+        var executor = Executor();
+
+        var all = await executor.ExecuteAsync(Compile(having: null), Options, CancellationToken.None);
+        var ordered = all.Rows.OrderBy(r => Convert.ToDouble(r[1]!)).ToArray();
+        var excluded = new[] { Convert.ToDouble(ordered[1][1]!) };
+
+        var filtered = await executor.ExecuteAsync(
+            Compile([new HavingSpec(0, HavingOperator.NotIn, excluded)]), Options, CancellationToken.None);
+
+        Assert.Equal(3, filtered.Rows.Count);
+        Assert.Equal(
+            all.Rows.Select(r => (string?)r[0]).Where(r => !Equals(r, ordered[1][0])).ToHashSet(),
+            filtered.Rows.Select(r => (string?)r[0]).ToHashSet());
+    }
+
+    [Fact]
     public async Task HavingAppliesBeforeTopNRanking()
     {
         var executor = Executor();

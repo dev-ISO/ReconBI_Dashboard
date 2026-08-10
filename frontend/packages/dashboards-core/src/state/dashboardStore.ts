@@ -1,6 +1,7 @@
 import { createStore, type StoreApi } from 'zustand/vanilla';
 import type { DashboardsApi } from '../api/DashboardsApi';
 import type { ChartSpec } from '../types/chart';
+import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
   emptyLayout,
   filterCardClauses,
@@ -16,6 +17,7 @@ import {
   type DashboardTile,
   type DrillthroughState,
   type FilterCard,
+  type FilterIndicatorStyle,
   type PageDrillthrough,
   type PageMobileLayout,
   type ImageTileSpec,
@@ -25,7 +27,14 @@ import {
   type SlicerVariant,
   type TextTileSpec,
 } from '../types/dashboard';
-import type { CellValue, FilterClause, FilterValue } from '../types/query';
+import type {
+  CellValue,
+  DateBucket,
+  DimensionRef,
+  FilterClause,
+  FilterValue,
+} from '../types/query';
+import type { ColumnType } from '../types/schema';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
 import { sanitizeRichHtml } from '../util/richText';
@@ -114,6 +123,235 @@ export interface HoverHighlight {
   /** Chart tile the hover came from; that tile never dims itself. */
   sourceTileId: string;
 }
+
+/* ================================================== cross-filter clause build
+ * Clicking a datum turns ONE raw cell into the clause every other tile adds to
+ * its query. For plain dimensions that is an `eq` (or `isNull`). For a DATE
+ * BUCKET it must be a RANGE:
+ *
+ *  - the raw cell is the bucket's START INSTANT, and the engine frequently
+ *    serializes it with a zone offset ("2023-09-30T19:00:00-05:00" IS the
+ *    October bucket) — feeding that string back as a filter value blows up on
+ *    a `date` column ("cannot be interpreted as Date");
+ *  - even with a parseable value, `eq bucketStart` matches only rows that fall
+ *    exactly on the boundary, not the bucket's other rows.
+ *
+ * So a bucket click emits DATE-ONLY 'yyyy-MM-dd' bounds covering the whole
+ * bucket. Every calendar computation below runs on UTC parts — never
+ * `new Date(x).toISOString()`, which drags the value through the browser's
+ * local zone and can shift it a full day (exactly the reported bug).
+ *
+ * The range travels as ONE inclusive `between` clause because CrossFilter
+ * carries a single FilterClause; [start, end] with end = nextBucketStart - 1
+ * day is the exact same row set as [start, nextBucketStart) for date-grained
+ * data.
+ */
+
+/** A timezone-free calendar date (month is 1-based). */
+export interface CalendarDate {
+  year: number;
+  month: number;
+  day: number;
+}
+
+const pad2 = (n: number): string => String(n).padStart(2, '0');
+
+/** 'yyyy-MM-dd' — the only date shape cross-filter clauses ever put on the wire. */
+export const formatDateOnly = (date: CalendarDate): string =>
+  `${String(date.year).padStart(4, '0')}-${pad2(date.month)}-${pad2(date.day)}`;
+
+/** Calendar parts of an epoch instant, read in UTC. */
+const utcCalendarOf = (ms: number): CalendarDate | null => {
+  if (!Number.isFinite(ms)) return null;
+  const date = new Date(ms);
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+};
+
+/** UTC calendar arithmetic (Date.UTC normalizes overflowing month/day parts). */
+const shiftUtc = (date: CalendarDate, months: number, days: number): CalendarDate => {
+  // setUTCFullYear (not the Date.UTC year argument) so years 0-99 stay literal.
+  const at = new Date(0);
+  at.setUTCFullYear(date.year, date.month - 1 + months, date.day + days);
+  return utcCalendarOf(at.getTime()) ?? date;
+};
+
+/**
+ * ISO-8601-ish date/timestamp shapes the engine emits. Groups: y, m, d, HH,
+ * mm, ss, zone ('Z' / '±hh:mm' / '±hhmm'; ABSENT for a naive local timestamp).
+ */
+const ISO_LIKE =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?\s*(Z|[+-]\d{2}:?\d{2})?$/i;
+
+/** Can `date` be the START of a bucket of this grain? */
+const isBucketStart = (date: CalendarDate, bucket: DateBucket): boolean => {
+  switch (bucket) {
+    case 'year':
+      return date.month === 1 && date.day === 1;
+    case 'quarter':
+      return (date.month - 1) % 3 === 0 && date.day === 1;
+    case 'month':
+      return date.day === 1;
+    default:
+      // week/day: any calendar date is a legal bucket start.
+      return true;
+  }
+};
+
+/**
+ * The calendar date a raw bucket cell denotes, resolved WITHOUT ever touching
+ * the browser's local zone:
+ *  - naive string ("2023-10-01", "2023-10-01T00:00:00") -> its literal date
+ *    (Date.parse would re-interpret it in the local zone);
+ *  - zoned string -> the literal date when that is a legal midnight bucket
+ *    start (the server rendered the boundary in its own zone), otherwise the
+ *    UTC date of the instant (the "2023-09-30T19:00:00-05:00" case, whose
+ *    instant is 2023-10-01T00:00Z = the October bucket);
+ *  - Date / epoch number -> UTC parts.
+ */
+export const bucketDateOf = (raw: unknown, bucket: DateBucket): CalendarDate | null => {
+  if (raw instanceof Date) return utcCalendarOf(raw.getTime());
+  if (typeof raw === 'number') return utcCalendarOf(raw);
+  if (typeof raw !== 'string') return null;
+  const text = raw.trim();
+  if (text === '') return null;
+  const match = ISO_LIKE.exec(text);
+  if (match) {
+    const literal: CalendarDate = {
+      year: Number(match[1]),
+      month: Number(match[2]),
+      day: Number(match[3]),
+    };
+    if (match[7] === undefined) return literal;
+    const midnight = (match[4] ?? '00') === '00' && (match[5] ?? '00') === '00' && (match[6] ?? '00') === '00';
+    if (midnight && isBucketStart(literal, bucket)) return literal;
+    return utcCalendarOf(Date.parse(text)) ?? literal;
+  }
+  const parsed = Date.parse(text);
+  return Number.isNaN(parsed) ? null : utcCalendarOf(parsed);
+};
+
+/** Floors a calendar date onto its bucket's first day. */
+const startOfBucket = (date: CalendarDate, bucket: DateBucket): CalendarDate => {
+  switch (bucket) {
+    case 'year':
+      return { year: date.year, month: 1, day: 1 };
+    case 'quarter':
+      return { year: date.year, month: date.month - ((date.month - 1) % 3), day: 1 };
+    case 'month':
+      return { year: date.year, month: date.month, day: 1 };
+    default:
+      // week/day: the engine already truncated to the bucket's first day.
+      return date;
+  }
+};
+
+/** The bucket after `start` (its half-open upper bound). */
+const nextBucketStart = (start: CalendarDate, bucket: DateBucket): CalendarDate => {
+  switch (bucket) {
+    case 'year':
+      return shiftUtc(start, 12, 0);
+    case 'quarter':
+      return shiftUtc(start, 3, 0);
+    case 'month':
+      return shiftUtc(start, 1, 0);
+    case 'week':
+      return shiftUtc(start, 0, 7);
+    default:
+      return shiftUtc(start, 0, 1);
+  }
+};
+
+/** Inclusive calendar bounds (+ the half-open upper bound) of a raw bucket cell. */
+export const dateBucketRange = (
+  raw: unknown,
+  bucket: DateBucket,
+): { start: CalendarDate; end: CalendarDate; next: CalendarDate } | null => {
+  const at = bucketDateOf(raw, bucket);
+  if (at === null) return null;
+  const start = startOfBucket(at, bucket);
+  const next = nextBucketStart(start, bucket);
+  return { start, end: shiftUtc(next, 0, -1), next };
+};
+
+/**
+ * Inclusive 'between' clause over date-only (or last-instant) bounds.
+ *
+ * The engine compiles `between` to `col >= a AND col <= b` against the RAW
+ * column (never the truncated expression), so the upper bound has to match
+ * the column's own resolution — `inclusiveDateUpperBound` owns that decision
+ * for every date path in the app (cross-filters, slicers, presets). For a
+ * `date` column `>= '2023-10-01' AND <= '2023-10-31'` is exactly
+ * `[Oct 1, Nov 1)`; for a `timestamp` one the bound moves to the day's last
+ * instant so the bucket's final day is not dropped.
+ */
+const betweenClause = (
+  dimension: { table: string; column: string },
+  start: CalendarDate,
+  end: CalendarDate,
+  columnType: ColumnType | null | undefined,
+): FilterClause => ({
+  table: dimension.table,
+  column: dimension.column,
+  operator: 'between',
+  values: [formatDateOnly(start), inclusiveDateUpperBound(formatDateOnly(end), columnType)],
+});
+
+/**
+ * What the RESULT column says about the clicked dimension. The result column
+ * is authoritative: it reports the bucket the engine actually applied and the
+ * column's catalog type. Both are optional — callers without a result fall
+ * back to the spec's own dateBucket and the strict date form.
+ */
+export interface CrossFilterClauseOptions {
+  columnType?: ColumnType | null;
+  dateBucket?: DateBucket | null;
+}
+
+/**
+ * The cross-filter clause for one clicked category value on `dimension`:
+ * null -> isNull, a DATE-BUCKETED dimension -> the bucket's full range,
+ * anything else -> eq on the raw value.
+ */
+export const crossFilterClauseFor = (
+  dimension: DimensionRef,
+  raw: CellValue | Date,
+  options: CrossFilterClauseOptions = {},
+): FilterClause => {
+  const { table, column } = dimension;
+  if (raw === null) return { table, column, operator: 'isNull', values: [] };
+  const bucket = options.dateBucket ?? dimension.dateBucket ?? null;
+  if (bucket !== null) {
+    const range = dateBucketRange(raw, bucket);
+    if (range !== null) return betweenClause(dimension, range.start, range.end, options.columnType);
+  }
+  return { table, column, operator: 'eq', values: [raw as FilterValue] };
+};
+
+/**
+ * The cross-filter clause for a dragged AXIS RANGE on a date axis
+ * (format.zoom.dragAction === 'crossFilter'): the bucket containing `fromRaw`
+ * through the bucket containing `toRaw`, inclusive. Returns null when neither
+ * endpoint resolves to a date.
+ */
+export const dateRangeClauseFor = (
+  dimension: DimensionRef,
+  fromRaw: unknown,
+  toRaw: unknown,
+  options: CrossFilterClauseOptions = {},
+): FilterClause | null => {
+  const bucket = options.dateBucket ?? dimension.dateBucket ?? 'day';
+  const from = dateBucketRange(fromRaw, bucket);
+  const to = dateBucketRange(toRaw, bucket);
+  if (from === null && to === null) return null;
+  const first = from ?? to!;
+  const last = to ?? from!;
+  // Tolerate a backwards drag (right-to-left selection).
+  const ordered =
+    formatDateOnly(first.start) <= formatDateOnly(last.start)
+      ? { start: first.start, end: last.end }
+      : { start: last.start, end: first.end };
+  return betweenClause(dimension, ordered.start, ordered.end, options.columnType);
+};
 
 const initialState: DashboardStoreState = {
   list: [],
@@ -972,6 +1210,21 @@ export class DashboardStore {
   /** View-mode auto-refresh interval (persisted with the layout on save). */
   setRefreshSeconds(seconds: number | null): void {
     this.mutateLayout((layout) => ({ ...layout, refreshSeconds: seconds }));
+  }
+
+  /**
+   * Cross-filter indicator look/placement (persisted with the layout). A patch
+   * MERGES onto whatever is there — absent fields keep falling back to the
+   * component defaults, so an untouched dashboard never gains a filterIndicator
+   * key. `null` resets the dashboard back to those defaults.
+   */
+  setFilterIndicator(patch: Partial<FilterIndicatorStyle> | null): void {
+    const current = this.state.current;
+    if (!current) return;
+    const next =
+      patch === null ? null : { ...(current.layout.filterIndicator ?? {}), ...patch };
+    if (stableStringify(current.layout.filterIndicator ?? null) === stableStringify(next)) return;
+    this.mutateLayout((layout) => ({ ...layout, filterIndicator: next }));
   }
 
   /* ------------------------------------------------------- field parameters */

@@ -1,6 +1,7 @@
 // Pure print geometry + pagination shared by DashboardPrintView (full-screen
 // preview) and PrintConfigDialog (live thumbnail) — one function, no drift.
 import {
+  displayDateBound,
   isChartTile,
   isImageTile,
   isSlicerTile,
@@ -98,9 +99,16 @@ export function headerHeightPx(options: PrintOptions, hasFilterSummary: boolean)
 
 /* ------------------------------------------------------------ filter summary */
 
-/** Human summary of a slicer/date clause for the printed filter line. */
-const describeClause = (clause: FilterClause): string => {
-  const values = clause.values.map((value) => String(value));
+/**
+ * Human summary of a slicer/date clause — the printed filter line AND the
+ * on-screen filter indicator share it so both read identically.
+ */
+export const describeClause = (clause: FilterClause): string => {
+  // Date ranges on a timestamp column carry the day's last instant as their
+  // upper bound; people read the range in days, so show it that way.
+  const values = clause.values.map((value) =>
+    typeof value === 'string' ? displayDateBound(value) : String(value),
+  );
   switch (clause.operator) {
     case 'between':
       return `${values[0] ?? ''} to ${values[1] ?? ''}`;
@@ -188,6 +196,13 @@ export interface PrintLayout {
   userScale: number;
   /** Width the tile geometry is computed at (contentWidth / userScale). */
   layoutWidth: number;
+  /**
+   * Width the composed content ACTUALLY occupies, pre-scale: the span of grid
+   * columns the dashboard uses (grid flow) or the full layout width
+   * (sequential). Narrower than layoutWidth whenever the dashboard leaves
+   * empty columns — that slack is what horizontal alignment redistributes.
+   */
+  contentWidth: number;
   /** Page-1 header footprint (0 when every header line is off). */
   headerHeight: number;
   /** Never empty — a chartless dashboard yields one page with zero blocks. */
@@ -247,14 +262,39 @@ export function computePrintLayout(
   );
 
   let raw: RawBlock[];
+  // Composed content width: grid flow shrink-wraps to the columns the
+  // dashboard actually uses (shifted flush left), so a layout occupying only
+  // half the grid has real slack for the alignment setting to distribute
+  // instead of silently hugging the left margin. Bands keep their RELATIVE
+  // offsets — the whole composition shifts by one common amount, so tiles
+  // stacked across bands stay aligned with each other.
+  //
+  // Shrink-wrap is an ALIGNMENT affordance, not a layout normalization, so it
+  // engages ONLY for 'center'/'right'. At the default 'left' the grid keeps
+  // its absolute column origin — a dashboard indented to column 2 prints
+  // indented, byte-identical to the pre-shrink-wrap algorithm — because
+  // re-origining there would silently change every default print.
+  const shrinkWrap = (options.alignH ?? 'left') !== 'left';
+  let contentWidth = layoutWidth;
   if (options.flow === 'grid') {
     const colW = (layoutWidth - GRID_GAP * (GRID_COLS - 1)) / GRID_COLS;
+    let originX = 0;
+    if (shrinkWrap && chartTiles.length > 0) {
+      const firstCol = chartTiles.reduce((min, tile) => Math.min(min, tile.layout.x), GRID_COLS);
+      const lastCol = chartTiles.reduce(
+        (max, tile) => Math.max(max, tile.layout.x + tile.layout.w),
+        0,
+      );
+      const span = Math.max(1, lastCol - firstCol);
+      originX = firstCol * (colW + GRID_GAP);
+      contentWidth = span * colW + (span - 1) * GRID_GAP;
+    }
     raw = computeBands(chartTiles).map((band, index) => ({
       key: `band-${index}`,
       layoutHeight: (band.yEnd - band.yStart) * (GRID_ROW_H + GRID_GAP) - GRID_GAP,
       tiles: band.tiles.map((tile) => ({
         tile,
-        left: tile.layout.x * (colW + GRID_GAP),
+        left: tile.layout.x * (colW + GRID_GAP) - originX,
         top: (tile.layout.y - band.yStart) * (GRID_ROW_H + GRID_GAP),
         width: tile.layout.w * colW + (tile.layout.w - 1) * GRID_GAP,
         height: tile.layout.h * GRID_ROW_H + (tile.layout.h - 1) * GRID_GAP,
@@ -294,10 +334,10 @@ export function computePrintLayout(
     const scale = userScale * fit;
     pages[pages.length - 1]!.blocks.push({
       key: block.key,
-      layoutWidth,
+      layoutWidth: contentWidth,
       layoutHeight: block.layoutHeight,
       scale,
-      width: layoutWidth * scale,
+      width: contentWidth * scale,
       height: block.layoutHeight * scale,
       marginTop: gapBefore,
       tiles: block.tiles,
@@ -306,5 +346,5 @@ export function computePrintLayout(
     count += 1;
   }
 
-  return { geometry, userScale, layoutWidth, headerHeight, pages };
+  return { geometry, userScale, layoutWidth, contentWidth, headerHeight, pages };
 }

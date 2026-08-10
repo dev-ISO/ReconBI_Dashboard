@@ -10,16 +10,24 @@ import {
 import { createPortal } from 'react-dom';
 import { AlertTriangle, ChevronDown, RefreshCw, Search, X } from 'lucide-react';
 import {
+  dateOnlyPartOf,
+  inclusiveDateUpperBound,
   slicerClauseOf,
   slicerPresetOf,
+  type ColumnType,
   type DashboardParameter,
   type FilterClause,
   type FilterValue,
   type SlicerTileSpec,
+  type SlicerTileStyle,
 } from '@recon/dashboards-core';
 import { DistinctValueList } from '../chart-builder/DistinctValueList';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
+import { useColumnType } from './columnType';
 import { RcdButton, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+import { ScrollFades, useScrollAffordance } from './ScrollFades';
+import { SlicerCalendarFields } from './SlicerCalendar';
+import { SlicerChecklistPanel } from './SlicerChecklistPanel';
 import {
   customPresetId,
   parseCustomPreset,
@@ -69,6 +77,17 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
 
   const setClause = (next: FilterClause | null) => runtime.dashboards.setSlicerValue(tileId, next);
 
+  /**
+   * Catalog type of the sliced column. Date clauses need it to render their
+   * inclusive upper bound at the column's own resolution; unresolved (null)
+   * keeps the bare-date form a `date` column requires.
+   */
+  const { type: columnType, settled: columnTypeSettled } = useColumnType(
+    modelId,
+    spec.table,
+    spec.column,
+  );
+
   /* --------------------------------------------------- field-param variant */
 
   const parameters = useDashboardState((state) => state.current?.layout.parameters ?? null);
@@ -93,20 +112,39 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
    */
   const untouched = value === undefined;
   useEffect(() => {
-    if (spec.variant !== 'relativeDate' || !untouched || !spec.preset) return;
-    const initial = relativePresetClause(spec.preset, spec.table, spec.column);
-    runtime.dashboards.setSlicerValue(
-      tileId,
-      initial === null ? null : { clause: initial, presetId: spec.preset },
-    );
-  }, [runtime, tileId, spec.variant, spec.preset, spec.table, spec.column, untouched]);
+    if (spec.variant !== 'relativeDate' || !spec.preset) return;
+    // Wait for the column type to settle: this clause is emitted once and is
+    // not recomputed until the next refresh tick, so baking an unresolved
+    // type into it would leave a timestamp column short its last day.
+    if (!columnTypeSettled) return;
+    // Untouched default only — an explicit clear stores null and must NOT
+    // resurrect it. The lone exception is re-emitting that same default when
+    // the catalog resolves after the first paint (guarded to a no-op below).
+    if (!untouched && activePresetId !== spec.preset) return;
+    const initial = relativePresetClause(spec.preset, spec.table, spec.column, columnType);
+    const next = initial === null ? null : { clause: initial, presetId: spec.preset };
+    if (!untouched && JSON.stringify(next) === JSON.stringify(value)) return;
+    runtime.dashboards.setSlicerValue(tileId, next);
+  }, [
+    runtime,
+    tileId,
+    spec.variant,
+    spec.preset,
+    spec.table,
+    spec.column,
+    untouched,
+    activePresetId,
+    columnType,
+    columnTypeSettled,
+    value,
+  ]);
 
   const pickRelativePreset = (presetId: string) => {
     if (presetId === 'all') {
       setClause(null);
     } else {
       runtime.dashboards.setSlicerValue(tileId, {
-        clause: relativePresetClause(presetId, spec.table, spec.column),
+        clause: relativePresetClause(presetId, spec.table, spec.column, columnType),
         presetId,
       });
     }
@@ -160,22 +198,17 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         No model attached to this dashboard.
       </div>
     ) : spec.variant === 'checklist' ? (
-      // Compact overrides reach INTO DistinctValueList via arbitrary variants
-      // (its rows are labels): tighter rows + smaller text. Literal classes.
-      // max-w keeps rows readable on wide tiles (anchored top-left).
-      <div
-        className={`max-w-[24rem]${
-          compact ? ' [&_label]:gap-1.5 [&_label]:py-0.5 [&_label]:text-xs' : ''
-        }`}
-      >
-        <DistinctValueList
-          modelId={modelId}
-          table={spec.table}
-          column={spec.column}
-          selected={inSelected}
-          onToggle={toggleInValue}
-        />
-      </div>
+      // Fills the tile and owns its own (row-snapped) scroll container — the
+      // shared DistinctValueList's fixed-height box clipped mid-row here.
+      <SlicerChecklistPanel
+        modelId={modelId}
+        table={spec.table}
+        column={spec.column}
+        label={spec.label}
+        compact={compact}
+        selected={inSelected}
+        onToggle={toggleInValue}
+      />
     ) : spec.variant === 'dropdown' ? (
       <DropdownSlicer
         modelId={modelId}
@@ -217,10 +250,29 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         onPick={pickRelativePreset}
       />
     ) : (
-      <DateRangeSlicer spec={spec} compact={compact} clause={clause} onChange={setClause} />
+      <DateRangeSlicer
+        modelId={modelId}
+        columnType={columnType}
+        spec={spec}
+        compact={compact}
+        clause={clause}
+        onChange={setClause}
+        allowClear={spec.showClear !== false}
+      />
     );
 
   const showClear = hasSelection && spec.showClear !== false;
+  /**
+   * Variants that size (and scroll) their own body: wrapping them in an
+   * overflow-y-auto would either clip a popover or produce the nested
+   * double-scrollbar that half-clipped checklist rows.
+   */
+  const bodyManagesHeight =
+    spec.variant === 'dropdown' ||
+    spec.variant === 'dropdownMulti' ||
+    spec.variant === 'checklist' ||
+    spec.variant === 'buttons' ||
+    spec.variant === 'dateRange';
 
   return (
     <TileFrame
@@ -273,14 +325,9 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         )}
         {/* The dropdown variants' popovers must escape the tile — no scroll
             container around them (overflow-y would clip the panel; the
-            multi-select popover is portaled but keeps the same layout). */}
-        <div
-          className={
-            spec.variant === 'dropdown' || spec.variant === 'dropdownMulti'
-              ? 'min-h-0 flex-1'
-              : 'min-h-0 flex-1 overflow-y-auto'
-          }
-        >
+            multi-select popover is portaled but keeps the same layout). The
+            checklist/buttons bodies stretch to the tile and scroll internally. */}
+        <div className={bodyManagesHeight ? 'min-h-0 flex-1' : 'min-h-0 flex-1 overflow-y-auto'}>
           {body}
         </div>
       </div>
@@ -510,6 +557,7 @@ function MultiValuePopover({
 }) {
   const runtime = useRuntime();
   const cardRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
   const [search, setSearch] = useState('');
   const [debounced, setDebounced] = useState('');
@@ -621,6 +669,19 @@ function MultiValuePopover({
 
   const selectedKeys = useMemo(() => new Set(selected.map(keyOf)), [selected]);
 
+  const listScroll = useScrollAffordance(listRef, `${listed.length}:${state.status}`);
+  // Rows are uniform, so the average row height is exact enough to say how
+  // many are still below the fold.
+  const rowHeight = listed.length > 0 ? listScroll.contentHeight / listed.length : 0;
+  const rowsPastFold =
+    rowHeight > 0
+      ? Math.max(
+          0,
+          listed.length -
+            Math.round((listScroll.scrollTop + listScroll.viewportHeight) / rowHeight),
+        )
+      : 0;
+
   /** Union of the current selection and every currently listed value. */
   const selectAllListed = () => {
     const union = [...selected];
@@ -654,42 +715,48 @@ function MultiValuePopover({
         />
       </div>
 
-      <div className="mt-2 min-h-16 flex-1 overflow-y-auto rounded-md border border-rcd-border">
-        {state.status === 'error' ? (
-          <div className="flex flex-col items-center gap-2 p-4 text-center">
-            <AlertTriangle size={16} className="text-[var(--rcd-status-warn)]" />
-            <p className="max-w-full break-words text-xs text-rcd-text-2">{state.error}</p>
-            <RcdButton onClick={() => setRetryToken((t) => t + 1)}>
-              <RefreshCw size={13} />
-              Retry
-            </RcdButton>
-          </div>
-        ) : state.status === 'loading' && listed.length === 0 ? (
-          <div className="flex h-20 items-center justify-center">
-            <RcdSpinner label="Loading values…" />
-          </div>
-        ) : listed.length === 0 ? (
-          <p className="p-3 text-xs text-rcd-muted">No values match.</p>
-        ) : (
-          <div className={`flex flex-col p-1 ${state.status === 'loading' ? 'opacity-60' : ''}`}>
-            {listed.map((value) => (
-              <label
-                key={keyOf(value)}
-                className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-              >
-                <input
-                  type="checkbox"
-                  className="accent-[var(--rcd-accent)]"
-                  checked={selectedKeys.has(keyOf(value))}
-                  onChange={() => onToggle(value)}
-                />
-                <span className="min-w-0 truncate" title={String(value)}>
-                  {String(value)}
-                </span>
-              </label>
-            ))}
-          </div>
-        )}
+      {/* Same overflow doctrine as the checklist body: the scroll container
+          lives inside a relative frame so the fades/“+N more” chip can sit on
+          its edges instead of scrolling away with the rows. */}
+      <div className="relative mt-2 min-h-16 flex-1 overflow-hidden rounded-md border border-rcd-border">
+        <div ref={listRef} className="h-full overflow-y-auto">
+          {state.status === 'error' ? (
+            <div className="flex flex-col items-center gap-2 p-4 text-center">
+              <AlertTriangle size={16} className="text-[var(--rcd-status-warn)]" />
+              <p className="max-w-full break-words text-xs text-rcd-text-2">{state.error}</p>
+              <RcdButton onClick={() => setRetryToken((t) => t + 1)}>
+                <RefreshCw size={13} />
+                Retry
+              </RcdButton>
+            </div>
+          ) : state.status === 'loading' && listed.length === 0 ? (
+            <div className="flex h-20 items-center justify-center">
+              <RcdSpinner label="Loading values…" />
+            </div>
+          ) : listed.length === 0 ? (
+            <p className="p-3 text-xs text-rcd-muted">No values match.</p>
+          ) : (
+            <div className={`flex flex-col p-1 ${state.status === 'loading' ? 'opacity-60' : ''}`}>
+              {listed.map((value) => (
+                <label
+                  key={keyOf(value)}
+                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                >
+                  <input
+                    type="checkbox"
+                    className="accent-[var(--rcd-accent)]"
+                    checked={selectedKeys.has(keyOf(value))}
+                    onChange={() => onToggle(value)}
+                  />
+                  <span className="min-w-0 truncate" title={String(value)}>
+                    {String(value)}
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+        <ScrollFades state={listScroll} moreCount={rowsPastFold} />
       </div>
 
       <div className="mt-2 flex shrink-0 items-center justify-between gap-2 border-t border-rcd-border pt-2">
@@ -736,7 +803,49 @@ interface ButtonsFetchState {
   error: string | null;
 }
 
-/** Horizontal wrap of single-select value pills (eq; click again deselects). */
+/* ------------------------------------------------------- buttons geometry */
+
+type ButtonSize = NonNullable<SlicerTileStyle['buttonSize']>;
+
+/** Literal class sets (host Tailwind builds scan for whole class names). */
+const BUTTON_SIZE_CLASSES: Record<ButtonSize, string> = {
+  sm: 'h-6 px-2 text-xs',
+  md: 'h-8 px-3 text-sm',
+  lg: 'h-10 px-4 text-[15px]',
+};
+
+const BUTTON_GAP_CLASSES: Record<ButtonSize, string> = {
+  sm: 'gap-1',
+  md: 'gap-1.5',
+  lg: 'gap-2',
+};
+
+/** Horizontal placement of the group / of items inside grid cells. */
+const BUTTON_JUSTIFY_CLASSES = {
+  left: 'justify-start',
+  center: 'justify-center',
+  right: 'justify-end',
+} as const;
+
+const BUTTON_JUSTIFY_ITEMS_CLASSES = {
+  left: 'justify-items-start',
+  center: 'justify-items-center',
+  right: 'justify-items-end',
+} as const;
+
+/** Vertical placement of the whole group inside the tile body. */
+const BUTTON_VALIGN_CLASSES = {
+  top: 'justify-start',
+  middle: 'justify-center',
+  bottom: 'justify-end',
+} as const;
+
+/**
+ * Value pills honoring the buttons-variant style block: size, fill (stretch to
+ * share the width), fixed column grid, and horizontal/vertical placement of
+ * the group inside the tile. Multi-select semantics are unchanged (each pill
+ * toggles membership of the 'in' clause).
+ */
 function ButtonsSlicer({
   modelId,
   spec,
@@ -820,39 +929,76 @@ function ButtonsSlicer({
     return <p className="p-2 text-xs text-rcd-muted">No values to show.</p>;
   }
 
+  const style = spec.style ?? {};
+  const size: ButtonSize = style.buttonSize ?? (compact ? 'sm' : 'md');
+  const align = style.buttonAlign ?? 'left';
+  const verticalAlign = style.buttonVerticalAlign ?? 'top';
+  const fill = style.buttonFill === true;
+  const columns =
+    typeof style.buttonColumns === 'number' && style.buttonColumns >= 1
+      ? Math.min(Math.trunc(style.buttonColumns), 12)
+      : null;
+
+  const gap = BUTTON_GAP_CLASSES[size];
+  const groupClasses =
+    columns !== null
+      ? `grid ${gap} ${fill ? 'justify-items-stretch' : BUTTON_JUSTIFY_ITEMS_CLASSES[align]}`
+      : fill
+        ? // basis-24 (not basis-0) so pills still wrap instead of shrinking to
+          // unreadable slivers; flex-1 then shares the leftover width evenly.
+          `flex flex-wrap content-start ${gap}`
+        : `flex flex-wrap content-start items-center ${gap} ${BUTTON_JUSTIFY_CLASSES[align]}`;
+  const itemClasses =
+    columns !== null ? (fill ? 'w-full' : '') : fill ? 'min-w-0 flex-1 basis-24' : 'max-w-full';
+
   return (
-    <div className="flex flex-wrap content-start items-center gap-1.5 p-0.5">
-      {state.values.slice(0, BUTTONS_CAP).map((value) => {
-        const isActive = selected.includes(value);
-        return (
-          <button
-            key={keyOf(value)}
-            type="button"
-            aria-pressed={isActive}
-            onClick={() => onToggle(value)}
-            title={String(value)}
-            // Uniform pill geometry (fixed height/radius, consistent gap); the
-            // selected state is an accent FILL with readable inverted text.
-            className={`inline-flex max-w-full items-center truncate rounded-md border transition-colors ${
-              compact ? 'h-6 px-2.5 text-xs' : 'h-8 px-3 text-sm'
-            } ${
-              isActive
-                ? 'border-rcd-accent bg-rcd-accent font-medium text-white hover:opacity-90'
-                : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
-            }`}
-          >
-            <span className="truncate">{String(value)}</span>
-          </button>
-        );
-      })}
-      {state.hasMore && (
-        <span
-          className="self-center text-[11px] text-rcd-muted"
-          title="More values exist — switch this slicer to the checklist or dropdown variant to search them."
+    // min-h-full on the inner column (rather than justify on the scroller)
+    // keeps middle/bottom alignment reachable when the pills overflow.
+    <div className="h-full min-h-0 overflow-y-auto p-0.5">
+      <div className={`flex min-h-full flex-col ${BUTTON_VALIGN_CLASSES[verticalAlign]}`}>
+        <div
+          className={groupClasses}
+          style={
+            columns === null
+              ? undefined
+              : { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }
+          }
         >
-          + more
-        </span>
-      )}
+          {state.values.slice(0, BUTTONS_CAP).map((value) => {
+            const isActive = selected.includes(value);
+            return (
+              <button
+                key={keyOf(value)}
+                type="button"
+                aria-pressed={isActive}
+                onClick={() => onToggle(value)}
+                title={String(value)}
+                // Uniform pill geometry (fixed height/radius, consistent gap);
+                // the selected state is an accent FILL with inverted text.
+                className={`inline-flex items-center justify-center overflow-hidden rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] ${
+                  BUTTON_SIZE_CLASSES[size]
+                } ${itemClasses} ${
+                  isActive
+                    ? 'border-rcd-accent bg-rcd-accent font-medium text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90'
+                    : 'border-rcd-border bg-rcd-surface text-rcd-text-2 hover:border-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
+                }`}
+              >
+                <span className="min-w-0 truncate">{String(value)}</span>
+              </button>
+            );
+          })}
+        </div>
+        {state.hasMore && (
+          <p
+            className={`shrink-0 pt-1 text-[11px] text-rcd-muted ${
+              align === 'center' ? 'text-center' : align === 'right' ? 'text-right' : 'text-left'
+            }`}
+            title="More values exist — switch this slicer to the checklist or dropdown variant to search them."
+          >
+            + more values
+          </p>
+        )}
+      </div>
     </div>
   );
 }
@@ -1026,40 +1172,82 @@ function FieldParamSlicer({
   );
 }
 
-/** Two date inputs: both = between, one-sided = gte/lte ('YYYY-MM-DD' values). */
+/**
+ * Two date endpoints: both = between, one-sided = gte/lte (DATE-ONLY
+ * 'YYYY-MM-DD' strings, never local ISO timestamps). The 'native' picker keeps
+ * the browser date inputs (default); 'calendar' swaps in the popover calendar
+ * with data-availability marks. Both paths clear to null — never to an
+ * empty-string range that would filter everything out.
+ */
 function DateRangeSlicer({
+  modelId,
   spec,
   compact,
   clause,
+  columnType,
   onChange,
+  allowClear,
 }: {
+  modelId: number;
   spec: SlicerTileSpec;
   compact: boolean;
   clause: FilterClause | null;
+  /** Catalog type of spec.column; null = unresolved (assume plain `date`). */
+  columnType: ColumnType | null;
   onChange: (clause: FilterClause | null) => void;
+  /** spec.showClear !== false — gates the inline clear affordance. */
+  allowClear: boolean;
 }) {
   const [from, to] = useMemo<[string, string]>(() => {
     if (!clause) return ['', ''];
-    const first = typeof clause.values[0] === 'string' ? clause.values[0] : '';
-    const second = typeof clause.values[1] === 'string' ? clause.values[1] : '';
-    if (clause.operator === 'between') return [first, second];
-    if (clause.operator === 'gte') return [first, ''];
-    if (clause.operator === 'lte') return ['', first];
+    // An upper endpoint on a timestamp column carries the day's last instant;
+    // the date inputs and the calendar speak only bare 'yyyy-MM-dd', so read
+    // every endpoint back as its day.
+    const dayAt = (index: number): string => {
+      const raw = clause.values[index];
+      return typeof raw === 'string' ? (dateOnlyPartOf(raw) ?? '') : '';
+    };
+    if (clause.operator === 'between') return [dayAt(0), dayAt(1)];
+    if (clause.operator === 'gte') return [dayAt(0), ''];
+    if (clause.operator === 'lte') return ['', dayAt(0)];
     return ['', ''];
   }, [clause]);
 
   const update = (nextFrom: string, nextTo: string) => {
     const base = { table: spec.table, column: spec.column };
+    // Lower bounds stay bare: midnight already includes the whole first day
+    // at either resolution. Upper bounds must match the column's resolution.
+    const upper = inclusiveDateUpperBound(nextTo, columnType);
     if (nextFrom !== '' && nextTo !== '') {
-      onChange({ ...base, operator: 'between', values: [nextFrom, nextTo] });
+      onChange({ ...base, operator: 'between', values: [nextFrom, upper] });
     } else if (nextFrom !== '') {
       onChange({ ...base, operator: 'gte', values: [nextFrom] });
     } else if (nextTo !== '') {
-      onChange({ ...base, operator: 'lte', values: [nextTo] });
+      onChange({ ...base, operator: 'lte', values: [upper] });
     } else {
       onChange(null);
     }
   };
+
+  const options = spec.dateRange ?? {};
+  const hasRange = from !== '' || to !== '';
+
+  if (options.picker === 'calendar') {
+    return (
+      <SlicerCalendarFields
+        modelId={modelId}
+        table={spec.table}
+        column={spec.column}
+        label={spec.label}
+        compact={compact}
+        options={options}
+        from={from}
+        to={to}
+        onChange={update}
+        showClear={allowClear}
+      />
+    );
+  }
 
   // w-full + max-w: each field caps at 18rem but still shrinks in narrow
   // tiles; flex-wrap puts From/To side by side when the tile is wide enough.
@@ -1069,29 +1257,47 @@ function DateRangeSlicer({
   const inputClasses = compact ? 'h-7 w-full text-xs' : 'w-full';
 
   return (
-    <div className={compact ? 'flex flex-wrap gap-1 p-0.5' : 'flex flex-wrap gap-2 p-0.5'}>
-      <label className={labelClasses}>
-        From
-        <RcdInput
-          type="date"
-          value={from}
-          max={to || undefined}
-          onChange={(event) => update(event.target.value, to)}
-          aria-label={`${spec.label} from date`}
-          className={inputClasses}
-        />
-      </label>
-      <label className={labelClasses}>
-        To
-        <RcdInput
-          type="date"
-          value={to}
-          min={from || undefined}
-          onChange={(event) => update(from, event.target.value)}
-          aria-label={`${spec.label} to date`}
-          className={inputClasses}
-        />
-      </label>
+    <div className={compact ? 'flex flex-col gap-1 p-0.5' : 'flex flex-col gap-2 p-0.5'}>
+      <div className={compact ? 'flex flex-wrap gap-1' : 'flex flex-wrap gap-2'}>
+        <label className={labelClasses}>
+          From
+          <RcdInput
+            type="date"
+            value={from}
+            max={to || undefined}
+            onChange={(event) => update(event.target.value, to)}
+            aria-label={`${spec.label} from date`}
+            className={inputClasses}
+          />
+        </label>
+        <label className={labelClasses}>
+          To
+          <RcdInput
+            type="date"
+            value={to}
+            min={from || undefined}
+            onChange={(event) => update(from, event.target.value)}
+            aria-label={`${spec.label} to date`}
+            className={inputClasses}
+          />
+        </label>
+      </div>
+      {allowClear && hasRange && (
+        // Explicit "back to all dates": emptying both native inputs is fiddly
+        // (and some browsers refuse), so the range gets its own clear.
+        <div className="flex">
+          <RcdButton
+            variant="ghost"
+            size="sm"
+            className={compact ? '!h-6 !px-1.5 !text-[11px]' : '!px-2'}
+            title="Clear the date range (back to all dates)"
+            onClick={() => onChange(null)}
+          >
+            <X size={12} />
+            Clear dates
+          </RcdButton>
+        </div>
+      )}
     </div>
   );
 }

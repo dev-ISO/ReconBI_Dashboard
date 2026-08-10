@@ -1,4 +1,4 @@
-export const RCD_CORE_VERSION = '0.3.1';
+export const RCD_CORE_VERSION = '0.4.0';
 
 export * from './types/schema';
 export * from './types/model';
@@ -24,8 +24,17 @@ export { QueryCache } from './state/queryCache';
 export type { QueryCacheEntry, QueryCacheState } from './state/queryCache';
 export { ModelStore } from './state/modelStore';
 export type { AsyncStatus, EditableModel, ModelStoreState, NewRelationshipInput } from './state/modelStore';
-export { DashboardStore } from './state/dashboardStore';
+export {
+  DashboardStore,
+  bucketDateOf,
+  crossFilterClauseFor,
+  dateBucketRange,
+  dateRangeClauseFor,
+  formatDateOnly,
+} from './state/dashboardStore';
 export type {
+  CalendarDate,
+  CrossFilterClauseOptions,
   DashboardStoreState,
   FilterCardOverride,
   HoverHighlight,
@@ -34,6 +43,7 @@ export type {
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime } from './state/createRuntime';
 
+export { dateOnlyPartOf, displayDateBound, inclusiveDateUpperBound } from './util/dateBounds';
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
 export { sanitizeRichHtml } from './util/richText';
@@ -45,3 +55,5 @@ export {
   formatDatePattern,
 } from './util/format';
 export { seriesColor, CATEGORICAL_SLOTS, CHART_THEMES } from './util/palette';
+export { buildXlsx, downloadXlsx } from './util/xlsx';
+export type { XlsxSheetInput } from './util/xlsx';

@@ -32,6 +32,7 @@ import {
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdIconButton } from '../primitives';
+import { TileFilterBadge } from './FilterIndicator';
 import { TileFrame } from './TileFrame';
 
 /**
@@ -87,9 +88,13 @@ const HAVING_OPERATORS: ReadonlySet<string> = new Set([
  * through the RESULT columns onto the effective spec:
  * - DIMENSION columns -> FilterClauses ('values' -> in, null-only -> isNull;
  *   conditions map 1:1 onto FilterOperators, 'between' takes two values);
- * - MEASURE columns -> HAVING entries {measureIndex, operator, values}
- *   (numeric conditions only — contains/startsWith and value lists have no
- *   post-aggregation wire form and are dropped).
+ * - MEASURE columns -> HAVING entries {measureIndex, operator, values}:
+ *   numeric conditions map 1:1; Excel value checklists map onto membership —
+ *   a plain list keeps the checked aggregated values (HAVING 'in'; NULL never
+ *   matches), an INVERTED list (renderer contract: the UNCHECKED values,
+ *   committed when "(Blanks)" is checked) maps onto 'notIn', whose complement
+ *   semantics keep blank (NULL) aggregates. contains/startsWith still have no
+ *   post-aggregation wire form and are dropped.
  */
 const translateTableFilters = (
   list: TableColumnFilter[],
@@ -122,7 +127,19 @@ const translateTableFilters = (
       continue;
     }
     const measureIndex = measureNames.indexOf(filter.column);
-    if (measureIndex === -1 || filter.kind !== 'condition') continue;
+    if (measureIndex === -1) continue;
+    if (filter.kind === 'values') {
+      const numbers = filter.values.filter(
+        (v): v is number => typeof v === 'number' && Number.isFinite(v),
+      );
+      if (numbers.length === 0) continue; // nothing expressible -> no-op
+      // `inverted` is the renderer-side extension of the shared filter
+      // contract (TableChart's TableColumnFilter); structural typing lets the
+      // wider object flow through, so it is read off the value here.
+      const inverted = (filter as { inverted?: boolean }).inverted === true;
+      having.push({ measureIndex, operator: inverted ? 'notIn' : 'in', values: numbers });
+      continue;
+    }
     if (!HAVING_OPERATORS.has(filter.operator)) continue;
     const numbers = filter.values
       .map((v) => (typeof v === 'number' ? v : Number(v)))
@@ -184,19 +201,49 @@ export interface DashboardChartTileProps {
   activeCategoryLabel: string | null;
   /** Legend label while this tile is the LEGEND cross-filter source (emphasis). */
   selectedLegendLabel: string | null;
+  /**
+   * Small corner badge naming the dashboard filter(s) currently reaching this
+   * tile (FilterIndicatorStyle.badgeTiles). Null/absent = no badge.
+   */
+  filterBadgeLabel?: string | null;
+  /** Accent override for the badge (indicator style). */
+  filterBadgeAccent?: string | null;
   onSelect: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
   onDelete: () => void;
   /** Edit-mode right-click on the tile (opens the chart context card). */
   onTileContextMenu?: (position: { x: number; y: number }) => void;
-  /** Cross-filter datum click, called with the EFFECTIVE (drilled) chart. */
-  onCrossFilter: (chart: ChartSpec, info: ChartDatumClickInfo) => void;
+  /**
+   * Cross-filter datum click, called with the EFFECTIVE (drilled) chart plus
+   * the freshest RESULT columns — the clause builder needs the column's
+   * catalog type and the bucket the engine actually applied to turn a clicked
+   * date bucket into a range instead of an (unparseable) eq.
+   */
+  onCrossFilter: (
+    chart: ChartSpec,
+    info: ChartDatumClickInfo,
+    columns: QueryColumn[] | null,
+  ) => void;
   /**
    * Legend cross-filter selection (legendMode 'crossFilter'), called with the
    * EFFECTIVE (drilled) chart; null event = clear the page-wide filter.
    */
-  onLegendSelect: (chart: ChartSpec, e: ChartLegendSelectEvent | null) => void;
+  onLegendSelect: (
+    chart: ChartSpec,
+    e: ChartLegendSelectEvent | null,
+    columns: QueryColumn[] | null,
+  ) => void;
+  /**
+   * Date-axis drag range (format.zoom.dragAction === 'crossFilter'): the RAW
+   * endpoints of the dragged window, to become the SAME range-style
+   * cross-filter a bucket click produces, sourced from this tile.
+   */
+  onAxisRangeCrossFilter?: (
+    chart: ChartSpec,
+    range: { fromRaw: unknown; toRaw: unknown },
+    columns: QueryColumn[] | null,
+  ) => void;
   /** Point right-click (view mode): the EFFECTIVE chart + point payload. */
   onPointMenu?: (payload: { tileId: string; chart: ChartSpec; event: ChartPointEvent }) => void;
   /**
@@ -266,6 +313,8 @@ export function DashboardChartTile({
   filters,
   activeCategoryLabel,
   selectedLegendLabel,
+  filterBadgeLabel = null,
+  filterBadgeAccent = null,
   onSelect,
   onEdit,
   onDuplicate,
@@ -273,6 +322,7 @@ export function DashboardChartTile({
   onTileContextMenu,
   onCrossFilter,
   onLegendSelect,
+  onAxisRangeCrossFilter,
   onPointMenu,
   onChartMenu,
   reportEffective,
@@ -385,15 +435,21 @@ export function DashboardChartTile({
 
   const isTable = chart.type === 'table';
   const tableOptions = chart.format.table ?? null;
-  const pageSize = isTable && tableOptions?.pageSize != null && tableOptions.pageSize > 0
-    ? tableOptions.pageSize
-    : null;
 
   const [tableState, setTableState] = useState<TileTableState>(TABLE_ROOT);
   /** Transient Excel-style per-column header filters (renderer contract). */
   const [tableFilters, setTableFilters] = useState<TableColumnFilter[]>(NO_TABLE_FILTERS);
-  /** View-mode column width/order tweaks (edit mode persists to the doc). */
+  /** View-mode column width/order/page-size tweaks (edit mode persists to the doc). */
   const [tableLayoutOverride, setTableLayoutOverride] = useState<ChartTableLayoutPatch | null>(null);
+
+  // Effective page size: a viewer's pager pick (renderer contract: it rides
+  // the layout-patch channel; 0 = "All"/unpaged) wins over the authored
+  // table.pageSize. The pick is transient view state, so it re-queries via
+  // the existing offset/limit mechanism without touching the doc.
+  const pageSizePick = (tableLayoutOverride as { pageSize?: number } | null)?.pageSize;
+  const effectivePageSize = pageSizePick ?? tableOptions?.pageSize ?? null;
+  const pageSize =
+    isTable && effectivePageSize != null && effectivePageSize > 0 ? effectivePageSize : null;
 
   // Sort/page/column-filter reset whenever the EFFECTIVE query identity
   // changes — drill level/path, drillthrough/slicer/cross-filter clauses,
@@ -474,11 +530,15 @@ export function DashboardChartTile({
   columnValuesInputRef.current = { drilledChart, filters, tableFilters };
 
   /**
-   * Distinct values for a column's filter dropdown. Dimension columns run a
-   * /query/values request through the shared cache WITH the tile's current
-   * filters minus that column's own header filter (Excel semantics: the open
-   * menu shows what the OTHER filters leave visible). Measure columns resolve
-   * empty (the renderer offers conditions only there).
+   * Distinct values for a column's filter dropdown, always with the tile's
+   * current filters MINUS that column's own header filter (Excel semantics:
+   * the open menu shows what the OTHER filters leave visible).
+   * - DIMENSION columns run a /query/values request through the shared cache.
+   * - MEASURE columns run the tile's own grouped query WITHOUT offset/limit
+   *   (so pagination can never truncate the list) through the shared cache
+   *   and reduce that column to its distinct aggregated values, sorted, with
+   *   a null entry when blank aggregates exist. Capped at 200 (the renderer's
+   *   COLUMN_VALUES_CAP note threshold).
    */
   const handleRequestColumnValues = useCallback(
     async (column: string): Promise<CellValue[]> => {
@@ -490,12 +550,41 @@ export function DashboardChartTile({
         .filter((c) => c.role === 'dimension')
         .map((c) => c.name);
       const dim = dims[dimNames.indexOf(column)];
-      if (!dim) return [];
       const others = translateTableFilters(
         inputs.tableFilters.filter((f) => f.column !== column),
         result?.columns,
         dims,
       );
+      if (!dim) {
+        // Measure column: distinct AGGREGATED values over the full filtered,
+        // pre-pagination result. Other measures' HAVING conditions still apply.
+        const target = (result?.columns ?? []).find(
+          (c) => c.role === 'measure' && c.name === column,
+        );
+        if (!target) return [];
+        const base = toWireSpec(inputs.drilledChart, modelId, [
+          ...inputs.filters,
+          ...others.clauses,
+        ]);
+        const spec = others.having.length > 0 ? { ...base, having: others.having } : base;
+        const full = await runtime.queries.run(spec);
+        const index = full.columns.findIndex((c) => c.name === column);
+        if (index === -1) return [];
+        const seen = new Map<string, CellValue>();
+        for (const row of full.rows) {
+          const value = row[index] ?? null;
+          const key = value === null ? ' null' : `${typeof value}:${String(value)}`;
+          if (!seen.has(key)) seen.set(key, value);
+        }
+        return [...seen.values()]
+          .sort((a, b) => {
+            if (a === null) return 1; // blanks last, Excel-style
+            if (b === null) return -1;
+            if (typeof a === 'number' && typeof b === 'number') return a - b;
+            return String(a).localeCompare(String(b));
+          })
+          .slice(0, 200);
+      }
       const values = await runtime.queries.distinct({
         modelId,
         table: dim.table,
@@ -699,6 +788,43 @@ export function DashboardChartTile({
       : null;
   }, [hoverEnabled, hoverHighlight, tileId, drilledChart.query.axis, drilledChart.query.legend]);
 
+  /* ------------------------------------------------ own selection / ranges */
+
+  /**
+   * Echo of THIS tile's own cross-filter source state: the clicked category
+   * and/or legend value stay marked on the source chart while the page-wide
+   * filter is live (format.selectionHighlight === false opts out). The
+   * receiver-side dimming other tiles get is unrelated (highlightCategory).
+   */
+  const selection = useMemo(() => {
+    if (chart.format.selectionHighlight === false) return null;
+    if (activeCategoryLabel === null && selectedLegendLabel === null) return null;
+    return { category: activeCategoryLabel, legendValue: selectedLegendLabel };
+  }, [chart.format.selectionHighlight, activeCategoryLabel, selectedLegendLabel]);
+
+  // Freshest effective chart + result columns for the stable range callback
+  // (assignment every render, mirrors hoverDimsRef).
+  const crossInputsRef = useRef<{ chart: ChartSpec; columns: QueryColumn[] | null }>({
+    chart: drilledChart,
+    columns: null,
+  });
+  crossInputsRef.current = {
+    chart: drilledChart,
+    columns: lastResultRef.current?.columns ?? null,
+  };
+
+  /** Date-axis drag selection -> the same range cross-filter a bucket click makes. */
+  const axisRangeEnabled =
+    onAxisRangeCrossFilter !== undefined && chart.format.zoom?.dragAction === 'crossFilter';
+
+  const handleAxisRangeSelect = useCallback(
+    (range: { fromRaw: unknown; toRaw: unknown }) => {
+      const inputs = crossInputsRef.current;
+      onAxisRangeCrossFilter?.(inputs.chart, range, inputs.columns);
+    },
+    [onAxisRangeCrossFilter],
+  );
+
   /* -------------------------------------------------------------- reporting */
 
   // Ref-style report (assignment only, mirrors ChartTile's wireSpecRef): the
@@ -837,9 +963,17 @@ export function DashboardChartTile({
 
   return (
     <div
-      className={`h-full rounded-xl ${editable && selected ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''}`}
+      className={`relative h-full rounded-xl ${editable && selected ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''}`}
       onClick={editable ? onSelect : undefined}
     >
+      {filterBadgeLabel !== null && filterBadgeLabel !== '' && (
+        // Edit mode keeps the kebab in the top-right corner — shift left of it.
+        <TileFilterBadge
+          label={filterBadgeLabel}
+          accentColor={filterBadgeAccent}
+          positionClassName={editable ? 'right-9 top-1.5' : 'right-1.5 top-1.5'}
+        />
+      )}
       <TileFrame
         title={chart.title}
         editable={editable}
@@ -865,7 +999,10 @@ export function DashboardChartTile({
             // Drill mode owns clicks exclusively: on, clicks drill (never
             // cross-filter); off, clicks cross-filter exactly as before.
             onDatumClick={
-              drillMode ? undefined : (info) => onCrossFilter(drilledChart, info)
+              drillMode
+                ? undefined
+                : (info) =>
+                    onCrossFilter(drilledChart, info, lastResultRef.current?.columns ?? null)
             }
             onPointClick={drillMode && canDrillDeeper ? drillDown : undefined}
             onPointContextMenu={
@@ -880,9 +1017,15 @@ export function DashboardChartTile({
             }
             // Legend clicks are never drill clicks — they cross-filter (or
             // clear) regardless of drill mode.
-            onLegendSelect={(e) => onLegendSelect(drilledChart, e)}
+            onLegendSelect={(e) =>
+              onLegendSelect(drilledChart, e, lastResultRef.current?.columns ?? null)
+            }
             selectedLegendLabel={selectedLegendLabel}
             activeCategory={activeCategoryLabel !== null ? { label: activeCategoryLabel } : null}
+            // Renderer-side marking of THIS tile's own clicked datum/legend
+            // value while it is the cross-filter source.
+            selection={selection}
+            onAxisRangeSelect={axisRangeEnabled ? handleAxisRangeSelect : undefined}
             onPointHover={hoverEnabled ? handlePointHover : undefined}
             highlightCategory={highlightCategory}
             tableSort={tableState.sort}

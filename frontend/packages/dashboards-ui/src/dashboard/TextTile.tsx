@@ -48,6 +48,22 @@ const RICH_TEXT_CLASSES =
   '[&_h3]:my-0.5 [&_h3]:text-lg [&_h3]:font-semibold ' +
   '[&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-0.5 [&_ul]:list-disc [&_ul]:pl-5';
 
+/**
+ * The tile's content area SCROLLS instead of clipping: a text tile only two
+ * grid rows tall used to slice its single line in half with no way to reach
+ * the rest. Vertical auto-scroll with a stable gutter (so the last line never
+ * hides behind the scrollbar), a subtle thin thumb that is actually visible on
+ * a white tile, and bottom padding so the final line's descenders are never
+ * flush against the clip edge. Paddings stay tight — TileFrame already adds
+ * its own p-2, and every px matters in a two-row tile.
+ */
+const SCROLL_CLASSES =
+  'min-h-0 overflow-y-auto overflow-x-hidden overscroll-contain [scrollbar-gutter:stable] ' +
+  '[&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-track]:bg-transparent ' +
+  '[&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-black/20 ' +
+  'hover:[&::-webkit-scrollbar-thumb]:bg-black/35 ' +
+  'dark:[&::-webkit-scrollbar-thumb]:bg-white/25 dark:hover:[&::-webkit-scrollbar-thumb]:bg-white/40';
+
 const specStyle = (spec: TextTileSpec): CSSProperties => ({
   ...(spec.background ? { backgroundColor: spec.background } : null),
   ...(spec.align ? { textAlign: spec.align } : null),
@@ -57,12 +73,25 @@ const specStyle = (spec: TextTileSpec): CSSProperties => ({
  * Presentational rich-text body (view mode + reusable by the print view).
  * Sanitizes again before dangerouslySetInnerHTML as a second belt — the store
  * already sanitizes every write.
+ *
+ * `scroll` is on by default; the print view turns it OFF (paper cannot scroll,
+ * and a reserved scrollbar gutter would shift the printed text).
  */
-export function TextTileContent({ spec, className = '' }: { spec: TextTileSpec; className?: string }) {
+export function TextTileContent({
+  spec,
+  className = '',
+  scroll = true,
+}: {
+  spec: TextTileSpec;
+  className?: string;
+  scroll?: boolean;
+}) {
   const html = useMemo(() => sanitizeRichHtml(spec.html), [spec.html]);
   return (
     <div
-      className={`${RICH_TEXT_CLASSES} h-full overflow-auto rounded-lg p-2 ${className}`}
+      className={`${RICH_TEXT_CLASSES} h-full rounded-lg px-2 pb-2 pt-1.5 ${
+        scroll ? SCROLL_CLASSES : 'overflow-hidden'
+      } ${className}`}
       style={specStyle(spec)}
       dangerouslySetInnerHTML={{ __html: html }}
     />
@@ -288,7 +317,7 @@ function TextTileEditor({ tileId, spec }: { tileId: string; spec: TextTileSpec }
         onFocus={handleFocus}
         onKeyUp={saveSelection}
         onMouseUp={saveSelection}
-        className={`${RICH_TEXT_CLASSES} min-h-0 flex-1 cursor-text overflow-auto rounded-md p-1.5 outline-none ring-[var(--rcd-accent-interactive)] focus:ring-1`}
+        className={`${RICH_TEXT_CLASSES} ${SCROLL_CLASSES} flex-1 cursor-text rounded-md px-1.5 pb-1.5 pt-1 outline-none ring-[var(--rcd-accent-interactive)] focus:ring-1`}
         style={specStyle(spec)}
         dangerouslySetInnerHTML={{ __html: html }}
       />
