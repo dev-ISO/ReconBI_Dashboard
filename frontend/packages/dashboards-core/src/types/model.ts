@@ -68,15 +68,38 @@ export interface Measure {
    * When set, this is a calculated measure: `column` must stay null (server
    * MDL014) and `aggregation` is ignored by the engine (send 'sum' to satisfy
    * the wire shape). `table` remains required — it anchors join planning.
+   * Expressions may reference other expression measures (cycles are server
+   * MDL016) and may be wrapped in PERCENTOFTOTAL(...) at the outermost level.
    */
   expression?: string | null;
+  /** Free-text documentation shown in field lists / tooltips. */
+  description?: string | null;
+  /** Grouping folder for field lists (e.g. 'Finance\\Core'). */
+  displayFolder?: string | null;
+  /**
+   * Excel-style number pattern (e.g. '$#,##0.00;($#,##0.00)') rendered via
+   * formatNumberPattern. Wins over formatHint when both are set; threads
+   * through query results as QueryColumn.formatString.
+   */
+  formatString?: string | null;
 }
 
-/** Engine-generated calendar table ('YYYY-MM-DD' range; null = engine defaults). */
+/** Wire mirror of the backend WeekStartDay enum. */
+export type WeekStartDay = 'monday' | 'sunday';
+
+/**
+ * Engine-generated calendar table ('YYYY-MM-DD' range; null = engine
+ * defaults). fiscalYearStartMonth (1-12, default 1 = calendar; server MDL015)
+ * shapes the fiscal_* columns — fiscal_year is labeled by the year the fiscal
+ * year ENDS in. weekStartDay (default 'monday') shapes day_of_week/week_start;
+ * is_weekend is always Sat/Sun.
+ */
 export interface DateTableDef {
   name: string;
   rangeStart?: string | null;
   rangeEnd?: string | null;
+  fiscalYearStartMonth?: number | null;
+  weekStartDay?: WeekStartDay | null;
 }
 
 export interface ModelDefinition {
@@ -114,7 +137,12 @@ export const tableKey = (schema: string, name: string): string => `${schema}.${n
 /** Canonical relationship/query key for a date table. */
 export const dateTableKey = (name: string): string => `#date.${name}`;
 
-/** The fixed columns every engine date table exposes, in display order. */
+/**
+ * The fixed columns every engine date table exposes, in display order
+ * (mirrors backend DateTableSchema.Build). fiscal_* honor
+ * fiscalYearStartMonth (calendar-equal when it is 1); day_of_week/week_start
+ * honor weekStartDay; year_month sorts lexicographically = chronologically.
+ */
 export const DATE_TABLE_COLUMNS: readonly { name: string; type: ColumnType }[] = [
   { name: 'date_key', type: 'date' },
   { name: 'year', type: 'integer' },
@@ -124,6 +152,23 @@ export const DATE_TABLE_COLUMNS: readonly { name: string; type: ColumnType }[] =
   { name: 'week', type: 'integer' },
   { name: 'day', type: 'integer' },
   { name: 'day_name', type: 'text' },
+  { name: 'month_name_full', type: 'text' },
+  { name: 'day_name_full', type: 'text' },
+  { name: 'day_of_week', type: 'integer' },
+  { name: 'day_of_year', type: 'integer' },
+  { name: 'iso_year', type: 'integer' },
+  { name: 'iso_week', type: 'integer' },
+  { name: 'is_weekend', type: 'boolean' },
+  { name: 'year_month', type: 'text' },
+  { name: 'month_year_label', type: 'text' },
+  { name: 'quarter_label', type: 'text' },
+  { name: 'year_quarter', type: 'text' },
+  { name: 'month_start', type: 'date' },
+  { name: 'week_start', type: 'date' },
+  { name: 'days_in_month', type: 'integer' },
+  { name: 'fiscal_year', type: 'integer' },
+  { name: 'fiscal_quarter', type: 'integer' },
+  { name: 'fiscal_month', type: 'integer' },
 ];
 
 export const emptyDefinition = (): ModelDefinition => ({

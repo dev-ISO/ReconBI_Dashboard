@@ -27,6 +27,17 @@ public sealed record ModelSaveRequest(
 public sealed record ModelValidationOutcome(bool Valid, ValidationResult Result);
 
 /// <summary>
+/// Portable, host-independent form of a model: everything needed to recreate it
+/// elsewhere, and nothing tied to this installation (no id, owner, sharing flag
+/// or timestamps). Round-trips through <see cref="DataModelService.ImportAsync"/>.
+/// </summary>
+public sealed record ModelExportDocument(
+    string Name,
+    string? Description,
+    string DataSourceName,
+    ModelDefinition Definition);
+
+/// <summary>
 /// CRUD + validation for semantic models. Every save re-validates the parsed
 /// definition against the live (cached) catalog snapshot; a definition that
 /// fails validation never reaches the database.
@@ -40,6 +51,9 @@ public sealed class DataModelService(
     ReconDashboardsOptions options,
     TimeProvider timeProvider)
 {
+    /// <summary>Mirrors the rcd_data_models.name column width.</summary>
+    private const int MaxNameLength = 128;
+
     public async Task<IReadOnlyList<ModelSummary>> ListVisibleAsync(CancellationToken ct)
     {
         var userId = currentUser.GetUserId();
@@ -201,6 +215,64 @@ public sealed class DataModelService(
         return ServiceResult<bool>.Ok(true);
     }
 
+    /// <summary>
+    /// Copies a model the caller can see (their own, or a shared one they cannot
+    /// edit) into a new model they own outright: same definition, unshared, name
+    /// suffixed so it never collides with their existing models. The copy goes
+    /// through <see cref="CreateAsync"/>, so catalog validation and the per-user
+    /// model cap apply exactly as they would to a hand-authored save.
+    /// </summary>
+    public async Task<ServiceResult<SemanticModel>> DuplicateAsync(int id, CancellationToken ct)
+    {
+        var source = await GetAsync(id, ct);
+        if (!source.Succeeded)
+        {
+            return source;
+        }
+
+        var detail = source.Value!;
+        var name = await NextCopyNameAsync(currentUser.GetUserId(), detail.Name, ct);
+
+        // The stored definition travels verbatim rather than via the parsed form,
+        // so a copy is byte-identical to its source before normalization.
+        var definitionJson = await db.DataModels.AsNoTracking()
+            .Where(m => m.Id == id)
+            .Select(m => m.DefinitionJson)
+            .FirstAsync(ct);
+
+        return await CreateAsync(
+            new ModelSaveRequest(name, detail.Description, detail.DataSourceName, definitionJson), ct);
+    }
+
+    /// <summary>
+    /// The portable document for a model visible to the caller. Visibility is the
+    /// same rule <see cref="GetAsync"/> applies — a shared model exports for
+    /// everyone, a private one only for its owner.
+    /// </summary>
+    public async Task<ServiceResult<ModelExportDocument>> ExportAsync(int id, CancellationToken ct)
+    {
+        var source = await GetAsync(id, ct);
+        if (!source.Succeeded)
+        {
+            return ServiceResult<ModelExportDocument>.Fail(source.Error!);
+        }
+
+        var model = source.Value!;
+        return ServiceResult<ModelExportDocument>.Ok(
+            new ModelExportDocument(model.Name, model.Description, model.DataSourceName, model.Definition));
+    }
+
+    /// <summary>
+    /// Creates a caller-owned model from a portable document. Deliberately the
+    /// same path as <see cref="CreateAsync"/> — an import is just a save whose
+    /// content came from a file — so catalog validation, the size cap, the
+    /// per-user cap and the name-conflict error all behave identically. Imports
+    /// are never shared: promoting one to a shared default is a separate,
+    /// admin-gated edit.
+    /// </summary>
+    public Task<ServiceResult<SemanticModel>> ImportAsync(ModelSaveRequest request, CancellationToken ct) =>
+        CreateAsync(request with { IsShared = false, ExpectedUpdatedAtUtc = null }, ct);
+
     /// <summary>Dry-run validation for the GUI; returns findings even when invalid.</summary>
     public async Task<ServiceResult<ModelValidationOutcome>> ValidateAsync(
         string dataSourceName, string definitionJson, CancellationToken ct)
@@ -257,6 +329,51 @@ public sealed class DataModelService(
         // Round-trip through the parsed form so what we persist is normalized.
         var definition = ModelJson.TryDeserialize(request.DefinitionJson, out _)!;
         return ServiceResult<ModelDefinition>.Ok(definition);
+    }
+
+    /// <summary>
+    /// First free name in the sequence "X (copy)", "X (copy 2)", "X (copy 3)"…
+    /// for this owner. The unique index on (OwnerUserId, Name) makes an unsuffixed
+    /// copy unusable the moment one already exists.
+    /// </summary>
+    private async Task<string> NextCopyNameAsync(string ownerUserId, string sourceName, CancellationToken ct)
+    {
+        var candidate = ComposeCopyName(sourceName, copyNumber: null);
+        if (!await NameTakenAsync(ownerUserId, candidate, excludeId: null, ct))
+        {
+            return candidate;
+        }
+
+        // Bounded by the per-user cap: the caller cannot own more models than
+        // that, so a free slot always appears first — unless they are already at
+        // the limit, in which case CreateAsync reports the limit anyway.
+        var ceiling = options.Limits.MaxModelsPerUser + 2;
+        for (var copyNumber = 2; copyNumber <= ceiling; copyNumber++)
+        {
+            candidate = ComposeCopyName(sourceName, copyNumber);
+            if (!await NameTakenAsync(ownerUserId, candidate, excludeId: null, ct))
+            {
+                return candidate;
+            }
+        }
+
+        return candidate;
+    }
+
+    /// <summary>
+    /// "X (copy)" / "X (copy N)", trimmed so the suffix survives even when the
+    /// source name already fills the column.
+    /// </summary>
+    private static string ComposeCopyName(string sourceName, int? copyNumber)
+    {
+        var suffix = copyNumber is null ? " (copy)" : $" (copy {copyNumber})";
+        var stem = sourceName.Trim();
+        if (stem.Length + suffix.Length > MaxNameLength)
+        {
+            stem = stem[..(MaxNameLength - suffix.Length)].TrimEnd();
+        }
+
+        return stem + suffix;
     }
 
     private async Task<bool> NameTakenAsync(string ownerUserId, string name, int? excludeId, CancellationToken ct)

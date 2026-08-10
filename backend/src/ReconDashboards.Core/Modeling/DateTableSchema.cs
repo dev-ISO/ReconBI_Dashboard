@@ -27,7 +27,16 @@ public static class DateTableSchema
     /// <summary>CTE name; always dialect-quoted at the point of emission.</summary>
     public static string CteName(DateTableDef dateTable) => "dt_" + dateTable.Name;
 
-    /// <summary>Synthesizes the catalog entry the resolver/validator sees. date_key is the primary key, so many-to-one onto it is proven.</summary>
+    /// <summary>
+    /// Synthesizes the catalog entry the resolver/validator sees. date_key is
+    /// the primary key, so many-to-one onto it is proven. Column set (v2):
+    /// calendar parts, unabbreviated names, ISO year/week, weekday facts
+    /// (day_of_week/week_start honor <see cref="DateTableDef.WeekStartDay"/>;
+    /// is_weekend is always Sat/Sun), sortable labels (year_month sorts
+    /// lexicographically = chronologically), month anchors, and fiscal_*
+    /// columns (equal to calendar values when fiscalYearStartMonth is 1 —
+    /// always emitted).
+    /// </summary>
     public static TableSchema Build(DateTableDef dateTable) => new(
         SchemaName, dateTable.Name, TableKind.View, RowEstimate: null, Comment: null,
         Columns:
@@ -40,6 +49,23 @@ public static class DateTableSchema
             new ColumnSchema("week", 6, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
             new ColumnSchema("day", 7, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
             new ColumnSchema("day_name", 8, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("month_name_full", 9, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("day_name_full", 10, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("day_of_week", 11, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("day_of_year", 12, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("iso_year", 13, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("iso_week", 14, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("is_weekend", 15, "boolean", NormalizedType.Boolean, IsNullable: false, Comment: null),
+            new ColumnSchema("year_month", 16, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("month_year_label", 17, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("quarter_label", 18, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("year_quarter", 19, "text", NormalizedType.Text, IsNullable: false, Comment: null),
+            new ColumnSchema("month_start", 20, "date", NormalizedType.Date, IsNullable: false, Comment: null),
+            new ColumnSchema("week_start", 21, "date", NormalizedType.Date, IsNullable: false, Comment: null),
+            new ColumnSchema("days_in_month", 22, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("fiscal_year", 23, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("fiscal_quarter", 24, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
+            new ColumnSchema("fiscal_month", 25, "integer", NormalizedType.Integer, IsNullable: false, Comment: null),
         ],
         PrimaryKey: [DateKeyColumn],
         UniqueConstraints: []);

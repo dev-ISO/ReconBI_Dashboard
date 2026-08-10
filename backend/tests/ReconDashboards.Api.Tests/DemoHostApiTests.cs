@@ -244,6 +244,163 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
         Assert.Contains(json["issues"]!.AsArray(), i => i!["code"]!.GetValue<string>() == "MDL002");
     }
 
+    // ---------- model duplicate / export / import ----------
+
+    [Fact]
+    public async Task Models_Duplicate_OfSharedModel_IsAuthorOnly_AndYieldsAnOwnedUnsharedCopy()
+    {
+        var carol = _factory.AsUser("carol");
+        var name = UniqueName("Company Default");
+        var id = await CreateModelAsync(carol, name, isShared: true);
+
+        // Duplicate sits in the Author slot: the viewer is stopped by policy.
+        var bobAttempt = await _factory.AsUser("bob").PostAsync($"{Models}/{id}/duplicate", content: null);
+        Assert.Equal(HttpStatusCode.Forbidden, bobAttempt.StatusCode);
+
+        var alice = _factory.AsUser("alice");
+        var first = await alice.PostAsync($"{Models}/{id}/duplicate", content: null);
+        Assert.Equal(HttpStatusCode.Created, first.StatusCode);
+        var copy = await ReadJsonAsync(first);
+        Assert.Equal($"{name} (copy)", copy["name"]!.GetValue<string>());
+        Assert.True(copy["ownerIsMe"]!.GetValue<bool>());
+        Assert.False(copy["isShared"]!.GetValue<bool>());
+        Assert.NotEqual(id, copy["id"]!.GetValue<int>());
+
+        // The definition came across whole.
+        var original = await ReadJsonAsync(await carol.GetAsync($"{Models}/{id}"));
+        Assert.Equal(original["definition"]!.ToJsonString(), copy["definition"]!.ToJsonString());
+
+        // A second copy walks to "(copy 2)" rather than colliding.
+        var second = await alice.PostAsync($"{Models}/{id}/duplicate", content: null);
+        Assert.Equal(HttpStatusCode.Created, second.StatusCode);
+        Assert.Equal($"{name} (copy 2)", (await ReadJsonAsync(second))["name"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Models_Duplicate_OfAnotherUsersPrivateModel_Returns404()
+    {
+        var id = await CreateModelAsync(_factory.AsUser("alice"), UniqueName("Alice Private"));
+
+        var response = await _factory.AsUser("carol").PostAsync($"{Models}/{id}/duplicate", content: null);
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("rcd.model.not_found", (await ReadJsonAsync(response))["errorCode"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Models_Export_IsViewable_AndReturnsAPortableDocumentAsAnAttachment()
+    {
+        var carol = _factory.AsUser("carol");
+        var name = UniqueName("Exportable Model");
+        var id = await CreateModelAsync(carol, name, isShared: true);
+
+        // Export is in the View slot: the viewer can take a copy of a shared model.
+        var response = await _factory.AsUser("bob").GetAsync($"{Models}/{id}/export");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        var disposition = response.Content.Headers.ContentDisposition;
+        Assert.NotNull(disposition);
+        Assert.Equal("attachment", disposition.DispositionType);
+        Assert.EndsWith(".model.json", disposition.FileName!.Trim('"'));
+
+        var document = await ReadJsonAsync(response);
+        Assert.Equal(name, document["name"]!.GetValue<string>());
+        Assert.Equal("demo", document["dataSourceName"]!.GetValue<string>());
+        Assert.Equal(1, document["definition"]!["version"]!.GetValue<int>());
+        Assert.Equal(2, document["definition"]!["tables"]!.AsArray().Count);
+
+        // Installation-specific fields stay out of the portable document.
+        var keys = document.AsObject().Select(p => p.Key).ToArray();
+        Assert.DoesNotContain("id", keys);
+        Assert.DoesNotContain("isShared", keys);
+        Assert.DoesNotContain("ownerIsMe", keys);
+    }
+
+    [Fact]
+    public async Task Models_Export_OfAnotherUsersPrivateModel_Returns404()
+    {
+        var id = await CreateModelAsync(_factory.AsUser("alice"), UniqueName("Alice Secret"));
+
+        var response = await _factory.AsUser("carol").GetAsync($"{Models}/{id}/export");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Equal("rcd.model.not_found", (await ReadJsonAsync(response))["errorCode"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Models_Import_AsViewerBob_Returns403()
+    {
+        var body = new
+        {
+            name = UniqueName("Bob Import"),
+            description = (string?)null,
+            dataSourceName = "demo",
+            definition = ModelDefinition(),
+        };
+
+        var response = await _factory.AsUser("bob").PostAsJsonAsync($"{Models}/import", body);
+
+        Assert.Equal(HttpStatusCode.Forbidden, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Models_ExportThenImport_RoundTripsTheDefinition_AndRejectsADuplicateName()
+    {
+        var alice = _factory.AsUser("alice");
+        var id = await CreateModelAsync(alice, UniqueName("Round Trip"));
+        var exported = await ReadJsonAsync(await alice.GetAsync($"{Models}/{id}/export"));
+        var definitionJson = exported["definition"]!.ToJsonString();
+
+        var importName = UniqueName("Round Trip Imported");
+        exported["name"] = importName;
+        var imported = await alice.PostAsJsonAsync($"{Models}/import", exported);
+        Assert.Equal(HttpStatusCode.Created, imported.StatusCode);
+        var created = await ReadJsonAsync(imported);
+        Assert.Equal(importName, created["name"]!.GetValue<string>());
+        Assert.True(created["ownerIsMe"]!.GetValue<bool>());
+        Assert.False(created["isShared"]!.GetValue<bool>());
+        Assert.Equal(definitionJson, created["definition"]!.ToJsonString());
+
+        // Re-exporting the import reproduces the original document byte for byte.
+        var reExported = await ReadJsonAsync(await alice.GetAsync($"{Models}/{created["id"]!.GetValue<int>()}/export"));
+        Assert.Equal(definitionJson, reExported["definition"]!.ToJsonString());
+
+        // Importing the same document again collides on the name.
+        var again = await alice.PostAsJsonAsync($"{Models}/import", exported);
+        Assert.Equal(HttpStatusCode.Conflict, again.StatusCode);
+        Assert.Equal("rcd.model.name_conflict", (await ReadJsonAsync(again))["errorCode"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Models_Import_OfADefinitionTheCatalogRejects_Returns422WithIssues()
+    {
+        var body = new
+        {
+            name = UniqueName("Broken Import"),
+            description = (string?)null,
+            dataSourceName = "demo",
+            definition = ModelDefinition(measureColumn: "does_not_exist"),
+        };
+
+        var response = await _factory.AsUser("alice").PostAsJsonAsync($"{Models}/import", body);
+
+        Assert.Equal(HttpStatusCode.UnprocessableEntity, response.StatusCode);
+        var problem = await ReadJsonAsync(response);
+        Assert.Equal("rcd.model.invalid", problem["errorCode"]!.GetValue<string>());
+        Assert.Contains(problem["issues"]!.AsArray(), i => i!["code"]!.GetValue<string>() == "MDL002");
+    }
+
+    [Fact]
+    public async Task Models_Import_WithoutADefinition_Returns400()
+    {
+        var body = new { name = UniqueName("Empty Import"), dataSourceName = "demo" };
+
+        var response = await _factory.AsUser("alice").PostAsJsonAsync($"{Models}/import", body);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Equal("rcd.model.invalid_json", (await ReadJsonAsync(response))["errorCode"]!.GetValue<string>());
+    }
+
     // ---------- query ----------
 
     [Fact]

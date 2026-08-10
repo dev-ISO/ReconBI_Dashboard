@@ -6,12 +6,32 @@ import {
   tableKey,
   type DateTableDef,
   type Relationship,
+  type WeekStartDay,
 } from '@recon/dashboards-core';
 import { useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect } from '../primitives';
 
 /** Letters/digits/underscores, not starting with a digit. */
 const NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+const MONTHS: readonly string[] = [
+  'January',
+  'February',
+  'March',
+  'April',
+  'May',
+  'June',
+  'July',
+  'August',
+  'September',
+  'October',
+  'November',
+  'December',
+];
+
+/** Engine defaults when the fields are absent (see DateTableDef docs). */
+const DEFAULT_FISCAL_START = 1;
+const DEFAULT_WEEK_START: WeekStartDay = 'monday';
 
 const rangeSummary = (def: DateTableDef): string => {
   const start = def.rangeStart ?? null;
@@ -21,8 +41,18 @@ const rangeSummary = (def: DateTableDef): string => {
   return start ? `From ${start}` : `Until ${end ?? ''}`;
 };
 
+/** Second summary line — only rendered when something differs from defaults. */
+const calendarSummary = (def: DateTableDef): string | null => {
+  const parts: string[] = [];
+  const fiscal = def.fiscalYearStartMonth ?? DEFAULT_FISCAL_START;
+  if (fiscal !== DEFAULT_FISCAL_START) parts.push(`FY starts ${MONTHS[fiscal - 1]}`);
+  const week = def.weekStartDay ?? DEFAULT_WEEK_START;
+  if (week !== DEFAULT_WEEK_START) parts.push('Weeks start Sunday');
+  return parts.length > 0 ? parts.join(' · ') : null;
+};
+
 interface DateTableDialogProps {
-  /** null = creating a new date table (name editable); otherwise range edit. */
+  /** null = creating a new date table. */
   initial: DateTableDef | null;
   existingNames: string[];
   onClose: () => void;
@@ -33,14 +63,23 @@ function DateTableDialog({ initial, existingNames, onClose, onSave }: DateTableD
   const [name, setName] = useState(initial?.name ?? '');
   const [rangeStart, setRangeStart] = useState(initial?.rangeStart ?? '');
   const [rangeEnd, setRangeEnd] = useState(initial?.rangeEnd ?? '');
+  const [fiscalStart, setFiscalStart] = useState(
+    initial?.fiscalYearStartMonth ?? DEFAULT_FISCAL_START,
+  );
+  const [weekStart, setWeekStart] = useState<WeekStartDay>(
+    initial?.weekStartDay ?? DEFAULT_WEEK_START,
+  );
 
   const trimmed = name.trim();
-  const nameTaken =
-    initial === null && existingNames.some((n) => n.toLowerCase() === trimmed.toLowerCase());
+  // A rename must not collide with ANOTHER table; keeping its own name is fine.
+  const nameTaken = existingNames.some(
+    (n) => n.toLowerCase() !== (initial?.name ?? '').toLowerCase() &&
+      n.toLowerCase() === trimmed.toLowerCase(),
+  );
   const nameInvalid = trimmed !== '' && !NAME_PATTERN.test(trimmed);
   const rangeInvalid = rangeStart !== '' && rangeEnd !== '' && rangeStart > rangeEnd;
-  const canSave =
-    trimmed !== '' && !nameTaken && !nameInvalid && !rangeInvalid;
+  const canSave = trimmed !== '' && !nameTaken && !nameInvalid && !rangeInvalid;
+  const renaming = initial !== null && trimmed !== initial.name;
 
   return (
     <RcdDialog
@@ -55,9 +94,12 @@ function DateTableDialog({ initial, existingNames, onClose, onSave }: DateTableD
             disabled={!canSave}
             onClick={() =>
               onSave({
-                name: initial?.name ?? trimmed,
+                name: trimmed,
                 rangeStart: rangeStart === '' ? null : rangeStart,
                 rangeEnd: rangeEnd === '' ? null : rangeEnd,
+                // Omit the engine defaults so untouched tables stay byte-identical.
+                fiscalYearStartMonth: fiscalStart === DEFAULT_FISCAL_START ? null : fiscalStart,
+                weekStartDay: weekStart === DEFAULT_WEEK_START ? null : weekStart,
               })
             }
           >
@@ -73,8 +115,7 @@ function DateTableDialog({ initial, existingNames, onClose, onSave }: DateTableD
             value={name}
             onChange={(event) => setName(event.target.value)}
             placeholder="e.g. Calendar"
-            disabled={initial !== null}
-            className="w-full disabled:opacity-60"
+            className="w-full"
           />
           {nameInvalid && (
             <span className="text-xs text-[var(--rcd-status-critical)]">
@@ -84,6 +125,13 @@ function DateTableDialog({ initial, existingNames, onClose, onSave }: DateTableD
           {nameTaken && (
             <span className="text-xs text-[var(--rcd-status-critical)]">
               A date table with this name already exists.
+            </span>
+          )}
+          {renaming && !nameInvalid && !nameTaken && (
+            <span className="text-xs text-rcd-muted">
+              Renaming re-points every link to this calendar. Charts that reference{' '}
+              <code className="font-mono">{dateTableKey(initial.name)}</code> by name need
+              updating.
             </span>
           )}
         </label>
@@ -108,16 +156,59 @@ function DateTableDialog({ initial, existingNames, onClose, onSave }: DateTableD
             />
           </label>
         </div>
-        {rangeInvalid ? (
+        {rangeInvalid && (
           <span className="text-xs text-[var(--rcd-status-critical)]">
             The start date must be on or before the end date.
           </span>
-        ) : (
-          <span className="text-xs text-rcd-muted">
-            Leave the range empty to let the engine pick sensible defaults. The table exposes
-            date_key, year, quarter, month, month_name, week, day, and day_name.
-          </span>
         )}
+
+        <div className="flex gap-3">
+          <label className="flex flex-1 flex-col gap-1">
+            <span className="text-xs font-medium text-rcd-text-2">Fiscal year starts</span>
+            <RcdSelect
+              value={String(fiscalStart)}
+              onChange={(event) => setFiscalStart(Number(event.target.value))}
+              className="w-full"
+            >
+              {MONTHS.map((month, index) => (
+                <option key={month} value={index + 1}>
+                  {month}
+                </option>
+              ))}
+            </RcdSelect>
+          </label>
+          <label className="flex flex-1 flex-col gap-1">
+            <span className="text-xs font-medium text-rcd-text-2">Week starts</span>
+            <RcdSelect
+              value={weekStart}
+              onChange={(event) => setWeekStart(event.target.value as WeekStartDay)}
+              className="w-full"
+            >
+              <option value="monday">Monday</option>
+              <option value="sunday">Sunday</option>
+            </RcdSelect>
+          </label>
+        </div>
+        <span className="text-xs text-rcd-muted">
+          The fiscal year is labelled by the year it ENDS in; January means the fiscal columns
+          match the calendar ones. The week setting shapes{' '}
+          <code className="font-mono">day_of_week</code> and{' '}
+          <code className="font-mono">week_start</code> —{' '}
+          <code className="font-mono">is_weekend</code> is always Saturday/Sunday.
+        </span>
+
+        <span className="text-xs text-rcd-muted">
+          Leave the range empty to let the engine pick sensible defaults. The calendar exposes 25
+          columns, including sortable <code className="font-mono">year_month</code>, full{' '}
+          <code className="font-mono">month_name_full</code>/
+          <code className="font-mono">day_name_full</code>,{' '}
+          <code className="font-mono">fiscal_year</code>/
+          <code className="font-mono">fiscal_quarter</code>/
+          <code className="font-mono">fiscal_month</code>,{' '}
+          <code className="font-mono">iso_year</code>/<code className="font-mono">iso_week</code>,{' '}
+          <code className="font-mono">week_start</code>, and{' '}
+          <code className="font-mono">is_weekend</code>.
+        </span>
       </div>
     </RcdDialog>
   );
@@ -141,6 +232,8 @@ export function DateTablesPanel() {
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<DateTableDef | null>(null);
   const [deleting, setDeleting] = useState<DateTableDef | null>(null);
+  /** Link pending removal (destructive → confirmed, like every other delete). */
+  const [unlinking, setUnlinking] = useState<Relationship | null>(null);
   /** Date-table name whose inline link flow is open, with its draft. */
   const [linking, setLinking] = useState<{ dateTable: string; draft: LinkDraft } | null>(null);
 
@@ -203,8 +296,8 @@ export function DateTablesPanel() {
 
       {dateTables.length === 0 ? (
         <p className="px-3 py-2 text-sm text-rcd-muted">
-          No date tables yet. A date table gives charts a shared calendar (year, quarter, month…)
-          to slice any linked date column by.
+          No date tables yet. A date table gives charts a shared 25-column calendar (year,
+          quarter, month, ISO week, fiscal periods…) to slice any linked date column by.
         </p>
       ) : (
         <ul className="flex min-h-0 flex-1 flex-col gap-1.5 overflow-y-auto px-3 pb-3">
@@ -212,6 +305,7 @@ export function DateTablesPanel() {
             const links = relationshipsByDateTable.get(def.name) ?? [];
             const isLinkingThis = linking?.dateTable === def.name;
             const columnOptions = isLinkingThis ? temporalColumns(linking.draft.table) : [];
+            const calendar = calendarSummary(def);
             return (
               <li
                 key={def.name}
@@ -223,12 +317,15 @@ export function DateTablesPanel() {
                     type="button"
                     className="min-w-0 flex-1 text-left"
                     onClick={() => setEditing(def)}
-                    title="Edit date range"
+                    title="Edit name, range, and calendar settings"
                   >
                     <span className="block truncate text-sm text-rcd-text">{def.name}</span>
                     <span className="block truncate text-xs text-rcd-muted">
                       {rangeSummary(def)}
                     </span>
+                    {calendar && (
+                      <span className="block truncate text-xs text-rcd-muted">{calendar}</span>
+                    )}
                   </button>
                   <RcdIconButton
                     aria-label={`Delete date table ${def.name}`}
@@ -249,7 +346,7 @@ export function DateTablesPanel() {
                         <RcdIconButton
                           aria-label={`Remove link ${r.fromTable}.${r.fromColumn}`}
                           className="p-0.5"
-                          onClick={() => models.removeRelationship(r.id)}
+                          onClick={() => setUnlinking(r)}
                         >
                           <X size={12} />
                         </RcdIconButton>
@@ -370,14 +467,29 @@ export function DateTablesPanel() {
           existingNames={dateTables.map((d) => d.name)}
           onClose={() => setEditing(null)}
           onSave={(def) => {
-            models.updateDateTable(def.name, {
-              rangeStart: def.rangeStart,
-              rangeEnd: def.rangeEnd,
-            });
+            // The store's rename path re-points relationships at the new key.
+            models.updateDateTable(editing.name, def);
             setEditing(null);
           }}
         />
       )}
+
+      <ConfirmDialog
+        title="Remove link"
+        message={
+          unlinking
+            ? `Stop slicing ${unlinking.fromTable}.${unlinking.fromColumn} by this calendar?`
+            : ''
+        }
+        confirmLabel="Remove"
+        danger
+        open={unlinking !== null}
+        onCancel={() => setUnlinking(null)}
+        onConfirm={() => {
+          if (unlinking) models.removeRelationship(unlinking.id);
+          setUnlinking(null);
+        }}
+      />
 
       <ConfirmDialog
         title="Delete date table"

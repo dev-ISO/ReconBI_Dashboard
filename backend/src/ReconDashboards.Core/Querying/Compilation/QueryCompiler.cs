@@ -13,7 +13,9 @@ public sealed record ResolvedDimension(DimensionSpec Spec, TableSchema Table, Co
 /// <summary>
 /// A calculated measure's parsed expression with its references resolved:
 /// the distinct table keys used by direct aggregate calls, and each [reference]
-/// mapped to the (plain) model measure it names.
+/// mapped to the model measure it names — plain (Expression null) or itself
+/// expression-based (inlined transitively at emission; cycles/depth are
+/// rejected during resolution).
 /// </summary>
 public sealed record ResolvedMeasureExpression(
     MeasureExprNode Root,
@@ -23,9 +25,13 @@ public sealed record ResolvedMeasureExpression(
 /// <summary>
 /// Expression is non-null for calculated measures; Aggregation/Column are then
 /// unused. Calc is a post-aggregation window transform (running total, YTD,
-/// prior-period family) applied over the grouped result.
+/// prior-period family) applied over the grouped result. PercentOfTotal marks
+/// a measure whose expression was wrapped in PERCENTOFTOTAL(...): Expression
+/// holds the unwrapped inner expression and the compiler divides the grouped
+/// value by its grand total in the window stage. FormatString is the measure's
+/// Excel-style pattern, threaded to result columns for the renderer.
 /// </summary>
-public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null, MeasureCalcSpec? Calc = null);
+public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null, MeasureCalcSpec? Calc = null, bool PercentOfTotal = false, string? FormatString = null);
 
 public sealed record ResolvedFilter(TableSchema Table, ColumnSchema Column, FilterOperator Operator, IReadOnlyList<JsonElement> Values);
 
@@ -117,6 +123,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         {
             if (spec.Measures[i].Calc is { } calc)
             {
+                if (measures[i].PercentOfTotal)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_PCT_TOTAL_UNSUPPORTED",
+                        $"Measure '{measures[i].Label}': a {calc.Kind} calculation cannot be combined with PERCENTOFTOTAL.");
+                }
+
                 ValidateCalc(calc, dimensions, measures[i].Label);
                 measures[i] = measures[i] with { Calc = calc };
             }
@@ -132,24 +145,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         foreach (var m in measures)
         {
-            involved.Add(m.Table.Key);
-            foreach (var f in m.Filters)
-            {
-                involved.Add(f.Table.Key);
-            }
-
-            if (m.Expression is { } expression)
-            {
-                involved.UnionWith(expression.AggregateTableKeys);
-                foreach (var reference in expression.References.Values)
-                {
-                    involved.Add(reference.Table.Key);
-                    foreach (var f in reference.Filters)
-                    {
-                        involved.Add(f.Table.Key);
-                    }
-                }
-            }
+            CollectInvolvedTables(m, involved);
         }
 
         foreach (var f in filters)
@@ -261,6 +257,28 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     }
 
     /// <summary>
+    /// Every table a measure can touch, walking nested expression references
+    /// transitively (resolution already rejected cycles, so this terminates).
+    /// </summary>
+    private static void CollectInvolvedTables(ResolvedMeasure measure, HashSet<string> involved)
+    {
+        involved.Add(measure.Table.Key);
+        foreach (var f in measure.Filters)
+        {
+            involved.Add(f.Table.Key);
+        }
+
+        if (measure.Expression is { } expression)
+        {
+            involved.UnionWith(expression.AggregateTableKeys);
+            foreach (var reference in expression.References.Values)
+            {
+                CollectInvolvedTables(reference, involved);
+            }
+        }
+    }
+
+    /// <summary>
     /// Date tables become resolvable exactly like catalog tables by appending
     /// their synthesized schemas to the snapshot. Nothing is introspected; the
     /// "#date." key prefix guarantees no collision with real tables.
@@ -367,7 +385,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 prepared, spec, topN, dimensionExprs, selectItems, measureExprs, whereParts, havingParts, effectiveLimit, bag, warnings, calendarCtes);
         }
 
-        if (prepared.Measures.Any(m => m.Calc is not null))
+        if (NeedsWindowStage(prepared))
         {
             var core = BuildAggregateCore(selectItems, plan, prepared.Schema, whereParts, dimensionExprs, havingParts);
             return EmitWithCalcs(
@@ -428,10 +446,17 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 "QRY_BAD_SORT", $"Top N ranks by measure {topN.ByMeasureIndex}, which does not exist.");
         }
 
+        if (prepared.Measures[topN.ByMeasureIndex].PercentOfTotal)
+        {
+            throw new QueryCompilationException(
+                "QRY_PCT_TOTAL_UNSUPPORTED",
+                $"Top N cannot rank by '{prepared.Measures[topN.ByMeasureIndex].Label}': PERCENTOFTOTAL is computed after ranking, so ranking by it would silently rank by the raw value instead. Rank by another measure.");
+        }
+
         var n = Math.Clamp(topN.N, 1, effectiveLimit);
         var plan = prepared.Plan;
         var rankAlias = dialect.QuoteIdentifier($"meas{topN.ByMeasureIndex}");
-        var hasCalc = prepared.Measures.Any(m => m.Calc is not null);
+        var hasCalc = NeedsWindowStage(prepared);
 
         if (!topN.IncludeOthers)
         {
@@ -560,11 +585,21 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings);
     }
 
+    /// <summary>True when any measure needs the post-aggregation window stage (time-intelligence calc or percent-of-total).</summary>
+    private static bool NeedsWindowStage(PreparedQuery prepared) =>
+        prepared.Measures.Any(m => m.Calc is not null || m.PercentOfTotal);
+
     /// <summary>
     /// Post-aggregation calc stage. The grouped statement (the aggregate core,
     /// or the whole Top-N stage) becomes the "__rcd_base" CTE and calc measures
     /// become window expressions over it: the FIRST dimension is the ordering
     /// axis, every other dimension partitions (legend / small multiples).
+    /// PERCENTOFTOTAL measures also live here: value / SUM(value) OVER () — an
+    /// unpartitioned grand total over the rows of the base stage, i.e. the
+    /// current result set AFTER WHERE/HAVING/Top-N folding but BEFORE the final
+    /// LIMIT/OFFSET. With Top-N the total therefore covers exactly the
+    /// displayed rows (including the Others bucket when present); NULL group
+    /// values are ignored by SUM. A zero/NULL grand total yields NULL.
     /// When a bucket-relative kind (YTD or the prior-period family) rides a
     /// date-bucketed axis the base is densified first: the full bucket series
     /// between the observed min and max axis value is generated, CROSS JOINed
@@ -645,15 +680,30 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             outerItems.Add(densify ? $"{baseAlias}.{isTopAlias} AS {isTopAlias}" : isTopAlias);
         }
 
-        var axisRef = dimRefs[0];
+        // Calc measures are guaranteed >= 1 dimension (ValidateCalc); a pure
+        // percent-of-total query may have none (the single row is then 100%).
+        var axisRef = dimRefs.Length > 0 ? dimRefs[0] : "";
         var partition = dimRefs.Skip(1).ToArray();
 
         for (var i = 0; i < prepared.Measures.Count; i++)
         {
+            var measure = prepared.Measures[i];
             var measureRef = densify ? $"{baseAlias}.{MeasAlias(i)}" : MeasAlias(i);
-            outerItems.Add(prepared.Measures[i].Calc is { } calc
-                ? $"{CalcExpression(calc, measureRef, axisRef, partition, bag)} AS {MeasAlias(i)}"
-                : densify ? $"{measureRef} AS {MeasAlias(i)}" : measureRef);
+            string item;
+            if (measure.Calc is { } calc)
+            {
+                item = $"{CalcExpression(calc, measureRef, axisRef, partition, bag)} AS {MeasAlias(i)}";
+            }
+            else if (measure.PercentOfTotal)
+            {
+                item = $"(CAST({measureRef} AS decimal) / NULLIF({dialect.Aggregate(Aggregation.Sum, measureRef)} OVER (), 0)) AS {MeasAlias(i)}";
+            }
+            else
+            {
+                item = densify ? $"{measureRef} AS {MeasAlias(i)}" : measureRef;
+            }
+
+            outerItems.Add(item);
         }
 
         var sql = new StringBuilder();
@@ -836,19 +886,30 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// <summary>
     /// One rendered CTE per referenced date table ("dt_{name}" AS (SELECT ...)).
     /// Both range ends are ALWAYS parameters — defaults are computed here from
-    /// the injected clock, so statement text stays constant.
+    /// the injected clock, so statement text stays constant for fixed calendar
+    /// settings. The fiscal start month is re-validated here (defense in depth
+    /// behind MDL015) and handed to the dialect as an integer; the week start
+    /// is a two-state flag — neither ever carries client text into SQL.
     /// </summary>
     private List<string> BuildCalendarCtes(IReadOnlyList<DateTableDef> dateTables, ParameterBag bag)
     {
         var ctes = new List<string>(dateTables.Count);
         foreach (var dateTable in dateTables)
         {
+            var fiscalStart = dateTable.EffectiveFiscalYearStartMonth;
+            if (fiscalStart is < 1 or > 12)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DATE_TABLE",
+                    $"Date table '{dateTable.Name}' has an invalid fiscalYearStartMonth {fiscalStart}; it must be between 1 and 12.");
+            }
+
             var start = dateTable.RangeStart ?? DateTableSchema.DefaultRangeStart;
             var end = dateTable.RangeEnd ?? DateTableSchema.DefaultRangeEnd(_clock);
             var startPlaceholder = dialect.ParameterPlaceholder(bag.Add(start, NormalizedType.Date));
             var endPlaceholder = dialect.ParameterPlaceholder(bag.Add(end, NormalizedType.Date));
             ctes.Add(
-                $"{dialect.QuoteIdentifier(DateTableSchema.CteName(dateTable))} AS (\n{dialect.CalendarTableSql(startPlaceholder, endPlaceholder)}\n)");
+                $"{dialect.QuoteIdentifier(DateTableSchema.CteName(dateTable))} AS (\n{dialect.CalendarTableSql(startPlaceholder, endPlaceholder, fiscalStart, dateTable.WeekStartsMonday)}\n)");
         }
 
         return ctes;
@@ -924,7 +985,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
             return ResolveMeasureCore(
                 measure.Name, measure.Table, measure.Aggregation, measure.Column,
-                measure.MeasureFilters, measure.FormatHint, model, schema);
+                measure.MeasureFilters, measure.FormatHint, measure.FormatString, model, schema);
         }
 
         if (spec.Table is null || spec.Aggregation is null)
@@ -935,115 +996,166 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         var label = spec.Alias
             ?? (spec.Column is null ? $"{spec.Aggregation}" : $"{spec.Aggregation} of {spec.Column}");
-        return ResolveMeasureCore(label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, model, schema);
+        return ResolveMeasureCore(label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, null, model, schema);
     }
+
+    /// <summary>Maximum expression-measure reference chain; mirrors <see cref="SemanticModelValidator.MaxMeasureReferenceDepth"/>.</summary>
+    private const int MaxMeasureReferenceDepth = 8;
+
+    private ResolvedMeasure ResolveExpressionMeasure(Measure measure, ModelDefinition model, DatabaseSchema schema) =>
+        ResolveExpressionMeasure(measure, model, schema, new HashSet<Guid>(), depth: 0);
 
     /// <summary>
     /// Resolves a calculated measure: parse (QRY_BAD_MEASURE on failure), then
     /// resolve every aggregate call against the catalog and every [reference]
-    /// against the model's plain measures. Nothing unresolved survives — that
-    /// is the security bar for expressions.
+    /// against the model's measures — recursively for expression measures, so
+    /// nested measures inline transitively at emission. Nothing unresolved
+    /// survives — that is the security bar for expressions. Reference cycles
+    /// (QRY_MEASURE_CYCLE) and chains deeper than
+    /// <see cref="MaxMeasureReferenceDepth"/> are rejected here as a defense in
+    /// depth behind the validator's MDL016. An outermost PERCENTOFTOTAL is
+    /// unwrapped into <see cref="ResolvedMeasure.PercentOfTotal"/>; a measure
+    /// that uses it may not be referenced by another expression (its window
+    /// cannot be inlined into a grouped aggregate).
     /// </summary>
-    private ResolvedMeasure ResolveExpressionMeasure(Measure measure, ModelDefinition model, DatabaseSchema schema)
+    private ResolvedMeasure ResolveExpressionMeasure(
+        Measure measure, ModelDefinition model, DatabaseSchema schema, HashSet<Guid> visiting, int depth)
     {
-        if (measure.Column is not null)
+        if (!visiting.Add(measure.Id))
         {
             throw new QueryCompilationException(
-                "QRY_BAD_MEASURE", $"Measure '{measure.Name}' is expression-based and may not also set a source column.");
+                "QRY_MEASURE_CYCLE", $"Measure '{measure.Name}' participates in a measure-reference cycle.");
         }
 
-        if (model.FindTable(measure.Table) is null)
+        if (depth > MaxMeasureReferenceDepth)
         {
-            throw new QueryCompilationException("QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' is not part of the model.");
+            throw new QueryCompilationException(
+                "QRY_MEASURE_CYCLE",
+                $"Measure '{measure.Name}' sits more than {MaxMeasureReferenceDepth} expression-measure references deep; flatten the chain.");
         }
 
-        var table = schema.FindTable(measure.Table)
-            ?? throw new QueryCompilationException(
-                "QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' no longer exists in the data source.");
-
-        MeasureExprNode root;
         try
         {
-            root = MeasureExpressionParser.Parse(measure.Expression!);
-        }
-        catch (MeasureExpressionParseException ex)
-        {
-            throw new QueryCompilationException("QRY_BAD_MEASURE", $"Measure '{measure.Name}': {ex.Message}");
-        }
-
-        var aggregateTables = new List<string>();
-        var references = new Dictionary<string, ResolvedMeasure>(StringComparer.Ordinal);
-
-        foreach (var node in MeasureExpressionParser.Flatten(root))
-        {
-            switch (node)
+            if (measure.Column is not null)
             {
-                case AggregateCallNode { TableKey: { } tableKey } call:
-                    if (model.FindTable(tableKey) is null)
-                    {
-                        throw new QueryCompilationException(
-                            "QRY_UNKNOWN_TABLE",
-                            $"Measure '{measure.Name}' expression references table '{tableKey}', which is not part of the model.");
-                    }
-
-                    var callTable = schema.FindTable(tableKey)
-                        ?? throw new QueryCompilationException(
-                            "QRY_UNKNOWN_TABLE", $"Table '{tableKey}' no longer exists in the data source.");
-                    var callColumn = callTable.FindColumn(call.Column!)
-                        ?? throw new QueryCompilationException(
-                            "QRY_UNKNOWN_COLUMN",
-                            $"Measure '{measure.Name}' expression references column '{call.Column}', which does not exist on '{tableKey}'.");
-                    if (!IsAggregationCompatible(call.Aggregation, callColumn.Type))
-                    {
-                        throw new QueryCompilationException(
-                            "QRY_BAD_MEASURE",
-                            $"Measure '{measure.Name}' expression: {call.Aggregation} is not valid for column '{call.Column}' of type {callColumn.Type}.");
-                    }
-
-                    if (!aggregateTables.Contains(tableKey))
-                    {
-                        aggregateTables.Add(tableKey);
-                    }
-
-                    break;
-
-                case MeasureRefNode reference when !references.ContainsKey(reference.Name):
-                    var (target, ambiguous) = MeasureExpressionParser.ResolveMeasureRef(model, reference.Name);
-                    if (ambiguous)
-                    {
-                        throw new QueryCompilationException(
-                            "QRY_BAD_MEASURE",
-                            $"Measure '{measure.Name}' expression reference '[{reference.Name}]' matches more than one model measure.");
-                    }
-
-                    if (target is null)
-                    {
-                        throw new QueryCompilationException(
-                            "QRY_BAD_MEASURE",
-                            $"Measure '{measure.Name}' expression references measure '[{reference.Name}]', which does not exist.");
-                    }
-
-                    if (target.Expression is not null)
-                    {
-                        throw new QueryCompilationException(
-                            "QRY_BAD_MEASURE",
-                            $"Measure '{measure.Name}' expression references '[{reference.Name}]', which is itself expression-based; expression measures may only reference plain aggregation measures.");
-                    }
-
-                    references[reference.Name] = ResolveMeasureCore(
-                        target.Name, target.Table, target.Aggregation, target.Column,
-                        target.MeasureFilters, target.FormatHint, model, schema);
-                    break;
+                throw new QueryCompilationException(
+                    "QRY_BAD_MEASURE", $"Measure '{measure.Name}' is expression-based and may not also set a source column.");
             }
+
+            if (model.FindTable(measure.Table) is null)
+            {
+                throw new QueryCompilationException("QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' is not part of the model.");
+            }
+
+            var table = schema.FindTable(measure.Table)
+                ?? throw new QueryCompilationException(
+                    "QRY_UNKNOWN_TABLE", $"Table '{measure.Table}' no longer exists in the data source.");
+
+            MeasureExprNode root;
+            try
+            {
+                root = MeasureExpressionParser.Parse(measure.Expression!);
+            }
+            catch (MeasureExpressionParseException ex)
+            {
+                throw new QueryCompilationException("QRY_BAD_MEASURE", $"Measure '{measure.Name}': {ex.Message}");
+            }
+
+            var percentOfTotal = false;
+            if (root is PercentOfTotalNode pct)
+            {
+                percentOfTotal = true;
+                root = pct.Inner;
+            }
+
+            var aggregateTables = new List<string>();
+            var references = new Dictionary<string, ResolvedMeasure>(StringComparer.Ordinal);
+
+            foreach (var node in MeasureExpressionParser.Flatten(root))
+            {
+                switch (node)
+                {
+                    case AggregateCallNode { TableKey: { } tableKey } call:
+                        if (model.FindTable(tableKey) is null)
+                        {
+                            throw new QueryCompilationException(
+                                "QRY_UNKNOWN_TABLE",
+                                $"Measure '{measure.Name}' expression references table '{tableKey}', which is not part of the model.");
+                        }
+
+                        var callTable = schema.FindTable(tableKey)
+                            ?? throw new QueryCompilationException(
+                                "QRY_UNKNOWN_TABLE", $"Table '{tableKey}' no longer exists in the data source.");
+                        var callColumn = callTable.FindColumn(call.Column!)
+                            ?? throw new QueryCompilationException(
+                                "QRY_UNKNOWN_COLUMN",
+                                $"Measure '{measure.Name}' expression references column '{call.Column}', which does not exist on '{tableKey}'.");
+                        if (!IsAggregationCompatible(call.Aggregation, callColumn.Type))
+                        {
+                            throw new QueryCompilationException(
+                                "QRY_BAD_MEASURE",
+                                $"Measure '{measure.Name}' expression: {call.Aggregation} is not valid for column '{call.Column}' of type {callColumn.Type}.");
+                        }
+
+                        if (!aggregateTables.Contains(tableKey))
+                        {
+                            aggregateTables.Add(tableKey);
+                        }
+
+                        break;
+
+                    case MeasureRefNode reference when !references.ContainsKey(reference.Name):
+                        var (target, ambiguous) = MeasureExpressionParser.ResolveMeasureRef(model, reference.Name);
+                        if (ambiguous)
+                        {
+                            throw new QueryCompilationException(
+                                "QRY_BAD_MEASURE",
+                                $"Measure '{measure.Name}' expression reference '[{reference.Name}]' matches more than one model measure.");
+                        }
+
+                        if (target is null)
+                        {
+                            throw new QueryCompilationException(
+                                "QRY_BAD_MEASURE",
+                                $"Measure '{measure.Name}' expression references measure '[{reference.Name}]', which does not exist.");
+                        }
+
+                        if (target.Expression is not null)
+                        {
+                            var resolvedTarget = ResolveExpressionMeasure(target, model, schema, visiting, depth + 1);
+                            if (resolvedTarget.PercentOfTotal)
+                            {
+                                throw new QueryCompilationException(
+                                    "QRY_BAD_MEASURE",
+                                    $"Measure '{measure.Name}' expression references '[{reference.Name}]', which uses PERCENTOFTOTAL; percent-of-total measures cannot be embedded in another expression.");
+                            }
+
+                            references[reference.Name] = resolvedTarget;
+                        }
+                        else
+                        {
+                            references[reference.Name] = ResolveMeasureCore(
+                                target.Name, target.Table, target.Aggregation, target.Column,
+                                target.MeasureFilters, target.FormatHint, target.FormatString, model, schema);
+                        }
+
+                        break;
+                }
+            }
+
+            var resolvedFilters = measure.MeasureFilters
+                .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
+                .ToArray();
+
+            return new ResolvedMeasure(
+                measure.Name, table, measure.Aggregation, Column: null, resolvedFilters, measure.FormatHint,
+                new ResolvedMeasureExpression(root, aggregateTables, references),
+                Calc: null, PercentOfTotal: percentOfTotal, FormatString: measure.FormatString);
         }
-
-        var resolvedFilters = measure.MeasureFilters
-            .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
-            .ToArray();
-
-        return new ResolvedMeasure(
-            measure.Name, table, measure.Aggregation, Column: null, resolvedFilters, measure.FormatHint,
-            new ResolvedMeasureExpression(root, aggregateTables, references));
+        finally
+        {
+            visiting.Remove(measure.Id);
+        }
     }
 
     private ResolvedMeasure ResolveMeasureCore(
@@ -1053,6 +1165,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         string? columnName,
         IReadOnlyList<FilterSpec> filters,
         string? formatHint,
+        string? formatString,
         ModelDefinition model,
         DatabaseSchema schema)
     {
@@ -1087,7 +1200,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
             .ToArray();
 
-        return new ResolvedMeasure(label, table, aggregation, column, resolvedFilters, formatHint);
+        return new ResolvedMeasure(label, table, aggregation, column, resolvedFilters, formatHint, FormatString: formatString);
     }
 
     private ResolvedFilter ResolveFilter(
@@ -1199,6 +1312,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             }
 
             var label = measures[condition.MeasureIndex].Label;
+            if (measures[condition.MeasureIndex].PercentOfTotal)
+            {
+                throw new QueryCompilationException(
+                    "QRY_PCT_TOTAL_UNSUPPORTED",
+                    $"Having condition on measure '{label}': PERCENTOFTOTAL is computed after the HAVING stage, so the condition would silently filter on the raw value. Filter on the underlying measure instead.");
+            }
+
             if (!Enum.IsDefined(condition.Operator))
             {
                 throw new QueryCompilationException(
@@ -1471,10 +1591,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     /// <summary>
     /// Renders a calculated measure's AST. Arithmetic is parenthesized per
-    /// node, division is NULLIF-guarded, aggregate calls render through the
-    /// dialect with plan aliases, and [references] substitute the referenced
-    /// measure's aggregate SQL. The expression measure's own filters apply to
-    /// every aggregate it renders (combined with a reference's own filters).
+    /// node, division ('/' and 2-arg DIVIDE) is NULLIF-guarded, comparisons
+    /// and AND/OR/NOT render from normalized whitelists, IF/SWITCH become
+    /// CASE forms (omitted branches are NULL), scalar functions emit their
+    /// ANSI shapes (ROUND casts to numeric with parse-validated digits),
+    /// aggregate calls render through the dialect with plan aliases, and
+    /// [references] substitute the referenced measure's SQL — plain aggregate
+    /// or, for nested expression measures, its whole inlined expression.
+    ///
+    /// FILTER COMPOSITION RULE: every rendered aggregate carries the AND of
+    /// the filters of every measure on the reference path from the queried
+    /// measure down to that aggregate (the target's own filters plus every
+    /// enclosing expression measure's filters, accumulated outer-to-inner).
     /// </summary>
     private string ExpressionSql(
         MeasureExprNode node,
@@ -1483,20 +1611,86 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         JoinPlan plan,
         ParameterBag bag)
     {
+        string Render(MeasureExprNode child) => ExpressionSql(child, expression, outerFilters, plan, bag);
+
         switch (node)
         {
             case NumberLiteralNode number:
                 return number.Literal;
 
             case UnaryMinusNode unary:
-                return $"(-{ExpressionSql(unary.Operand, expression, outerFilters, plan, bag)})";
+                return $"(-{Render(unary.Operand)})";
 
             case BinaryNode binary:
-                var left = ExpressionSql(binary.Left, expression, outerFilters, plan, bag);
-                var right = ExpressionSql(binary.Right, expression, outerFilters, plan, bag);
+                var left = Render(binary.Left);
+                var right = Render(binary.Right);
                 return binary.Operator == '/'
                     ? $"({left} / NULLIF({right}, 0))"
                     : $"({left} {binary.Operator} {right})";
+
+            case ComparisonNode comparison:
+                var comparisonOperator = comparison.Operator switch
+                {
+                    "=" or "<>" or ">" or ">=" or "<" or "<=" => comparison.Operator,
+                    _ => throw new InvalidOperationException($"Unknown comparison operator '{comparison.Operator}'."),
+                };
+                return $"({Render(comparison.Left)} {comparisonOperator} {Render(comparison.Right)})";
+
+            case BooleanBinaryNode boolean:
+                return $"({Render(boolean.Left)} {(boolean.IsAnd ? "AND" : "OR")} {Render(boolean.Right)})";
+
+            case NotNode not:
+                return $"(NOT {Render(not.Operand)})";
+
+            case IfNode conditional:
+                return conditional.Else is null
+                    ? $"CASE WHEN {Render(conditional.Condition)} THEN {Render(conditional.Then)} END"
+                    : $"CASE WHEN {Render(conditional.Condition)} THEN {Render(conditional.Then)} ELSE {Render(conditional.Else)} END";
+
+            case SwitchNode sw:
+                var switchSql = new StringBuilder("CASE ").Append(Render(sw.Subject));
+                foreach (var switchCase in sw.Cases)
+                {
+                    switchSql.Append(" WHEN ").Append(Render(switchCase.Value))
+                        .Append(" THEN ").Append(Render(switchCase.Result));
+                }
+
+                if (sw.Default is not null)
+                {
+                    switchSql.Append(" ELSE ").Append(Render(sw.Default));
+                }
+
+                return switchSql.Append(" END").ToString();
+
+            case DivideNode divide:
+                var numerator = Render(divide.Numerator);
+                var denominator = Render(divide.Denominator);
+                return divide.Alternate is null
+                    ? $"({numerator} / NULLIF({denominator}, 0))"
+                    : $"CASE WHEN {denominator} IS NULL OR {denominator} = 0 THEN {Render(divide.Alternate)} ELSE ({numerator} / {denominator}) END";
+
+            case ScalarCallNode scalar:
+                var arguments = string.Join(", ", scalar.Arguments.Select(Render));
+                var functionName = scalar.Function switch
+                {
+                    ScalarFunction.Abs => "ABS",
+                    ScalarFunction.Ceiling => "CEILING",
+                    ScalarFunction.Floor => "FLOOR",
+                    ScalarFunction.Sqrt => "SQRT",
+                    ScalarFunction.Exp => "EXP",
+                    ScalarFunction.Ln => "LN",
+                    ScalarFunction.Power => "POWER",
+                    ScalarFunction.Coalesce => "COALESCE",
+                    _ => throw new InvalidOperationException($"Unknown scalar function {scalar.Function}."),
+                };
+                return $"{functionName}({arguments})";
+
+            case RoundNode round:
+                // Digits were range-checked at parse time; invariant int text.
+                return $"ROUND(CAST({Render(round.Argument)} AS numeric), {round.Digits.ToString(System.Globalization.CultureInfo.InvariantCulture)})";
+
+            case BlankNode:
+                return "NULL";
 
             case AggregateCallNode call:
                 var argument = call.Column is null
@@ -1509,6 +1703,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 IReadOnlyList<ResolvedFilter> combined = outerFilters.Count == 0
                     ? target.Filters
                     : [.. target.Filters, .. outerFilters];
+                if (target.Expression is { } nested)
+                {
+                    // Inline the nested expression measure with the combined
+                    // filter set as ITS outer filters (see composition rule).
+                    return ExpressionSql(nested.Root, nested, combined, plan, bag);
+                }
+
                 return AggregateWithFilters(
                     dialect.Aggregate(target.Aggregation, AggregateArgument(target, plan)), combined, plan, bag);
 
@@ -1737,6 +1938,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                         : m.Column?.Type ?? NormalizedType.Integer;
             var label = m.Label;
             var formatHint = m.FormatHint;
+            var formatString = m.FormatString;
             if (m.Calc is { } calc)
             {
                 label += calc.Kind switch
@@ -1754,9 +1956,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 }
             }
 
+            if (m.PercentOfTotal && formatHint is null && formatString is null)
+            {
+                formatHint = "percent"; // the ratio renders as % unless the model styles it
+            }
+
             columns.Add(new ResultColumnPlan(
                 $"meas{i}", label, ResultColumnRole.Measure, type,
-                m.Column is null ? null : $"{m.Table.Key}.{m.Column.Name}", null, formatHint));
+                m.Column is null ? null : $"{m.Table.Key}.{m.Column.Name}", null, formatHint, formatString));
         }
 
         return columns;

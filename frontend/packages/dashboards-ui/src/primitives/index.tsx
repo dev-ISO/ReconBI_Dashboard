@@ -102,6 +102,12 @@ export interface RcdDialogProps {
   draggable?: boolean;
   /** Bottom-right corner handle resizes the panel. */
   resizable?: boolean;
+  /**
+   * Overrides the default dimmed backdrop classes (bg-black/40 + blur), e.g.
+   * "bg-black/10" for a light wash that keeps the content behind readable.
+   * Click-to-close is unaffected.
+   */
+  backdropClassName?: string;
 }
 
 interface DialogPoint {
@@ -128,13 +134,24 @@ const clampDialogPos = (x: number, y: number, w: number, h: number): DialogPoint
 
 /**
  * Session-scoped memory for draggable/resizable dialogs: reopening restores the
- * last size/position (no persistence). Shared by all opted-in dialogs — today
- * only the chart-builder dialog opts in.
+ * last size/position (no persistence). Keyed by dialog title so different
+ * opted-in dialogs (chart builder, relationship editor, …) don't inherit each
+ * other's geometry.
  */
-let lastDialogGeometry: { pos: DialogPoint | null; size: DialogSize | null } | null = null;
+const lastDialogGeometries = new Map<string, { pos: DialogPoint | null; size: DialogSize | null }>();
 
 /** Focus-trapped modal; Esc closes. No browser dialogs anywhere in the library. */
-export function RcdDialog({ title, open, onClose, children, footer, wide, draggable, resizable }: RcdDialogProps) {
+export function RcdDialog({
+  title,
+  open,
+  onClose,
+  children,
+  footer,
+  wide,
+  draggable,
+  resizable,
+  backdropClassName,
+}: RcdDialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
 
   // null = default flex-centered / class-driven size. Once the user drags or
@@ -155,13 +172,14 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
     setSize(next);
   };
   const rememberGeometry = () => {
-    if (floating) lastDialogGeometry = { ...geometryRef.current };
+    if (floating) lastDialogGeometries.set(title, { ...geometryRef.current });
   };
 
   // Restore the session's last geometry on each open (re-clamped to the viewport).
   useEffect(() => {
-    if (!open || !floating || !lastDialogGeometry) return;
-    const remembered = lastDialogGeometry;
+    if (!open || !floating) return;
+    const remembered = lastDialogGeometries.get(title);
+    if (!remembered) return;
     let w: number | null = null;
     let h: number | null = null;
     if (remembered.size) {
@@ -170,7 +188,7 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
       applySize({ w, h });
     }
     if (remembered.pos) applyPos(clampDialogPos(remembered.pos.x, remembered.pos.y, w ?? DIALOG_MIN_W, h ?? DIALOG_MIN_H));
-  }, [open, floating]);
+  }, [open, floating, title]);
 
   const onTitlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!draggable) return;
@@ -283,7 +301,11 @@ export function RcdDialog({ title, open, onClose, children, footer, wide, dragga
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-[2px]" onClick={onClose} aria-hidden />
+      <div
+        className={`absolute inset-0 ${backdropClassName ?? 'bg-black/40 backdrop-blur-[2px]'}`}
+        onClick={onClose}
+        aria-hidden
+      />
       <div
         ref={panelRef}
         role="dialog"

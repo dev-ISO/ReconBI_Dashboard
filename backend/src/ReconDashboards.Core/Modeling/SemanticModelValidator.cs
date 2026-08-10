@@ -15,11 +15,17 @@ namespace ReconDashboards.Core.Modeling;
 /// active-graph cycle · MDL008 aggregation/type compatibility · MDL009
 /// many-side cardinality unproven (warning) · MDL010 name collisions (warning) ·
 /// MDL011 unusable endpoint type · MDL012 measure expression parse error ·
-/// MDL013 measure expression reference invalid · MDL014 expression measure also
-/// sets a column · MDL015 date-table range invalid.
+/// MDL013 measure expression reference invalid (incl. references to
+/// PERCENTOFTOTAL measures) · MDL014 expression measure also sets a column ·
+/// MDL015 date-table settings invalid (empty range, fiscalYearStartMonth
+/// outside 1-12, unknown weekStartDay) · MDL016 measure reference cycle or a
+/// reference chain nested more than 8 expression measures deep.
 /// </summary>
 public sealed class SemanticModelValidator
 {
+    /// <summary>Maximum expression-measure reference chain (mirrored by the compiler's QRY_MEASURE_CYCLE guard).</summary>
+    public const int MaxMeasureReferenceDepth = 8;
+
     public ValidationResult Validate(ModelDefinition definition, DatabaseSchema schema)
     {
         var result = new ValidationResult();
@@ -28,6 +34,7 @@ public sealed class SemanticModelValidator
         ValidateDateTables(definition, catalogTables, result);
         ValidateRelationships(definition, catalogTables, result);
         ValidateMeasures(definition, catalogTables, result);
+        ValidateMeasureReferenceGraph(definition, result);
         ValidateNameCollisions(definition, result);
 
         return result;
@@ -68,6 +75,24 @@ public sealed class SemanticModelValidator
                 result.AddError(
                     "MDL015",
                     $"Date table '{dateTable.Name}' has an empty range: rangeStart {start:yyyy-MM-dd} is after rangeEnd {end:yyyy-MM-dd}.",
+                    path);
+                continue;
+            }
+
+            if (dateTable.FiscalYearStartMonth is { } fiscalStart && fiscalStart is < 1 or > 12)
+            {
+                result.AddError(
+                    "MDL015",
+                    $"Date table '{dateTable.Name}' has an invalid fiscalYearStartMonth {fiscalStart}; it must be between 1 and 12.",
+                    path);
+                continue;
+            }
+
+            if (dateTable.WeekStartDay is { } weekStart && !Enum.IsDefined(weekStart))
+            {
+                result.AddError(
+                    "MDL015",
+                    $"Date table '{dateTable.Name}' has an unknown weekStartDay; expected monday or sunday.",
                     path);
                 continue;
             }
@@ -361,10 +386,15 @@ public sealed class SemanticModelValidator
     }
 
     /// <summary>
-    /// MDL012: expression does not parse. MDL013: a reference does not resolve —
-    /// unknown/non-model table, unknown column, non-numeric column for sum/avg,
-    /// unknown or ambiguous [measure], or a [measure] that is itself
-    /// expression-based (nesting/cycles are rejected outright).
+    /// MDL012: expression does not parse (grammar v2: arithmetic, comparisons,
+    /// AND/OR/NOT in conditions, IF/SWITCH/DIVIDE, scalar functions, BLANK(),
+    /// an optional outermost PERCENTOFTOTAL). MDL013: a reference does not
+    /// resolve — unknown/non-model table, unknown column, aggregation/type
+    /// mismatch, unknown or ambiguous [measure], or a [measure] whose own
+    /// expression uses PERCENTOFTOTAL (a post-aggregation window that cannot
+    /// be inlined into another expression). References to other expression
+    /// measures are allowed; cycles/depth are MDL016 (see
+    /// <see cref="ValidateMeasureReferenceGraph"/>).
     /// </summary>
     private static void ValidateMeasureExpression(
         ModelDefinition definition,
@@ -438,17 +468,148 @@ public sealed class SemanticModelValidator
                             $"Measure '{measure.Name}' expression references measure '[{reference.Name}]', which does not exist.",
                             expressionPath);
                     }
-                    else if (target.Expression is not null)
+                    else if (target.Expression is not null && ExpressionRootIsPercentOfTotal(target))
                     {
                         result.AddError(
                             "MDL013",
-                            $"Measure '{measure.Name}' expression references '[{reference.Name}]', which is itself expression-based; expression measures may only reference plain aggregation measures.",
+                            $"Measure '{measure.Name}' expression references '[{reference.Name}]', which uses PERCENTOFTOTAL; percent-of-total measures cannot be embedded in another expression.",
                             expressionPath);
                     }
 
                     break;
             }
         }
+    }
+
+    /// <summary>True when the measure's expression parses and is wrapped in PERCENTOFTOTAL.</summary>
+    private static bool ExpressionRootIsPercentOfTotal(Measure measure)
+    {
+        try
+        {
+            return MeasureExpressionParser.Parse(measure.Expression!) is PercentOfTotalNode;
+        }
+        catch (MeasureExpressionParseException)
+        {
+            return false; // its own MDL012 covers it
+        }
+    }
+
+    /// <summary>
+    /// MDL016: whole-model reference-graph checks for expression measures.
+    /// A cycle ([A] -> [B] -> [A], including self-reference) is reported once
+    /// per validation at the measure that closes it; acyclic chains deeper
+    /// than <see cref="MaxMeasureReferenceDepth"/> expression measures are
+    /// reported at the chain head. Unparseable expressions (MDL012) and
+    /// unresolved references (MDL013) are simply absent from the graph.
+    /// </summary>
+    private static void ValidateMeasureReferenceGraph(ModelDefinition definition, ValidationResult result)
+    {
+        var expressionTargets = new Dictionary<Guid, IReadOnlyList<Measure>>();
+        foreach (var measure in definition.Measures)
+        {
+            if (measure.Expression is null)
+            {
+                continue;
+            }
+
+            MeasureExprNode root;
+            try
+            {
+                root = MeasureExpressionParser.Parse(measure.Expression);
+            }
+            catch (MeasureExpressionParseException)
+            {
+                continue;
+            }
+
+            expressionTargets[measure.Id] = MeasureExpressionParser.Flatten(root)
+                .OfType<MeasureRefNode>()
+                .Select(r => MeasureExpressionParser.ResolveMeasureRef(definition, r.Name))
+                .Where(t => t is { Ambiguous: false, Match.Expression: not null })
+                .Select(t => t.Match!)
+                .DistinctBy(m => m.Id)
+                .ToArray();
+        }
+
+        var state = new Dictionary<Guid, int>(); // 1 = on stack, 2 = finished
+        var chainDepth = new Dictionary<Guid, int>();
+        var cycleReported = false;
+
+        int Visit(Measure measure, List<Measure> stack)
+        {
+            if (state.TryGetValue(measure.Id, out var s))
+            {
+                if (s == 2)
+                {
+                    return chainDepth.GetValueOrDefault(measure.Id);
+                }
+
+                if (!cycleReported)
+                {
+                    cycleReported = true;
+                    var closingIndex = stack.FindIndex(m => m.Id == measure.Id);
+                    var names = stack.Skip(Math.Max(closingIndex, 0))
+                        .Select(m => $"'{m.Name}'")
+                        .Append($"'{measure.Name}'");
+                    var measureIndex = IndexOf(definition, measure.Id);
+                    result.AddError(
+                        "MDL016",
+                        $"Measure references form a cycle: {string.Join(" -> ", names)}. Break the loop so each measure can be inlined.",
+                        measureIndex >= 0 ? $"measures[{measureIndex}].expression" : null);
+                }
+
+                return 0;
+            }
+
+            if (!expressionTargets.TryGetValue(measure.Id, out var targets))
+            {
+                state[measure.Id] = 2;
+                return 0; // plain measure (or one whose expression failed earlier checks)
+            }
+
+            state[measure.Id] = 1;
+            stack.Add(measure);
+            var depth = 0;
+            foreach (var target in targets)
+            {
+                depth = Math.Max(depth, Visit(target, stack) + 1);
+            }
+
+            stack.RemoveAt(stack.Count - 1);
+            state[measure.Id] = 2;
+            chainDepth[measure.Id] = depth;
+            return depth;
+        }
+
+        for (var i = 0; i < definition.Measures.Count; i++)
+        {
+            var measure = definition.Measures[i];
+            if (!expressionTargets.ContainsKey(measure.Id) || state.ContainsKey(measure.Id))
+            {
+                continue;
+            }
+
+            if (Visit(measure, []) > MaxMeasureReferenceDepth)
+            {
+                result.AddError(
+                    "MDL016",
+                    $"Measure '{measure.Name}' references measures more than {MaxMeasureReferenceDepth} levels deep; flatten the chain.",
+                    $"measures[{i}].expression");
+            }
+        }
+    }
+
+    private static int IndexOf(ModelDefinition definition, Guid measureId)
+    {
+        for (var i = 0; i < definition.Measures.Count; i++)
+        {
+            if (definition.Measures[i].Id == measureId)
+            {
+                return i;
+            }
+        }
+
+        return -1;
     }
 
     private static void ValidateNameCollisions(ModelDefinition definition, ValidationResult result)

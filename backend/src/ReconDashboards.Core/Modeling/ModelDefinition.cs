@@ -81,8 +81,11 @@ public sealed record Relationship(
 /// Column is null only for Count (COUNT(*)) and for calculated measures. When
 /// <see cref="Expression"/> is set the measure is calculated: Aggregation and
 /// Column are ignored (Column must stay null — MDL014) and the expression
-/// composes aggregate calls / [references] to plain measures. Table remains the
-/// measure's home table (it anchors join planning).
+/// composes aggregate calls / [references] to other measures (plain or
+/// expression-based; cycles are MDL016). Table remains the measure's home
+/// table (it anchors join planning). Description/DisplayFolder are pure UI
+/// metadata; FormatString is an Excel-style number pattern the renderer feeds
+/// to its pattern formatter (it wins over FormatHint when both are set).
 /// </summary>
 public sealed record Measure(
     Guid Id,
@@ -92,19 +95,44 @@ public sealed record Measure(
     string? Column = null,
     string? FormatHint = null,
     IReadOnlyList<FilterSpec>? Filters = null,
-    string? Expression = null)
+    string? Expression = null,
+    string? Description = null,
+    string? DisplayFolder = null,
+    string? FormatString = null)
 {
     public IReadOnlyList<FilterSpec> MeasureFilters => Filters ?? [];
+}
+
+/// <summary>Wire names via the converter: "monday", "sunday".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<WeekStartDay>))]
+public enum WeekStartDay
+{
+    Monday,
+    Sunday,
 }
 
 /// <summary>
 /// A model-declared VIRTUAL calendar table (see <see cref="DateTableSchema"/>).
 /// Null range bounds default at compile time to 2015-01-01 and Dec 31 of next
-/// year; both ends are always bound as parameters.
+/// year; both ends are always bound as parameters. FiscalYearStartMonth (1-12,
+/// default 1 = calendar) and WeekStartDay (default monday) shape the generated
+/// fiscal_* / day_of_week / week_start columns; both are validated (MDL015)
+/// and inlined into the calendar SQL only as vetted constants, never as text.
 /// </summary>
-public sealed record DateTableDef(string Name, DateOnly? RangeStart = null, DateOnly? RangeEnd = null)
+public sealed record DateTableDef(
+    string Name,
+    DateOnly? RangeStart = null,
+    DateOnly? RangeEnd = null,
+    int? FiscalYearStartMonth = null,
+    WeekStartDay? WeekStartDay = null)
 {
     public string Key => $"{DateTableSchema.KeyPrefix}{Name}";
+
+    /// <summary>Validated fiscal start month with the calendar default.</summary>
+    public int EffectiveFiscalYearStartMonth => FiscalYearStartMonth ?? 1;
+
+    /// <summary>True unless the model explicitly picked Sunday-start weeks.</summary>
+    public bool WeekStartsMonday => (WeekStartDay ?? Modeling.WeekStartDay.Monday) == Modeling.WeekStartDay.Monday;
 }
 
 /// <summary>

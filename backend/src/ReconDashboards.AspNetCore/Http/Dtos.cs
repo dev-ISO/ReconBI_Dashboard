@@ -103,6 +103,24 @@ public sealed record ValidationIssueDto(string Code, string Severity, string Mes
 
 public sealed record ValidateModelResponse(bool Valid, IReadOnlyList<ValidationIssueDto> Issues);
 
+/// <summary>
+/// The portable model document: the body of GET /models/{id}/export and,
+/// unchanged, the body POST /models/import accepts back. Carries no id, owner
+/// or sharing flag — those belong to the installation, not the definition.
+/// </summary>
+public sealed record ModelExportResponse(
+    string Name,
+    string? Description,
+    string DataSourceName,
+    JsonElement Definition);
+
+/// <summary>POST /models/import body — an export document, possibly renamed.</summary>
+public sealed record ImportModelRequest(
+    string Name,
+    string? Description,
+    string DataSourceName,
+    JsonElement Definition);
+
 public sealed record DashboardSummaryResponse(
     int Id,
     string Name,
@@ -141,7 +159,8 @@ public sealed record QueryColumnDto(
     string Type,
     string? Source,
     string? DateBucket,
-    string? FormatHint);
+    string? FormatHint,
+    string? FormatString = null);
 
 public sealed record QueryWarningDto(string Code, string Message);
 
@@ -196,6 +215,18 @@ public static class DtoMapping
             doc.RootElement.Clone());
     }
 
+    /// <summary>
+    /// Serializes the definition through ModelJson so an exported file is
+    /// byte-for-byte what the engine persists, independent of the host's MVC
+    /// JSON settings.
+    /// </summary>
+    public static ModelExportResponse ToModelExportResponse(ModelExportDocument document)
+    {
+        using var doc = JsonDocument.Parse(ModelJson.Serialize(document.Definition));
+        return new ModelExportResponse(
+            document.Name, document.Description, document.DataSourceName, doc.RootElement.Clone());
+    }
+
     public static ValidationIssueDto ToIssueDto(ValidationIssue issue) =>
         new(issue.Code, issue.Severity.ToString().ToLowerInvariant(), issue.Message, issue.Path);
 
@@ -209,7 +240,8 @@ public static class DtoMapping
                 Camel(c.Type.ToString()),
                 c.Source,
                 c.DateBucket is { } bucket ? Camel(bucket.ToString()) : null,
-                c.FormatHint))
+                c.FormatHint,
+                c.FormatString))
             .ToArray();
 
         var warnings = outcome.Compiled.Warnings

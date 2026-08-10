@@ -25,8 +25,33 @@ public class QueryCompilerDateTableTests
     private static readonly IReadOnlyDictionary<string, IReadOnlyList<RowFilter>> NoRowFilters =
         new Dictionary<string, IReadOnlyList<RowFilter>>();
 
+    /// <summary>Default settings: fiscalYearStartMonth 1 (fiscal_* = calendar), Monday weeks.</summary>
     private const string CalendarBody = """
-SELECT d::date AS "date_key", EXTRACT(YEAR FROM d)::int AS "year", EXTRACT(QUARTER FROM d)::int AS "quarter", EXTRACT(MONTH FROM d)::int AS "month", TO_CHAR(d, 'Mon') AS "month_name", EXTRACT(WEEK FROM d)::int AS "week", EXTRACT(DAY FROM d)::int AS "day", TO_CHAR(d, 'Dy') AS "day_name"
+SELECT d::date AS "date_key",
+       EXTRACT(YEAR FROM d)::int AS "year",
+       EXTRACT(QUARTER FROM d)::int AS "quarter",
+       EXTRACT(MONTH FROM d)::int AS "month",
+       TO_CHAR(d, 'Mon') AS "month_name",
+       EXTRACT(WEEK FROM d)::int AS "week",
+       EXTRACT(DAY FROM d)::int AS "day",
+       TO_CHAR(d, 'Dy') AS "day_name",
+       TO_CHAR(d, 'FMMonth') AS "month_name_full",
+       TO_CHAR(d, 'FMDay') AS "day_name_full",
+       EXTRACT(ISODOW FROM d)::int AS "day_of_week",
+       EXTRACT(DOY FROM d)::int AS "day_of_year",
+       EXTRACT(ISOYEAR FROM d)::int AS "iso_year",
+       EXTRACT(WEEK FROM d)::int AS "iso_week",
+       (EXTRACT(ISODOW FROM d)::int >= 6) AS "is_weekend",
+       TO_CHAR(d, 'YYYY-MM') AS "year_month",
+       TO_CHAR(d, 'Mon YYYY') AS "month_year_label",
+       TO_CHAR(d, '"Q"Q') AS "quarter_label",
+       TO_CHAR(d, 'YYYY-"Q"Q') AS "year_quarter",
+       date_trunc('month', d)::date AS "month_start",
+       date_trunc('week', d)::date AS "week_start",
+       EXTRACT(DAY FROM (date_trunc('month', d) + interval '1 month - 1 day'))::int AS "days_in_month",
+       EXTRACT(YEAR FROM d)::int AS "fiscal_year",
+       EXTRACT(QUARTER FROM d)::int AS "fiscal_quarter",
+       EXTRACT(MONTH FROM d)::int AS "fiscal_month"
 FROM generate_series(@p0::timestamp, @p1::timestamp, interval '1 day') AS d
 """;
 

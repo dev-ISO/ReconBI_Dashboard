@@ -92,24 +92,26 @@ public class SemanticModelValidatorExpressionTests
     }
 
     [Fact]
-    public void ReferenceToAnotherExpressionMeasureIsMdl013()
+    public void ReferenceToAnotherExpressionMeasureIsAllowed()
     {
         var first = ExpressionMeasure("First", "[Order Count] * 2");
         var second = ExpressionMeasure("Second", "[First] / 2");
 
         var result = Validate(first, second);
 
-        var issue = AssertSingleError(result, "MDL013");
-        Assert.Contains("itself expression-based", issue.Message, StringComparison.Ordinal);
+        Assert.True(result.IsValid);
+        Assert.Empty(result.Issues);
     }
 
     [Fact]
-    public void SelfReferenceIsRejectedAsNestedExpression()
+    public void SelfReferenceIsAMeasureCycleMdl016()
     {
         var result = Validate(ExpressionMeasure("Loop", "[Loop] + count(*)"));
 
-        var issue = AssertSingleError(result, "MDL013");
-        Assert.Contains("itself expression-based", issue.Message, StringComparison.Ordinal);
+        var issue = AssertSingleError(result, "MDL016");
+        Assert.Contains("cycle", issue.Message, StringComparison.Ordinal);
+        Assert.Contains("'Loop'", issue.Message, StringComparison.Ordinal);
+        Assert.EndsWith(".expression", issue.Path!, StringComparison.Ordinal);
     }
 
     [Fact]

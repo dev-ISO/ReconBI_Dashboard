@@ -266,16 +266,17 @@ LIMIT @p0
         AssertCompilationError("QRY_BAD_MEASURE", ExpressionMeasure("Bad", "[No Such Measure] / count(*)"));
 
     [Fact]
-    public void ReferenceToAnotherExpressionMeasureIsRejected()
+    public void ReferenceToAnotherExpressionMeasureInlinesTransitively()
     {
         var first = ExpressionMeasure("First", "[Total Order Value] / [Order Count]");
         var second = ExpressionMeasure("Second", "[First] * 2");
-        var model = ModelWith(first, second);
+        var compiled = Compile(SpecFor(second), ModelWith(first, second));
 
-        var ex = Assert.Throws<QueryCompilationException>(
-            () => Compiler.Prepare(SpecFor(second), model, TestFixtures.BuildDemoSchema(), new RcdLimits()));
-        Assert.Equal("QRY_BAD_MEASURE", ex.Code);
-        Assert.Contains("itself expression-based", ex.Message, StringComparison.Ordinal);
+        AssertSql("""
+SELECT ((SUM("t0"."order_total") / NULLIF(COUNT(*), 0)) * 2) AS "meas0"
+FROM "public"."orders" AS "t0"
+LIMIT @p0
+""", compiled);
     }
 
     [Fact]

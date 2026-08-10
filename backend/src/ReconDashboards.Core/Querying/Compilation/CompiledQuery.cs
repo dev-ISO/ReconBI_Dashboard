@@ -9,7 +9,11 @@ public enum ResultColumnRole
     Measure,
 }
 
-/// <summary>Shape metadata for one output column ("dim0", "meas1", ...).</summary>
+/// <summary>
+/// Shape metadata for one output column ("dim0", "meas1", ...). FormatHint is
+/// the legacy loose hint ("currency"/"percent"/"$"); FormatString is a model
+/// measure's Excel-style pattern and wins in the renderer when both are set.
+/// </summary>
 public sealed record ResultColumnPlan(
     string Name,
     string Label,
@@ -17,7 +21,8 @@ public sealed record ResultColumnPlan(
     NormalizedType Type,
     string? Source,
     DateBucket? DateBucket,
-    string? FormatHint);
+    string? FormatHint,
+    string? FormatString = null);
 
 public sealed record EngineWarning(string Code, string Message);
 

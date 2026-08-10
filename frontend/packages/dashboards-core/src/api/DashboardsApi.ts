@@ -30,6 +30,19 @@ export interface SaveModelBody {
   expectedUpdatedAtUtc?: string | null;
 }
 
+/**
+ * Portable model document — the body of GET /models/{id}/export, accepted back
+ * unchanged by importModel. Deliberately carries no id, owner or sharing flag:
+ * those belong to an installation, not to the definition. This is the shape
+ * committed to source control for the seeded default model.
+ */
+export interface ModelExportDocument {
+  name: string;
+  description?: string | null;
+  dataSourceName: string;
+  definition: ModelDefinition;
+}
+
 export interface SaveDashboardBody {
   name: string;
   description?: string | null;
@@ -115,6 +128,30 @@ export class DashboardsApi {
 
   deleteModel(id: number): Promise<void> {
     return this.fetcher(this.url(`/models/${id}`), { method: 'DELETE' });
+  }
+
+  /**
+   * Copies a model the caller can see (typically the shared default they cannot
+   * edit) into a new one they own. Named "{source} (copy)", de-duplicated
+   * server-side against the caller's own models.
+   */
+  duplicateModel(id: number): Promise<ModelDetail> {
+    return this.fetcher(this.url(`/models/${id}/duplicate`), { method: 'POST' });
+  }
+
+  /** The model as a portable document — readable by anyone who can see it. */
+  exportModel(id: number, signal?: AbortSignal): Promise<ModelExportDocument> {
+    return this.fetcher(this.url(`/models/${id}/export`), { signal });
+  }
+
+  /**
+   * Creates a caller-owned (never shared) model from an exported document.
+   * Validation, size/count limits and name conflicts surface exactly as they do
+   * for createModel — notably RcdApiError 'rcd.model.name_conflict' on a name
+   * the caller already uses.
+   */
+  importModel(body: ModelExportDocument): Promise<ModelDetail> {
+    return this.fetcher(this.url('/models/import'), { method: 'POST', body });
   }
 
   validateModel(dataSourceName: string, definition: ModelDefinition): Promise<ValidationOutcome> {

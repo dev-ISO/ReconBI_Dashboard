@@ -252,12 +252,28 @@ export const formatDatePattern = (date: Date, mask: string): string => {
   }
 };
 
-/** Human label for one cell, driven by the column's type/bucket/format hint. */
+/**
+ * Is the string a full Excel-style number pattern (digit placeholders or
+ * sections) rather than a legacy loose hint ("$", "%", "currency", "percent")?
+ * Any '#', '0' or ';' routes through formatNumberPattern; bare hints keep the
+ * legacy sniff so existing models render byte-identically.
+ */
+const isNumberPattern = (s: string): boolean => /[#0;]/.test(s);
+
+/**
+ * Human label for one cell, driven by the column's type/bucket/format
+ * metadata. Precedence for numbers: formatString (Excel pattern from the
+ * model measure) > pattern-shaped formatHint > legacy $/% hint sniff >
+ * default thousands format.
+ */
 export const formatCellValue = (value: CellValue, column: QueryColumn): string => {
   if (value === null) return '(Blank)';
 
   if (typeof value === 'number') {
-    const hint = column.formatHint ?? '';
+    const pattern = column.formatString ?? '';
+    if (pattern && isNumberPattern(pattern)) return formatNumberPattern(value, pattern);
+    const hint = pattern || (column.formatHint ?? '');
+    if (isNumberPattern(hint)) return formatNumberPattern(value, hint);
     if (hint.includes('$') || hint === 'currency') return currencyFormat.format(value);
     if (hint.includes('%') || hint === 'percent') return percentFormat.format(value);
     return numberFormat.format(value);

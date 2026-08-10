@@ -47,12 +47,18 @@ public interface ISqlDialect
     string CastToDate(string expression);
 
     /// <summary>
-    /// The SELECT body of a virtual calendar CTE: columns date_key (date),
-    /// year/quarter/month/week/day (int), month_name/day_name (text), one row
-    /// per day from start to end inclusive. Both placeholders are bound as
-    /// date parameters by the compiler.
+    /// The SELECT body of a virtual calendar CTE — one row per day from start
+    /// to end inclusive, emitting exactly the columns of
+    /// <see cref="Modeling.DateTableSchema.Build"/> in order. Both range
+    /// placeholders are bound as date parameters by the compiler.
+    /// <paramref name="fiscalYearStartMonth"/> is a compiler-validated integer
+    /// in [1, 12] and <paramref name="weekStartsMonday"/> a plain flag; they
+    /// may be inlined only as constants / fixed SQL fragments — never as
+    /// client text. Name/label columns must be deterministic regardless of
+    /// server locale (e.g. Postgres non-TM TO_CHAR templates are always
+    /// English), and year_month must sort lexicographically = chronologically.
     /// </summary>
-    string CalendarTableSql(string startPlaceholder, string endPlaceholder);
+    string CalendarTableSql(string startPlaceholder, string endPlaceholder, int fiscalYearStartMonth, bool weekStartsMonday);
 
     /// <summary>
     /// A set-returning expression producing every bucket start from

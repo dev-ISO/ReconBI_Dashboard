@@ -128,7 +128,7 @@ Page:
 
 ```tsx
 <DashboardsProvider baseUrl="/api/rcd/v1" fetcher={fetcher}>
-  <DashboardView dashboardId={id} readonly={!canEdit} />   {/* or DashboardListPanel / ModelEditor */}
+  <DashboardView dashboardId={id} readonly={!canEdit} />   {/* or DashboardListPanel / ModelListPanel / ModelEditor */}
 </DashboardsProvider>
 ```
 

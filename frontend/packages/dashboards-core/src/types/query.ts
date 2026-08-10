@@ -96,6 +96,12 @@ export interface QueryColumn {
   source: string | null;
   dateBucket: DateBucket | null;
   formatHint: string | null;
+  /**
+   * Model measure's Excel-style pattern (Measure.formatString) threaded
+   * through the engine; wins over formatHint in formatCellValue. Optional so
+   * pre-existing literals/mocks keep compiling.
+   */
+  formatString?: string | null;
 }
 
 export type CellValue = string | number | boolean | null;

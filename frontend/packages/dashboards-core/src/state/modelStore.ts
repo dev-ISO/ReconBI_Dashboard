@@ -229,6 +229,30 @@ export class ModelStore {
     }));
   }
 
+  /**
+   * Swaps a relationship's endpoints (table + column together). The wire
+   * format has no one-to-many value — 'from' is ALWAYS the many side — so the
+   * UI expresses one-to-many as a many-to-one with swapped endpoints. Pure
+   * local mutation; cannot introduce duplicates because the add path already
+   * dedupes both orientations of an endpoint pair.
+   */
+  swapRelationshipDirection(id: string): void {
+    this.mutateDefinition((definition) => ({
+      ...definition,
+      relationships: definition.relationships.map((r) =>
+        r.id === id
+          ? {
+              ...r,
+              fromTable: r.toTable,
+              fromColumn: r.toColumn,
+              toTable: r.fromTable,
+              toColumn: r.fromColumn,
+            }
+          : r,
+      ),
+    }));
+  }
+
   removeRelationship(id: string): void {
     this.mutateDefinition((definition) => ({
       ...definition,
@@ -250,6 +274,28 @@ export class ModelStore {
       ...definition,
       measures: definition.measures.map((m) => (m.id === id ? { ...m, ...patch } : m)),
     }));
+  }
+
+  /**
+   * Copies a measure (expression, filters, and metadata included) under a
+   * deduped "… (copy)" name. Pure local mutation; returns the new measure, or
+   * null when the id is unknown.
+   */
+  duplicateMeasure(id: string): Measure | null {
+    const definition = this.state.current?.definition;
+    const source = definition?.measures.find((m) => m.id === id);
+    if (!definition || !source) return null;
+
+    const taken = new Set(definition.measures.map((m) => m.name.toLowerCase()));
+    let name = `${source.name} (copy)`;
+    for (let n = 2; taken.has(name.toLowerCase()); n++) name = `${source.name} (copy ${n})`;
+
+    const copy: Measure = { ...source, id: newId(), name };
+    this.mutateDefinition((current) => ({
+      ...current,
+      measures: [...current.measures, copy],
+    }));
+    return copy;
   }
 
   removeMeasure(id: string): void {

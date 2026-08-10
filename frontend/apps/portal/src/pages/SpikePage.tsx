@@ -163,6 +163,34 @@ export function SpikePage() {
               }))
             }
             onAcceptSuggestion={acceptSuggestion}
+            onDeleteRelationships={(ids) =>
+              setDefinition((d) => ({
+                ...d,
+                relationships: d.relationships.filter((r) => !ids.includes(r.id)),
+              }))
+            }
+            onSetRelationshipActive={(id, isActive) =>
+              setDefinition((d) => ({
+                ...d,
+                relationships: d.relationships.map((r) => (r.id === id ? { ...r, isActive } : r)),
+              }))
+            }
+            onSwapRelationship={(id) =>
+              setDefinition((d) => ({
+                ...d,
+                relationships: d.relationships.map((r) =>
+                  r.id === id
+                    ? {
+                        ...r,
+                        fromTable: r.toTable,
+                        fromColumn: r.toColumn,
+                        toTable: r.fromTable,
+                        toColumn: r.fromColumn,
+                      }
+                    : r,
+                ),
+              }))
+            }
             onRemoveTable={(key) =>
               setDefinition((d) => ({
                 ...d,

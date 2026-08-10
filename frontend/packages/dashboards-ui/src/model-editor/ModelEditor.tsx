@@ -99,6 +99,22 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
   const handleEditRelationship = useCallback((id: string) => setEditingRelId(id), []);
   const handleRemoveTable = useCallback((key: string) => setRemovingTable(key), []);
 
+  // Immediate (no-confirm) relationship mutations — the model is local-until-Save.
+  const handleDeleteRelationships = useCallback(
+    (ids: string[]) => {
+      for (const id of ids) models.removeRelationship(id);
+    },
+    [models],
+  );
+  const handleSetRelationshipActive = useCallback(
+    (id: string, isActive: boolean) => models.updateRelationship(id, { isActive }),
+    [models],
+  );
+  const handleSwapRelationship = useCallback(
+    (id: string) => models.swapRelationshipDirection(id),
+    [models],
+  );
+
   const handleValidate = useCallback(async () => {
     const state = models.store.getState().current;
     if (!state) return;
@@ -269,6 +285,9 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
             onEditRelationship={handleEditRelationship}
             onAcceptSuggestion={handleAcceptSuggestion}
             onRemoveTable={handleRemoveTable}
+            onDeleteRelationships={handleDeleteRelationships}
+            onSetRelationshipActive={handleSetRelationshipActive}
+            onSwapRelationship={handleSwapRelationship}
           />
         </div>
 
@@ -288,7 +307,14 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
           relationship={editingRelationship}
           open
           onClose={() => setEditingRelId(null)}
-          onSave={(patch) => models.updateRelationship(editingRelationship.id, patch)}
+          onSave={(patch) => {
+            models.updateRelationship(editingRelationship.id, {
+              cardinality: patch.cardinality,
+              isActive: patch.isActive,
+            });
+            // One-to-many = many-to-one with swapped endpoints (from = many side).
+            if (patch.swapEndpoints) models.swapRelationshipDirection(editingRelationship.id);
+          }}
           onDelete={() => models.removeRelationship(editingRelationship.id)}
         />
       )}

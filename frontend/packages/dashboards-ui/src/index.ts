@@ -1,6 +1,6 @@
 import './styles/rcd.css';
 
-export const RCD_UI_VERSION = '0.2.0';
+export const RCD_UI_VERSION = '0.3.0';
 
 export {
   DashboardsProvider,
@@ -54,3 +54,5 @@ export { DashboardView } from './dashboard/DashboardView';
 export type { DashboardViewProps } from './dashboard/DashboardView';
 export { DashboardListPanel } from './dashboard/DashboardListPanel';
 export type { DashboardListPanelProps } from './dashboard/DashboardListPanel';
+export { ModelListPanel } from './model-list/ModelListPanel';
+export type { ModelListPanelProps } from './model-list/ModelListPanel';
