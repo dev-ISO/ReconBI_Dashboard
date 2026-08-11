@@ -1,5 +1,5 @@
 import { useSyncExternalStore } from 'react';
-import { createFetchFetcher, type RcdFetcher } from '@recon/dashboards-core';
+import { createFetchFetcher, RcdApiError, type RcdFetcher } from '@recon/dashboards-core';
 
 // Demo-host authentication: pick a canned user, hold the JWT in localStorage.
 // This whole module is portal-only; hosts wire their own auth into RcdFetcher.
@@ -55,5 +55,37 @@ export function useCurrentUser(): string | null {
   );
 }
 
-/** Fetcher handed to DashboardsProvider — attaches the demo JWT. */
-export const portalFetcher: RcdFetcher = createFetchFetcher(getToken);
+/**
+ * Silent re-login on token expiry. Demo tokens are passwordless (the demo
+ * host mints one for any canned user), so an expired JWT is never a dead
+ * end: mint a fresh token for the remembered user and retry once. Concurrent
+ * 401s share one in-flight re-login.
+ */
+let relogging: Promise<void> | null = null;
+const reloginAsStoredUser = (): Promise<void> => {
+  const username = getUsername();
+  if (!username) return Promise.reject(new Error('No demo user selected.'));
+  relogging ??= loginAs(username).finally(() => {
+    relogging = null;
+  });
+  return relogging;
+};
+
+const baseFetcher = createFetchFetcher(getToken);
+
+/** Fetcher handed to DashboardsProvider — attaches the demo JWT and
+ *  transparently refreshes it when the server says 401. */
+export const portalFetcher: RcdFetcher = async <T,>(
+  path: string,
+  init?: Parameters<RcdFetcher>[1],
+): Promise<T> => {
+  try {
+    return await baseFetcher<T>(path, init);
+  } catch (error) {
+    if (error instanceof RcdApiError && error.status === 401 && getUsername() !== null) {
+      await reloginAsStoredUser();
+      return baseFetcher<T>(path, init);
+    }
+    throw error;
+  }
+};

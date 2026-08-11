@@ -398,10 +398,22 @@ export interface DashboardLayoutDoc {
    * click emphasis naturally only renders on its own page.
    */
   crossFilterScope?: CrossFilterScope | null;
+  /**
+   * Default view-mode sizing (v1-compatible evolution; absent = 'actual').
+   * 'fitPage' scales the page's grid DOWN (never up past 1:1) so its full
+   * height fits the box the host gives the dashboard — no vertical scrolling.
+   * Viewers can override per session from the toolbar's View control; that
+   * override is transient and never written here. Edit mode always renders
+   * 1:1 (drag math), and the phone stack ignores fit entirely.
+   */
+  defaultViewFit?: ViewFitMode | null;
 }
 
 /** Reach of active cross-filters (layout doc `crossFilterScope`). */
 export type CrossFilterScope = 'page' | 'dashboard';
+
+/** View-mode page sizing (layout doc `defaultViewFit` + the toolbar control). */
+export type ViewFitMode = 'actual' | 'fitPage';
 
 export const isSlicerTile = (
   tile: DashboardTile,

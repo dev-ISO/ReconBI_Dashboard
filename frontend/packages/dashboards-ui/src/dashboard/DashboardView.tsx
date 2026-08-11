@@ -34,6 +34,7 @@ import {
   type FilterIndicatorStyle,
   type FilterValue,
   type QueryColumn,
+  type ViewFitMode,
 } from '@recon/dashboards-core';
 import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuilder';
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
@@ -59,6 +60,7 @@ import {
 } from './FilterIndicator';
 import { FilterIndicatorMenu } from './FilterIndicatorMenu';
 import { FiltersPane } from './FiltersPane';
+import { FitPageViewport } from './FitPageViewport';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
 import { MOBILE_BREAKPOINT, MobileLayoutEditor, MobileStack } from './MobileLayout';
@@ -311,6 +313,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [placementOverride, setPlacementOverride] = useState<FilterIndicatorPlacement | null>(null);
   /** Pointer position while the indicator is being dragged; null = not dragging. */
   const [indicatorDragPos, setIndicatorDragPos] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * View-mode session override of the doc's default view sizing (null =
+   * follow `layout.defaultViewFit`). Same doctrine as placementOverride:
+   * transient personal tweak, never persisted; edit-mode picks write the doc
+   * default instead (and edit mode always renders 1:1 regardless).
+   */
+  const [viewFitOverride, setViewFitOverride] = useState<ViewFitMode | null>(null);
 
   // Ctrl/Cmd-click detection for additive cross-filtering (see module header).
   useClickModifierTracker();
@@ -1235,6 +1244,22 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const isMobileView =
     mode === 'view' && containerWidth !== null && containerWidth < MOBILE_BREAKPOINT;
 
+  /* ------------------------------------------------------ view fit (scale) */
+
+  /**
+   * Effective view sizing: edit mode shows (and edits) the authored doc
+   * default but always RENDERS 1:1 (drag/resize math must stay unscaled);
+   * view mode honors the session override first, then the doc default. The
+   * phone stack ignores fit entirely — scaling a single-column stack down
+   * would just shrink text.
+   */
+  const docViewFit: ViewFitMode =
+    (current?.id === dashboardId ? current.layout.defaultViewFit : null) ?? 'actual';
+  const effectiveViewFit: ViewFitMode =
+    mode === 'edit' ? docViewFit : (viewFitOverride ?? docViewFit);
+  const fitPageActive =
+    mode === 'view' && !isMobileView && effectiveViewFit === 'fitPage';
+
   // The phone-layout editor only makes sense while editing; leaving edit mode
   // (save/discard) drops back to the desktop canvas.
   useEffect(() => {
@@ -1510,6 +1535,19 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         onConfigureFilterIndicator={
           editable ? (position) => setIndicatorMenu(position) : undefined
         }
+        viewFit={effectiveViewFit}
+        // View menu: transient session choice in view mode; the persisted doc
+        // default in edit mode (store normalizes 'actual' back to absent).
+        // Hidden in the phone stack, where fit doesn't apply.
+        onChangeViewFit={
+          isMobileView
+            ? undefined
+            : mode === 'edit'
+              ? editable
+                ? (fit) => runtime.dashboards.setDefaultViewFit(fit)
+                : undefined
+              : (fit) => setViewFitOverride(fit)
+        }
         // 'header' docking slot: compact chips inline in the toolbar row.
         centerContent={
           headerIndicator ? (
@@ -1637,13 +1675,18 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               renderTile={renderTile}
             />
           ) : (
-            <DashboardGrid
-              items={gridItems}
-              editable={editable}
-              onLayoutChange={handleLayoutChange}
-              renderItem={renderTile}
-              draggableHandle=".rcd-tile-drag-handle"
-            />
+            // Fit to page (view mode only): the viewport scales the grid down
+            // so the whole page fits the available height; inactive it is a
+            // style-less passthrough. Edit mode and MobileStack never scale.
+            <FitPageViewport active={fitPageActive}>
+              <DashboardGrid
+                items={gridItems}
+                editable={editable}
+                onLayoutChange={handleLayoutChange}
+                renderItem={renderTile}
+                draggableHandle=".rcd-tile-drag-handle"
+              />
+            </FitPageViewport>
           )}
         </div>
 

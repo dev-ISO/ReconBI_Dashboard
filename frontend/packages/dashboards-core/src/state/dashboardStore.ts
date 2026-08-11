@@ -28,6 +28,7 @@ import {
   type SlicerValues,
   type SlicerVariant,
   type TextTileSpec,
+  type ViewFitMode,
 } from '../types/dashboard';
 import type {
   CellValue,
@@ -1358,6 +1359,19 @@ export class DashboardStore {
       patch === null ? null : { ...(current.layout.filterIndicator ?? {}), ...patch };
     if (stableStringify(current.layout.filterIndicator ?? null) === stableStringify(next)) return;
     this.mutateLayout((layout) => ({ ...layout, filterIndicator: next }));
+  }
+
+  /**
+   * Doc-level default view sizing (persisted with the layout on save; written
+   * from the toolbar's View control in EDIT mode). 'actual'/null normalize to
+   * null — absent means actual, so an untouched dashboard never gains the key.
+   * View-mode viewer overrides are transient component state and never route
+   * through here.
+   */
+  setDefaultViewFit(fit: ViewFitMode | null): void {
+    const next = fit === 'actual' ? null : fit;
+    if ((this.state.current?.layout.defaultViewFit ?? null) === next) return;
+    this.mutateLayout((layout) => ({ ...layout, defaultViewFit: next }));
   }
 
   /* ------------------------------------------------------- field parameters */

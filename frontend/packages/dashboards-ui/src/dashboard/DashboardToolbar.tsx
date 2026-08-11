@@ -9,20 +9,23 @@ import {
   Highlighter,
   Image as ImageIcon,
   Mail,
+  Maximize,
   MoreHorizontal,
   MoreVertical,
   Pencil,
   Plus,
   Printer,
   RefreshCw,
+  Scan,
   Share2,
+  Shrink,
   SlidersHorizontal,
   Smartphone,
   Trash2,
   Type,
   Variable,
 } from 'lucide-react';
-import type { AlertFiring } from '@recon/dashboards-core';
+import type { AlertFiring, ViewFitMode } from '@recon/dashboards-core';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdInput, RcdSelect } from '../primitives';
 
 /** Bookmark row data the toolbar menu needs (name + identity only). */
@@ -97,6 +100,13 @@ export interface DashboardToolbarProps {
    * indicator's 'header' docking slot (compact chips, out of the way).
    */
   centerContent?: ReactNode;
+  /** Current view sizing shown by the View menu (control hidden when the handler is absent). */
+  viewFit?: ViewFitMode;
+  /**
+   * Changes the view sizing: a transient per-session viewer choice in VIEW
+   * mode, the persisted doc default (`defaultViewFit`) in EDIT mode.
+   */
+  onChangeViewFit?: (fit: ViewFitMode) => void;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -148,6 +158,8 @@ export function DashboardToolbar({
   onToggleMobileLayout,
   onConfigureFilterIndicator,
   centerContent,
+  viewFit = 'actual',
+  onChangeViewFit,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -193,6 +205,10 @@ export function DashboardToolbar({
           onRename={onRenameBookmark}
           onDelete={onDeleteBookmark}
         />
+      )}
+
+      {onChangeViewFit && (
+        <ViewMenu viewFit={viewFit} isEdit={mode === 'edit'} onChange={onChangeViewFit} />
       )}
 
       {onToggleFilters && (
@@ -451,6 +467,104 @@ function AlertsBell({ firings }: { firings: AlertFiring[] }) {
               </div>
             ))
           )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * The View menu (Power BI's View > page-sizing options): Actual size vs Fit
+ * to page, with a check on the active option. In VIEW mode picking an option
+ * is a transient per-session choice; in EDIT mode it writes the dashboard's
+ * persisted default (`defaultViewFit`, saved with the layout) — the caption
+ * under the items says so. Same card pattern as AddTileMenu; the trigger gets
+ * pressed styling while the page is fitted so the state reads at a glance.
+ */
+function ViewMenu({
+  viewFit,
+  isEdit,
+  onChange,
+}: {
+  viewFit: ViewFitMode;
+  isEdit: boolean;
+  onChange: (fit: ViewFitMode) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        setOpen(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [open]);
+
+  const pick = (fit: ViewFitMode) => {
+    setOpen(false);
+    onChange(fit);
+  };
+
+  const options: { fit: ViewFitMode; icon: ReactNode; label: string }[] = [
+    { fit: 'actual', icon: <Maximize size={14} />, label: 'Actual size' },
+    { fit: 'fitPage', icon: <Shrink size={14} />, label: 'Fit to page' },
+  ];
+
+  return (
+    <div className="relative shrink-0" ref={rootRef}>
+      <RcdIconButton
+        aria-label="View size"
+        title={isEdit ? 'View size (default for viewers)' : 'View size'}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        className={
+          open || viewFit === 'fitPage' ? 'bg-black/5 text-rcd-text dark:bg-white/10' : ''
+        }
+      >
+        <Scan size={14} />
+      </RcdIconButton>
+
+      {open && (
+        <div
+          role="menu"
+          aria-label="View size"
+          className="absolute right-0 top-full z-40 mt-1 w-48 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
+        >
+          {options.map((option) => (
+            <button
+              key={option.fit}
+              type="button"
+              role="menuitemradio"
+              aria-checked={viewFit === option.fit}
+              onClick={() => pick(option.fit)}
+              className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+            >
+              <span className="w-3.5 shrink-0">
+                {viewFit === option.fit && <Check size={14} className="text-rcd-accent" />}
+              </span>
+              <span aria-hidden className="shrink-0 text-rcd-muted">
+                {option.icon}
+              </span>
+              {option.label}
+            </button>
+          ))}
+          <p className="border-t border-rcd-border px-3 pb-0.5 pt-1.5 text-[11px] leading-snug text-rcd-muted">
+            {isEdit
+              ? 'Saved with the dashboard as the default for viewers.'
+              : 'Fit to page scales the page to fit without scrolling.'}
+          </p>
         </div>
       )}
     </div>
