@@ -231,6 +231,8 @@ export interface ChartRendererProps {
   /** Total pages; null = unknown, keeps "next" enabled until the tile knows. */
   tablePageCount?: number | null;
   onTablePageChange?: (page: number) => void;
+  /** Total row count over the full filtered result; null = unknown. */
+  tableTotalRows?: number | null;
   /** Full-data totals aligned to the measure columns (bold pinned bottom row). */
   totalsRow?: (number | null)[] | null;
   /** Column resize / header drag-to-reorder patches for the tile to persist. */
@@ -2000,6 +2002,10 @@ function CartesianChart({
   const dragMouseDown = dragZoomOn
     ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
         if (event.button !== 0) return;
+        // Kill the native text-selection anchor: without this a drag-zoom
+        // sweep selects every x-axis label it passes over (the CSS
+        // user-select guard in chart.css is the belt; this is the braces).
+        event.preventDefault();
         const idx = displayIndexFromState(state);
         if (idx === undefined) return;
         dragRef.current = { startIdx: idx, startX: event.clientX, moved: false };
@@ -3033,6 +3039,7 @@ export default function ChartRenderer({
   tablePage = 0,
   tablePageCount = null,
   onTablePageChange,
+  tableTotalRows = null,
   totalsRow = null,
   onTableLayoutChange,
   tableFilters,
@@ -3700,6 +3707,7 @@ export default function ChartRenderer({
           tablePage={tablePage}
           tablePageCount={tablePageCount}
           onTablePageChange={onTablePageChange}
+          tableTotalRows={tableTotalRows}
           totalsRow={totalsRow}
           onTableLayoutChange={onTableLayoutChange}
           tableFilters={tableFilters}

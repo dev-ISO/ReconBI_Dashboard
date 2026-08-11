@@ -2224,6 +2224,15 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           {isCartesian && (
             <>
               <CheckboxRow
+                label="Include blank dates"
+                checked={format.excludeBlankDates === false}
+                onChange={(checked) => patch({ excludeBlankDates: checked ? false : undefined })}
+              />
+              <p className="text-xs text-rcd-muted">
+                Rows without a date are dropped from date axes by default — a (Blank) category
+                skews the timeline. Check to keep them.
+              </p>
+              <CheckboxRow
                 label="Trim empty edge periods"
                 checked={format.trimEmptyEdges ?? false}
                 onChange={(checked) => patch({ trimEmptyEdges: checked || undefined })}

@@ -16,6 +16,8 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Filter as FilterIcon,
   Loader2,
 } from 'lucide-react';
@@ -171,6 +173,13 @@ export interface TableChartProps {
   /** Total pages; null = unknown -> keep "next" enabled until the tile says otherwise. */
   tablePageCount?: number | null;
   onTablePageChange?: (page: number) => void;
+  /**
+   * Total row count over the FULL filtered result (the tile's lazy companion
+   * count query); null = unknown. Drives the "of N" row label and, together
+   * with tablePageCount, the Last-page jump. The pager degrades gracefully
+   * without it: plain "Page X", no Last button.
+   */
+  tableTotalRows?: number | null;
   /**
    * Full-data totals, aligned to the MEASURE columns in RESULT order (index i
    * = i-th measure column). Renders a bold pinned bottom "Total" row.
@@ -873,6 +882,7 @@ export function TableChart({
   tablePage = 0,
   tablePageCount = null,
   onTablePageChange,
+  tableTotalRows = null,
   totalsRow = null,
   onTableLayoutChange,
   tableFilters,
@@ -986,7 +996,19 @@ export function TableChart({
 
   // ---- resize (pointer capture on the header-edge handle) -----------------
   const resizable = Boolean(onTableLayoutChange);
-  const resizeRef = useRef<{ name: string; startX: number; startWidth: number } | null>(null);
+  /**
+   * `width` is the LIVE dragged width, kept on the ref alongside the draft
+   * state: pointermove is a continuous-priority event, so the state update
+   * from the final move may not have committed when pointerup fires — a
+   * commit that read `draftWidths` here could see a stale (or empty) draft
+   * and silently drop the resize. The ref always holds the exact last width.
+   */
+  const resizeRef = useRef<{
+    name: string;
+    startX: number;
+    startWidth: number;
+    width: number | null;
+  } | null>(null);
   const startResize = (name: string) => (e: ReactPointerEvent<HTMLSpanElement>) => {
     e.preventDefault();
     e.stopPropagation();
@@ -994,21 +1016,34 @@ export function TableChart({
       widths[name] ??
       headerRefs.current.get(name)?.getBoundingClientRect().width ??
       FALLBACK_COLUMN_WIDTH;
-    resizeRef.current = { name, startX: e.clientX, startWidth };
+    resizeRef.current = { name, startX: e.clientX, startWidth, width: null };
     e.currentTarget.setPointerCapture(e.pointerId);
   };
   const moveResize = (e: ReactPointerEvent<HTMLSpanElement>) => {
     const drag = resizeRef.current;
     if (!drag) return;
     const width = Math.max(MIN_COLUMN_WIDTH, Math.round(drag.startWidth + e.clientX - drag.startX));
+    drag.width = width;
     setDraftWidths((prev) => (prev[drag.name] === width ? prev : { ...prev, [drag.name]: width }));
   };
   const endResize = () => {
     const drag = resizeRef.current;
     if (!drag) return;
     resizeRef.current = null;
-    const width = draftWidths[drag.name];
-    if (width !== undefined) onTableLayoutChange?.({ columnWidths: { [drag.name]: width } });
+    if (drag.width !== null) {
+      onTableLayoutChange?.({ columnWidths: { [drag.name]: drag.width } });
+    }
+    // Release the draft: the consumer's echo (doc write in edit mode, layout
+    // override in view mode) owns the value from here. A draft that lingered
+    // forever used to MASK later doc/override changes — the doc could silently
+    // lose widths while the table still painted them, so resizes only
+    // "un-stuck" after a remount. The commit above and this clear land in one
+    // batched render alongside the consumer's echo, so nothing flickers.
+    setDraftWidths((prev) => {
+      if (!(drag.name in prev)) return prev;
+      const { [drag.name]: _released, ...rest } = prev;
+      return rest;
+    });
   };
 
   // ---- reorder (HTML5 header drag) ----------------------------------------
@@ -1200,15 +1235,20 @@ export function TableChart({
   };
   const showPager = paged || sizePickerEnabled;
   /**
-   * Total row count when derivable: unpaged tables have every row in hand;
-   * paged tables learn the total once the LAST page is reached (page count
-   * comes from the tile's short-page detection).
+   * Total row count: the tile's companion count query when it has answered
+   * (tableTotalRows), else derivable locally — unpaged tables have every row
+   * in hand; paged tables learn the total once the LAST page is reached
+   * (page count via the tile's short-page detection).
    */
-  const totalRows = !paged
-    ? result.rows.length
-    : tablePageCount != null && tablePage === tablePageCount - 1
-      ? tablePage * pageSize + rows.length
-      : null;
+  const totalRows =
+    tableTotalRows ??
+    (!paged
+      ? result.rows.length
+      : tablePageCount != null && tablePage === tablePageCount - 1
+        ? tablePage * pageSize + rows.length
+        : null);
+  const canLast =
+    Boolean(onTablePageChange) && tablePageCount != null && tablePage < tablePageCount - 1;
 
   const headerLabel = (column: QueryColumn): string =>
     column.role === 'measure'
@@ -1595,11 +1635,20 @@ export function TableChart({
             {!paged
               ? `${totalRows} rows`
               : rows.length > 0
-                ? `rows ${firstRowNumber}–${lastRowNumber}${totalRows != null ? ` of ${totalRows}` : ''}`
+                ? `${totalRows != null ? `${totalRows} rows · ` : ''}rows ${firstRowNumber}–${lastRowNumber}`
                 : 'no rows'}
           </span>
           {paged && (
             <>
+              <button
+                type="button"
+                disabled={!canPrev}
+                onClick={() => onTablePageChange?.(0)}
+                className="rounded p-0.5 enabled:hover:bg-black/5 disabled:opacity-40 enabled:dark:hover:bg-white/10"
+                aria-label="First page"
+              >
+                <ChevronsLeft size={14} />
+              </button>
               <button
                 type="button"
                 disabled={!canPrev}
@@ -1621,6 +1670,17 @@ export function TableChart({
                 aria-label="Next page"
               >
                 <ChevronRight size={14} />
+              </button>
+              {/* Last-page jump needs a known page count; without one it sits
+                  disabled rather than guessing (graceful "Page X" mode). */}
+              <button
+                type="button"
+                disabled={!canLast}
+                onClick={() => tablePageCount != null && onTablePageChange?.(tablePageCount - 1)}
+                className="rounded p-0.5 enabled:hover:bg-black/5 disabled:opacity-40 enabled:dark:hover:bg-white/10"
+                aria-label="Last page"
+              >
+                <ChevronsRight size={14} />
               </button>
             </>
           )}

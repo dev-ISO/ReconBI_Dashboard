@@ -28,6 +28,18 @@
   border-radius: 6px;
 }
 
+/* BUG FIX — drag-zoom selecting axis text: a drag gesture across the plot
+   used to sweep a native text selection over every SVG x-axis label (and any
+   HTML label overlays) it passed, painting them all blue. Chart text is never
+   prose — labels, ticks and legends have no copy-selection use — so suppress
+   selection for the whole recharts wrapper (user-select inherits). A drag
+   that STARTS in a no-select subtree can't anchor a selection at all, which
+   also protects text outside the chart from being swept into one. */
+.rcd-root .recharts-wrapper {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 /* Zoom control cluster (format.zoom): the compact corner button toolbar that
    replaced the recharts Brush strip. Semi-transparent until hovered or
    keyboard-focused so it never competes with the data; opacity (not display)

@@ -33,8 +33,12 @@ export interface ChartTableSort {
 
 /** Persistable table layout tweak reported by the renderer (drag/resize). */
 export interface ChartTableLayoutPatch {
+  /** Only the column(s) a resize touched, px — consumers must DEEP-merge
+   *  this map over the stored one (a shallow spread drops other columns). */
   columnWidths?: Record<string, number>;
   columnOrder?: string[];
+  /** Viewer's rows-per-page pick from the pager (0 = "All"/unpaged). */
+  pageSize?: number;
 }
 
 /**
@@ -92,6 +96,8 @@ interface RendererPointHandlers {
   /** Known page count; null while unknown (› disabled on a short page). */
   tablePageCount?: number | null;
   onTablePageChange?: (page: number) => void;
+  /** Total row count over the full filtered result; null = unknown. */
+  tableTotalRows?: number | null;
   /** Totals row aligned to measure columns; null = none. */
   totalsRow?: (number | null)[] | null;
   /** Column drag/resize report (persist or keep transient — caller's call). */
@@ -157,6 +163,11 @@ export interface ChartTileProps {
   tablePage?: number;
   tablePageCount?: number | null;
   onTablePageChange?: (page: number) => void;
+  /**
+   * Total row count over the full filtered result (the dashboard tile's lazy
+   * companion count query); null = unknown -> the pager degrades to "Page X".
+   */
+  tableTotalRows?: number | null;
   /** Totals row aligned to measure columns (companion no-dimension query). */
   totalsRow?: (number | null)[] | null;
   /** Column width/order drag report (persist or transient — caller's call). */
@@ -210,6 +221,7 @@ export function ChartTile({
   tablePage = 0,
   tablePageCount = null,
   onTablePageChange,
+  tableTotalRows = null,
   totalsRow = null,
   onTableLayoutChange,
   tableFilters,
@@ -255,16 +267,15 @@ export function ChartTile({
   const okRowCount = entry?.status === 'ok' && entry.data ? entry.data.rows.length : null;
 
   /**
-   * Known page count: a SHORT page (fewer rows than pageSize) marks the last
-   * page — › disables; a full page keeps it unknown (null). The caller's
-   * tablePageCount passes through when paging is off.
+   * Known page count. The caller's tablePageCount (companion count query) is
+   * authoritative when present; otherwise a SHORT page (fewer rows than
+   * pageSize) marks the last page — › disables — and a full page keeps it
+   * unknown (null). Passes through unchanged when paging is off.
    */
-  const derivedPageCount =
-    pagingActive && okRowCount !== null
-      ? okRowCount < pageSize
-        ? tablePage + 1
-        : null
-      : tablePageCount;
+  const derivedPageCount = pagingActive
+    ? (tablePageCount ??
+      (okRowCount !== null && okRowCount < pageSize ? tablePage + 1 : null))
+    : tablePageCount;
 
   // Paging past the end (exactly-full last page + ›) lands on an empty page;
   // step back automatically so the user is never stranded on "No data".
@@ -328,6 +339,7 @@ export function ChartTile({
             tablePage={tablePage}
             tablePageCount={derivedPageCount}
             onTablePageChange={onTablePageChange}
+            tableTotalRows={tableTotalRows}
             totalsRow={totalsRow}
             onTableLayoutChange={onTableLayoutChange}
             tableFilters={tableFilters}

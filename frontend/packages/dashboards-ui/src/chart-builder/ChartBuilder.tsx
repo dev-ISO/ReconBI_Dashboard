@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -20,10 +20,11 @@ import {
   type ModelDefinition,
 } from '@recon/dashboards-core';
 import { shapeChartData } from '../chart/chartData';
-import { ChartTile } from '../chart/ChartTile';
+import { ChartTile, type ChartTableLayoutPatch } from '../chart/ChartTile';
 import { FormatPanel } from '../chart/FormatPanel';
 import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdInput } from '../primitives';
+import { PaneDivider, useBuilderPanes } from './builderLayout';
 import { ChartTypePicker } from './ChartTypePicker';
 import { FieldList } from './FieldList';
 import { FilterEditor } from './FilterEditor';
@@ -85,6 +86,16 @@ export function ChartBuilder({
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [filterTarget, setFilterTarget] = useState<FilterEditorTarget | null>(null);
   const lastDragEndAt = useRef(0);
+
+  // Manual pane sizing (drag the hairline dividers); fluid grid until touched.
+  const gridRef = useRef<HTMLDivElement>(null);
+  const fieldsPaneRef = useRef<HTMLDivElement>(null);
+  const middlePaneRef = useRef<HTMLDivElement>(null);
+  const paneRefs = useMemo(
+    () => ({ fields: fieldsPaneRef, middle: middlePaneRef }),
+    [],
+  );
+  const panes = useBuilderPanes(gridRef, paneRefs);
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
@@ -150,6 +161,27 @@ export function ChartBuilder({
     }));
   };
 
+  /**
+   * Preview-table drags (column resize / header reorder / pager page-size
+   * pick) persist straight into the WORKING SPEC's format.table, exactly like
+   * the dashboard tile does in edit mode — so table layout is editable from
+   * the builder itself. TableChart emits only the touched column in
+   * columnWidths, hence the deep merge.
+   */
+  const handlePreviewTableLayout = useCallback((patch: ChartTableLayoutPatch) => {
+    setDraft((current) => {
+      if (current.type !== 'table') return current;
+      const table = { ...current.format.table };
+      if (patch.columnWidths) {
+        table.columnWidths = { ...current.format.table?.columnWidths, ...patch.columnWidths };
+      }
+      if (patch.columnOrder) table.columnOrder = patch.columnOrder;
+      // pageSize rides the same layout channel (renderer contract).
+      if (patch.pageSize !== undefined) table.pageSize = patch.pageSize;
+      return { ...current, format: { ...current.format, table } };
+    });
+  }, []);
+
   const editingClause =
     filterTarget !== null && filterTarget.index !== null
       ? (draft.query.filters[filterTarget.index] ?? null)
@@ -187,11 +219,21 @@ export function ChartBuilder({
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
       >
-        {/* Fluid columns: field list and the wells column narrow within their
-            minmax ranges; the preview takes every remaining pixel, so
-            resizing the dialog genuinely grows the chart on both axes. */}
-        <div className="grid min-h-0 flex-1 grid-cols-[minmax(6.5rem,11.5rem)_minmax(13rem,21rem)_minmax(8rem,1fr)] gap-3">
-          <div className="min-h-0 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface">
+        {/* Fluid columns by default: field list and the wells column narrow
+            within their minmax ranges; the preview takes every remaining
+            pixel, so resizing the dialog genuinely grows the chart on both
+            axes. Dragging a hairline divider pins that pane's width (persisted
+            in localStorage; double-click resets to fluid) — the divider
+            columns replace the old gap so the rhythm is unchanged. */}
+        <div
+          ref={gridRef}
+          className="grid min-h-0 flex-1"
+          style={{ gridTemplateColumns: panes.gridTemplateColumns }}
+        >
+          <div
+            ref={fieldsPaneRef}
+            className="min-h-0 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface"
+          >
             <FieldList
               model={model}
               catalog={catalog ?? null}
@@ -203,7 +245,9 @@ export function ChartBuilder({
             />
           </div>
 
-          <div className="flex min-h-0 flex-col gap-3">
+          <PaneDivider pane="fields" panes={panes} label="Resize field list" />
+
+          <div ref={middlePaneRef} className="flex min-h-0 flex-col gap-3">
             <div
               className="flex w-fit shrink-0 items-center gap-1 rounded-lg bg-black/5 p-1 dark:bg-white/10"
               role="tablist"
@@ -286,12 +330,21 @@ export function ChartBuilder({
             )}
           </div>
 
+          <PaneDivider pane="middle" panes={panes} label="Resize settings column" />
+
           <div className="flex min-h-0 flex-col gap-1">
             <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
               Preview
             </span>
             <div className="min-h-[10rem] flex-1 rounded-md border border-rcd-border bg-rcd-surface p-2">
-              <ChartTile spec={draft} modelId={modelId} debounceMs={300} />
+              <ChartTile
+                spec={draft}
+                modelId={modelId}
+                debounceMs={300}
+                onTableLayoutChange={
+                  draft.type === 'table' ? handlePreviewTableLayout : undefined
+                }
+              />
             </div>
           </div>
         </div>

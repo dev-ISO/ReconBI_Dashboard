@@ -427,6 +427,16 @@ export interface ChartFormat {
    * 12-month warm-up of a period-change calc); default false.
    */
   trimEmptyEdges?: boolean;
+  /**
+   * Whether rows whose DATE-BUCKETED axis cell is blank (null) are dropped at
+   * shape time on cartesian charts (line/area/column/bar and their stacked
+   * variants — every type shaped through shapeChartData). Default TRUE: a
+   * "(Blank)" date bucket is almost always missing data that skews a time
+   * series, so an UNSET field drops it — consistent with how densified calc
+   * paths already drop null axis rows. Set false to keep the explicit
+   * "(Blank)" category. Non-date axes always keep their blank category.
+   */
+  excludeBlankDates?: boolean;
   /** Interactive zoom/pan view tools (cartesian charts). */
   zoom?: ChartZoomOptions;
   /**

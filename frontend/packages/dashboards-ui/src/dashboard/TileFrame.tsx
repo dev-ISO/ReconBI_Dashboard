@@ -226,15 +226,20 @@ export function TileFrame({
 
       {hideHeader && (editable || headerExtra) && (
         <>
-          {/* Slim hover drag strip: always in the DOM (react-grid-layout binds
-              by class), revealed on tile hover. Sits above the body so grabbing
-              the top edge always moves the tile. */}
+          {/* Slim hover drag strip — EDIT MODE ONLY (view mode never needs a
+              drag handle). Always in the DOM (react-grid-layout binds by
+              class) and always TRANSPARENT: the old solid hover bar covered
+              frameless tiles' inner titles. Only the small centered grip pill
+              paints on hover; the full-width strip stays an invisible grab
+              area at the very top edge. */}
           {editable && (
             <div
-              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-center justify-center rounded-t-xl border-b border-rcd-border bg-rcd-surface opacity-0 transition-opacity group-hover:opacity-90"
+              className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-start justify-center"
               title={`Drag to move ${title}`}
             >
-              <GripHorizontal size={12} className="text-rcd-muted" />
+              <span className="mt-[3px] flex items-center rounded-full border border-rcd-border bg-rcd-surface px-1.5 py-px opacity-0 shadow-sm transition-opacity group-hover:opacity-90">
+                <GripHorizontal size={10} className="text-rcd-muted" />
+              </span>
             </div>
           )}
           {/* Floating header extras + kebab, above the drag strip so they stay

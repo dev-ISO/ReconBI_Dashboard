@@ -142,6 +142,16 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   const axisIndex = axisColumn ? result.columns.indexOf(axisColumn) : -1;
   const axisIsDate = Boolean(axisColumn && axisColumn.dateBucket !== null);
 
+  // format.excludeBlankDates (default TRUE): rows with a null DATE-BUCKETED
+  // axis cell are dropped before shaping — a "(Blank)" bucket on a time axis
+  // is missing data that skews the series (same doctrine as densification's
+  // null-axis drop in the calc paths). Explicit false keeps the blank
+  // category; non-date axes are never touched.
+  const sourceRows =
+    axisIsDate && axisIndex >= 0 && spec.format.excludeBlankDates !== false
+      ? result.rows.filter((row) => (row[axisIndex] ?? null) !== null)
+      : result.rows;
+
   if (!hasLegend) {
     const series: ChartSeries[] = measureColumns.map((column, i) => ({
       key: column.name,
@@ -151,7 +161,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
       measureLabel: column.label,
     }));
 
-    const data = result.rows.map((row) => {
+    const data = sourceRows.map((row) => {
       const item: Record<string, CellValue> = {
         [AXIS_KEY]: axisColumn ? categoryLabel(row[axisIndex] ?? null, axisColumn, spec) : '',
         [RAW_AXIS_KEY]: axisColumn ? (row[axisIndex] ?? null) : null,
@@ -191,7 +201,7 @@ export function shapeChartData(result: QueryResult, spec: ChartSpec): ShapedChar
   const legendValues: string[] = [];
   const legendRawByLabel = new Map<string, CellValue>();
 
-  for (const row of result.rows) {
+  for (const row of sourceRows) {
     const axisLabel = axisColumn ? categoryLabel(row[axisIndex] ?? null, axisColumn, spec) : '';
     const legendLabel = formatCellValue(row[legendIndex] ?? null, legendColumn);
     if (!legendValues.includes(legendLabel)) {

@@ -89,6 +89,28 @@ const TABLE_ROOT: TileTableState = { sort: null, sortSpecs: NO_SORT_SPECS, page:
 
 const NO_TABLE_FILTERS: TableColumnFilter[] = [];
 
+/** format.table shape (kept structural — the core type is not re-exported). */
+type TableOptionsShape = NonNullable<ChartSpec['format']['table']>;
+
+/**
+ * Merges a renderer layout patch over stored table options. columnWidths is
+ * DEEP-merged: a resize patch carries only the column(s) the gesture touched,
+ * so a shallow spread would clobber every previously resized column's width —
+ * the "my column widths don't stick" bug (each new resize silently erased the
+ * others from the doc; the renderer's transient drag draft masked the loss
+ * until a remount made it visible).
+ */
+const mergeTablePatch = (
+  base: TableOptionsShape | undefined,
+  patch: ChartTableLayoutPatch,
+): TableOptionsShape => ({
+  ...base,
+  ...patch,
+  ...(patch.columnWidths
+    ? { columnWidths: { ...base?.columnWidths, ...patch.columnWidths } }
+    : null),
+});
+
 /** A chart's dimensions in wire order [axis, legend, smallMultiples] (mirrors toWireSpec). */
 const wireDimensionsOf = (chart: ChartSpec): DimensionRef[] => {
   const dims: DimensionRef[] = [];
@@ -481,7 +503,7 @@ export function DashboardChartTile({
   // the layout-patch channel; 0 = "All"/unpaged) wins over the authored
   // table.pageSize. The pick is transient view state, so it re-queries via
   // the existing offset/limit mechanism without touching the doc.
-  const pageSizePick = (tableLayoutOverride as { pageSize?: number } | null)?.pageSize;
+  const pageSizePick = tableLayoutOverride?.pageSize;
   const effectivePageSize = pageSizePick ?? tableOptions?.pageSize ?? null;
   const pageSize =
     isTable && effectivePageSize != null && effectivePageSize > 0 ? effectivePageSize : null;
@@ -654,7 +676,9 @@ export function DashboardChartTile({
   const handleTableLayoutChange = useCallback(
     (patch: ChartTableLayoutPatch) => {
       if (editable) {
-        // EDIT mode: persist into the BASE chart's format.table (dirties the doc).
+        // EDIT mode: persist into the BASE chart's format.table (dirties the
+        // doc). columnWidths merge DEEP (see mergeTablePatch) so resizing one
+        // column never erases the widths of previously resized ones.
         const state = runtime.dashboards.store.getState();
         const tile = (state.current?.layout.pages ?? [])
           .flatMap((page) => page.tiles)
@@ -664,13 +688,21 @@ export function DashboardChartTile({
           ...tile.chart,
           format: {
             ...tile.chart.format,
-            table: { ...tile.chart.format.table, ...patch },
+            table: mergeTablePatch(tile.chart.format.table, patch),
           },
         });
         return;
       }
-      // View mode: transient personal tweak only.
-      setTableLayoutOverride((prev) => ({ ...prev, ...patch }));
+      // View mode: transient personal tweak only — accumulated with the same
+      // deep columnWidths merge, and kept in component state so it survives
+      // table page flips within the session.
+      setTableLayoutOverride((prev) => ({
+        ...prev,
+        ...patch,
+        ...(patch.columnWidths
+          ? { columnWidths: { ...prev?.columnWidths, ...patch.columnWidths } }
+          : null),
+      }));
     },
     [editable, runtime, tileId],
   );
@@ -698,7 +730,9 @@ export function DashboardChartTile({
         ? {
             format: {
               ...drilledChart.format,
-              table: { ...drilledChart.format.table, ...tableLayoutOverride },
+              // Deep columnWidths merge: the override only carries the
+              // columns the viewer touched; authored widths must survive.
+              table: mergeTablePatch(drilledChart.format.table, tableLayoutOverride ?? {}),
             },
           }
         : {}),
@@ -764,6 +798,54 @@ export function DashboardChartTile({
         return typeof value === 'number' ? value : null;
       });
   }, [totalsSpec, totalsEntry]);
+
+  /* -------------------------------------------------------- table row count */
+
+  // Pager "Page X of Y" / "N rows": the SAME companion-query-through-the-cache
+  // mechanism the totals row uses, run whenever the table pages (totals on or
+  // off). The count of a grouped table's rows is the count of its GROUPS, so
+  // the companion is the tile's own grouped query with sort/limit/offset
+  // stripped — sort can't change the group set, so every sort state shares
+  // one cached entry, and the wire spec matches what pagination walks
+  // (dimension filters AND HAVING included). Lazy + cached: it runs once per
+  // filter state and only while pageSize is active.
+  const countSpec = useMemo(() => {
+    if (!isTable || pageSize === null || modelId === null) return null;
+    if (drilledChart.query.measures.length === 0) return null;
+    const base = toWireSpec(
+      { ...drilledChart, query: { ...drilledChart.query, sort: [], limit: null } },
+      modelId,
+      mergedFilters,
+    );
+    return tableHaving.length > 0 ? { ...base, having: tableHaving } : base;
+  }, [isTable, pageSize, modelId, drilledChart, mergedFilters, tableHaving]);
+
+  const countKey = countSpec ? runtime.queries.keyFor(countSpec) : null;
+  const countEntry = useQueryCacheState((state) =>
+    countKey ? state.entries[countKey] : undefined,
+  );
+  const countSpecRef = useRef(countSpec);
+  countSpecRef.current = countSpec;
+
+  useEffect(() => {
+    if (!countKey) return;
+    const spec = countSpecRef.current;
+    if (!spec) return;
+    runtime.queries.run(spec).catch(() => {
+      // surfaced via the cache entry (the pager degrades to "Page X")
+    });
+  }, [runtime, countKey, refreshKey]);
+
+  // A server-truncated companion can't count everything — report "unknown"
+  // (graceful "Page X", no Last jump) instead of a wrong smaller total.
+  const tableTotalRows = useMemo<number | null>(() => {
+    if (!countSpec || countEntry?.status !== 'ok' || !countEntry.data) return null;
+    return countEntry.data.meta.truncated ? null : countEntry.data.rows.length;
+  }, [countSpec, countEntry]);
+  const tablePageCount =
+    tableTotalRows !== null && pageSize !== null
+      ? Math.max(1, Math.ceil(tableTotalRows / pageSize))
+      : null;
 
   /* ------------------------------------------------------- hover highlight */
 
@@ -1097,8 +1179,9 @@ export function DashboardChartTile({
               isTable && tableOptions?.sortable !== false ? handleTableSortChange : undefined
             }
             tablePage={tableState.page}
-            tablePageCount={null}
+            tablePageCount={tablePageCount}
             onTablePageChange={pageSize !== null ? handleTablePageChange : undefined}
+            tableTotalRows={tableTotalRows}
             totalsRow={totalsRow}
             onTableLayoutChange={isTable ? handleTableLayoutChange : undefined}
             tableFilters={isTable ? tableFilters : undefined}
