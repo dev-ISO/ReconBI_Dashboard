@@ -10,7 +10,12 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import { CalendarDays, ChevronLeft, ChevronRight, X } from 'lucide-react';
-import type { CellValue, DateRangeOptions } from '@recon/dashboards-core';
+import {
+  stableStringify,
+  type CellValue,
+  type DateRangeOptions,
+  type FilterClause,
+} from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdSpinner } from '../primitives';
 
@@ -171,6 +176,9 @@ const FAILED: DateAvailability = { ...IDLE, status: 'error' };
  *  fetch itself; this avoids re-bucketing 1k values on every popover open). */
 const availabilityCache = new Map<string, DateAvailability>();
 
+/** Shared empty clause set (a fresh [] default would rebuild the memo key). */
+const NO_FILTERS: FilterClause[] = [];
+
 function deriveAvailability(values: CellValue[], hasMore: boolean): DateAvailability {
   const days = new Set<string>();
   const months = new Set<string>();
@@ -191,16 +199,22 @@ function deriveAvailability(values: CellValue[], hasMore: boolean): DateAvailabi
  * Distinct values of a date column, bucketed into day/month availability sets.
  * Same endpoint the checklist variant uses (`runtime.queries.distinct`, whose
  * 5-minute cache dedupes repeat opens); fetched lazily — `enabled` flips true
- * the first time a calendar opens — and memoized per column.
+ * the first time a calendar opens — and memoized per column PLUS the cascade
+ * clause set (a cascading slicer marks only the days that survive the other
+ * filters, so the memo key must carry them or two scopes would collide).
  */
 export function useDateAvailability(
   modelId: number,
   table: string,
   column: string,
   enabled: boolean,
+  filters: FilterClause[] = NO_FILTERS,
 ): DateAvailability {
   const runtime = useRuntime();
-  const cacheKey = `${modelId}|${table}|${column}`;
+  const filtersKey = stableStringify(filters);
+  const cacheKey = `${modelId}|${table}|${column}|${filtersKey}`;
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
   const [result, setResult] = useState<DateAvailability>(
     () => availabilityCache.get(cacheKey) ?? IDLE,
   );
@@ -215,7 +229,14 @@ export function useDateAvailability(
     let cancelled = false;
     setResult(LOADING);
     runtime.queries
-      .distinct({ modelId, table, column, search: null, filters: [], limit: AVAILABILITY_LIMIT })
+      .distinct({
+        modelId,
+        table,
+        column,
+        search: null,
+        filters: [...filtersRef.current],
+        limit: AVAILABILITY_LIMIT,
+      })
       .then((response) => {
         const derived = deriveAvailability(response.values, response.hasMore);
         availabilityCache.set(cacheKey, derived);
@@ -266,6 +287,12 @@ export interface SlicerCalendarFieldsProps {
   onChange: (from: string, to: string) => void;
   /** Honors spec.showClear; hides the inline Clear affordances when false. */
   showClear: boolean;
+  /**
+   * CASCADE clauses (SlicerTileSpec.cascade): scope the data-availability
+   * marks to the days that survive the dashboard's other filters. Empty = the
+   * whole column. Must be referentially stable.
+   */
+  filters?: FilterClause[];
 }
 
 /**
@@ -284,6 +311,7 @@ export function SlicerCalendarFields({
   to,
   onChange,
   showClear,
+  filters = NO_FILTERS,
 }: SlicerCalendarFieldsProps) {
   const [editing, setEditing] = useState<Endpoint | null>(null);
   /** Availability is fetched lazily: the first open arms it for good. */
@@ -293,7 +321,13 @@ export function SlicerCalendarFields({
 
   const wantsAvailability =
     options.showAvailability !== false || needsAvailability(options.initialMonth);
-  const availability = useDateAvailability(modelId, table, column, armed && wantsAvailability);
+  const availability = useDateAvailability(
+    modelId,
+    table,
+    column,
+    armed && wantsAvailability,
+    filters,
+  );
 
   const open = (endpoint: Endpoint) => {
     setArmed(true);

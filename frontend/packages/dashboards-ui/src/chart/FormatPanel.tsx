@@ -1545,10 +1545,16 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const setZoom = (partial: Partial<ChartZoomOptions>) => {
     const merged = { ...format.zoom, ...partial };
     const next: ChartZoomOptions = {};
+    // `brush` is the legacy wire key for "zoom controls enabled" (the strip
+    // itself is gone; a corner button cluster renders instead).
     if (merged.brush) next.brush = true;
     if (merged.dragZoom) next.dragZoom = true;
     if (merged.dragZoom && merged.dragAction === 'crossFilter') next.dragAction = 'crossFilter';
     if (merged.wheel) next.wheel = true;
+    const lastN = merged.initialWindow?.lastN;
+    if (typeof lastN === 'number' && lastN >= 1) {
+      next.initialWindow = { lastN: Math.round(lastN) };
+    }
     patch({ zoom: Object.keys(next).length > 0 ? next : undefined });
   };
 
@@ -1728,6 +1734,34 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.rowBanding) next.rowBanding = true;
     if (merged.singleColor) next.singleColor = true;
     if (merged.color != null) next.color = merged.color;
+    // Wave 15 additions — every one prunes back to its default so an untouched
+    // gantt keeps an empty (undefined) options object.
+    if (merged.progressColor != null) next.progressColor = merged.progressColor;
+    if (merged.barOpacity !== undefined && merged.barOpacity < 1) {
+      next.barOpacity = merged.barOpacity;
+    }
+    if (merged.bandingColor != null) next.bandingColor = merged.bandingColor;
+    if (merged.milestoneColor != null) next.milestoneColor = merged.milestoneColor;
+    if (merged.milestoneShape === 'diamond') next.milestoneShape = 'diamond';
+    if (merged.labelColor != null) next.labelColor = merged.labelColor;
+    if (merged.shadeWeekends) next.shadeWeekends = true;
+    if (merged.shadeColor != null) next.shadeColor = merged.shadeColor;
+    if (merged.todayLabel === false) next.todayLabel = false;
+    if (merged.durationLabels !== undefined && merged.durationLabels !== 'off') {
+      next.durationLabels = merged.durationLabels;
+    }
+    // Start-ascending IS the chart's default order, so it stays out of the
+    // spec; any other field (or a descending direction) is written explicitly.
+    const sortField = merged.sortBy ?? 'start';
+    const descending = merged.sortDirection === 'desc';
+    if (sortField !== 'start' || descending) {
+      next.sortBy = sortField;
+      if (descending) next.sortDirection = 'desc';
+    }
+    if (merged.groupLanes) next.groupLanes = true;
+    if (merged.axisTicks !== undefined && merged.axisTicks !== 'auto') {
+      next.axisTicks = merged.axisTicks;
+    }
     patch({ gantt: Object.keys(next).length > 0 ? next : undefined });
   };
 
@@ -2206,12 +2240,45 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
       {showZoomSection && (
         <CollapsibleSection title="Zoom & pan" {...sectionProps('zoom')}>
           <CheckboxRow
-            label="Brush strip"
+            label="Zoom controls"
             checked={format.zoom?.brush ?? false}
             onChange={(checked) => setZoom({ brush: checked || undefined })}
           />
           <p className="text-xs text-rcd-muted">
-            Mini strip below the plot: drag to window the view, drag its edges to pan.
+            Compact buttons in the plot corner: zoom in/out, pan and reset. Hold a button to
+            keep moving.
+          </p>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Initial view
+            <RcdSelect
+              aria-label="Initial view window"
+              className="w-36 shrink-0"
+              value={(format.zoom?.initialWindow?.lastN ?? 0) >= 1 ? 'lastN' : 'all'}
+              onChange={(event) =>
+                setZoom({
+                  initialWindow: event.target.value === 'lastN' ? { lastN: 12 } : null,
+                })
+              }
+            >
+              <option value="all">All data</option>
+              <option value="lastN">Last N periods</option>
+            </RcdSelect>
+          </label>
+          {(format.zoom?.initialWindow?.lastN ?? 0) >= 1 && (
+            <NumberRow
+              label="Periods shown"
+              value={format.zoom?.initialWindow?.lastN}
+              min={1}
+              max={999}
+              placeholder="12"
+              onChange={(next) =>
+                setZoom({ initialWindow: next !== undefined && next >= 1 ? { lastN: next } : null })
+              }
+            />
+          )}
+          <p className="text-xs text-rcd-muted">
+            Opens the chart on its most recent buckets; viewers can still pan and zoom, and
+            reset returns here.
           </p>
           <CheckboxRow
             label="Drag to zoom"
@@ -2249,7 +2316,7 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           />
           <p className="text-xs text-rcd-muted">
             Ctrl/Cmd + wheel zooms at the cursor; a plain wheel zooms only while already zoomed
-            in. Double-click resets any zoom.
+            in. Double-click resets to the initial view.
           </p>
           {hasSmallMultiples && (
             <p className="text-xs text-rcd-muted">
@@ -2474,29 +2541,57 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             value={format.gantt?.cornerRadius}
             onChange={(next) => setGantt({ cornerRadius: next })}
           />
+          <NumberRow
+            label="Bar opacity %"
+            min={10}
+            max={100}
+            placeholder="100"
+            value={
+              format.gantt?.barOpacity !== undefined
+                ? Math.round(format.gantt.barOpacity * 100)
+                : undefined
+            }
+            onChange={(next) =>
+              setGantt({
+                barOpacity:
+                  next === undefined ? undefined : Math.min(1, Math.max(0.1, next / 100)),
+              })
+            }
+          />
           <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
-            Task labels
+            Milestones
             <RcdSelect
-              aria-label="Gantt task labels"
+              aria-label="Gantt milestone shape"
               className="w-36 shrink-0"
-              value={format.gantt?.taskLabels ?? 'axis'}
+              value={format.gantt?.milestoneShape ?? 'bar'}
               onChange={(event) =>
                 setGantt({
-                  taskLabels: event.target.value as NonNullable<GanttOptions['taskLabels']>,
+                  milestoneShape: event.target.value as NonNullable<
+                    GanttOptions['milestoneShape']
+                  >,
                 })
               }
             >
-              <option value="axis">Beside the axis</option>
-              <option value="inside">Inside the bar</option>
-              <option value="adjacent">After the bar</option>
-              <option value="off">Hidden</option>
+              <option value="bar">Thin bar</option>
+              <option value="diamond">Diamond</option>
             </RcdSelect>
           </label>
+          <p className="text-xs text-rcd-muted">
+            How tasks whose start equals their end are drawn.
+          </p>
           <CheckboxRow
             label="Row banding"
             checked={format.gantt?.rowBanding ?? false}
             onChange={(checked) => setGantt({ rowBanding: checked || undefined })}
           />
+          {Boolean(format.gantt?.rowBanding) && (
+            <ColorRow
+              label="Banding color"
+              value={format.gantt?.bandingColor}
+              fallback={TEXT_SWATCH}
+              onChange={(next) => setGantt({ bandingColor: next })}
+            />
+          )}
           <CheckboxRow
             label="Single color"
             checked={format.gantt?.singleColor ?? false}
@@ -2516,6 +2611,123 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               : 'Single color ignores the group palette; per-group colors live under Series.'}
           </p>
 
+          <h4 className={SUBHEAD_CLASS}>Colors</h4>
+          <ColorRow
+            label="Progress fill"
+            value={format.gantt?.progressColor}
+            fallback={TEXT_SWATCH}
+            onChange={(next) => setGantt({ progressColor: next })}
+          />
+          <ColorRow
+            label="Milestones"
+            value={format.gantt?.milestoneColor}
+            fallback={DEFAULT_SWATCH}
+            onChange={(next) => setGantt({ milestoneColor: next })}
+          />
+          <ColorRow
+            label="Bar labels"
+            value={format.gantt?.labelColor}
+            fallback={TEXT_SWATCH}
+            onChange={(next) => setGantt({ labelColor: next })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Unset keeps the theme defaults: a neutral wash for the progress fill, the bar&apos;s
+            own color for milestones, and auto-contrast ink for labels drawn on a bar.
+            {spec.query.legend != null && ' Per-group bar colors live under Series → Colors.'}
+          </p>
+
+          <h4 className={SUBHEAD_CLASS}>Labels</h4>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Task labels
+            <RcdSelect
+              aria-label="Gantt task labels"
+              className="w-36 shrink-0"
+              value={format.gantt?.taskLabels ?? 'axis'}
+              onChange={(event) =>
+                setGantt({
+                  taskLabels: event.target.value as NonNullable<GanttOptions['taskLabels']>,
+                })
+              }
+            >
+              <option value="axis">Beside the axis</option>
+              <option value="inside">Inside the bar</option>
+              <option value="adjacent">After the bar</option>
+              <option value="off">Hidden</option>
+            </RcdSelect>
+          </label>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Duration labels
+            <RcdSelect
+              aria-label="Gantt duration labels"
+              className="w-36 shrink-0"
+              value={format.gantt?.durationLabels ?? 'off'}
+              onChange={(event) =>
+                setGantt({
+                  durationLabels: event.target.value as NonNullable<
+                    GanttOptions['durationLabels']
+                  >,
+                })
+              }
+            >
+              <option value="off">Hidden</option>
+              <option value="inside">Inside the bar</option>
+              <option value="adjacent">After the bar</option>
+            </RcdSelect>
+          </label>
+          <p className="text-xs text-rcd-muted">
+            Humanized bar lengths (12d, 3.5mo); hidden automatically on bars too narrow to fit.
+          </p>
+
+          <h4 className={SUBHEAD_CLASS}>Structure</h4>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Sort rows by
+            <RcdSelect
+              aria-label="Gantt row sort field"
+              className="w-36 shrink-0"
+              value={format.gantt?.sortBy ?? 'start'}
+              onChange={(event) =>
+                setGantt({ sortBy: event.target.value as NonNullable<GanttOptions['sortBy']> })
+              }
+            >
+              <option value="start">Start date</option>
+              <option value="end">End date</option>
+              <option value="duration">Duration</option>
+              <option value="name">Task name</option>
+            </RcdSelect>
+          </label>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Direction
+            <RcdSelect
+              aria-label="Gantt row sort direction"
+              className="w-36 shrink-0"
+              value={format.gantt?.sortDirection ?? 'asc'}
+              onChange={(event) =>
+                setGantt({
+                  sortDirection: event.target.value as NonNullable<
+                    GanttOptions['sortDirection']
+                  >,
+                })
+              }
+            >
+              <option value="asc">Ascending</option>
+              <option value="desc">Descending</option>
+            </RcdSelect>
+          </label>
+          <p className="text-xs text-rcd-muted">
+            A Sort set on the query itself always wins over this.
+          </p>
+          <CheckboxRow
+            label="Group lanes"
+            checked={format.gantt?.groupLanes ?? false}
+            disabled={spec.query.legend == null}
+            onChange={(checked) => setGantt({ groupLanes: checked || undefined })}
+          />
+          <p className="text-xs text-rcd-muted">
+            {spec.query.legend == null
+              ? 'Needs a Group / color field: rows then cluster under a group header.'
+              : 'Clusters rows by group under a slim header row (name, task count, span).'}
+          </p>
+
           <h4 className={SUBHEAD_CLASS}>Overlays</h4>
           <CheckboxRow
             label="Today line"
@@ -2523,13 +2735,36 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             onChange={(checked) => setGantt({ showToday: checked || undefined })}
           />
           {Boolean(format.gantt?.showToday) && (
+            <>
+              <ColorRow
+                label="Today color"
+                value={format.gantt?.todayColor}
+                fallback="#ef4444"
+                onChange={(next) => setGantt({ todayColor: next })}
+              />
+              <CheckboxRow
+                label="Today caption"
+                checked={format.gantt?.todayLabel ?? true}
+                onChange={(checked) => setGantt({ todayLabel: checked ? undefined : false })}
+              />
+            </>
+          )}
+          <CheckboxRow
+            label="Weekend shading"
+            checked={format.gantt?.shadeWeekends ?? false}
+            onChange={(checked) => setGantt({ shadeWeekends: checked || undefined })}
+          />
+          {Boolean(format.gantt?.shadeWeekends) && (
             <ColorRow
-              label="Today color"
-              value={format.gantt?.todayColor}
-              fallback="#ef4444"
-              onChange={(next) => setGantt({ todayColor: next })}
+              label="Shading color"
+              value={format.gantt?.shadeColor}
+              fallback={TEXT_SWATCH}
+              onChange={(next) => setGantt({ shadeColor: next })}
             />
           )}
+          <p className="text-xs text-rcd-muted">
+            Saturday/Sunday bands; skipped automatically once the axis reaches month scale.
+          </p>
           <CheckboxRow
             label="Progress fill"
             checked={format.gantt?.showProgress ?? true}
@@ -2539,7 +2774,42 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             Needs a Progress field (0–1 or 0–100); drawn as a darker inner fill.
           </p>
 
-          <h4 className={SUBHEAD_CLASS}>Time axis labels</h4>
+          <h4 className={SUBHEAD_CLASS}>Time axis</h4>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Tick unit
+            <RcdSelect
+              aria-label="Gantt time axis tick unit"
+              className="w-36 shrink-0"
+              value={format.gantt?.axisTicks ?? 'auto'}
+              onChange={(event) =>
+                setGantt({
+                  axisTicks: event.target.value as NonNullable<GanttOptions['axisTicks']>,
+                })
+              }
+            >
+              <option value="auto">Auto</option>
+              <option value="weekly">Weekly</option>
+              <option value="monthly">Monthly</option>
+              <option value="quarterly">Quarterly</option>
+              <option value="yearly">Yearly</option>
+            </RcdSelect>
+          </label>
+          <p className="text-xs text-rcd-muted">
+            A forced unit falls back to Auto when it would crowd the axis.
+          </p>
+          {/* The Axes section is hidden for gantt (it has no numeric value
+              axis), so its gridline switches live here, with the gantt's own
+              orientation-aware defaults: time rules on, row rules off. */}
+          <CheckboxRow
+            label="Time gridlines"
+            checked={format.gridX ?? true}
+            onChange={(checked) => patch({ gridX: checked ? undefined : false })}
+          />
+          <CheckboxRow
+            label="Row gridlines"
+            checked={format.gridY ?? false}
+            onChange={(checked) => patch({ gridY: checked || undefined })}
+          />
           <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
             Date labels
             <RcdSelect

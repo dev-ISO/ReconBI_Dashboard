@@ -38,8 +38,10 @@
 # query (params resolved to their default option).
 # -Modernize: runs AFTER -Full. Additive, in-place refresh of the five -Full
 # company dashboards (ids 6-10) plus the -Showcase "Feature Showcase" so they
-# exercise the wave 12/13 capabilities: a gantt tile, brush/drag zoom and
-# drag-to-cross-filter, auto + log axis scales, trimEmptyEdges, gridX,
+# exercise the wave 12/13 capabilities: a gantt tile, zoom controls/drag zoom
+# (zoom.brush now enables the corner button cluster; long trends open on an
+# initialWindow of the last 12 months) and drag-to-cross-filter, auto + log
+# axis scales, trimEmptyEdges, gridX,
 # table paging + per-column alignment, measure-grammar v2 (IF / DIVIDE /
 # PERCENTOFTOTAL with formatString + displayFolder + description), a July
 # fiscal calendar, per-dashboard filter indicators and restyled slicers.
@@ -2516,7 +2518,7 @@ if ($Modernize) {
         # -------------------------------------------------------------------
         Write-Host "`nModernize: Executive Overview"
         $doc = MzFetch 'Executive Overview'
-        $doc['description'] = 'C-suite view of maintenance spend. Wave 12/13: a full-width filter BANNER docked in the header, dashboard-wide cross-filter scope, brush + drag zoom on the cost trend, a YoY line with its 12-month warm-up trimmed away, and a fiscal-quarter rollup off the July fiscal calendar.'
+        $doc['description'] = 'C-suite view of maintenance spend. Wave 12/13: a full-width filter BANNER docked in the header, dashboard-wide cross-filter scope, corner zoom controls + drag zoom on the cost trend (opens on the last 12 months), a YoY line with its 12-month warm-up trimmed away, and a fiscal-quarter rollup off the July fiscal calendar.'
         $doc.layout['filterIndicator'] = @{ placement = 'header'; variant = 'banner'; size = 'md'; badgeTiles = $true }
         $doc.layout['crossFilterScope'] = 'dashboard'
 
@@ -2532,8 +2534,8 @@ if ($Modernize) {
         MzMove $hero 0 9 16 9
         MzSetFormat $hero @{
             gridX = $true
-            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
-            container = MzHero 'Cost trend' 'monthly spend against cumulative total on the right axis &mdash; drag a rectangle to zoom the view, or window it with the brush strip; double-click resets'
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view'; initialWindow = @{ lastN = 12 } }
+            container = MzHero 'Cost trend' 'monthly spend against cumulative total on the right axis &mdash; opens on the last 12 months; drag a rectangle or use the corner zoom controls to move around, double-click resets'
         }
         MzMove (MzTile $page (FullId 'tile-d1-donut')) 16 9 8 9
         MzMove (MzTile $page (FullId 'tile-d1-mix')) 12 18 12 9
@@ -2630,7 +2632,7 @@ if ($Modernize) {
             tooltip = @{ accentBorder = $true }
             container = MzHero 'Work order timeline' ('one bar per plant unit, from its first order opened since {0} to its last order closed, coloured by region; the inner fill is the DIVIDE() completion rate and the red rule is today' -f $ganttFromLabel)
         })
-        MzUpsertTile $page (MzTextTile 'd2-zoomnote' @{ x = 0; y = 23; w = 24; h = 2 } '<p><b>Two ways to explore the row below.</b> <span style="color:#64748b">Left: <i>Open Orders by Site</i> re-queries itself every 30 seconds. Right: drag across a span of months on <i>Monthly Orders by Priority</i> and the whole dashboard cross-filters to that date range (zoom dragAction = crossFilter); the brush strip under it windows the view without filtering, and a double-click clears the zoom.</span></p>' '#fff7ed')
+        MzUpsertTile $page (MzTextTile 'd2-zoomnote' @{ x = 0; y = 23; w = 24; h = 2 } '<p><b>Two ways to explore the row below.</b> <span style="color:#64748b">Left: <i>Open Orders by Site</i> re-queries itself every 30 seconds. Right: drag across a span of months on <i>Monthly Orders by Priority</i> and the whole dashboard cross-filters to that date range (zoom dragAction = crossFilter); the corner zoom controls pan/zoom the view without filtering, and a double-click resets it.</span></p>' '#fff7ed')
         MzMove (MzTile $page (FullId 'tile-d2-live')) 0 25 12 9
         $priostack = MzTile $page (FullId 'tile-d2-priostack')
         MzMove $priostack 12 25 12 9
@@ -2666,7 +2668,7 @@ if ($Modernize) {
         # -------------------------------------------------------------------
         Write-Host "`nModernize: Cost & Vendor Management"
         $doc = MzFetch 'Cost & Vendor Management'
-        $doc['description'] = 'Procurement view. Wave 12/13: a custom-accent filter pill, a PERCENTOFTOTAL() spend-share donut, brush + drag zoom on the spend trend, a paged part-consumption table with wrapped descriptions, and a cost-driver scatter pair - one auto-ranged, one on a log price axis.'
+        $doc['description'] = 'Procurement view. Wave 12/13: a custom-accent filter pill, a PERCENTOFTOTAL() spend-share donut, corner zoom controls + drag zoom on the spend trend (opens on the last 12 months), a paged part-consumption table with wrapped descriptions, and a cost-driver scatter pair - one auto-ranged, one on a log price axis.'
         $doc.layout['filterIndicator'] = @{
             placement = 'top-center'; variant = 'pill'; size = 'md'
             accentColor = $berry; background = '#f5f3ff'; textColor = '#4c1d95'; badgeTiles = $true
@@ -2683,7 +2685,7 @@ if ($Modernize) {
         })
         MzSetFormat (MzTile $page (FullId 'tile-d3-trend')) @{
             gridX = $true
-            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view'; initialWindow = @{ lastN = 12 } }
         }
         MzSyncMobile $page
 
@@ -2726,7 +2728,7 @@ if ($Modernize) {
         # -------------------------------------------------------------------
         Write-Host "`nModernize: Workforce & Productivity"
         $doc = MzFetch 'Workforce & Productivity'
-        $doc['description'] = 'People view on the Workforce model. Wave 12/13: brush + drag zoom on the labour trend, large filled 2-column button slicers, and a paged assignment roster with centred role columns. This dashboard deliberately leaves filterIndicator unset, so cross-filters here show in the stock pill.'
+        $doc['description'] = 'People view on the Workforce model. Wave 12/13: corner zoom controls + drag zoom on the labour trend (opens on the last 12 months), large filled 2-column button slicers, and a paged assignment roster with centred role columns. This dashboard deliberately leaves filterIndicator unset, so cross-filters here show in the stock pill.'
 
         $page = MzPage $doc 'Team Overview'
         MzMove (MzTile $page (FullId 'tile-d4-sl-region')) 0 4 8 5
@@ -2738,8 +2740,8 @@ if ($Modernize) {
         MzMove $labor 12 9 12 10
         MzSetFormat $labor @{
             gridX = $true
-            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
-            container = MzHero 'Labour trend' 'hours booked per month with a 3-month moving average &mdash; drag to zoom into a busy stretch, or window it with the brush strip'
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view'; initialWindow = @{ lastN = 12 } }
+            container = MzHero 'Labour trend' 'hours booked per month with a 3-month moving average &mdash; opens on the last 12 months; drag to zoom into a busy stretch, or use the corner zoom controls'
         }
         MzSyncMobile $page
 
@@ -2813,7 +2815,7 @@ if ($Modernize) {
         # -------------------------------------------------------------------
         Write-Host "`nModernize: Feature Showcase"
         $doc = MzFetch 'Feature Showcase'
-        $doc['description'] = 'Every advanced feature on one dashboard: drill hierarchies, cross-filter spotlight, time intelligence, small multiples, conditional formatting, drillthrough and bookmarks - now with brush + drag zoom, trimEmptyEdges on the YoY warm-up, angled axis labels, gridlines, paged tables and a corner filter stack.'
+        $doc['description'] = 'Every advanced feature on one dashboard: drill hierarchies, cross-filter spotlight, time intelligence, small multiples, conditional formatting, drillthrough and bookmarks - now with corner zoom controls + drag zoom, trimEmptyEdges on the YoY warm-up, angled axis labels, gridlines, paged tables and a corner filter stack.'
         $doc.layout['filterIndicator'] = @{ placement = 'bottom-right'; variant = 'stack'; size = 'md'; badgeTiles = $true }
 
         $page = MzPage $doc 'Drill & Explore'
@@ -2892,7 +2894,7 @@ if ($Modernize) {
     Assert ($docs['Executive Overview'].layout.filterIndicator.placement -eq 'header' -and $docs['Executive Overview'].layout.filterIndicator.variant -eq 'banner') 'D6 filterIndicator: header banner persisted'
     Assert ($docs['Executive Overview'].layout.crossFilterScope -eq 'dashboard') 'D6 crossFilterScope dashboard persisted'
     $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-hero')
-    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom -and $t.chart.format.zoom.dragAction -eq 'view') 'D6 hero: zoom brush + dragZoom + dragAction view persisted'
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom -and $t.chart.format.zoom.dragAction -eq 'view' -and $t.chart.format.zoom.initialWindow.lastN -eq 12) 'D6 hero: zoom controls + dragZoom + dragAction view + initialWindow lastN 12 persisted'
     Assert ($t.chart.format.gridX -and $t.chart.format.secondaryAxisKeys.Count -eq 1) 'D6 hero: gridX added WITHOUT dropping the -Full dual axis'
     $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-sites')
     Assert ((@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50') 'D6 site table: pageSizeOptions 10/25/50 persisted'
@@ -2939,7 +2941,7 @@ if ($Modernize) {
     $t = VTile 'Cost & Vendor Management' 'Spend Overview' (MzId 'tile-d3-pct')
     Assert ($t.chart.query.measures[0].measureId -eq $mPctSpend -and $t.chart.type -eq 'donut') 'D8 share donut: bound to the PERCENTOFTOTAL() measure'
     $t = VTile 'Cost & Vendor Management' 'Spend Overview' (FullId 'tile-d3-trend')
-    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom) 'D8 spend trend: brush + drag zoom persisted'
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom -and $t.chart.format.zoom.initialWindow.lastN -eq 12) 'D8 spend trend: zoom controls + drag zoom + initialWindow lastN 12 persisted'
     $t = VTile 'Cost & Vendor Management' 'Cost Drivers' (FullId 'tile-d3-scatter')
     Assert ($t.chart.format.xAxisScale.range -eq 'auto' -and $t.chart.format.yAxisScale.range -eq 'auto') 'D8 cost-vs-labour scatter: x + y axis range auto persisted'
     $t = VTile 'Cost & Vendor Management' 'Cost Drivers' (MzId 'tile-d3-unitcost')
@@ -2951,7 +2953,7 @@ if ($Modernize) {
     # --- D9 Workforce & Productivity (default indicator on purpose) ---
     Assert ($null -eq $docs['Workforce & Productivity'].layout.filterIndicator) 'D9 filterIndicator: left unset so the default pill is on show'
     $t = VTile 'Workforce & Productivity' 'Team Overview' (FullId 'tile-d4-labor')
-    Assert ($t.chart.format.zoom.brush -and $t.chart.format.gridX) 'D9 labour trend: brush zoom + gridX persisted'
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.gridX -and $t.chart.format.zoom.initialWindow.lastN -eq 12) 'D9 labour trend: zoom controls + gridX + initialWindow lastN 12 persisted'
     $t = VTile 'Workforce & Productivity' 'Assignments' (FullId 'tile-d4-roster')
     Assert ($t.chart.format.table.columnAlign.Role -eq 'center' -and (@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50') 'D9 roster: centred Role + pageSizeOptions persisted'
 

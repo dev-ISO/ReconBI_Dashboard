@@ -158,7 +158,8 @@ export function DashboardToolbar({
   onToggleMobileLayout,
   onConfigureFilterIndicator,
   centerContent,
-  viewFit = 'actual',
+  // Fit to page is the product default (matches the view's docViewFit default).
+  viewFit = 'fitPage',
   onChangeViewFit,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -562,7 +563,7 @@ function ViewMenu({
           ))}
           <p className="border-t border-rcd-border px-3 pb-0.5 pt-1.5 text-[11px] leading-snug text-rcd-muted">
             {isEdit
-              ? 'Saved with the dashboard as the default for viewers.'
+              ? 'Saved as the viewer default. Dashboards open in Fit to page unless set to Actual size.'
               : 'Fit to page scales the page to fit without scrolling.'}
           </p>
         </div>

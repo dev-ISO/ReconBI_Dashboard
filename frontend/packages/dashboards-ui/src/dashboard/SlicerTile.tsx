@@ -8,12 +8,13 @@ import {
   type RefObject,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, ChevronDown, RefreshCw, Search, X } from 'lucide-react';
+import { AlertTriangle, ChevronDown, RefreshCw, X } from 'lucide-react';
 import {
   dateOnlyPartOf,
   inclusiveDateUpperBound,
   slicerClauseOf,
   slicerPresetOf,
+  stableStringify,
   type ColumnType,
   type DashboardParameter,
   type FilterClause,
@@ -21,13 +22,11 @@ import {
   type SlicerTileSpec,
   type SlicerTileStyle,
 } from '@recon/dashboards-core';
-import { DistinctValueList } from '../chart-builder/DistinctValueList';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
 import { useColumnType } from './columnType';
 import { RcdButton, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
-import { ScrollFades, useScrollAffordance } from './ScrollFades';
 import { SlicerCalendarFields } from './SlicerCalendar';
-import { SlicerChecklistPanel } from './SlicerChecklistPanel';
+import { SlicerChecklistPanel, summarizeSelection } from './SlicerChecklistPanel';
 import {
   customPresetId,
   parseCustomPreset,
@@ -56,6 +55,32 @@ const BUTTONS_CAP = 12;
 /** Stable identity for a filter value across types ('1' vs 1 vs true). */
 const keyOf = (value: FilterValue): string => `${typeof value}:${String(value)}`;
 
+/** Shared empty clause set — a fresh [] per render would restart every fetch. */
+const NO_FILTERS: FilterClause[] = [];
+
+/** Rows a dropdown popover opens at when its list is long enough to fill them.
+ *  7 keeps rows + search + footer inside the popover's max-h-80 (8 rows left
+ *  the last row clipped by ~10-24px); overflow scrolls behind the fades. */
+const POPOVER_ROWS = 7;
+
+/**
+ * Holds a clause array at a stable identity while its CONTENTS are unchanged.
+ * The store rebuilds the cascade set on every slicer/cross-filter write, so
+ * without this every unrelated selection elsewhere would restart this
+ * slicer's distinct fetch (and thrash its list) even though the scope is
+ * identical.
+ */
+function useStableClauses(clauses: FilterClause[]): FilterClause[] {
+  const key = stableStringify(clauses);
+  const keyRef = useRef(key);
+  const valueRef = useRef(clauses);
+  if (key !== keyRef.current) {
+    keyRef.current = key;
+    valueRef.current = clauses;
+  }
+  return valueRef.current;
+}
+
 /**
  * A slicer as a grid tile (draggable/resizable like charts). The body renders
  * by variant; right-click anywhere (or the kebab in edit mode) opens the
@@ -69,6 +94,27 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
   const clause = slicerClauseOf(value);
   const activePresetId = slicerPresetOf(value);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
+
+  /* -------------------------------------------------------------- cascade */
+
+  /**
+   * CASCADING slicer (spec.cascade): the available-value fetch is scoped by
+   * the dashboard's other active filters. The clause set comes from the store
+   * (cascadeFiltersForSlicer — other slicers on this page + cross-filters,
+   * minus anything on this slicer's own column), so no DashboardView prop is
+   * needed. Subscribing to the RAW store fields the helper reads gives the
+   * memo its revision (they are replaced, never mutated, on every change) —
+   * note the selector gotcha: raw fields only, no `?? []` fallback inside.
+   */
+  const slicerValues = useDashboardState((state) => state.slicerValues);
+  const crossFilters = useDashboardState((state) => state.crossFilters);
+  const cascadeOn = spec.cascade === true && spec.variant !== 'fieldParam';
+  const cascadeFilters = useStableClauses(
+    useMemo(
+      () => (cascadeOn ? runtime.dashboards.cascadeFiltersForSlicer(tileId) : NO_FILTERS),
+      [cascadeOn, runtime, tileId, slicerValues, crossFilters],
+    ),
+  );
 
   /** Frameless mode: no header bar; the label becomes an inline body caption. */
   const hideHeader = spec.style?.hideHeader === true;
@@ -170,14 +216,18 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
   };
 
   const inSelected = clause?.operator === 'in' ? clause.values : [];
-  const toggleInValue = (value: FilterValue) => {
-    const next = inSelected.includes(value)
-      ? inSelected.filter((v) => v !== value)
-      : [...inSelected, value];
+  /** Bulk write of the whole 'in' set (Select all / Clear). */
+  const setInValues = (values: FilterValue[]) =>
     setClause(
-      next.length > 0
-        ? { table: spec.table, column: spec.column, operator: 'in', values: next }
+      values.length > 0
+        ? { table: spec.table, column: spec.column, operator: 'in', values }
         : null,
+    );
+  const toggleInValue = (value: FilterValue) => {
+    setInValues(
+      inSelected.includes(value)
+        ? inSelected.filter((v) => v !== value)
+        : [...inSelected, value],
     );
   };
 
@@ -198,8 +248,10 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         No model attached to this dashboard.
       </div>
     ) : spec.variant === 'checklist' ? (
-      // Fills the tile and owns its own (row-snapped) scroll container — the
-      // shared DistinctValueList's fixed-height box clipped mid-row here.
+      // Fills the tile and owns its own (row-snapped) scroll container: a
+      // fixed-height list box clipped mid-row inside short tiles. The dropdown
+      // variants render this SAME panel inside their popovers, so the three
+      // value-listing variants cannot drift apart feature-wise.
       <SlicerChecklistPanel
         modelId={modelId}
         table={spec.table}
@@ -208,6 +260,9 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
+        onSetValues={setInValues}
+        filters={cascadeFilters}
+        cascade={cascadeOn}
       />
     ) : spec.variant === 'dropdown' ? (
       <DropdownSlicer
@@ -216,7 +271,9 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
-        onClear={() => setClause(null)}
+        onSetValues={setInValues}
+        filters={cascadeFilters}
+        cascade={cascadeOn}
       />
     ) : spec.variant === 'dropdownMulti' ? (
       <DropdownMultiSlicer
@@ -225,13 +282,9 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
-        onSetValues={(values) =>
-          setClause(
-            values.length > 0
-              ? { table: spec.table, column: spec.column, operator: 'in', values }
-              : null,
-          )
-        }
+        onSetValues={setInValues}
+        filters={cascadeFilters}
+        cascade={cascadeOn}
       />
     ) : spec.variant === 'buttons' ? (
       <ButtonsSlicer
@@ -240,6 +293,8 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         compact={compact}
         selected={inSelected}
         onToggle={toggleInValue}
+        filters={cascadeFilters}
+        cascade={cascadeOn}
       />
     ) : spec.variant === 'relativeDate' ? (
       <RelativeDateSlicer
@@ -258,6 +313,7 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
         clause={clause}
         onChange={setClause}
         allowClear={spec.showClear !== false}
+        filters={cascadeFilters}
       />
     );
 
@@ -360,14 +416,18 @@ function DropdownSlicer({
   compact,
   selected,
   onToggle,
-  onClear,
+  onSetValues,
+  filters,
+  cascade,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
   compact: boolean;
   selected: FilterValue[];
   onToggle: (value: FilterValue) => void;
-  onClear: () => void;
+  onSetValues: (values: FilterValue[]) => void;
+  filters: FilterClause[];
+  cascade: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -424,21 +484,24 @@ function DropdownSlicer({
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1 w-72 max-w-[80vw] rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]">
-          <DistinctValueList
+        // Same panel the checklist tile and the multi-select popover render —
+        // search, Select all/Clear, fades and cascade behave identically here.
+        <div className="absolute left-0 top-full z-40 mt-1 flex max-h-80 w-72 max-w-[80vw] flex-col rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]">
+          <SlicerChecklistPanel
             modelId={modelId}
             table={spec.table}
             column={spec.column}
+            label={spec.label}
+            compact={compact}
             selected={selected}
             onToggle={onToggle}
+            onSetValues={onSetValues}
+            filters={filters}
+            cascade={cascade}
+            fallbackRows={POPOVER_ROWS}
+            autoHeight
+            autoFocusSearch
           />
-          {active && (
-            <div className="flex justify-end pt-2">
-              <RcdButton variant="ghost" onClick={onClear}>
-                Clear selection
-              </RcdButton>
-            </div>
-          )}
         </div>
       )}
     </div>
@@ -446,11 +509,13 @@ function DropdownSlicer({
 }
 
 /**
- * Multi-select dropdown: a summary trigger ("All" / the one value / "3
- * selected") opening a PORTALED popover that extends beyond the tile bounds —
- * anchored to the trigger rect, viewport-clamped, with its own search +
- * checkbox rows + Select all/Clear footer. Produces the same 'in' clause the
- * checklist variant produces.
+ * Multi-select dropdown: a summary trigger ("All" / "Gulf Coast" / "Gulf Coast
+ * +2 more") opening a PORTALED popover that OVERLAYS the tile and everything
+ * around it — anchored to the trigger rect, viewport-clamped. The panel inside
+ * is the very same SlicerChecklistPanel the in-tile checklist variant renders,
+ * so this variant is a strict superset: identical search, Select all / Clear,
+ * scroll fades, "+N more" chip and cascade behavior, plus the overlay. Both
+ * variants emit the same 'in' clause, so switching between them is lossless.
  */
 function DropdownMultiSlicer({
   modelId,
@@ -459,6 +524,8 @@ function DropdownMultiSlicer({
   selected,
   onToggle,
   onSetValues,
+  filters,
+  cascade,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
@@ -466,6 +533,8 @@ function DropdownMultiSlicer({
   selected: FilterValue[];
   onToggle: (value: FilterValue) => void;
   onSetValues: (values: FilterValue[]) => void;
+  filters: FilterClause[];
+  cascade: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -478,12 +547,7 @@ function DropdownMultiSlicer({
   }, []);
 
   const active = selected.length > 0;
-  const summary =
-    selected.length === 0
-      ? 'All'
-      : selected.length === 1
-        ? String(selected[0])
-        : `${selected.length} selected`;
+  const summary = summarizeSelection(selected);
 
   return (
     <>
@@ -492,13 +556,20 @@ function DropdownMultiSlicer({
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
-        title={active ? `${spec.label}: ${summary}` : `${spec.label}: all values`}
+        title={active ? `${spec.label}: ${summary.title}` : `${spec.label}: all values`}
         onClick={() => (open ? close() : setOpen(true))}
         className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
         } ${active ? 'border-[var(--rcd-accent-interactive)]' : 'border-rcd-border'}`}
       >
-        <span className="min-w-0 truncate">{summary}</span>
+        {/* "First value +N more": the count is its own non-shrinking node, so
+            a long first label ellipsizes around it instead of hiding it. */}
+        <span className="flex min-w-0 items-baseline gap-1">
+          <span className="min-w-0 truncate">{active ? summary.first : summary.text}</span>
+          {summary.moreCount > 0 && (
+            <span className="shrink-0 text-rcd-text-2">+{summary.moreCount} more</span>
+          )}
+        </span>
         <ChevronDown size={13} className="shrink-0 text-rcd-muted" />
       </button>
 
@@ -511,9 +582,12 @@ function DropdownMultiSlicer({
               anchor={triggerRef}
               modelId={modelId}
               spec={spec}
+              compact={compact}
               selected={selected}
               onToggle={onToggle}
               onSetValues={onSetValues}
+              filters={filters}
+              cascade={cascade}
               onClose={close}
             />
           </div>,
@@ -523,113 +597,64 @@ function DropdownMultiSlicer({
   );
 }
 
-interface PopoverFetchState {
-  status: 'loading' | 'ok' | 'error';
-  values: FilterValue[];
-  hasMore: boolean;
-  error: string | null;
-}
-
 /**
- * The multi-select panel: searchable checkbox list over the column's distinct
- * values (shared query cache, server-side search; selected values stay pinned
- * when the search response omits them) with a Select all / Clear footer.
- * Fixed-position, anchored under the trigger and clamped to the viewport
- * (flips above when there is no room below). Closes on outside click, Escape,
- * scrolling outside the panel, and window resize.
+ * The multi-select panel's positioning shell: fixed-position, anchored under
+ * the trigger and clamped to the viewport (flips above when there is no room
+ * below), re-measured whenever its own content resizes. Closes on outside
+ * click, Escape, scrolling outside the panel, and window resize. The contents
+ * are SlicerChecklistPanel — see DropdownMultiSlicer.
  */
 function MultiValuePopover({
   anchor,
   modelId,
   spec,
+  compact,
   selected,
   onToggle,
   onSetValues,
+  filters,
+  cascade,
   onClose,
 }: {
   anchor: RefObject<HTMLButtonElement | null>;
   modelId: number;
   spec: SlicerTileSpec;
+  compact: boolean;
   selected: FilterValue[];
   onToggle: (value: FilterValue) => void;
   onSetValues: (values: FilterValue[]) => void;
+  filters: FilterClause[];
+  cascade: boolean;
   onClose: () => void;
 }) {
-  const runtime = useRuntime();
   const cardRef = useRef<HTMLDivElement>(null);
-  const listRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState<{ x: number; y: number } | null>(null);
-  const [search, setSearch] = useState('');
-  const [debounced, setDebounced] = useState('');
-  const [retryToken, setRetryToken] = useState(0);
-  const [state, setState] = useState<PopoverFetchState>({
-    status: 'loading',
-    values: [],
-    hasMore: false,
-    error: null,
-  });
-
-  useEffect(() => {
-    const timer = setTimeout(() => setDebounced(search), 250);
-    return () => clearTimeout(timer);
-  }, [search]);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    let cancelled = false;
-    setState((prev) => ({ ...prev, status: 'loading', error: null }));
-    runtime.queries
-      .distinct(
-        {
-          modelId,
-          table: spec.table,
-          column: spec.column,
-          search: debounced.trim() || null,
-          filters: [],
-        },
-        controller.signal,
-      )
-      .then((result) => {
-        if (cancelled) return;
-        setState({
-          status: 'ok',
-          values: result.values.filter((value): value is FilterValue => value !== null),
-          hasMore: result.hasMore,
-          error: null,
-        });
-      })
-      .catch((error: unknown) => {
-        if (cancelled || (error instanceof DOMException && error.name === 'AbortError')) return;
-        setState({
-          status: 'error',
-          values: [],
-          hasMore: false,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-    return () => {
-      cancelled = true;
-      controller.abort();
-    };
-  }, [runtime, modelId, spec.table, spec.column, debounced, retryToken]);
 
   // Anchor under the trigger, clamp to the viewport, flip above when the panel
-  // would spill past the bottom. Re-measured when the list content changes
-  // size; hidden until the first measurement lands (no corner flash).
+  // would spill past the bottom. A ResizeObserver re-runs it whenever the list
+  // grows/shrinks (values landing, a search narrowing the rows); the panel
+  // stays hidden until the first measurement lands (no corner flash).
   useLayoutEffect(() => {
     const trigger = anchor.current;
     const card = cardRef.current;
     if (!trigger || !card) return;
-    const a = trigger.getBoundingClientRect();
-    const rect = card.getBoundingClientRect();
-    const x = Math.max(8, Math.min(a.left, window.innerWidth - rect.width - 8));
-    let y = a.bottom + 4;
-    if (y + rect.height > window.innerHeight - 8) {
-      const above = a.top - rect.height - 4;
-      y = above >= 8 ? above : Math.max(8, window.innerHeight - rect.height - 8);
-    }
-    setPos({ x, y });
-  }, [anchor, state.status, state.values.length]);
+    const place = () => {
+      const a = trigger.getBoundingClientRect();
+      const rect = card.getBoundingClientRect();
+      const x = Math.max(8, Math.min(a.left, window.innerWidth - rect.width - 8));
+      let y = a.bottom + 4;
+      if (y + rect.height > window.innerHeight - 8) {
+        const above = a.top - rect.height - 4;
+        y = above >= 8 ? above : Math.max(8, window.innerHeight - rect.height - 8);
+      }
+      setPos((prev) => (prev && prev.x === x && prev.y === y ? prev : { x, y }));
+    };
+    place();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(place);
+    observer.observe(card);
+    return () => observer.disconnect();
+  }, [anchor]);
 
   useEffect(() => {
     const isInside = (target: EventTarget | null): boolean =>
@@ -659,42 +684,6 @@ function MultiValuePopover({
     };
   }, [anchor, onClose]);
 
-  // Selected values stay listed (and un-toggleable) even when the current
-  // search response doesn't include them — same doctrine as DistinctValueList.
-  const listed = useMemo<FilterValue[]>(() => {
-    const fetchedKeys = new Set(state.values.map(keyOf));
-    const pinned = selected.filter((value) => !fetchedKeys.has(keyOf(value)));
-    return [...pinned, ...state.values];
-  }, [state.values, selected]);
-
-  const selectedKeys = useMemo(() => new Set(selected.map(keyOf)), [selected]);
-
-  const listScroll = useScrollAffordance(listRef, `${listed.length}:${state.status}`);
-  // Rows are uniform, so the average row height is exact enough to say how
-  // many are still below the fold.
-  const rowHeight = listed.length > 0 ? listScroll.contentHeight / listed.length : 0;
-  const rowsPastFold =
-    rowHeight > 0
-      ? Math.max(
-          0,
-          listed.length -
-            Math.round((listScroll.scrollTop + listScroll.viewportHeight) / rowHeight),
-        )
-      : 0;
-
-  /** Union of the current selection and every currently listed value. */
-  const selectAllListed = () => {
-    const union = [...selected];
-    const have = new Set(selected.map(keyOf));
-    for (const value of state.values) {
-      if (!have.has(keyOf(value))) {
-        have.add(keyOf(value));
-        union.push(value);
-      }
-    }
-    onSetValues(union);
-  };
-
   return (
     <div
       ref={cardRef}
@@ -703,95 +692,21 @@ function MultiValuePopover({
       style={{ left: pos?.x ?? 0, top: pos?.y ?? 0, visibility: pos ? undefined : 'hidden' }}
       className="fixed z-50 flex max-h-80 w-72 max-w-[92vw] flex-col rounded-md border border-rcd-border bg-rcd-surface p-2 shadow-[var(--rcd-shadow-2)]"
     >
-      <div className="relative shrink-0">
-        <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-rcd-muted" />
-        <RcdInput
-          autoFocus
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search values…"
-          aria-label={`Search ${spec.column} values`}
-          className="w-full pl-7"
-        />
-      </div>
-
-      {/* Same overflow doctrine as the checklist body: the scroll container
-          lives inside a relative frame so the fades/“+N more” chip can sit on
-          its edges instead of scrolling away with the rows. */}
-      <div className="relative mt-2 min-h-16 flex-1 overflow-hidden rounded-md border border-rcd-border">
-        <div ref={listRef} className="h-full overflow-y-auto">
-          {state.status === 'error' ? (
-            <div className="flex flex-col items-center gap-2 p-4 text-center">
-              <AlertTriangle size={16} className="text-[var(--rcd-status-warn)]" />
-              <p className="max-w-full break-words text-xs text-rcd-text-2">{state.error}</p>
-              <RcdButton onClick={() => setRetryToken((t) => t + 1)}>
-                <RefreshCw size={13} />
-                Retry
-              </RcdButton>
-            </div>
-          ) : state.status === 'loading' && listed.length === 0 ? (
-            <div className="flex h-20 items-center justify-center">
-              <RcdSpinner label="Loading values…" />
-            </div>
-          ) : listed.length === 0 ? (
-            <p className="p-3 text-xs text-rcd-muted">No values match.</p>
-          ) : (
-            <div className={`flex flex-col p-1 ${state.status === 'loading' ? 'opacity-60' : ''}`}>
-              {listed.map((value) => (
-                <label
-                  key={keyOf(value)}
-                  className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-                >
-                  <input
-                    type="checkbox"
-                    className="accent-[var(--rcd-accent)]"
-                    checked={selectedKeys.has(keyOf(value))}
-                    onChange={() => onToggle(value)}
-                  />
-                  <span className="min-w-0 truncate" title={String(value)}>
-                    {String(value)}
-                  </span>
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
-        <ScrollFades state={listScroll} moreCount={rowsPastFold} />
-      </div>
-
-      <div className="mt-2 flex shrink-0 items-center justify-between gap-2 border-t border-rcd-border pt-2">
-        <div className="flex items-center gap-1">
-          <RcdButton
-            variant="ghost"
-            className="!px-2 !py-1 !text-xs"
-            disabled={state.status !== 'ok' || state.values.length === 0}
-            title={
-              state.hasMore
-                ? 'Selects the values listed here (more exist — refine your search)'
-                : 'Select every listed value'
-            }
-            onClick={selectAllListed}
-          >
-            Select all
-          </RcdButton>
-          <RcdButton
-            variant="ghost"
-            className="!px-2 !py-1 !text-xs"
-            disabled={selected.length === 0}
-            title="Clear the selection"
-            onClick={() => onSetValues([])}
-          >
-            Clear
-          </RcdButton>
-        </div>
-        <span className="shrink-0 text-[11px] text-rcd-muted">
-          {selected.length > 0
-            ? `${selected.length} selected`
-            : state.hasMore
-              ? 'More values exist'
-              : 'All values'}
-        </span>
-      </div>
+      <SlicerChecklistPanel
+        modelId={modelId}
+        table={spec.table}
+        column={spec.column}
+        label={spec.label}
+        compact={compact}
+        selected={selected}
+        onToggle={onToggle}
+        onSetValues={onSetValues}
+        filters={filters}
+        cascade={cascade}
+        fallbackRows={POPOVER_ROWS}
+        autoHeight
+        autoFocusSearch
+      />
     </div>
   );
 }
@@ -845,6 +760,12 @@ const BUTTON_VALIGN_CLASSES = {
  * share the width), fixed column grid, and horizontal/vertical placement of
  * the group inside the tile. Multi-select semantics are unchanged (each pill
  * toggles membership of the 'in' clause).
+ *
+ * The pill SET comes from the same distinct-values endpoint every other
+ * variant uses (capped at BUTTONS_CAP), so cascade works here too: the cap'd
+ * fetch simply carries the cascade clauses. Selected values the response no
+ * longer contains are still rendered (dashed + dimmed) — a filter is never
+ * silently invisible.
  */
 function ButtonsSlicer({
   modelId,
@@ -852,6 +773,8 @@ function ButtonsSlicer({
   compact,
   selected,
   onToggle,
+  filters,
+  cascade,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
@@ -859,6 +782,8 @@ function ButtonsSlicer({
   /** Multi-select: pills toggle membership of an 'in' clause. */
   selected: readonly FilterValue[];
   onToggle: (value: FilterValue) => void;
+  filters: FilterClause[];
+  cascade: boolean;
 }) {
   const runtime = useRuntime();
   const [retryToken, setRetryToken] = useState(0);
@@ -869,6 +794,10 @@ function ButtonsSlicer({
     error: null,
   });
 
+  const filtersKey = stableStringify(filters);
+  const filtersRef = useRef(filters);
+  filtersRef.current = filters;
+
   useEffect(() => {
     let cancelled = false;
     setState((prev) => ({ ...prev, status: 'loading', error: null }));
@@ -878,7 +807,8 @@ function ButtonsSlicer({
         table: spec.table,
         column: spec.column,
         search: null,
-        filters: [],
+        // Cascade clauses ride into the shared distinct cache key.
+        filters: [...filtersRef.current],
         limit: BUTTONS_CAP,
       })
       .then((result) => {
@@ -902,7 +832,7 @@ function ButtonsSlicer({
     return () => {
       cancelled = true;
     };
-  }, [runtime, modelId, spec.table, spec.column, retryToken]);
+  }, [runtime, modelId, spec.table, spec.column, filtersKey, retryToken]);
 
   if (state.status === 'error') {
     return (
@@ -925,8 +855,24 @@ function ButtonsSlicer({
     );
   }
 
-  if (state.values.length === 0) {
-    return <p className="p-2 text-xs text-rcd-muted">No values to show.</p>;
+  // Available pills (capped) plus any SELECTED value the response omitted —
+  // pinned first so a filter is never invisible. Under cascade with a complete
+  // response those pinned values are genuinely unavailable and render dimmed;
+  // without cascade they merely fell past BUTTONS_CAP, so they stay normal.
+  const available = state.values.slice(0, BUTTONS_CAP);
+  const availableKeys = new Set(available.map(keyOf));
+  const pinned = selected.filter((value) => !availableKeys.has(keyOf(value)));
+  const listed = [...pinned, ...available];
+  const dimPinned = cascade && state.status === 'ok' && !state.hasMore;
+  const pinnedKeys = new Set(pinned.map(keyOf));
+  const selectedKeys = new Set(selected.map(keyOf));
+
+  if (listed.length === 0) {
+    return (
+      <p className="p-2 text-xs text-rcd-muted">
+        {cascade ? 'No values remain under the other filters.' : 'No values to show.'}
+      </p>
+    );
   }
 
   const style = spec.style ?? {};
@@ -964,20 +910,28 @@ function ButtonsSlicer({
               : { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }
           }
         >
-          {state.values.slice(0, BUTTONS_CAP).map((value) => {
-            const isActive = selected.includes(value);
+          {listed.map((value) => {
+            const key = keyOf(value);
+            const isActive = selectedKeys.has(key);
+            const unavailable = dimPinned && pinnedKeys.has(key);
             return (
               <button
-                key={keyOf(value)}
+                key={key}
                 type="button"
                 aria-pressed={isActive}
                 onClick={() => onToggle(value)}
-                title={String(value)}
+                title={
+                  unavailable
+                    ? `${String(value)} — selected, but no rows match it under the other filters`
+                    : String(value)
+                }
                 // Uniform pill geometry (fixed height/radius, consistent gap);
-                // the selected state is an accent FILL with inverted text.
+                // the selected state is an accent FILL with inverted text; a
+                // selected-but-unavailable value keeps the fill at low opacity
+                // behind a dashed border so it still reads as "click to clear".
                 className={`inline-flex items-center justify-center overflow-hidden rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] ${
                   BUTTON_SIZE_CLASSES[size]
-                } ${itemClasses} ${
+                } ${itemClasses} ${unavailable ? 'border-dashed italic opacity-50' : ''} ${
                   isActive
                     ? 'border-rcd-accent bg-rcd-accent font-medium text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90'
                     : 'border-rcd-border bg-rcd-surface text-rcd-text-2 hover:border-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
@@ -1187,6 +1141,7 @@ function DateRangeSlicer({
   columnType,
   onChange,
   allowClear,
+  filters,
 }: {
   modelId: number;
   spec: SlicerTileSpec;
@@ -1197,6 +1152,8 @@ function DateRangeSlicer({
   onChange: (clause: FilterClause | null) => void;
   /** spec.showClear !== false — gates the inline clear affordance. */
   allowClear: boolean;
+  /** Cascade clauses; scope the calendar's data-availability marks. */
+  filters: FilterClause[];
 }) {
   const [from, to] = useMemo<[string, string]>(() => {
     if (!clause) return ['', ''];
@@ -1245,6 +1202,7 @@ function DateRangeSlicer({
         to={to}
         onChange={update}
         showClear={allowClear}
+        filters={filters}
       />
     );
   }

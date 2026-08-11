@@ -117,6 +117,18 @@ export interface SlicerTileSpec {
   /** dateRange variant behavior; absent = native inputs. */
   dateRange?: DateRangeOptions;
   /**
+   * CASCADING slicer (Power BI "filter available values"): the distinct-value
+   * fetch behind this slicer is constrained by the dashboard's other active
+   * filters, so the list only offers values that still exist under them.
+   * Default false — absent keeps the unconstrained (full-column) list.
+   *
+   * The constraining set is `DashboardStore.cascadeFiltersForSlicer` (other
+   * slicers on the same page + active cross-filters, ALWAYS excluding any
+   * clause on this slicer's own table.column). Selections are never dropped:
+   * a selected value the cascade trims away stays listed, dimmed.
+   */
+  cascade?: boolean;
+  /**
    * relativeDate variant: persisted preset id (e.g. 'last30d', 'ytd',
    * 'lastN:6:month') applied when the dashboard opens with no runtime
    * selection yet. Runtime preset choices live in SlicerValues (bookmarks

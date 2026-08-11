@@ -27,14 +27,37 @@ export interface SlicerConfigMenuProps {
 /** yyyy-MM pin accepted by DateRangeOptions.initialMonth. */
 const MONTH_PIN = /^\d{4}-(0[1-9]|1[0-2])$/;
 
-const VARIANTS: { value: SlicerVariant; label: string }[] = [
-  { value: 'checklist', label: 'Checklist' },
-  { value: 'dropdown', label: 'Dropdown' },
-  { value: 'dropdownMulti', label: 'Dropdown (multi-select)' },
+const VARIANTS: { value: SlicerVariant; label: string; hint?: string }[] = [
+  { value: 'checklist', label: 'Checklist', hint: 'Searchable list filling the tile' },
+  { value: 'dropdown', label: 'Dropdown', hint: 'Panel drops inside the tile' },
+  {
+    value: 'dropdownMulti',
+    label: 'Dropdown (overlay)',
+    hint: 'Same list, floating over the dashboard',
+  },
   { value: 'buttons', label: 'Buttons' },
   { value: 'dateRange', label: 'Date range' },
   { value: 'relativeDate', label: 'Relative date' },
 ];
+
+/**
+ * Variants that list the column's distinct values. They all emit exactly one
+ * `in` clause over the slicer's column, so switching between them is LOSSLESS
+ * (the selection carries over) and the cascade toggle applies to all of them.
+ * The date variants (between/gte/lte) and fieldParam (no clause) are separate
+ * families — crossing families still clears, since the old clause shape means
+ * nothing to the new body.
+ */
+const VALUE_LISTING_VARIANTS: ReadonlySet<SlicerVariant> = new Set<SlicerVariant>([
+  'checklist',
+  'dropdown',
+  'dropdownMulti',
+  'buttons',
+]);
+
+/** True when a selection made under `from` is still valid under `to`. */
+const clauseShapeSurvives = (from: SlicerVariant, to: SlicerVariant): boolean =>
+  VALUE_LISTING_VARIANTS.has(from) && VALUE_LISTING_VARIANTS.has(to);
 
 /**
  * Right-click / kebab configuration card for a slicer tile. A fixed-position
@@ -99,9 +122,14 @@ export function SlicerConfigMenu({
   const setVariant = (variant: SlicerVariant) => {
     if (variant === spec.variant) return;
     runtime.dashboards.updateSlicer(tileId, { variant });
-    // Variants build different clause shapes (in / eq / between) — a stale
-    // selection from the old variant must not keep filtering charts.
-    runtime.dashboards.setSlicerValue(tileId, null);
+    // Variants build different clause shapes (in / eq / between), so a stale
+    // selection from another FAMILY must not keep filtering charts. Within the
+    // value-listing family the clause is identical ('in' over this column), so
+    // the switch is lossless — checklist ⇄ dropdown ⇄ overlay dropdown ⇄
+    // buttons all keep what the user had picked.
+    if (!clauseShapeSurvives(spec.variant, variant)) {
+      runtime.dashboards.setSlicerValue(tileId, null);
+    }
   };
 
   const commitLabel = () => {
@@ -133,6 +161,15 @@ export function SlicerConfigMenu({
 
   const style = spec.style ?? {};
   const dateRange = spec.dateRange ?? {};
+
+  /**
+   * The cascade toggle applies wherever the slicer LISTS values from the
+   * column — every value-listing variant, plus the calendar picker (whose
+   * availability marks come from the same distinct query).
+   */
+  const showCascade =
+    VALUE_LISTING_VARIANTS.has(spec.variant) ||
+    (spec.variant === 'dateRange' && dateRange.picker === 'calendar');
 
   /** Flips one visual-mode flag, preserving the other (style patches whole). */
   const toggleStyleFlag = (flag: 'hideHeader' | 'compact') => {
@@ -214,18 +251,29 @@ export function SlicerConfigMenu({
                 {VARIANTS.map((variant) => (
                   <label
                     key={variant.value}
-                    className="flex cursor-pointer items-center gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
+                    className="flex cursor-pointer items-start gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
                   >
                     <input
                       type="radio"
                       name={`rcd-slicer-variant-${tileId}`}
-                      className="accent-[var(--rcd-accent)]"
+                      className="mt-1 accent-[var(--rcd-accent)]"
                       checked={spec.variant === variant.value}
                       onChange={() => setVariant(variant.value)}
                     />
-                    {variant.label}
+                    <span className="min-w-0 flex-1">
+                      {variant.label}
+                      {variant.hint && (
+                        <span className="block text-[11px] leading-tight text-rcd-muted">
+                          {variant.hint}
+                        </span>
+                      )}
+                    </span>
                   </label>
                 ))}
+                <p className="px-3 pb-1 pt-0.5 text-[11px] leading-tight text-rcd-muted">
+                  Checklist, dropdown and buttons share one selection — switching
+                  between them keeps what you picked.
+                </p>
               </>
             )}
 
@@ -264,6 +312,31 @@ export function SlicerConfigMenu({
               />
               Compact
             </label>
+
+            {showCascade && (
+              <>
+                <Divider />
+                <SectionLabel>Available values</SectionLabel>
+                <label className="flex cursor-pointer items-start gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+                  <input
+                    type="checkbox"
+                    className="mt-1 accent-[var(--rcd-accent)]"
+                    checked={spec.cascade === true}
+                    onChange={() =>
+                      runtime.dashboards.updateSlicer(tileId, { cascade: !(spec.cascade === true) })
+                    }
+                  />
+                  <span className="min-w-0 flex-1">
+                    Filter available values by other filters
+                    <span className="block text-[11px] leading-tight text-rcd-muted">
+                      {spec.variant === 'dateRange'
+                        ? 'Marks only the days that survive the other slicers and cross-filters.'
+                        : 'Lists only values that survive the other slicers and cross-filters on this page. Values you already picked stay listed, dimmed.'}
+                    </span>
+                  </span>
+                </label>
+              </>
+            )}
 
             {spec.variant === 'buttons' && (
               <>

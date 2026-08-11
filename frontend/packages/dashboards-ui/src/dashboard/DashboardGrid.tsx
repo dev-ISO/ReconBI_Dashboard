@@ -26,8 +26,18 @@ export interface DashboardGridProps {
   /**
    * Minimum canvas height in grid rows (default 24) so edit mode always has
    * empty space to drag tiles into; the canvas still grows past it with content.
+   * Superseded by `boundaryHeight` when provided.
    */
   minRows?: number;
+  /**
+   * Edit-mode page boundary (px): the canvas height that fits the current
+   * viewport without scrolling (Power BI's page edge). When set, the canvas'
+   * min-height is exactly this — authors get a screen-sized workspace, not an
+   * arbitrarily tall one — and a subtle dashed guide line marks the fold.
+   * Tiles can still be dragged past it (the canvas grows with content; taller
+   * existing dashboards simply show content past the line).
+   */
+  boundaryHeight?: number | null;
 }
 
 /**
@@ -41,6 +51,7 @@ export function DashboardGrid({
   renderItem,
   draggableHandle,
   minRows = 24,
+  boundaryHeight = null,
 }: DashboardGridProps) {
   const layout: Layout[] = useMemo(
     () =>
@@ -59,8 +70,30 @@ export function DashboardGrid({
   return (
     // Free canvas (Power BI-style): no auto-compaction, collisions blocked, and
     // a min-height floor so there is always empty space to drag tiles into.
-    // RGL still grows its own height past the floor as tiles move down.
-    <div style={{ minHeight: editable ? minRows * (ROW_HEIGHT + MARGIN) : undefined }}>
+    // With a measured page boundary the floor is EXACTLY the viewport-fitting
+    // height (screen-sized workspace, not an arbitrarily tall one); RGL still
+    // grows its own height past the floor as tiles move down.
+    <div
+      className={editable ? 'relative' : undefined}
+      style={{
+        minHeight: editable ? (boundaryHeight ?? minRows * (ROW_HEIGHT + MARGIN)) : undefined,
+      }}
+    >
+      {editable && boundaryHeight != null && (
+        // Page-boundary guide (Power BI's page edge): everything above the
+        // dashed line fits the current viewport without scrolling. Purely
+        // visual — never intercepts pointer events; tiles paint over it.
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-x-0"
+          style={{ top: boundaryHeight }}
+        >
+          <div className="border-t border-dashed border-rcd-border" />
+          <span className="absolute right-0 top-1 rounded bg-rcd-surface px-1.5 py-0.5 text-[10px] font-medium text-rcd-muted shadow-[var(--rcd-shadow-1)]">
+            Page boundary — tiles below this line will scroll for viewers
+          </span>
+        </div>
+      )}
       <Grid
         className="rcd-dashboard-grid"
         layout={layout}

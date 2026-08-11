@@ -152,6 +152,66 @@ export interface GanttOptions {
   singleColor?: boolean;
   /** The bar color used in single-color mode / when there is no group. */
   color?: string;
+
+  /* --- Colors (per-GROUP colors live in format.colorOverrides, keyed by the
+     group label — the same Series > Colors swatches every other chart uses) --- */
+  /**
+   * Inner completion-fill color. Default (undefined) keeps the theme-neutral
+   * overlay: the text token at low alpha, which darkens the bar in light theme
+   * and lightens it in dark.
+   */
+  progressColor?: string;
+  /** Bar fill opacity 0..1 (default 1 = fully opaque). */
+  barOpacity?: number;
+  /** Row-banding tint (default undefined = the neutral text-token wash). */
+  bandingColor?: string;
+  /** Color for zero-duration tasks (milestones); default = the task's own color. */
+  milestoneColor?: string;
+  /**
+   * How zero-duration tasks draw: 'bar' (default) keeps the 2px sliver,
+   * 'diamond' draws a centered diamond marker.
+   */
+  milestoneShape?: 'bar' | 'diamond';
+  /**
+   * Color for the on-bar task/duration labels ('inside' and 'adjacent'
+   * placements). Default: inside labels auto-contrast against the bar color
+   * (white unless the bar is very light), adjacent labels use the muted text
+   * token.
+   */
+  labelColor?: string;
+
+  /* --- Overlays --- */
+  /** Subtle Sat/Sun background bands; silently skipped at month+ tick scale. */
+  shadeWeekends?: boolean;
+  /** Weekend/period shading color (default: the neutral text-token wash). */
+  shadeColor?: string;
+  /** 'Today' caption on the today line (default true, when the line is shown). */
+  todayLabel?: boolean;
+
+  /* --- Labels --- */
+  /**
+   * Humanized bar durations ('12d', '3.5mo'), independent of taskLabels;
+   * auto-hidden on bars too narrow to carry the text. Default 'off'.
+   */
+  durationLabels?: 'off' | 'inside' | 'adjacent';
+
+  /* --- Structure --- */
+  /**
+   * Row order. Applies only when the query carries no explicit sort — an
+   * explicit query.sort always wins. Default 'start' / 'asc'.
+   */
+  sortBy?: 'start' | 'end' | 'duration' | 'name';
+  sortDirection?: 'asc' | 'desc';
+  /**
+   * Cluster rows by group under a slim group header row (name + task count +
+   * span summary bar), with tighter intra-group spacing. Ignored when the
+   * chart has no group dimension. Default false.
+   */
+  groupLanes?: boolean;
+
+  /* --- Time axis --- */
+  /** Force the time-axis tick unit when 'auto' picks poorly. Default 'auto'. */
+  axisTicks?: 'auto' | 'weekly' | 'monthly' | 'quarterly' | 'yearly';
 }
 
 /** Date axis label presets for bucketed dimensions. */
@@ -298,7 +358,12 @@ export interface AxisLabelFit {
 
 /** Interactive view tools over cartesian charts (view-only unless noted). */
 export interface ChartZoomOptions {
-  /** Recharts brush strip below the plot: drag to window, drag edges to pan. */
+  /**
+   * LEGACY (wave 12-14): used to render a recharts Brush strip below the plot.
+   * The strip is gone; a truthy `brush` is now an alias for "zoom controls
+   * enabled" — it shows the corner zoom/pan button cluster instead, so saved
+   * charts and seeds keep working unchanged.
+   */
   brush?: boolean;
   /** Drag a rectangle on the plot to zoom the view; double-click resets. */
   dragZoom?: boolean;
@@ -310,6 +375,14 @@ export interface ChartZoomOptions {
   dragAction?: 'view' | 'crossFilter';
   /** Mouse-wheel zoom centred on the cursor (view-only; default false). */
   wheel?: boolean;
+  /**
+   * Default view window applied whenever the chart's data (re)loads:
+   * `{ lastN: 12 }` opens on the last 12 axis buckets (Power BI-style "show
+   * recent periods first"). Null/undefined = open at full extent. Purely a
+   * view default — the viewer can still pan/zoom away from it; the zoom
+   * cluster's reset (and plot double-click) returns to this window.
+   */
+  initialWindow?: { lastN?: number } | null;
 }
 
 export interface ChartFormat {

@@ -315,11 +315,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [indicatorDragPos, setIndicatorDragPos] = useState<{ x: number; y: number } | null>(null);
   /**
    * View-mode session override of the doc's default view sizing (null =
-   * follow `layout.defaultViewFit`). Same doctrine as placementOverride:
-   * transient personal tweak, never persisted; edit-mode picks write the doc
-   * default instead (and edit mode always renders 1:1 regardless).
+   * follow `layout.defaultViewFit`). Transient personal tweak, never
+   * persisted — but held in the STORE, not component state, so it survives
+   * page switches and any remount of this component within the session;
+   * edit-mode picks write the doc default instead (and edit mode always
+   * renders 1:1 regardless).
    */
-  const [viewFitOverride, setViewFitOverride] = useState<ViewFitMode | null>(null);
+  const viewFitOverride = useDashboardState((state) => state.viewFitOverride);
 
   // Ctrl/Cmd-click detection for additive cross-filtering (see module header).
   useClickModifierTracker();
@@ -1244,17 +1246,49 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const isMobileView =
     mode === 'view' && containerWidth !== null && containerWidth < MOBILE_BREAKPOINT;
 
+  /* --------------------------------------------- edit-mode canvas boundary */
+
+  /** The grid scroll area (ref'd for the edit-mode page-boundary measure). */
+  const scrollAreaRef = useRef<HTMLDivElement>(null);
+  /**
+   * Edit-mode page boundary: the canvas height (px) that fits the CURRENT
+   * viewport without scrolling — Power BI's "page edge". Measured off the
+   * scroll area's client box minus its p-3 padding, rounded with a 1px
+   * dead-band so ResizeObserver jitter never churns the canvas.
+   */
+  const [canvasBoundary, setCanvasBoundary] = useState<number | null>(null);
+  useEffect(() => {
+    if (!editable || mobileEditOpen) {
+      setCanvasBoundary(null);
+      return;
+    }
+    const node = scrollAreaRef.current;
+    if (!node) return;
+    const measure = () => {
+      const next = Math.round(node.clientHeight) - 24; // p-3 top + bottom
+      setCanvasBoundary((prev) =>
+        next <= 0 ? null : prev !== null && Math.abs(prev - next) < 1 ? prev : next,
+      );
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [editable, mobileEditOpen]);
+
   /* ------------------------------------------------------ view fit (scale) */
 
   /**
    * Effective view sizing: edit mode shows (and edits) the authored doc
    * default but always RENDERS 1:1 (drag/resize math must stay unscaled);
-   * view mode honors the session override first, then the doc default. The
-   * phone stack ignores fit entirely — scaling a single-column stack down
-   * would just shrink text.
+   * view mode honors the session override first, then the doc default. FIT
+   * TO PAGE is the product default — a doc with no `defaultViewFit` fits;
+   * docs explicitly authored to 'actual' render 1:1 (and the toolbar's View
+   * menu still lets viewers switch either way). The phone stack ignores fit
+   * entirely — scaling a single-column stack down would just shrink text.
    */
   const docViewFit: ViewFitMode =
-    (current?.id === dashboardId ? current.layout.defaultViewFit : null) ?? 'actual';
+    (current?.id === dashboardId ? current.layout.defaultViewFit : null) ?? 'fitPage';
   const effectiveViewFit: ViewFitMode =
     mode === 'edit' ? docViewFit : (viewFitOverride ?? docViewFit);
   const fitPageActive =
@@ -1546,7 +1580,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               ? editable
                 ? (fit) => runtime.dashboards.setDefaultViewFit(fit)
                 : undefined
-              : (fit) => setViewFitOverride(fit)
+              : (fit) => runtime.dashboards.setViewFitOverride(fit)
         }
         // 'header' docking slot: compact chips inline in the toolbar row.
         centerContent={
@@ -1562,8 +1596,11 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       />
 
       {/* Banner indicator: in normal flow so it spans the full width and never
-          covers a tile (top edge here, bottom edge below the grid row). */}
-      {bannerIndicator && !bannerAtBottom && (
+          covers a tile (top edge here, bottom edge below the grid row). While
+          FIT is active it renders as an overlay INSIDE the content row instead
+          (below): an in-flow indicator appearing/disappearing would change the
+          measured height, resize every tile, and feed the shake loop. */}
+      {bannerIndicator && !bannerAtBottom && !fitPageActive && (
         <FilterIndicator
           entries={filterEntries}
           style={effectiveIndicatorStyle}
@@ -1574,6 +1611,36 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       {/* Flex row: grid area + (optional) right-docked Filters pane. Ref'd for
           the drag-to-dock slot geometry. */}
       <div ref={contentRowRef} className="relative flex min-h-0 flex-1">
+        {/* FIT-mode overlays for the in-flow indicator placements: same chips,
+            zero influence on the measured box (see the banner note above). */}
+        {fitPageActive && bannerIndicator && !bannerAtBottom && (
+          <div className="absolute inset-x-0 top-0 z-20">
+            <FilterIndicator
+              entries={filterEntries}
+              style={effectiveIndicatorStyle}
+              {...indicatorHandlers}
+            />
+          </div>
+        )}
+        {fitPageActive && bannerIndicator && bannerAtBottom && (
+          <div className="absolute inset-x-0 bottom-0 z-20">
+            <FilterIndicator
+              entries={filterEntries}
+              style={effectiveIndicatorStyle}
+              {...indicatorHandlers}
+            />
+          </div>
+        )}
+        {fitPageActive && footerIndicator && (
+          <div className="absolute inset-x-0 bottom-0 z-20 flex items-center justify-center gap-1.5 overflow-x-auto border-t border-rcd-border bg-rcd-surface px-3 py-1">
+            <FilterIndicator
+              entries={filterEntries}
+              style={effectiveIndicatorStyle}
+              inline
+              {...indicatorHandlers}
+            />
+          </div>
+        )}
         {/* Chip strip under the toolbar: the top-center filter indicator (so it
             can never overlap the toolbar's refresh caption), the drillthrough
             context on its target page, and transient export notices. */}
@@ -1626,7 +1693,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         )}
 
         <div
-          className={`h-full min-w-0 flex-1 overflow-auto ${
+          ref={scrollAreaRef}
+          // Fit mode never scrolls BY CONSTRUCTION (the page is scaled to fit
+          // the box), so the scrollbar is hard-disabled there: a sub-pixel
+          // overflow toggling a scrollbar would change the measured client box
+          // and oscillate the scale — the infinite-shake feedback path.
+          className={`h-full min-w-0 flex-1 ${fitPageActive ? 'overflow-hidden' : 'overflow-auto'} ${
             (editable && mobileEditOpen) || isMobileView ? '' : 'p-3'
           }`}
         >
@@ -1678,13 +1750,16 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             // Fit to page (view mode only): the viewport scales the grid down
             // so the whole page fits the available height; inactive it is a
             // style-less passthrough. Edit mode and MobileStack never scale.
-            <FitPageViewport active={fitPageActive}>
+            // contentKey re-measures synchronously on page switches so the new
+            // page's scale applies BEFORE its first paint.
+            <FitPageViewport active={fitPageActive} contentKey={activePage?.id ?? null}>
               <DashboardGrid
                 items={gridItems}
                 editable={editable}
                 onLayoutChange={handleLayoutChange}
                 renderItem={renderTile}
                 draggableHandle=".rcd-tile-drag-handle"
+                boundaryHeight={editable ? canvasBoundary : null}
               />
             </FitPageViewport>
           )}
@@ -1701,7 +1776,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         )}
       </div>
 
-      {bannerIndicator && bannerAtBottom && (
+      {bannerIndicator && bannerAtBottom && !fitPageActive && (
         <FilterIndicator
           entries={filterEntries}
           style={effectiveIndicatorStyle}
@@ -1709,8 +1784,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         />
       )}
 
-      {/* 'footer' docking slot: slim in-flow chip bar at the bottom edge. */}
-      {footerIndicator && (
+      {/* 'footer' docking slot: slim in-flow chip bar at the bottom edge
+          (overlay inside the content row instead while fit is active). */}
+      {footerIndicator && !fitPageActive && (
         <div className="flex w-full shrink-0 items-center justify-center gap-1.5 overflow-x-auto border-t border-rcd-border bg-rcd-surface px-3 py-1">
           <FilterIndicator
             entries={filterEntries}

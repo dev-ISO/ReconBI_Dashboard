@@ -5,13 +5,13 @@ import {
   useState,
   type CSSProperties,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type RefObject,
 } from 'react';
 import {
   Area,
   Bar,
-  Brush,
   CartesianGrid,
   Cell,
   ComposedChart,
@@ -349,6 +349,141 @@ const DRAG_ZOOM_MIN_PX = 4;
 
 /** Wheel zoom never narrows the view below this many buckets. */
 const MIN_WHEEL_BUCKETS = 3;
+
+/* -------------------------------------------------------------------------
+ * Zoom control cluster (replaces the recharts Brush strip)
+ *
+ * A compact button toolbar overlaying a corner of the plot: zoom in/out, pan
+ * left/right, reset. Semi-transparent until hovered (chart.css), positioned
+ * above the x-axis labels so it never covers them. Buttons step by a FRACTION
+ * of the current window (never one bucket) and repeat while held, so long
+ * series pan smoothly. All view-only — nothing here touches persisted state.
+ * ---------------------------------------------------------------------- */
+
+type ZoomStepAction = 'zoomIn' | 'zoomOut' | 'panLeft' | 'panRight' | 'reset';
+
+/** Fraction of the current window each cluster step (or hold tick) moves. */
+const ZOOM_STEP_FRACTION = 0.25;
+
+/** Press-and-hold repeat cadence for the cluster buttons. */
+const ZOOM_HOLD_REPEAT_MS = 140;
+
+/** 24-grid stroke icons (lucide-style) for the cluster buttons. */
+const ZOOM_ICONS: Record<ZoomStepAction, ReactNode> = {
+  zoomIn: (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.6-3.6M8.5 11h5M11 8.5v5" />
+    </>
+  ),
+  zoomOut: (
+    <>
+      <circle cx="11" cy="11" r="7" />
+      <path d="m20 20-3.6-3.6M8.5 11h5" />
+    </>
+  ),
+  panLeft: <path d="m14.5 6.5-5.5 5.5 5.5 5.5" />,
+  panRight: <path d="m9.5 6.5 5.5 5.5-5.5 5.5" />,
+  reset: (
+    <>
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
+    </>
+  ),
+};
+
+const ZOOM_BUTTON_TITLES: Record<ZoomStepAction, string> = {
+  zoomIn: 'Zoom in (hold to repeat)',
+  zoomOut: 'Zoom out (hold to repeat)',
+  panLeft: 'Pan left (hold to repeat)',
+  panRight: 'Pan right (hold to repeat)',
+  reset: 'Reset view',
+};
+
+function ZoomControlCluster({
+  onStep,
+  disabled,
+  style,
+}: {
+  onStep: (action: ZoomStepAction) => void;
+  /** Per-action no-op flags (edge of data / zoom limit / already at default). */
+  disabled: Record<ZoomStepAction, boolean>;
+  style?: CSSProperties;
+}) {
+  // One shared hold timer: pressing any button steps once immediately, then
+  // repeats until release. Release is a WINDOW listener — a button that
+  // becomes disabled mid-hold (edge reached) stops receiving pointer events,
+  // so its own pointerup could never arrive.
+  const holdRef = useRef<number | null>(null);
+  const stopHold = () => {
+    if (holdRef.current !== null) {
+      window.clearInterval(holdRef.current);
+      holdRef.current = null;
+    }
+  };
+  useEffect(() => stopHold, []);
+  const press = (action: ZoomStepAction) => (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    // No focus grab / text selection on rapid presses.
+    event.preventDefault();
+    stopHold();
+    onStep(action);
+    // onStep reads the live window from a ref, so a held-down callback never
+    // goes stale across the re-renders its own steps cause.
+    holdRef.current = window.setInterval(() => onStep(action), ZOOM_HOLD_REPEAT_MS);
+    window.addEventListener('pointerup', stopHold, { once: true });
+    window.addEventListener('pointercancel', stopHold, { once: true });
+  };
+  const button = (action: ZoomStepAction) => (
+    <button
+      key={action}
+      type="button"
+      title={ZOOM_BUTTON_TITLES[action]}
+      aria-label={ZOOM_BUTTON_TITLES[action]}
+      disabled={disabled[action]}
+      className="flex h-[22px] w-[22px] items-center justify-center rounded-[5px] text-rcd-text-2 transition-colors hover:bg-rcd-border hover:text-rcd-text disabled:pointer-events-none disabled:opacity-35"
+      onPointerDown={press(action)}
+      // Keyboard activation (Enter/Space fires click with detail 0) steps
+      // once; pointer presses are fully handled above.
+      onClick={(event) => {
+        if (event.detail === 0) onStep(action);
+      }}
+    >
+      <svg
+        width="13"
+        height="13"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        aria-hidden
+      >
+        {ZOOM_ICONS[action]}
+      </svg>
+    </button>
+  );
+  return (
+    <div
+      role="toolbar"
+      aria-label="Zoom controls"
+      className="rcd-zoom-cluster absolute z-10 flex items-center gap-0.5 rounded-md border border-rcd-border bg-rcd-surface p-0.5 shadow-sm"
+      style={style}
+      // The plot's own double-click resets the view; double-pressing a
+      // cluster button must not ALSO trigger it.
+      onDoubleClick={(event) => event.stopPropagation()}
+    >
+      {button('zoomOut')}
+      {button('zoomIn')}
+      <span aria-hidden className="mx-0.5 h-3.5 w-px bg-rcd-border" />
+      {button('panLeft')}
+      {button('panRight')}
+      <span aria-hidden className="mx-0.5 h-3.5 w-px bg-rcd-border" />
+      {button('reset')}
+    </div>
+  );
+}
 
 /** "No scale options" resolution: recharts defaults, nothing to warn about. */
 const NO_AXIS_SCALE: ResolvedAxisScale = { logFallback: false };
@@ -889,7 +1024,28 @@ export interface TooltipPayloadEntry {
   color?: string;
   dataKey?: string | number;
   payload?: unknown;
+  /** Recharts tooltipType echo: 'none' = the series opted out of tooltips. */
+  type?: string;
 }
+
+/**
+ * TOOLTIP LEAK FIX: recharts hands CUSTOM tooltip content the raw payload,
+ * including entries whose series opted out via `tooltipType="none"` — only
+ * recharts' DEFAULT content filters those, so trendline overlays surfaced as
+ * `__trend:<id>:<key>` rows in our card. Drop opted-out entries AND anything
+ * riding a synthetic `__`-prefixed dataKey (`__trend:`, `__rawAxis`, …):
+ * internal keys must never render as tooltip rows. Real series always carry
+ * wire column names (never `__`-prefixed; combo keys use U+001F separators
+ * and are name-labelled upstream), so nothing legitimate matches.
+ */
+const visibleTooltipEntries = (
+  payload: TooltipPayloadEntry[] | undefined,
+): TooltipPayloadEntry[] =>
+  (payload ?? []).filter(
+    (entry) =>
+      entry.type !== 'none' &&
+      !(typeof entry.dataKey === 'string' && entry.dataKey.startsWith('__')),
+  );
 
 /* -------------------------------------------------------------------------
  * Smart tooltip placement
@@ -980,8 +1136,8 @@ function placeTooltip(
   neighbours: readonly TipBox[] = [],
 ): { x: number; y: number } {
   const { w, h } = size;
-  // Clamp inside the PLOT when the card fits there (keeps it off the axes,
-  // legend and brush); fall back to the whole container in tiny tiles, where
+  // Clamp inside the PLOT when the card fits there (keeps it off the axes
+  // and legend); fall back to the whole container in tiny tiles, where
   // insisting on the plot area would leave nowhere to stand.
   const fitsPlot =
     w + 2 * TIP_EDGE <= plot.right - plot.left && h + 2 * TIP_EDGE <= plot.bottom - plot.top;
@@ -1184,7 +1340,11 @@ export function RcdChartTooltip({
   stacked?: boolean;
 }) {
   const cardRef = useRef<HTMLDivElement>(null);
-  const visible = active === true && payload != null && payload.length > 0;
+  // Synthetic/opted-out payload entries never become rows — and everything
+  // below (visibility, dodge spans, percent totals) reads the FILTERED list,
+  // so hidden entries can't skew the math either.
+  const entries = useMemo(() => visibleTooltipEntries(payload), [payload]);
+  const visible = active === true && entries.length > 0;
   const cardSize = useTooltipCardSize(cardRef, visible);
 
   // Chart geometry straight from the recharts store (this component renders
@@ -1220,8 +1380,8 @@ export function RcdChartTooltip({
       (s): s is NonNullable<typeof s> => s != null,
     );
     let value: { min: number; max: number } | null = null;
-    if ((marks === 'bars' || marks === 'points') && payload != null && valueScales.length > 0) {
-      const numbers = payload
+    if ((marks === 'bars' || marks === 'points') && entries.length > 0 && valueScales.length > 0) {
+      const numbers = entries
         .map((entry) => entry.value)
         .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
       // Stacked marks end at the running total; grouped/overlaid marks each
@@ -1263,7 +1423,7 @@ export function RcdChartTooltip({
       }
     }
     return { value, cross };
-  }, [payload, label, marks, stacked, rowsVertical, xScale, yScale, y2Scale]);
+  }, [entries, label, marks, stacked, rowsVertical, xScale, yScale, y2Scale]);
 
   // Resolve the boxes, then place. Until the card has been measured once we
   // render it hidden rather than guessing a size and jumping.
@@ -1333,7 +1493,7 @@ export function RcdChartTooltip({
   };
   const total =
     percentTotal ??
-    payload.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
+    entries.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
   return (
     <div
       ref={cardRef}
@@ -1344,7 +1504,7 @@ export function RcdChartTooltip({
         <div className="mb-1 truncate font-medium">{String(label)}</div>
       )}
       <div className="flex flex-col gap-1">
-        {payload.map((entry, i) => {
+        {entries.map((entry, i) => {
           const dataKey = typeof entry.dataKey === 'string' ? entry.dataKey : undefined;
           const color = tooltipEntryColor(entry);
           const share =
@@ -1624,7 +1784,13 @@ function CartesianChart({
   const showLegend =
     !panel &&
     (format.showLegend ?? (hasLegendDimension ? legendItems.length > 0 : shaped.series.length > 1));
-  const visibleSeries = shaped.series.filter((s) => !hidden.has(s.key));
+  // Memoized: this identity feeds the memoized trendline/window rows below —
+  // recharts treats a new data array as brand-new data (full re-render), so
+  // nothing on the render path may rebuild these per render.
+  const visibleSeries = useMemo(
+    () => shaped.series.filter((s) => !hidden.has(s.key)),
+    [shaped.series, hidden],
+  );
   const labelPosition = stacked ? 'center' : horizontal ? 'right' : 'top';
   const showDataLabels = Boolean(format.showDataLabels) && !panel?.hideDataLabels;
   // Single-series column/bar only: each category gets its own palette
@@ -1708,12 +1874,17 @@ function CartesianChart({
   // Trendlines: column/stackedColumn/line/area only — horizontal bars would
   // need value-axis fitting and are skipped silently (as are pie/kpi/table).
   // The overlays are injected into row COPIES under synthetic keys, so the
-  // shaped data the legend/reference lines read stays untouched.
-  const trendSpecs = !horizontal ? (format.trendlines ?? []) : [];
-  const { rows, overlays } =
-    trendSpecs.length > 0
-      ? buildTrendlines(trendSpecs, visibleSeries, shaped.data)
+  // shaped data the legend/reference lines read stays untouched. MEMOIZED:
+  // rows are the chart's data identity — rebuilding them per render made
+  // recharts fully re-render (and drop gestures) on every hover/drag state
+  // change, which is where the old zoom jank came from.
+  const trendSpecs = format.trendlines;
+  const { rows, overlays } = useMemo(() => {
+    const specs = !horizontal ? (trendSpecs ?? []) : [];
+    return specs.length > 0
+      ? buildTrendlines(specs, visibleSeries, shaped.data)
       : { rows: shaped.data, overlays: [] as TrendlineOverlay[] };
+  }, [trendSpecs, horizontal, visibleSeries, shaped.data]);
 
   // ---- zoom view window (format.zoom) --------------------------------------
   // Cartesian MAIN charts only: small-multiple panels ignore zoom entirely (a
@@ -1722,32 +1893,53 @@ function CartesianChart({
   // tools apply. The window is transient view state — never persisted.
   const zoomOpts = format.zoom;
   const zoomEligible = !panel && !horizontal && rows.length > 1;
-  const brushOn = zoomEligible && zoomOpts?.brush === true;
   const dragZoomOn = zoomEligible && zoomOpts?.dragZoom === true;
   const wheelOn = zoomEligible && zoomOpts?.wheel === true;
-  const zoomActive = brushOn || dragZoomOn || wheelOn;
+  const initialLastN = zoomOpts?.initialWindow?.lastN;
+  const hasInitialWindow = typeof initialLastN === 'number' && initialLastN >= 1;
+  // The corner button cluster replaces the old Brush strip: a truthy legacy
+  // `brush` is an alias for "zoom controls enabled" (wire compat), and any
+  // other zoom tool shows the cluster too, so every zoomed state stays
+  // visibly adjustable/resettable without hunting for hidden gestures.
+  const clusterOn =
+    zoomEligible &&
+    Boolean(zoomOpts && (zoomOpts.brush || zoomOpts.dragZoom || zoomOpts.wheel || hasInitialWindow));
+  const zoomActive = clusterOn || dragZoomOn || wheelOn;
 
-  // Reset the view whenever the data identity changes (new result, drill,
-  // slicer change) — a stale window over different rows would lie.
+  /** The configured default view over `len` rows; null = full extent. */
+  const defaultViewFor = (len: number): { start: number; end: number } | null =>
+    zoomEligible && hasInitialWindow && initialLastN < len
+      ? { start: len - initialLastN, end: len - 1 }
+      : null;
+
+  // (Re)apply the default view whenever the data identity changes (new
+  // result, drill, slicer change — a stale window over different rows would
+  // lie) or the configured initial view is edited (live Format-panel
+  // preview). Render-phase state adoption, NOT an effect: the first frame
+  // already shows the right window instead of flashing the full extent.
   const dataIdentity = `${rows.length}|${String(rows[0]?.[RAW_AXIS_KEY] ?? '')}|${String(
     rows[rows.length - 1]?.[RAW_AXIS_KEY] ?? '',
-  )}`;
-  useEffect(() => {
-    setViewWindow(null);
-  }, [dataIdentity]);
+  )}|${hasInitialWindow ? initialLastN : ''}`;
+  const [appliedIdentity, setAppliedIdentity] = useState<string | null>(null);
+  if (appliedIdentity !== dataIdentity) {
+    setAppliedIdentity(dataIdentity);
+    setViewWindow(defaultViewFor(rows.length));
+  }
 
   const lastRow = rows.length - 1;
   const winStart = viewWindow ? Math.max(0, Math.min(viewWindow.start, lastRow)) : 0;
   const winEnd = viewWindow ? Math.max(winStart, Math.min(viewWindow.end, lastRow)) : lastRow;
   /**
-   * Rows the user actually SEES. With the brush enabled the chart keeps the
-   * FULL rows (the strip must show the whole extent) and recharts windows the
-   * plot from the controlled brush indices; otherwise we slice manually.
-   * Either way recharts renders — and indexes events/Cells against — exactly
-   * this slice, so every handler below addresses displayRows.
+   * Rows the user actually SEES — recharts renders (and indexes events/Cells
+   * against) exactly this slice, so every handler below addresses
+   * displayRows. Identity is MEMOIZED (and the full extent reuses `rows`
+   * as-is): recharts must only see a new array when the window really moved,
+   * never because something unrelated re-rendered mid-gesture.
    */
-  const displayRows = viewWindow ? rows.slice(winStart, winEnd + 1) : rows;
-  const chartRows = brushOn ? rows : displayRows;
+  const displayRows = useMemo(
+    () => (winStart === 0 && winEnd === lastRow ? rows : rows.slice(winStart, winEnd + 1)),
+    [rows, winStart, winEnd, lastRow],
+  );
 
   // ---- axis scales (AxisScaleOptions) --------------------------------------
   // Extents cover the VISIBLE series on each axis (so legend toggles re-fit
@@ -1808,8 +2000,6 @@ function CartesianChart({
   const dragMouseDown = dragZoomOn
     ? (state: MouseHandlerDataParam, event: ReactMouseEvent<SVGGraphicsElement>) => {
         if (event.button !== 0) return;
-        // The brush strip manages its own dragging.
-        if ((event.target as Element | null)?.closest?.('.recharts-brush')) return;
         const idx = displayIndexFromState(state);
         if (idx === undefined) return;
         dragRef.current = { startIdx: idx, startX: event.clientX, moved: false };
@@ -1902,11 +2092,16 @@ function CartesianChart({
         return;
       }
       // Zoom centred on the cursor: keep the bucket under the pointer at the
-      // same fractional position inside the new window.
+      // same fractional position inside the new window. Fit-to-page wraps
+      // dashboards in a CSS scale(), so the client rect is in SCALED viewport
+      // px while the axis widths are LAYOUT px — normalize the pointer into
+      // layout px via the rect/offsetWidth ratio (the same compensation
+      // recharts applies internally) before mixing the two.
       const rect = node.getBoundingClientRect();
-      const plotLeft = rect.left + st.axisLeft;
-      const plotW = Math.max(1, rect.width - st.axisLeft - st.axisRight);
-      const f = Math.min(1, Math.max(0, (e.clientX - plotLeft) / plotW));
+      const scale = node.offsetWidth > 0 ? rect.width / node.offsetWidth : 1;
+      const xLayout = (e.clientX - rect.left) / scale;
+      const plotW = Math.max(1, node.offsetWidth - st.axisLeft - st.axisRight);
+      const f = Math.min(1, Math.max(0, (xLayout - st.axisLeft) / plotW));
       const anchor = st.start + Math.round(f * (count - 1));
       const start = Math.min(
         Math.max(0, anchor - Math.round(f * (newCount - 1))),
@@ -1917,6 +2112,61 @@ function CartesianChart({
     node.addEventListener('wheel', onWheel, { passive: false });
     return () => node.removeEventListener('wheel', onWheel);
   }, [wheelOn]);
+
+  // ---- zoom control cluster steps ------------------------------------------
+  // Shared by the corner buttons (single press and press-and-hold repeats).
+  // Reads the LIVE window from wheelStateRef — assigned every render above —
+  // so a hold interval created several renders ago still steps correctly.
+  // Steps move by ZOOM_STEP_FRACTION of the current window (min one bucket),
+  // and zooming out past the full extent clears the window entirely (which
+  // also releases plain-wheel scrolling back to the page).
+  const stepView = (action: ZoomStepAction) => {
+    const st = wheelStateRef.current;
+    const count = st.end - st.start + 1;
+    const clampStart = (start: number, size: number) =>
+      Math.min(Math.max(0, start), Math.max(0, st.len - size));
+    const centered = (size: number) =>
+      clampStart(Math.round((st.start + st.end) / 2 - (size - 1) / 2), size);
+    switch (action) {
+      case 'reset':
+        setViewWindow(defaultViewFor(st.len));
+        return;
+      case 'panLeft':
+      case 'panRight': {
+        if (count >= st.len) return;
+        const step =
+          Math.max(1, Math.round(count * ZOOM_STEP_FRACTION)) * (action === 'panLeft' ? -1 : 1);
+        const start = clampStart(st.start + step, count);
+        setViewWindow({ start, end: start + count - 1 });
+        return;
+      }
+      case 'zoomIn': {
+        if (count <= MIN_WHEEL_BUCKETS) return;
+        const size = Math.max(MIN_WHEEL_BUCKETS, Math.round(count * (1 - ZOOM_STEP_FRACTION)));
+        const start = centered(size);
+        setViewWindow({ start, end: start + size - 1 });
+        return;
+      }
+      case 'zoomOut': {
+        const size = Math.min(
+          st.len,
+          Math.max(count + 1, Math.round(count / (1 - ZOOM_STEP_FRACTION))),
+        );
+        if (size >= st.len) {
+          setViewWindow(null);
+          return;
+        }
+        const start = centered(size);
+        setViewWindow({ start, end: start + size - 1 });
+        return;
+      }
+    }
+  };
+  const atFullExtent = winStart === 0 && winEnd === lastRow;
+  const defaultView = defaultViewFor(rows.length);
+  const atDefaultView = defaultView
+    ? winStart === defaultView.start && winEnd === defaultView.end
+    : atFullExtent;
 
   // ---- designed fills (shadcn look) ---------------------------------------
   // Bars are flat solid fills at full color (no gradient, no self-stroke);
@@ -2156,12 +2406,13 @@ function CartesianChart({
     <div
       ref={wrapRef}
       className="relative h-full w-full min-w-0"
-      // Double-click anywhere on the plot resets the zoom view to full.
-      onDoubleClick={zoomActive ? () => setViewWindow(null) : undefined}
+      // Double-click anywhere on the plot resets the zoom view to the
+      // configured default (initialWindow when set, else the full extent).
+      onDoubleClick={zoomActive ? () => setViewWindow(defaultViewFor(rows.length)) : undefined}
     >
     <ResponsiveContainer width="100%" height="100%" debounce={RESIZE_DEBOUNCE}>
       <ComposedChart
-        data={chartRows}
+        data={displayRows}
         layout={horizontal ? 'vertical' : 'horizontal'}
         margin={
           panel
@@ -2489,26 +2740,30 @@ function CartesianChart({
               />
             ) : null;
           })()}
-        {brushOn && (
-          <Brush
-            className="rcd-chart-brush"
-            dataKey={shaped.axisKey}
-            height={22}
-            travellerWidth={8}
-            stroke="var(--rcd-axis)"
-            fill="transparent"
-            startIndex={winStart}
-            endIndex={winEnd}
-            onChange={(range) => {
-              const start = range.startIndex ?? 0;
-              const end = range.endIndex ?? lastRow;
-              // Back at full extent = no window (so wheel releases scrolling).
-              setViewWindow(start <= 0 && end >= lastRow ? null : { start, end });
-            }}
-          />
-        )}
       </ComposedChart>
     </ResponsiveContainer>
+    {clusterOn && (
+      <ZoomControlCluster
+        onStep={stepView}
+        disabled={{
+          zoomIn: winEnd - winStart + 1 <= MIN_WHEEL_BUCKETS,
+          zoomOut: atFullExtent,
+          panLeft: winStart <= 0,
+          panRight: winEnd >= lastRow,
+          reset: atDefaultView,
+        }}
+        // Bottom-right of the PLOT: clear of the x-axis labels below (their
+        // fitted height when measured) and of the right value axis when one
+        // is mounted — the cluster overlays data whitespace only.
+        style={{
+          right: (hasSecondary ? 56 : 0) + 12,
+          bottom:
+            (fittedTicks && labelFit ? labelFit.height : 30) +
+            (format.xAxisLabel && !htmlXTitle ? 16 : 0) +
+            8,
+        }}
+      />
+    )}
     {logNotes.length > 0 && (
       // Console-free log-fallback marker: a subtle in-chart badge, styled
       // like the small-multiples "+N more" note.

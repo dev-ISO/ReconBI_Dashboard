@@ -111,6 +111,14 @@ export interface DashboardStoreState {
    * on enterEdit (edit mode always shows/writes the authored doc state).
    */
   filterCardOverrides: Record<string, FilterCardOverride>;
+  /**
+   * View-mode transient override of the doc's default view sizing (null =
+   * follow `layout.defaultViewFit`, where absent means FIT TO PAGE). Lives in
+   * the store — NOT component state — so the viewer's choice survives page
+   * switches and any component remount within the session. NEVER persisted;
+   * cleared on open/close. Edit-mode picks write the doc default instead.
+   */
+  viewFitOverride: ViewFitMode | null;
   saveStatus: AsyncStatus;
   error: string | null;
 }
@@ -378,6 +386,7 @@ const initialState: DashboardStoreState = {
   drillthrough: null,
   lastAppliedBookmarkId: null,
   filterCardOverrides: {},
+  viewFitOverride: null,
   saveStatus: 'idle',
   error: null,
 };
@@ -449,6 +458,7 @@ export class DashboardStore {
       drillthrough: null,
       lastAppliedBookmarkId: null,
       filterCardOverrides: {},
+      viewFitOverride: null,
       saveStatus: 'idle',
       error: null,
     });
@@ -1213,6 +1223,62 @@ export class DashboardStore {
     return clauses;
   }
 
+  /**
+   * Filters that constrain a CASCADING slicer's AVAILABLE VALUES
+   * (SlicerTileSpec.cascade) — i.e. what its distinct-values fetch is scoped
+   * to. Deliberately NOT the same set as filtersForTile:
+   *
+   *  - INCLUDED: every OTHER slicer tile on the same page that currently holds
+   *    a clause, and every active cross-filter. Slicer "applies to" targeting
+   *    is ignored on purpose — it says which CHARTS a slicer filters, not what
+   *    the data universe looks like.
+   *  - EXCLUDED, always: any clause on this slicer's OWN table.column. A
+   *    slicer must never narrow its own option list (that would make
+   *    de-selecting a value impossible).
+   *  - EXCLUDED, by design: filter-pane cards and drillthrough context. They
+   *    are per-chart/per-page report scoping rather than user-driven slicing;
+   *    folding them in would make a slicer's list depend on invisible authored
+   *    state. (Documented scope choice — widen here if that changes.)
+   *
+   * Clauses are de-duplicated and sorted by their stable serialization so the
+   * array is order-stable: it is hashed straight into the distinct-value cache
+   * key (`stableStringify(DistinctValuesSpec)`, which includes `filters`).
+   */
+  cascadeFiltersForSlicer(tileId: string): FilterClause[] {
+    const layout = this.state.current?.layout;
+    if (!layout) return [];
+    const page = pagesOf(layout).find((p) => p.tiles.some((t) => t.id === tileId));
+    if (page === undefined) return [];
+    const self = page.tiles.find((t) => t.id === tileId);
+    const own = self?.slicer ? { table: self.slicer.table, column: self.slicer.column } : null;
+    const isOwnColumn = (clause: FilterClause): boolean =>
+      own !== null && clause.table === own.table && clause.column === own.column;
+
+    const seen = new Set<string>();
+    const clauses: FilterClause[] = [];
+    const push = (clause: FilterClause | null | undefined): void => {
+      if (clause == null || isOwnColumn(clause)) return;
+      const key = stableStringify(clause);
+      if (seen.has(key)) return;
+      seen.add(key);
+      clauses.push(clause);
+    };
+
+    for (const tile of page.tiles) {
+      if (tile.id === tileId || !isSlicerTile(tile)) continue;
+      push(slicerClauseOf(this.state.slicerValues[tile.id]));
+    }
+    for (const cross of this.state.crossFilters) {
+      if (cross.sourceTileId === tileId) continue;
+      push(cross.clause);
+    }
+    return clauses.sort((a, b) => {
+      const ka = stableStringify(a);
+      const kb = stableStringify(b);
+      return ka < kb ? -1 : ka > kb ? 1 : 0;
+    });
+  }
+
   /* ------------------------------------------------------------ drillthrough */
 
   /**
@@ -1363,15 +1429,25 @@ export class DashboardStore {
 
   /**
    * Doc-level default view sizing (persisted with the layout on save; written
-   * from the toolbar's View control in EDIT mode). 'actual'/null normalize to
-   * null — absent means actual, so an untouched dashboard never gains the key.
-   * View-mode viewer overrides are transient component state and never route
-   * through here.
+   * from the toolbar's View control in EDIT mode). FIT TO PAGE is the product
+   * default, so 'fitPage'/null normalize to null — absent means fit and an
+   * untouched dashboard never gains the key. 'actual' persists EXPLICITLY:
+   * docs authored to actual size keep rendering 1:1 for viewers. View-mode
+   * viewer overrides go through setViewFitOverride, never here.
    */
   setDefaultViewFit(fit: ViewFitMode | null): void {
-    const next = fit === 'actual' ? null : fit;
+    const next = fit === 'fitPage' ? null : fit;
     if ((this.state.current?.layout.defaultViewFit ?? null) === next) return;
     this.mutateLayout((layout) => ({ ...layout, defaultViewFit: next }));
+  }
+
+  /**
+   * View-mode transient view-sizing override (see DashboardStoreState.
+   * viewFitOverride). null returns the viewer to the doc default.
+   */
+  setViewFitOverride(fit: ViewFitMode | null): void {
+    if (this.state.viewFitOverride === fit) return;
+    this.set({ viewFitOverride: fit });
   }
 
   /* ------------------------------------------------------- field parameters */

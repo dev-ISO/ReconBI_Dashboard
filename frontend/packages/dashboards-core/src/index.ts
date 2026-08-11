@@ -1,4 +1,4 @@
-export const RCD_CORE_VERSION = '0.5.1';
+export const RCD_CORE_VERSION = '0.6.0';
 
 export * from './types/schema';
 export * from './types/model';

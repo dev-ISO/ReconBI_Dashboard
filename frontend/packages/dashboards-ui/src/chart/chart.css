@@ -28,30 +28,23 @@
   border-radius: 6px;
 }
 
-/* Zoom brush strip (format.zoom.brush): muted, rounded, token-colored so it
-   reads as part of the shadcn chart chrome rather than stock recharts blue.
-   rx is a presentation attribute, settable from CSS on SVG2 engines. */
-.rcd-root .rcd-chart-brush > rect {
-  stroke: var(--rcd-border);
-  fill: transparent;
-  rx: 4px;
+/* Zoom control cluster (format.zoom): the compact corner button toolbar that
+   replaced the recharts Brush strip. Semi-transparent until hovered or
+   keyboard-focused so it never competes with the data; opacity (not display)
+   keeps it discoverable and immediately clickable. Touch devices have no
+   hover, so they get a steadier resting opacity. */
+.rcd-root .rcd-zoom-cluster {
+  opacity: 0.45;
+  transition: opacity 120ms ease;
 }
 
-.rcd-root .rcd-chart-brush .recharts-brush-slide {
-  fill: var(--rcd-accent-interactive);
-  fill-opacity: 0.14;
-  stroke: none;
-  rx: 3px;
+.rcd-root .rcd-zoom-cluster:hover,
+.rcd-root .rcd-zoom-cluster:focus-within {
+  opacity: 1;
 }
 
-.rcd-root .rcd-chart-brush .recharts-brush-traveller rect {
-  fill: var(--rcd-surface);
-  stroke: var(--rcd-axis);
-  rx: 2px;
-}
-
-.rcd-root .rcd-chart-brush .recharts-brush-texts text,
-.rcd-root .rcd-chart-brush text {
-  fill: var(--rcd-muted);
-  font-size: 10px;
+@media (hover: none) {
+  .rcd-root .rcd-zoom-cluster {
+    opacity: 0.85;
+  }
 }

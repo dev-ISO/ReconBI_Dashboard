@@ -13,69 +13,133 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from 'react';
  * WidthProvider measures its container's LAYOUT width (contentRect, which CSS
  * transforms do not affect), so it lays tiles out to availWidth / s all by
  * itself; RGL row heights are width-independent, so contentHeight is stable
- * and the scale computation cannot feed back on itself.
+ * under the width compensation.
  *
  * No scroll remains because a scroll container's scrollable overflow is
  * computed from TRANSFORMED bounding boxes: the scaled subtree contributes
  * contentHeight * s (= availHeight), not its unscaled layout height. Nothing
  * here clips (`overflow` stays visible), so tile shadows render intact.
  *
- * Re-measures via ResizeObserver on both boxes: host resizes (outer) and
- * page switches / tile add-remove / height changes (content). Inactive, the
- * wrappers are style-less passthrough divs — edit mode and the phone stack
- * never scale.
+ * STABILITY (the anti-shake contract). The scale must never feed back on
+ * itself: a scale change resizes every chart, and if any of those resizes
+ * could move the measured boxes the page oscillates forever. Three guards
+ * mathematically break every such loop:
+ *
+ *  1. Integer metrics only — clientWidth/clientHeight/offsetHeight round to
+ *     CSS pixels, so sub-pixel layout jitter reads as "no change".
+ *  2. A < 1px dead-band on raw measurements: a ResizeObserver delivery whose
+ *     boxes differ from the last ACCEPTED measurement by less than 1px is
+ *     dropped without touching state.
+ *  3. The scale is quantized to 3 decimals (floored, so the scaled page can
+ *     never overflow by rounding up): equal-ish measurements always produce
+ *     the SAME scale value and the memoized setState bails out.
+ *
+ * The host must additionally keep the measured boxes independent of anything
+ * the fit result influences — DashboardView turns the grid area's scrollbar
+ * off (`overflow-hidden`) and takes in-flow filter indicators out of the
+ * measured column while fit is active, so applying/clearing filters can never
+ * move availHeight.
+ *
+ * NO FIRST-PAINT FLICKER: measurement runs synchronously in useLayoutEffect,
+ * so the first scale (and every `contentKey` = page-switch re-measure)
+ * commits BEFORE the browser paints. Until the very first successful
+ * measurement the wrapper renders `visibility: hidden` (not display:none —
+ * the hidden grid must still lay out to be measurable), so an unscaled frame
+ * is never painted. A transient zero-size pass (mid flex reflow, hidden tab)
+ * never overwrites a good fit: the last stable scale keeps rendering.
+ *
+ * Inactive, the wrappers are style-less passthrough divs — edit mode and the
+ * phone stack never scale.
  */
-export function FitPageViewport({ active, children }: { active: boolean; children: ReactNode }) {
+
+/** Scale floored to 3 decimals — never rounds UP into overflow. */
+const quantizeScale = (scale: number): number => Math.min(1, Math.floor(scale * 1000) / 1000);
+
+export function FitPageViewport({
+  active,
+  contentKey,
+  children,
+}: {
+  active: boolean;
+  /**
+   * Identity of the measured content (the active page id). A change forces a
+   * synchronous pre-paint re-measure, so page switches apply their scale
+   * before the new page is ever painted — even if the ResizeObserver never
+   * fires (equal-height pages) or its delivery was throttled away.
+   */
+  contentKey?: string | null;
+  children: ReactNode;
+}) {
   const outerRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
-  /** Last measurement: scale + the avail width the compensation is based on. */
+  /** Last committed fit: quantized scale + the avail width it compensates. */
   const [fit, setFit] = useState<{ scale: number; width: number } | null>(null);
+  /** Last ACCEPTED raw measurement (the < 1px dead-band compares against it). */
+  const raw = useRef<{ availH: number; availW: number; naturalH: number } | null>(null);
 
   useLayoutEffect(() => {
     if (!active) {
+      raw.current = null;
       setFit(null);
       return;
     }
     const outer = outerRef.current;
     const content = contentRef.current;
     if (!outer || !content) return;
-    const measure = () => {
+    const measure = (force: boolean) => {
       const availH = outer.clientHeight;
       const availW = outer.clientWidth;
       // Layout height — offsetHeight ignores the ancestor transform, so this
       // stays the grid's NATURAL height even while scaled.
       const naturalH = content.offsetHeight;
-      const scale = availH > 0 && naturalH > 0 ? Math.min(1, availH / naturalH) : 1;
-      setFit((prev) =>
-        prev !== null && prev.scale === scale && prev.width === availW
-          ? prev
+      // Transient zero-size pass: keep the last stable fit (and stay hidden
+      // if there was none yet) instead of flashing an unscaled frame.
+      if (availH <= 0 || availW <= 0 || naturalH <= 0) return;
+      const prev = raw.current;
+      if (
+        !force &&
+        prev !== null &&
+        Math.abs(prev.availH - availH) < 1 &&
+        Math.abs(prev.availW - availW) < 1 &&
+        Math.abs(prev.naturalH - naturalH) < 1
+      ) {
+        return; // sub-pixel RO delivery: ignored — no state, no relayout
+      }
+      raw.current = { availH, availW, naturalH };
+      const scale = quantizeScale(availH / naturalH);
+      setFit((old) =>
+        old !== null && old.scale === scale && old.width === availW
+          ? old
           : { scale, width: availW },
       );
     };
-    measure();
-    const observer = new ResizeObserver(measure);
+    // Synchronous pre-paint measurement: first activation AND every page
+    // switch (contentKey) re-measure before the browser paints.
+    measure(true);
+    const observer = new ResizeObserver(() => measure(false));
     observer.observe(outer);
     observer.observe(content);
     return () => observer.disconnect();
-  }, [active]);
+  }, [active, contentKey]);
 
-  // width > 0 guards a transient zero-width layout pass (e.g. mid flex
-  // reflow): rendering the grid at width 0/s would blank it until the next
-  // measurement, whereas passing through unscaled just shows one unscaled
-  // frame.
-  const scaled = active && fit !== null && fit.scale < 1 && fit.width > 0;
+  const scaled = active && fit !== null && fit.scale < 1;
 
   return (
     <div ref={outerRef} className={active ? 'h-full' : undefined}>
       <div
         style={
-          scaled && fit !== null
-            ? {
-                width: fit.width / fit.scale,
-                transform: `scale(${fit.scale})`,
-                transformOrigin: 'top left',
-              }
-            : undefined
+          !active
+            ? undefined
+            : fit === null
+              ? // Pre-first-measure: laid out (measurable) but never painted.
+                { visibility: 'hidden' }
+              : scaled
+                ? {
+                    width: fit.width / fit.scale,
+                    transform: `scale(${fit.scale})`,
+                    transformOrigin: 'top left',
+                  }
+                : undefined
         }
       >
         <div ref={contentRef}>{children}</div>
