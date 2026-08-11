@@ -18,7 +18,7 @@ public sealed class ModelsController(
     public async Task<IReadOnlyList<ModelSummaryResponse>> List(CancellationToken ct) =>
         (await models.ListVisibleAsync(ct))
             .Select(m => new ModelSummaryResponse(
-                m.Id, m.Name, m.Description, m.DataSourceName, m.IsShared, m.OwnerIsMe, m.UpdatedAtUtc))
+                m.Id, m.Name, m.Description, m.DataSourceName, m.IsShared, m.OwnerIsMe, m.UpdatedAtUtc, m.IsSystem))
             .ToArray();
 
     [HttpGet("{id:int}")]
@@ -27,7 +27,7 @@ public sealed class ModelsController(
     {
         var result = await models.GetAsync(id, ct);
         return result.Succeeded
-            ? Ok(DtoMapping.ToModelResponse(result.Value!, currentUser.GetUserId()))
+            ? Ok(ToResponse(result.Value!))
             : FromError(result.Error!);
     }
 
@@ -38,7 +38,7 @@ public sealed class ModelsController(
         var result = await models.CreateAsync(ToSaveRequest(request), ct);
         return result.Succeeded
             ? CreatedAtAction(nameof(Get), new { id = result.Value!.Id },
-                DtoMapping.ToModelResponse(result.Value!, currentUser.GetUserId()))
+                ToResponse(result.Value!))
             : FromError(result.Error!);
     }
 
@@ -48,7 +48,7 @@ public sealed class ModelsController(
     {
         var result = await models.UpdateAsync(id, ToSaveRequest(request), ct);
         return result.Succeeded
-            ? Ok(DtoMapping.ToModelResponse(result.Value!, currentUser.GetUserId()))
+            ? Ok(ToResponse(result.Value!))
             : FromError(result.Error!);
     }
 
@@ -71,7 +71,7 @@ public sealed class ModelsController(
         var result = await models.DuplicateAsync(id, ct);
         return result.Succeeded
             ? CreatedAtAction(nameof(Get), new { id = result.Value!.Id },
-                DtoMapping.ToModelResponse(result.Value!, currentUser.GetUserId()))
+                ToResponse(result.Value!))
             : FromError(result.Error!);
     }
 
@@ -116,7 +116,7 @@ public sealed class ModelsController(
 
         return result.Succeeded
             ? CreatedAtAction(nameof(Get), new { id = result.Value!.Id },
-                DtoMapping.ToModelResponse(result.Value!, currentUser.GetUserId()))
+                ToResponse(result.Value!))
             : FromError(result.Error!);
     }
 
@@ -160,6 +160,9 @@ public sealed class ModelsController(
 
         return slug.Length == 0 ? "model" : slug;
     }
+
+    private ModelResponse ToResponse(Core.Modeling.SemanticModel model) =>
+        DtoMapping.ToModelResponse(model, currentUser.GetUserId(), models.IsSystemOwner(model.OwnerUserId));
 
     private static ModelSaveRequest ToSaveRequest(SaveModelRequest request) =>
         new(request.Name, request.Description, request.DataSourceName,

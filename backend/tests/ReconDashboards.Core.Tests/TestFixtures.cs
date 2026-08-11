@@ -188,6 +188,8 @@ public sealed class ServiceTestHarness : IDisposable
 
     public SemanticModelValidator Validator { get; } = new();
 
+    public IUserDirectory UserDirectory { get; set; } = new NullUserDirectory();
+
     public ServiceTestHarness()
     {
         Connection = new SqliteConnection("DataSource=:memory:");
@@ -214,7 +216,7 @@ public sealed class ServiceTestHarness : IDisposable
         new(Db, CurrentUser, Registry, SchemaCache, Validator, Options, TimeProvider.System);
 
     public Services.DashboardService CreateDashboardService() =>
-        new(Db, CurrentUser, Options, TimeProvider.System);
+        new(Db, CurrentUser, UserDirectory, Options, TimeProvider.System);
 
     public void Dispose()
     {

@@ -30,6 +30,43 @@ export class RcdApiError extends Error {
   }
 }
 
+/**
+ * Fallback texts for well-known error codes whose response carried no usable
+ * detail (a bare "403 Forbidden" status line). Server-provided detail always
+ * wins — the backend's messages are contract-specified and more precise.
+ */
+const FRIENDLY_ERROR_TEXT: Record<string, string> = {
+  'rcd.dashboard.permission_denied': 'Your access to this dashboard does not allow that change.',
+  'rcd.dashboard.system_readonly':
+    'This is a built-in dashboard managed by the application. Make a copy to edit it.',
+  'rcd.model.system_readonly':
+    'This is a built-in model managed by the application. Make a copy to edit it.',
+  'rcd.dashboard.share_forbidden_fields':
+    'Your access does not allow changing the name, description, linked model, or publish state.',
+  'rcd.dashboard.share_target_invalid': 'One of the selected users cannot be granted access.',
+  'rcd.dashboard.stale':
+    'This dashboard changed on the server since you opened it. Reload to get the latest version.',
+};
+
+/**
+ * Human message for any error: RcdApiError detail (or, when the detail is just
+ * the raw status line, the error code's canned text) plus any error-severity
+ * validation issues; Error.message / String(error) otherwise.
+ */
+export const rcdErrorMessage = (error: unknown): string => {
+  if (error instanceof RcdApiError) {
+    const statusLineOnly = /^\d{3}\s/.test(error.message);
+    const friendly = error.errorCode === null ? undefined : FRIENDLY_ERROR_TEXT[error.errorCode];
+    const base = statusLineOnly && friendly ? friendly : error.message;
+    const issueText = error.issues
+      .filter((issue) => issue.severity === 'error')
+      .map((issue) => issue.message)
+      .join(' ');
+    return issueText ? `${base} ${issueText}` : base;
+  }
+  return error instanceof Error ? error.message : String(error);
+};
+
 /** Default fetcher for standalone use (portal/demo). */
 export const createFetchFetcher =
   (getToken?: () => string | null): RcdFetcher =>

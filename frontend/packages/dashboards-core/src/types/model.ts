@@ -118,6 +118,8 @@ export interface ModelSummary {
   isShared: boolean;
   ownerIsMe: boolean;
   updatedAtUtc: string;
+  /** Built-in (seeded) read-only content (0.8.0+; absent on older servers). */
+  isSystem?: boolean;
 }
 
 export interface ModelDetail {
@@ -130,6 +132,8 @@ export interface ModelDetail {
   createdAtUtc: string;
   updatedAtUtc: string;
   definition: ModelDefinition;
+  /** Built-in (seeded) read-only content (0.8.0+; absent on older servers). */
+  isSystem?: boolean;
 }
 
 export const tableKey = (schema: string, name: string): string => `${schema}.${name}`;

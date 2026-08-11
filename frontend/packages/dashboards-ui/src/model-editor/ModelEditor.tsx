@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, CheckCircle2, RefreshCw, Save, ShieldCheck, X } from 'lucide-react';
+import { AlertTriangle, CheckCircle2, Copy, Lock, RefreshCw, Save, ShieldCheck, X } from 'lucide-react';
 import type {
   CatalogTable,
   CanvasPosition,
@@ -142,6 +142,25 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
     }
   }, [models, onSaved]);
 
+  /** Built-in models are copy-to-edit: duplicate, then hand off to the copy. */
+  const [copying, setCopying] = useState(false);
+  const [copyError, setCopyError] = useState<string | null>(null);
+  const handleMakeCopy = useCallback(async () => {
+    const id = models.store.getState().current?.id;
+    if (id == null) return;
+    setCopying(true);
+    setCopyError(null);
+    try {
+      const copy = await runtime.api.duplicateModel(id);
+      void models.loadModels();
+      onSaved?.(copy.id);
+    } catch (error) {
+      setCopyError(errorMessage(error));
+    } finally {
+      setCopying(false);
+    }
+  }, [models, runtime, onSaved]);
+
   const editingRelationship = useMemo(
     () =>
       editingRelId !== null
@@ -199,8 +218,18 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
             onChange={(event) => models.setName(event.target.value)}
             aria-label="Model name"
             className="w-64 font-medium"
+            disabled={current.isSystem}
           />
-          {dirty && (
+          {current.isSystem && (
+            <span
+              className="inline-flex shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[11px] font-medium text-rcd-text-2 shadow-[var(--rcd-shadow-1)]"
+              title="Built-in content managed by the application. Make a copy to edit it."
+            >
+              <Lock size={11} />
+              Built-in
+            </span>
+          )}
+          {dirty && !current.isSystem && (
             <span
               className="h-2 w-2 shrink-0 rounded-full bg-rcd-accent"
               title="Unsaved changes"
@@ -210,20 +239,28 @@ export function ModelEditor({ modelId, dataSourceName, onSaved }: ModelEditorPro
         </div>
         <span className="text-xs text-rcd-muted">{current.dataSourceName}</span>
         <div className="ml-auto flex items-center gap-2">
-          {saveError && (
+          {(saveError ?? copyError) && (
             <span
               className="max-w-md truncate text-xs text-[var(--rcd-status-critical)]"
-              title={saveError}
+              title={saveError ?? copyError ?? undefined}
             >
-              {saveError}
+              {saveError ?? copyError}
             </span>
           )}
           <RcdButton onClick={() => void handleValidate()} disabled={validating}>
             <ShieldCheck size={14} /> {validating ? 'Validating…' : 'Validate'}
           </RcdButton>
-          <RcdButton variant="primary" onClick={() => void handleSave()} disabled={saving}>
-            <Save size={14} /> {saving ? 'Saving…' : 'Save'}
-          </RcdButton>
+          {current.isSystem ? (
+            // Built-in: the server refuses updates ('rcd.model.system_readonly')
+            // — the honest affordance is a caller-owned copy.
+            <RcdButton variant="primary" onClick={() => void handleMakeCopy()} disabled={copying}>
+              <Copy size={14} /> {copying ? 'Copying…' : 'Make a copy'}
+            </RcdButton>
+          ) : (
+            <RcdButton variant="primary" onClick={() => void handleSave()} disabled={saving}>
+              <Save size={14} /> {saving ? 'Saving…' : 'Save'}
+            </RcdButton>
+          )}
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-export const RCD_CORE_VERSION = '0.7.0';
+export const RCD_CORE_VERSION = '0.8.0';
 
 export * from './types/schema';
 export * from './types/model';
@@ -6,13 +6,16 @@ export * from './types/query';
 export * from './types/chart';
 export * from './types/dashboard';
 
-export { RcdApiError, createFetchFetcher } from './api/fetcher';
+export { RcdApiError, createFetchFetcher, rcdErrorMessage } from './api/fetcher';
 export type { RcdFetcher, RcdRequestInit } from './api/fetcher';
 export { DashboardsApi } from './api/DashboardsApi';
 export type {
   SaveModelBody,
   ModelExportDocument,
   SaveDashboardBody,
+  DashboardShareInput,
+  SaveDashboardSharesBody,
+  ListActivityOptions,
   ValidationOutcome,
   ExportQueryBody,
   ExportCsvResult,

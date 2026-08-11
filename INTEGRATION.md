@@ -91,6 +91,14 @@ Host-implemented seams:
 - `ICurrentUserProvider` — two members: `GetUserId()` (stable opaque id, e.g.
   the NameIdentifier claim) and `CanManageShared` (admin role check). The
   library stores the id as an opaque string; no FKs into host tables.
+- `IUserDirectory` (optional, 0.8.0+) — backs the Share dialog's user picker
+  (`GET users?query=`) and decorates share lists / activity entries / dashboard
+  summaries with display names. Two members: `ListUsersAsync(query, ct)` and a
+  batch `ResolveAsync(userIds, ct)` (never called per-row). Implement it over
+  your Users table and register it AFTER `AddReconDashboards` (last
+  registration wins). Without one, the built-in `NullUserDirectory` applies:
+  the picker lists nothing (the dialog shows "user directory not configured")
+  and ids echo back as display names — everything else keeps working.
 - `IRowFilterContributor` (zero or more) — row-level scoping. Called for EVERY
   table in every compiled query, including join targets. Return
   `RowFilterDecision.Filter(new RowFilter("col", RowFilterOperator.In, values))`
@@ -98,6 +106,46 @@ Host-implemented seams:
   DENIES the query — there is no unfiltered fallback. Scope your fact tables,
   not just dimension tables: the contributor only applies to tables actually
   referenced by a query.
+
+### Dashboard permissions (0.8.0+)
+
+Three distinct verbs (see SHARING-DESIGN.md for the full contract):
+
+- **Share**: named-user grants in `rcd_dashboard_shares`, each with three
+  flags — `canEditLayout` (move/resize tiles, doc settings, slicer/text/image
+  tiles), `canManagePages`, `canEditCharts`; all false = view-only. A grantee
+  save is diffed server-side and rejected (403
+  `rcd.dashboard.permission_denied`) when a change class exceeds their flags;
+  grantees can never change name/description/modelId/isShared
+  (`rcd.dashboard.share_forbidden_fields`).
+- **Publish**: the legacy `IsShared` boolean ("Everyone"), still admin-gated
+  via `ICurrentUserProvider.CanManageShared`.
+- **Built-in**: rows owned by `RcdOptions.SystemOwnerUserId` (default
+  `"system"`) are read-only for everyone — update/delete/share return 403
+  `rcd.dashboard.system_readonly` / `rcd.model.system_readonly`; duplicate
+  stays available to any viewer. Seed scripts (raw SQL) remain the only writer.
+
+Visibility is owner OR published OR share row. `DELETE /dashboards/{id}` is
+contextual: owner/admin soft-delete; a grantee only removes their own share
+row ("remove from my list"); publish-only viewers get 403. Every dashboard
+summary/detail now carries `isSystem`, `ownerDisplayName`, `shareCount`
+(0 unless owner/admin) and `myAccess { isOwner, canEdit, canEditLayout,
+canManagePages, canEditCharts, viaShare, viaPublish }`.
+
+New endpoints (all under the route prefix + `/v1`):
+
+| Endpoint | Slot | Purpose |
+|---|---|---|
+| `GET  dashboards/{id}/shares` | View | `{ shares: [...] }`, owner/admin only |
+| `PUT  dashboards/{id}/shares` | View | replaces the FULL grant set |
+| `POST dashboards/{id}/leave` | View | removes the caller's share row |
+| `GET  dashboards/{id}/activity?limit&beforeId` | View | `{ entries: [...] }`, newest 500 kept per dashboard |
+| `GET  users?query=` | View | share-picker directory (`IUserDirectory`) |
+
+Policy-slot note: dashboard `update`/`delete` moved from the Author to the
+View slot in 0.8.0 — the service-level rights above are authoritative (a
+grantee with edit permission may lack the host's author capability).
+`create`/`duplicate` and all model writes stay Author.
 
 ## 3. Frontend (React)
 
@@ -156,3 +204,21 @@ internals never leave the server.
 3. If the library schema changed: re-run the migration artifact (EF bundle or
    regenerated `rcd_schema.sql`) before deploying the new backend.
 4. Never re-use a version number — NuGet and npm both cache by version.
+
+### 0.7.0 → 0.8.0
+
+1. Apply the new migration `20260811182420_DashboardSharesAndActivity`
+   (adds `rcd_dashboard_shares` + `rcd_dashboard_activity`): re-run your EF
+   bundle, or re-apply the regenerated `db/rcd_schema.sql` — both are
+   idempotent. Do this BEFORE deploying the 0.8.0 backend.
+2. Optionally register an `IUserDirectory` (see §2) so the Share dialog can
+   list users; without it sharing still works but the picker is empty.
+3. If your seeds use a different built-in owner id than `"system"`, set
+   `rcd.SystemOwnerUserId` accordingly (or null to disable read-only seeds).
+4. Re-check host authorization: dashboard update/delete now sit in the View
+   policy slot (see §2) — hosts that relied on the Author policy to block
+   viewers from PUT/DELETE keep the same effective behavior through the
+   service-level ownership checks, but custom policy mappings should be
+   reviewed.
+5. Wire changes are additive only (`isSystem`, `ownerDisplayName`, `myAccess`,
+   `shareCount` on dashboard summaries/details; `isSystem` on models).

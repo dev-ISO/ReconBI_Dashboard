@@ -68,6 +68,8 @@ public static class AddReconDashboardsExtensions
         services.AddSingleton<ISchemaCache, MemorySchemaCache>();
         services.AddSingleton<SemanticModelValidator>();
         services.TryAddSingleton(TimeProvider.System);
+        // Host-overridable: a later AddScoped/AddSingleton<IUserDirectory> wins.
+        services.TryAddSingleton<IUserDirectory, NullUserDirectory>();
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
         services.AddScoped<ChartQueryService>();

@@ -37,6 +37,15 @@ public sealed class ReconDashboardsOptions
 
     public RcdLimits Limits { get; } = new();
 
+    /// <summary>
+    /// Owner id marking built-in (seeded) dashboards/models. Rows owned by this
+    /// id are read-only for everyone through the API — update/delete/share
+    /// return 403 (rcd.dashboard.system_readonly / rcd.model.system_readonly);
+    /// seed scripts remain the only writer. Duplicate stays available to any
+    /// viewer. Set to null/empty to disable.
+    /// </summary>
+    public string? SystemOwnerUserId { get; set; } = "system";
+
     /// <summary>Write one rcd_query_audit row per executed query.</summary>
     public bool EnableQueryAudit { get; set; }
 

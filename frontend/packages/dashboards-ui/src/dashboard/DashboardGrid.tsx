@@ -19,6 +19,12 @@ export interface DashboardGridItem {
 export interface DashboardGridProps {
   items: DashboardGridItem[];
   editable?: boolean;
+  /**
+   * Edit-mode canvas whose tiles cannot be moved or resized — an honest-UX
+   * lock for grantees without layout rights (the server enforces regardless).
+   * Ignored while `editable` is false.
+   */
+  locked?: boolean;
   onLayoutChange?: (items: DashboardGridItem[]) => void;
   renderItem: (id: string) => ReactNode;
   /** CSS selector for the per-tile drag handle; the whole tile drags when omitted. */
@@ -47,6 +53,7 @@ export interface DashboardGridProps {
 export function DashboardGrid({
   items,
   editable = false,
+  locked = false,
   onLayoutChange,
   renderItem,
   draggableHandle,
@@ -102,8 +109,8 @@ export function DashboardGrid({
         margin={[MARGIN, MARGIN]}
         compactType={null}
         preventCollision
-        isDraggable={editable}
-        isResizable={editable}
+        isDraggable={editable && !locked}
+        isResizable={editable && !locked}
         draggableHandle={draggableHandle}
         onLayoutChange={(next: Layout[]) =>
           onLayoutChange?.(

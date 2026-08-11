@@ -1,0 +1,464 @@
+import { useEffect, useMemo, useState } from 'react';
+import { Globe, Search, UserRound, X } from 'lucide-react';
+import { rcdErrorMessage, type RcdUser } from '@recon/dashboards-core';
+import { useRuntime } from '../provider/DashboardsProvider';
+import { RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+
+export interface ShareDialogProps {
+  open: boolean;
+  dashboardId: number;
+  onClose: () => void;
+  /**
+   * Shows the "Everyone (publish)" toggle bound to the legacy isShared flag.
+   * Admin-gated server-side (ICurrentUserProvider.CanManageShared) — hosts
+   * without an admin signal may pass owner-or-admin and let the server refuse.
+   */
+  canPublish?: boolean;
+  /** Current publish state (drives the toggle's initial value). */
+  isShared?: boolean;
+  /** Called after shares (and any publish change) saved successfully. */
+  onSaved?: () => void;
+}
+
+/** One editable grant row (existing share or freshly picked user). */
+interface ShareRow {
+  userId: string;
+  displayName: string | null;
+  canEditLayout: boolean;
+  canManagePages: boolean;
+  canEditCharts: boolean;
+}
+
+/** All three flags false = view-only. */
+const rowCanEdit = (row: ShareRow): boolean =>
+  row.canEditLayout || row.canManagePages || row.canEditCharts;
+
+/** The bulk "apply to selected" permission template. */
+interface PermissionTemplate {
+  mode: 'view' | 'edit';
+  layout: boolean;
+  pages: boolean;
+  charts: boolean;
+}
+
+const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', layout: true, pages: true, charts: true };
+
+const templatePermissions = (
+  template: PermissionTemplate,
+): Pick<ShareRow, 'canEditLayout' | 'canManagePages' | 'canEditCharts'> =>
+  template.mode === 'view'
+    ? { canEditLayout: false, canManagePages: false, canEditCharts: false }
+    : {
+        canEditLayout: template.layout,
+        canManagePages: template.pages,
+        canEditCharts: template.charts,
+      };
+
+/** Shared look of the three granular permission checkboxes. */
+function PermissionChecks({
+  layout,
+  pages,
+  charts,
+  onChange,
+  idPrefix,
+}: {
+  layout: boolean;
+  pages: boolean;
+  charts: boolean;
+  onChange: (patch: { layout?: boolean; pages?: boolean; charts?: boolean }) => void;
+  idPrefix: string;
+}) {
+  const options: { key: 'layout' | 'pages' | 'charts'; label: string; checked: boolean }[] = [
+    { key: 'layout', label: 'Layout', checked: layout },
+    { key: 'pages', label: 'Pages', checked: pages },
+    { key: 'charts', label: 'Charts', checked: charts },
+  ];
+  return (
+    <div className="flex items-center gap-3">
+      {options.map((option) => (
+        <label
+          key={option.key}
+          htmlFor={`${idPrefix}-${option.key}`}
+          className="flex items-center gap-1.5 text-xs text-rcd-text-2"
+        >
+          <input
+            id={`${idPrefix}-${option.key}`}
+            type="checkbox"
+            checked={option.checked}
+            onChange={(event) => onChange({ [option.key]: event.target.checked })}
+            className="accent-[var(--rcd-accent)]"
+          />
+          {option.label}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Share management for one dashboard (owner/admin): searchable multi-select
+ * user picker with chips, per-user view/edit permission rows (edit expands
+ * Layout/Pages/Charts checkboxes), bulk apply-on-add, removal of existing
+ * grants, and — for admins — the legacy "Everyone (publish)" toggle. Save
+ * issues ONE PUT replacing the full grant set.
+ */
+export function ShareDialog({
+  open,
+  dashboardId,
+  onClose,
+  canPublish = false,
+  isShared,
+  onSaved,
+}: ShareDialogProps) {
+  const runtime = useRuntime();
+
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [rows, setRows] = useState<ShareRow[]>([]);
+  /** Directory results for the current query; null until the first load. */
+  const [users, setUsers] = useState<RcdUser[] | null>(null);
+  /** True when the UNFILTERED directory came back empty (not configured). */
+  const [directoryEmpty, setDirectoryEmpty] = useState(false);
+  const [query, setQuery] = useState('');
+  /** Picked-but-not-yet-added users (the chips). */
+  const [picked, setPicked] = useState<RcdUser[]>([]);
+  const [template, setTemplate] = useState<PermissionTemplate>(DEFAULT_TEMPLATE);
+  const [publish, setPublish] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  // (Re)load shares + directory on each open.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    setSaveError(null);
+    setRows([]);
+    setPicked([]);
+    setQuery('');
+    setTemplate(DEFAULT_TEMPLATE);
+    setPublish(isShared ?? false);
+    Promise.all([runtime.dashboards.listShares(dashboardId), runtime.dashboards.listUsers()])
+      .then(([shares, directory]) => {
+        if (cancelled) return;
+        setRows(
+          shares.map((share) => ({
+            userId: share.userId,
+            displayName: share.displayName,
+            canEditLayout: share.canEditLayout,
+            canManagePages: share.canManagePages,
+            canEditCharts: share.canEditCharts,
+          })),
+        );
+        setUsers(directory);
+        setDirectoryEmpty(directory.length === 0);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) setLoadError(rcdErrorMessage(error));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, dashboardId, runtime, isShared]);
+
+  // Debounced directory search (skipped entirely when unconfigured).
+  useEffect(() => {
+    if (!open || directoryEmpty) return;
+    const timer = window.setTimeout(() => {
+      runtime.dashboards
+        .listUsers(query.trim() === '' ? undefined : query.trim())
+        .then(setUsers)
+        .catch(() => {
+          // keep the previous results on a failed search keystroke
+        });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [open, directoryEmpty, query, runtime]);
+
+  /** Directory hits not already granted or picked. */
+  const candidates = useMemo(() => {
+    const taken = new Set([...rows.map((r) => r.userId), ...picked.map((u) => u.id)]);
+    return (users ?? []).filter((user) => !taken.has(user.id)).slice(0, 8);
+  }, [users, rows, picked]);
+
+  const addPicked = () => {
+    if (picked.length === 0) return;
+    const perms = templatePermissions(template);
+    setRows((prev) => [
+      ...prev,
+      ...picked
+        .filter((user) => !prev.some((row) => row.userId === user.id))
+        .map((user) => ({ userId: user.id, displayName: user.displayName, ...perms })),
+    ]);
+    setPicked([]);
+  };
+
+  const patchRow = (userId: string, patch: Partial<ShareRow>) => {
+    setRows((prev) => prev.map((row) => (row.userId === userId ? { ...row, ...patch } : row)));
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setSaveError(null);
+    // Chips still sitting in the picker are included with the template perms —
+    // picking someone and hitting Save should never silently drop them.
+    const perms = templatePermissions(template);
+    const finalRows = [
+      ...rows,
+      ...picked
+        .filter((user) => !rows.some((row) => row.userId === user.id))
+        .map((user) => ({ userId: user.id, displayName: user.displayName, ...perms })),
+    ];
+    try {
+      await runtime.dashboards.saveShares(
+        dashboardId,
+        finalRows.map((row) => ({
+          userId: row.userId,
+          canEditLayout: row.canEditLayout,
+          canManagePages: row.canManagePages,
+          canEditCharts: row.canEditCharts,
+        })),
+      );
+      if (canPublish && isShared !== undefined && publish !== isShared) {
+        const ok = await runtime.dashboards.setPublish(publish);
+        if (!ok) {
+          throw new Error(
+            runtime.dashboards.store.getState().error ?? 'The publish change was rejected.',
+          );
+        }
+      }
+      onSaved?.();
+      onClose();
+    } catch (error) {
+      setSaveError(rcdErrorMessage(error));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <RcdDialog
+      title="Share dashboard"
+      open={open}
+      onClose={onClose}
+      footer={
+        <>
+          <RcdButton onClick={onClose} disabled={saving}>
+            Cancel
+          </RcdButton>
+          <RcdButton variant="primary" onClick={() => void handleSave()} disabled={saving || loading}>
+            {saving ? 'Saving…' : 'Save'}
+          </RcdButton>
+        </>
+      }
+    >
+      {loading ? (
+        <div className="flex h-32 items-center justify-center">
+          <RcdSpinner label="Loading sharing…" />
+        </div>
+      ) : loadError ? (
+        <p className="text-sm text-[var(--rcd-status-critical)]" role="alert">
+          {loadError}
+        </p>
+      ) : (
+        <div className="flex flex-col gap-4">
+          {/* -------------------------------------------------- user picker */}
+          {directoryEmpty ? (
+            <p className="rounded-lg border border-rcd-border bg-rcd-bg px-3 py-2 text-xs text-rcd-muted">
+              User directory not configured — people search is unavailable. Existing access can
+              still be removed below.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+                Add people
+                <div className="relative">
+                  <Search
+                    size={14}
+                    aria-hidden
+                    className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-rcd-muted"
+                  />
+                  <RcdInput
+                    value={query}
+                    onChange={(event) => setQuery(event.target.value)}
+                    placeholder="Search people…"
+                    aria-label="Search people to share with"
+                    className="w-full pl-8"
+                  />
+                </div>
+              </label>
+
+              {picked.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {picked.map((user) => (
+                    <span
+                      key={user.id}
+                      className="inline-flex items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface py-0.5 pl-2 pr-1 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-1)]"
+                    >
+                      {user.displayName}
+                      <button
+                        type="button"
+                        aria-label={`Remove ${user.displayName} from the selection`}
+                        onClick={() => setPicked((prev) => prev.filter((u) => u.id !== user.id))}
+                        className="rounded p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                      >
+                        <X size={11} />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {candidates.length > 0 && (
+                <div className="max-h-40 overflow-y-auto rounded-lg border border-rcd-border">
+                  {candidates.map((user) => (
+                    <button
+                      key={user.id}
+                      type="button"
+                      onClick={() => setPicked((prev) => [...prev, user])}
+                      className="flex w-full items-center gap-2 border-b border-rcd-border px-2.5 py-1.5 text-left last:border-b-0 hover:bg-black/5 dark:hover:bg-white/10"
+                    >
+                      <UserRound size={14} aria-hidden className="shrink-0 text-rcd-muted" />
+                      <span className="min-w-0 flex-1 truncate text-sm text-rcd-text">
+                        {user.displayName}
+                      </span>
+                      {user.email && (
+                        <span className="shrink-0 truncate text-xs text-rcd-muted">{user.email}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {candidates.length === 0 && query.trim() !== '' && (
+                <p className="text-xs text-rcd-muted">No matching people.</p>
+              )}
+
+              {/* Bulk template applied to every picked chip on Add. */}
+              {picked.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2.5 rounded-lg border border-rcd-border bg-rcd-bg px-2.5 py-2">
+                  <RcdSelect
+                    aria-label="Access for the selected people"
+                    value={template.mode}
+                    onChange={(event) =>
+                      setTemplate((prev) => ({ ...prev, mode: event.target.value as 'view' | 'edit' }))
+                    }
+                  >
+                    <option value="view">Can view</option>
+                    <option value="edit">Can edit</option>
+                  </RcdSelect>
+                  {template.mode === 'edit' && (
+                    <PermissionChecks
+                      idPrefix="rcd-share-template"
+                      layout={template.layout}
+                      pages={template.pages}
+                      charts={template.charts}
+                      onChange={(patch) => setTemplate((prev) => ({ ...prev, ...patch }))}
+                    />
+                  )}
+                  <RcdButton size="sm" variant="primary" className="ml-auto" onClick={addPicked}>
+                    Add {picked.length === 1 ? '1 person' : `${picked.length} people`}
+                  </RcdButton>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* ------------------------------------------------ current grants */}
+          <div className="flex flex-col gap-1">
+            <p className="text-sm text-rcd-text-2">People with access</p>
+            {rows.length === 0 ? (
+              <p className="text-xs text-rcd-muted">Not shared with anyone yet.</p>
+            ) : (
+              <div className="flex flex-col rounded-lg border border-rcd-border">
+                {rows.map((row) => (
+                  <div
+                    key={row.userId}
+                    className="flex flex-wrap items-center gap-2 border-b border-rcd-border px-2.5 py-2 last:border-b-0"
+                  >
+                    <UserRound size={14} aria-hidden className="shrink-0 text-rcd-muted" />
+                    <span
+                      className="min-w-0 flex-1 truncate text-sm text-rcd-text"
+                      title={row.userId}
+                    >
+                      {row.displayName ?? row.userId}
+                    </span>
+                    <RcdSelect
+                      aria-label={`Access for ${row.displayName ?? row.userId}`}
+                      value={rowCanEdit(row) ? 'edit' : 'view'}
+                      onChange={(event) =>
+                        patchRow(
+                          row.userId,
+                          event.target.value === 'edit'
+                            ? { canEditLayout: true, canManagePages: true, canEditCharts: true }
+                            : { canEditLayout: false, canManagePages: false, canEditCharts: false },
+                        )
+                      }
+                    >
+                      <option value="view">Can view</option>
+                      <option value="edit">Can edit</option>
+                    </RcdSelect>
+                    {rowCanEdit(row) && (
+                      <PermissionChecks
+                        idPrefix={`rcd-share-${row.userId}`}
+                        layout={row.canEditLayout}
+                        pages={row.canManagePages}
+                        charts={row.canEditCharts}
+                        onChange={(patch) =>
+                          patchRow(row.userId, {
+                            ...(patch.layout !== undefined ? { canEditLayout: patch.layout } : {}),
+                            ...(patch.pages !== undefined ? { canManagePages: patch.pages } : {}),
+                            ...(patch.charts !== undefined ? { canEditCharts: patch.charts } : {}),
+                          })
+                        }
+                      />
+                    )}
+                    <RcdIconButton
+                      aria-label={`Remove access for ${row.displayName ?? row.userId}`}
+                      title="Remove access"
+                      onClick={() =>
+                        setRows((prev) => prev.filter((r) => r.userId !== row.userId))
+                      }
+                    >
+                      <X size={13} />
+                    </RcdIconButton>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* ------------------------------------------------------ publish */}
+          {canPublish && (
+            <label className="flex items-start gap-2 border-t border-rcd-border pt-3 text-sm text-rcd-text">
+              <input
+                type="checkbox"
+                checked={publish}
+                onChange={(event) => setPublish(event.target.checked)}
+                className="mt-0.5 accent-[var(--rcd-accent)]"
+              />
+              <span className="flex flex-col">
+                <span className="flex items-center gap-1.5">
+                  <Globe size={13} aria-hidden className="text-rcd-muted" />
+                  Everyone (publish)
+                </span>
+                <span className="text-xs text-rcd-muted">
+                  Anyone in the workspace can view this dashboard.
+                </span>
+              </span>
+            </label>
+          )}
+
+          {saveError && (
+            <p className="text-xs text-[var(--rcd-status-critical)]" role="alert">
+              {saveError}
+            </p>
+          )}
+        </div>
+      )}
+    </RcdDialog>
+  );
+}

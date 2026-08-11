@@ -5,16 +5,21 @@ import {
   Bookmark,
   Check,
   ChevronDown,
+  Copy,
   Filter,
   Highlighter,
+  History,
   Image as ImageIcon,
+  Lock,
   Mail,
   Maximize,
   MoreHorizontal,
   MoreVertical,
+  Network,
   Pencil,
   Plus,
   Printer,
+  Redo2,
   RefreshCw,
   Scan,
   Share2,
@@ -23,6 +28,8 @@ import {
   Smartphone,
   Trash2,
   Type,
+  Undo2,
+  UserMinus,
   Variable,
 } from 'lucide-react';
 import type { AlertFiring, ViewFitMode } from '@recon/dashboards-core';
@@ -109,6 +116,32 @@ export interface DashboardToolbarProps {
    * mode, the persisted doc default (`defaultViewFit`) in EDIT mode.
    */
   onChangeViewFit?: (fit: ViewFitMode) => void;
+  /** Built-in (seeded) content: "Built-in" badge next to the name. */
+  isSystem?: boolean;
+  /** Opens the Share dialog (owner/admin, non-system; button hidden when absent). */
+  onShare?: () => void;
+  /** Overflow ⋯: "Make a copy" (available to everyone who can view). */
+  onMakeCopy?: () => void;
+  /** Overflow ⋯: "Activity" (edit-rights holders). */
+  onActivity?: () => void;
+  /** Overflow ⋯: "Linked model…" (owner/admin, edit mode — caller gates). */
+  onLinkedModel?: () => void;
+  /** Overflow ⋯: "Delete" (owner/admin, non-system; danger). */
+  onDelete?: () => void;
+  /** Overflow ⋯: "Remove from my list" (grantee; danger). */
+  onLeave?: () => void;
+  /** Edit-mode Undo/Redo buttons (hidden when the handlers are absent). */
+  canUndo?: boolean;
+  canRedo?: boolean;
+  onUndo?: () => void;
+  onRedo?: () => void;
+  /**
+   * Shows the edit-mode Add ▾ menu (default true). Grantees without chart
+   * rights get their add-tile affordance hidden here.
+   */
+  canAddTiles?: boolean;
+  /** Host-injected toolbar actions (e.g. "Send to chat"), right of the built-ins. */
+  extraActions?: ReactNode;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -163,6 +196,19 @@ export function DashboardToolbar({
   // Fit to page is the product default (matches the view's docViewFit default).
   viewFit = 'fitPage',
   onChangeViewFit,
+  isSystem = false,
+  onShare,
+  onMakeCopy,
+  onActivity,
+  onLinkedModel,
+  onDelete,
+  onLeave,
+  canUndo = false,
+  canRedo = false,
+  onUndo,
+  onRedo,
+  canAddTiles = true,
+  extraActions,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -171,15 +217,80 @@ export function DashboardToolbar({
     else onDiscard();
   };
 
+  // The ⋯ menu hosts the less-frequent actions in BOTH modes.
+  const overflowItems: OverflowItem[] = [];
+  if (mode === 'view' && !readonly && onSubscribe) {
+    overflowItems.push({
+      key: 'subscribe',
+      icon: <Mail size={14} />,
+      label: 'Subscribe…',
+      onClick: onSubscribe,
+    });
+  }
+  if (onActivity) {
+    overflowItems.push({
+      key: 'activity',
+      icon: <History size={14} />,
+      label: 'Activity',
+      onClick: onActivity,
+    });
+  }
+  if (onLinkedModel && mode === 'edit') {
+    overflowItems.push({
+      key: 'linkedModel',
+      icon: <Network size={14} />,
+      label: 'Linked model…',
+      onClick: onLinkedModel,
+    });
+  }
+  if (onMakeCopy) {
+    overflowItems.push({
+      key: 'makeCopy',
+      icon: <Copy size={14} />,
+      label: 'Make a copy',
+      onClick: onMakeCopy,
+    });
+  }
+  if (onDelete) {
+    overflowItems.push({
+      key: 'delete',
+      icon: <Trash2 size={14} />,
+      label: 'Delete',
+      danger: true,
+      onClick: onDelete,
+    });
+  }
+  if (onLeave) {
+    overflowItems.push({
+      key: 'leave',
+      icon: <UserMinus size={14} />,
+      label: 'Remove from my list',
+      danger: true,
+      onClick: onLeave,
+    });
+  }
+
   return (
     <div className="flex h-12 shrink-0 items-center gap-2 border-b border-rcd-border bg-rcd-surface px-4">
       <h1 className="truncate text-[15px] font-semibold tracking-[-0.01em] text-rcd-text" title={name}>
         {name}
       </h1>
+      {isSystem && (
+        <span
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[11px] font-medium text-rcd-text-2 shadow-[var(--rcd-shadow-1)]"
+          title="Built-in content managed by the application. Make a copy to edit it."
+        >
+          <Lock size={11} />
+          Built-in
+        </span>
+      )}
       {isShared && (
-        <span className="inline-flex shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[11px] font-medium text-rcd-text-2 shadow-[var(--rcd-shadow-1)]">
+        <span
+          className="inline-flex shrink-0 items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface px-2 py-0.5 text-[11px] font-medium text-rcd-text-2 shadow-[var(--rcd-shadow-1)]"
+          title="Published: visible to everyone"
+        >
           <Share2 size={11} />
-          Shared
+          Everyone
         </span>
       )}
       {mode === 'edit' && dirty && (
@@ -266,8 +377,15 @@ export function DashboardToolbar({
 
       {alertFirings !== undefined && <AlertsBell firings={alertFirings ?? []} />}
 
-      {mode === 'view' && !readonly && onSubscribe && (
-        <OverflowMenu onSubscribe={onSubscribe} />
+      {extraActions}
+
+      {overflowItems.length > 0 && <OverflowMenu items={overflowItems} />}
+
+      {onShare && (
+        <RcdButton onClick={onShare} className="shrink-0">
+          <Share2 size={14} />
+          Share
+        </RcdButton>
       )}
 
       {mode === 'view'
@@ -279,6 +397,28 @@ export function DashboardToolbar({
           )
         : !readonly && (
             <>
+              {onUndo && (
+                <RcdIconButton
+                  aria-label="Undo"
+                  title="Undo (Ctrl+Z)"
+                  disabled={!canUndo}
+                  onClick={onUndo}
+                  className="shrink-0"
+                >
+                  <Undo2 size={14} />
+                </RcdIconButton>
+              )}
+              {onRedo && (
+                <RcdIconButton
+                  aria-label="Redo"
+                  title="Redo (Ctrl+Y)"
+                  disabled={!canRedo}
+                  onClick={onRedo}
+                  className="shrink-0"
+                >
+                  <Redo2 size={14} />
+                </RcdIconButton>
+              )}
               {onToggleMobileLayout && (
                 <RcdIconButton
                   aria-label={mobileLayoutOpen ? 'Back to the desktop layout' : 'Edit the mobile layout'}
@@ -321,14 +461,16 @@ export function DashboardToolbar({
                   ))}
                 </RcdSelect>
               )}
-              <AddTileMenu
-                onAddChart={onAddChart}
-                onAddText={onAddText}
-                onAddImage={onAddImage}
-                onAddSlicer={onAddSlicer}
-                addSlicerDisabled={addSlicerDisabled ?? false}
-                onManageParameters={onManageParameters}
-              />
+              {canAddTiles && (
+                <AddTileMenu
+                  onAddChart={onAddChart}
+                  onAddText={onAddText}
+                  onAddImage={onAddImage}
+                  onAddSlicer={onAddSlicer}
+                  addSlicerDisabled={addSlicerDisabled ?? false}
+                  onManageParameters={onManageParameters}
+                />
+              )}
               <RcdButton onClick={handleDiscard} disabled={saving}>
                 Discard
               </RcdButton>
@@ -577,11 +719,23 @@ function ViewMenu({
   );
 }
 
+/** One entry of the toolbar's overflow ⋯ menu. */
+interface OverflowItem {
+  key: string;
+  icon: ReactNode;
+  label: string;
+  /** Critical styling (Delete / Remove from my list). */
+  danger?: boolean;
+  onClick: () => void;
+}
+
 /**
- * View-mode overflow "⋯" menu: hosts the less-frequent actions so the toolbar
- * stays uncrowded (currently just Subscribe). Same card pattern as AddTileMenu.
+ * Overflow "⋯" menu (both modes): hosts the less-frequent actions so the
+ * toolbar stays uncrowded — Subscribe, Activity, Linked model, Make a copy,
+ * Delete / Remove from my list. Same card pattern as AddTileMenu. Danger
+ * items sink to the bottom behind a divider.
  */
-function OverflowMenu({ onSubscribe }: { onSubscribe: () => void }) {
+function OverflowMenu({ items }: { items: OverflowItem[] }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -603,6 +757,27 @@ function OverflowMenu({ onSubscribe }: { onSubscribe: () => void }) {
     };
   }, [open]);
 
+  const plain = items.filter((item) => !item.danger);
+  const danger = items.filter((item) => item.danger);
+
+  const renderItem = (item: OverflowItem) => (
+    <button
+      key={item.key}
+      type="button"
+      role="menuitem"
+      onClick={() => {
+        setOpen(false);
+        item.onClick();
+      }}
+      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm hover:bg-black/5 dark:hover:bg-white/10 ${
+        item.danger ? 'text-[var(--rcd-status-critical)]' : 'text-rcd-text'
+      }`}
+    >
+      {item.icon}
+      {item.label}
+    </button>
+  );
+
   return (
     <div className="relative shrink-0" ref={rootRef}>
       <RcdIconButton
@@ -620,20 +795,13 @@ function OverflowMenu({ onSubscribe }: { onSubscribe: () => void }) {
         <div
           role="menu"
           aria-label="More actions"
-          className="absolute right-0 top-full z-40 mt-1 w-44 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
+          className="absolute right-0 top-full z-40 mt-1 w-52 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setOpen(false);
-              onSubscribe();
-            }}
-            className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10"
-          >
-            <Mail size={14} />
-            Subscribe…
-          </button>
+          {plain.map(renderItem)}
+          {plain.length > 0 && danger.length > 0 && (
+            <div className="my-1 border-t border-rcd-border" />
+          )}
+          {danger.map(renderItem)}
         </div>
       )}
     </div>

@@ -1,13 +1,23 @@
 import { createStore, type StoreApi } from 'zustand/vanilla';
-import type { DashboardsApi } from '../api/DashboardsApi';
+import type {
+  DashboardsApi,
+  DashboardShareInput,
+  ListActivityOptions,
+} from '../api/DashboardsApi';
+import { rcdErrorMessage } from '../api/fetcher';
 import type { ChartSpec } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
+  dashboardAccessOf,
   emptyLayout,
   filterCardClauses,
   isSlicerTile,
   slicerClauseOf,
+  type ActivityEntry,
   type CrossFilter,
+  type DashboardAccess,
+  type DashboardShare,
+  type RcdUser,
   type CrossFilterScope,
   type CrossFilterValue,
   type DashboardDetail,
@@ -50,6 +60,14 @@ export interface OpenDashboard {
   modelId: number | null;
   isShared: boolean;
   ownerIsMe: boolean;
+  /** Built-in (seeded) content — read-only for everyone; copy to edit. */
+  isSystem: boolean;
+  /** Owner's directory display name (null when unresolvable / pre-0.8 server). */
+  ownerDisplayName: string | null;
+  /** Caller's resolved rights (defaulted via dashboardAccessOf on pre-0.8 servers). */
+  myAccess: DashboardAccess;
+  /** Per-user grant count; 0 unless the caller is owner/admin. */
+  shareCount: number;
   expectedUpdatedAtUtc: string;
   layout: DashboardLayoutDoc;
 }
@@ -119,6 +137,14 @@ export interface DashboardStoreState {
    * cleared on open/close. Edit-mode picks write the doc default instead.
    */
   viewFitOverride: ViewFitMode | null;
+  /**
+   * Whether an edit-session undo/redo step is available. The snapshot stacks
+   * themselves live OUTSIDE the reactive state (class fields) — components
+   * only ever need these two booleans, and stacks of deep layout clones have
+   * no business feeding useSyncExternalStore.
+   */
+  canUndo: boolean;
+  canRedo: boolean;
   saveStatus: AsyncStatus;
   error: string | null;
 }
@@ -387,12 +413,37 @@ const initialState: DashboardStoreState = {
   lastAppliedBookmarkId: null,
   filterCardOverrides: {},
   viewFitOverride: null,
+  canUndo: false,
+  canRedo: false,
   saveStatus: 'idle',
   error: null,
 };
 
+/** One undo/redo step: the whole document + which page was active. */
+interface HistorySnapshot {
+  layout: DashboardLayoutDoc;
+  activePageId: string | null;
+}
+
+/** Same-tag pushes within `windowMs` of each other collapse into one entry. */
+interface HistoryCoalesce {
+  tag: string;
+  windowMs: number;
+}
+
+const HISTORY_CAP = 50;
+
 export class DashboardStore {
   readonly store: StoreApi<DashboardStoreState>;
+
+  /* Edit-session undo/redo (see DashboardStoreState.canUndo). The stacks hold
+   * PRE-change snapshots; only the canUndo/canRedo booleans are reactive. */
+  private undoStack: HistorySnapshot[] = [];
+  private redoStack: HistorySnapshot[] = [];
+  private lastHistoryTag: string | null = null;
+  private lastHistoryAt = 0;
+  /** >0 while inside groupHistory — inner mutations skip their own push. */
+  private historyDepth = 0;
 
   constructor(private readonly api: DashboardsApi) {
     this.store = createStore<DashboardStoreState>(() => ({ ...initialState }));
@@ -406,21 +457,125 @@ export class DashboardStore {
     return this.store.getState();
   }
 
-  private mutateLayout(mutate: (layout: DashboardLayoutDoc) => DashboardLayoutDoc): void {
+  /**
+   * Pushes the PRE-change document snapshot onto the undo stack (edit mode
+   * only; capped at 50; any push clears the redo branch). Every doc-mutating
+   * path calls this — mutateLayout is the central seam, and the two methods
+   * that write `current` directly (addPage / removePage) plus multi-mutation
+   * actions (groupHistory) push explicitly. `coalesce` merges rapid same-tag
+   * calls (applyLayout drag storms within 400ms, updateChart slider storms on
+   * one tile within 800ms) into ONE entry by keeping the first snapshot.
+   */
+  private pushHistory(coalesce?: HistoryCoalesce): void {
+    if (this.historyDepth > 0) return;
+    const current = this.state.current;
+    if (!current || this.state.mode !== 'edit') return;
+    const now = Date.now();
+    const merge =
+      coalesce !== undefined &&
+      this.lastHistoryTag === coalesce.tag &&
+      now - this.lastHistoryAt <= coalesce.windowMs &&
+      this.undoStack.length > 0;
+    this.lastHistoryTag = coalesce?.tag ?? null;
+    this.lastHistoryAt = now;
+    this.redoStack = [];
+    if (!merge) {
+      this.undoStack.push(
+        structuredClone({ layout: current.layout, activePageId: this.state.activePageId }),
+      );
+      if (this.undoStack.length > HISTORY_CAP) this.undoStack.shift();
+    }
+    if (!this.state.canUndo || this.state.canRedo) this.set({ canUndo: true, canRedo: false });
+  }
+
+  /** Runs several doc mutations as ONE undo step. */
+  private groupHistory(fn: () => void): void {
+    this.pushHistory();
+    this.historyDepth += 1;
+    try {
+      fn();
+    } finally {
+      this.historyDepth -= 1;
+    }
+  }
+
+  /** Drops both stacks (open/close/enterEdit/discardEdits — NOT save). */
+  private clearHistory(): void {
+    this.undoStack = [];
+    this.redoStack = [];
+    this.lastHistoryTag = null;
+    if (this.state.canUndo || this.state.canRedo) this.set({ canUndo: false, canRedo: false });
+  }
+
+  /** Restores the previous document snapshot (edit mode only). Dirties. */
+  undo(): void {
+    const current = this.state.current;
+    if (!current || this.state.mode !== 'edit' || this.undoStack.length === 0) return;
+    const snapshot = this.undoStack.pop()!;
+    this.redoStack.push(
+      structuredClone({ layout: current.layout, activePageId: this.state.activePageId }),
+    );
+    this.lastHistoryTag = null;
+    this.applySnapshot(snapshot);
+  }
+
+  /** Re-applies the last undone snapshot (edit mode only). Dirties. */
+  redo(): void {
+    const current = this.state.current;
+    if (!current || this.state.mode !== 'edit' || this.redoStack.length === 0) return;
+    const snapshot = this.redoStack.pop()!;
+    this.undoStack.push(
+      structuredClone({ layout: current.layout, activePageId: this.state.activePageId }),
+    );
+    this.lastHistoryTag = null;
+    this.applySnapshot(snapshot);
+  }
+
+  private applySnapshot(snapshot: HistorySnapshot): void {
     const current = this.state.current;
     if (!current) return;
+    this.set({
+      current: { ...current, layout: snapshot.layout },
+      // The snapshot's page may have been added after (undo of addPage) — fall
+      // back to a page that exists in the restored doc.
+      activePageId: resolveActivePageId(snapshot.layout, snapshot.activePageId),
+      dirty: true,
+      selectedTileId: null,
+      hoverHighlight: null,
+      canUndo: this.undoStack.length > 0,
+      canRedo: this.redoStack.length > 0,
+    });
+  }
+
+  private mutateLayout(
+    mutate: (layout: DashboardLayoutDoc) => DashboardLayoutDoc,
+    coalesce?: HistoryCoalesce,
+  ): void {
+    const current = this.state.current;
+    if (!current) return;
+    this.pushHistory(coalesce);
     this.set({ current: { ...current, layout: mutate(current.layout) }, dirty: true });
   }
 
-  private mutatePages(mutate: (pages: DashboardPage[]) => DashboardPage[]): void {
-    this.mutateLayout((layout) => ({ ...layout, pages: mutate(pagesOf(layout)) }));
+  private mutatePages(
+    mutate: (pages: DashboardPage[]) => DashboardPage[],
+    coalesce?: HistoryCoalesce,
+  ): void {
+    this.mutateLayout((layout) => ({ ...layout, pages: mutate(pagesOf(layout)) }), coalesce);
   }
 
   /** Applies a tile-list mutation to the ACTIVE page (all tile ops route here). */
-  private mutateActiveTiles(mutate: (tiles: DashboardTile[]) => DashboardTile[]): void {
+  private mutateActiveTiles(
+    mutate: (tiles: DashboardTile[]) => DashboardTile[],
+    coalesce?: HistoryCoalesce,
+  ): void {
     const activePageId = this.state.activePageId;
-    this.mutatePages((pages) =>
-      pages.map((page) => (page.id === activePageId ? { ...page, tiles: mutate(page.tiles) } : page)),
+    this.mutatePages(
+      (pages) =>
+        pages.map((page) =>
+          page.id === activePageId ? { ...page, tiles: mutate(page.tiles) } : page,
+        ),
+      coalesce,
     );
   }
 
@@ -444,6 +599,7 @@ export class DashboardStore {
   async open(id: number): Promise<void> {
     const detail = await this.api.getDashboard(id);
     const current = toOpen(detail);
+    this.clearHistory();
     this.set({
       current,
       mode: 'view',
@@ -469,6 +625,7 @@ export class DashboardStore {
     try {
       const detail = await this.api.createDashboard({ name, modelId, layout: emptyLayout() });
       const current = toOpen(detail);
+      this.clearHistory();
       this.set({
         current,
         mode: 'edit',
@@ -485,18 +642,21 @@ export class DashboardStore {
   }
 
   close(): void {
+    this.clearHistory();
     this.set({ ...initialState, list: this.state.list, listStatus: this.state.listStatus });
   }
 
   enterEdit(): void {
     const current = this.state.current;
     if (!current) return;
+    this.clearHistory();
     // View-mode filter tweaks are personal state — edit mode always shows and
     // mutates the authored doc, so overrides reset here.
     this.set({ mode: 'edit', draftBackup: structuredClone(current), filterCardOverrides: {} });
   }
 
   discardEdits(): void {
+    this.clearHistory();
     const backup = this.state.draftBackup;
     this.set({
       mode: 'view',
@@ -563,11 +723,25 @@ export class DashboardStore {
   }
 
   updateChart(tileId: string, chart: ChartSpec): void {
-    this.mutateActiveTiles((tiles) => tiles.map((t) => (t.id === tileId ? { ...t, chart } : t)));
+    // Same-tile bursts (FormatPanel slider storms) coalesce into one undo step.
+    this.mutateActiveTiles(
+      (tiles) => tiles.map((t) => (t.id === tileId ? { ...t, chart } : t)),
+      { tag: `updateChart:${tileId}`, windowMs: 800 },
+    );
   }
 
   removeTile(tileId: string): void {
-    this.mutateActiveTiles((tiles) => tiles.filter((t) => t.id !== tileId));
+    // The tile removal + its orphaned filter cards are ONE undo step.
+    this.groupHistory(() => {
+      this.mutateActiveTiles((tiles) => tiles.filter((t) => t.id !== tileId));
+      // Visual-scope filter cards targeting the removed tile go with it.
+      const cards = this.state.current?.layout.filterCards ?? [];
+      if (cards.some((c) => c.scope === 'visual' && c.targetTileId === tileId)) {
+        this.mutateFilterCards((all) =>
+          all.filter((c) => !(c.scope === 'visual' && c.targetTileId === tileId)),
+        );
+      }
+    });
     if (this.state.selectedTileId === tileId) {
       this.set({ selectedTileId: null });
     }
@@ -583,13 +757,6 @@ export class DashboardStore {
     // …and a removed hover-highlight source.
     if (this.state.hoverHighlight?.sourceTileId === tileId) {
       this.set({ hoverHighlight: null });
-    }
-    // Visual-scope filter cards targeting the removed tile go with it.
-    const cards = this.state.current?.layout.filterCards ?? [];
-    if (cards.some((c) => c.scope === 'visual' && c.targetTileId === tileId)) {
-      this.mutateFilterCards((all) =>
-        all.filter((c) => !(c.scope === 'visual' && c.targetTileId === tileId)),
-      );
     }
   }
 
@@ -626,19 +793,22 @@ export class DashboardStore {
   /** Grid callback: items carry tile ids + new geometry (active page only). */
   applyLayout(items: { id: string; x: number; y: number; w: number; h: number }[]): void {
     const byId = new Map(items.map((i) => [i.id, i]));
-    this.mutateActiveTiles((tiles) =>
-      tiles.map((tile) => {
-        const next = byId.get(tile.id);
-        if (!next) return tile;
-        const changed =
-          next.x !== tile.layout.x ||
-          next.y !== tile.layout.y ||
-          next.w !== tile.layout.w ||
-          next.h !== tile.layout.h;
-        return changed
-          ? { ...tile, layout: { ...tile.layout, x: next.x, y: next.y, w: next.w, h: next.h } }
-          : tile;
-      }),
+    // Drag/resize storms (RGL fires per animation step) are one undo step.
+    this.mutateActiveTiles(
+      (tiles) =>
+        tiles.map((tile) => {
+          const next = byId.get(tile.id);
+          if (!next) return tile;
+          const changed =
+            next.x !== tile.layout.x ||
+            next.y !== tile.layout.y ||
+            next.w !== tile.layout.w ||
+            next.h !== tile.layout.h;
+          return changed
+            ? { ...tile, layout: { ...tile.layout, x: next.x, y: next.y, w: next.w, h: next.h } }
+            : tile;
+        }),
+      { tag: 'applyLayout', windowMs: 400 },
     );
   }
 
@@ -772,6 +942,8 @@ export class DashboardStore {
       name: name?.trim() || nextPageName(pages),
       tiles: [],
     };
+    // Writes `current` directly (not via mutateLayout) — push explicitly.
+    this.pushHistory();
     this.set({
       current: { ...current, layout: { ...current.layout, pages: [...pages, page] } },
       dirty: true,
@@ -833,6 +1005,8 @@ export class DashboardStore {
         !(c.scope === 'page' && c.pageId === pageId) &&
         !(c.scope === 'visual' && c.targetTileId != null && removedIds.has(c.targetTileId)),
     );
+    // Writes `current` directly (not via mutateLayout) — push explicitly.
+    this.pushHistory();
     this.set({
       current: {
         ...current,
@@ -1504,6 +1678,93 @@ export class DashboardStore {
     if (this.state.parameterSelections[id] === clamped) return;
     this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
   }
+
+  /* --------------------------------------------- sharing/activity (0.8.0) */
+
+  /**
+   * Changes the linked model of the open dashboard (edit mode; persists
+   * through the normal Save like any other draft change). Owner/admin only —
+   * grantee saves carrying a modelId change are rejected server-side
+   * ('rcd.dashboard.share_forbidden_fields'). Not part of the undo snapshot
+   * (history captures the layout document only).
+   */
+  setModelId(modelId: number | null): void {
+    const current = this.state.current;
+    if (!current || current.modelId === modelId) return;
+    this.set({ current: { ...current, modelId }, dirty: true });
+  }
+
+  /**
+   * Writes ONLY the publish ("Everyone") flag of the open dashboard through
+   * updateDashboard, adopting the fresh concurrency stamp without leaving the
+   * caller's mode. Admin-gated server-side. NOTE: the body necessarily
+   * carries the CURRENT in-memory layout — flipping publish mid-edit persists
+   * the draft as it stands.
+   */
+  async setPublish(isShared: boolean): Promise<boolean> {
+    const current = this.state.current;
+    if (!current) return false;
+    if (current.isShared === isShared) return true;
+    try {
+      const saved = await this.api.updateDashboard(current.id, {
+        name: current.name,
+        description: current.description,
+        modelId: current.modelId,
+        layout: current.layout,
+        isShared,
+        expectedUpdatedAtUtc: current.expectedUpdatedAtUtc,
+      });
+      const live = this.state.current;
+      if (live && live.id === current.id) {
+        this.set({
+          current: { ...live, isShared: saved.isShared, expectedUpdatedAtUtc: saved.updatedAtUtc },
+        });
+      }
+      void this.loadList();
+      return true;
+    } catch (error) {
+      this.set({ error: messageOf(error) });
+      return false;
+    }
+  }
+
+  /** The dashboard's grant rows (owner/admin). Errors propagate to the caller. */
+  listShares(dashboardId: number): Promise<DashboardShare[]> {
+    return this.api.listDashboardShares(dashboardId);
+  }
+
+  /**
+   * Replaces the dashboard's full grant set, then refreshes the list (row
+   * shareCounts changed) and the open dashboard's count. Errors propagate.
+   */
+  async saveShares(dashboardId: number, shares: DashboardShareInput[]): Promise<void> {
+    await this.api.saveDashboardShares(dashboardId, { shares });
+    const current = this.state.current;
+    if (current && current.id === dashboardId) {
+      this.set({ current: { ...current, shareCount: shares.length } });
+    }
+    void this.loadList();
+  }
+
+  /** Activity log page (newest first; `beforeId` pages backwards). */
+  listActivity(dashboardId: number, options?: ListActivityOptions): Promise<ActivityEntry[]> {
+    return this.api.listDashboardActivity(dashboardId, options);
+  }
+
+  /** Host user directory for the share picker ([] = not configured). */
+  listUsers(query?: string): Promise<RcdUser[]> {
+    return this.api.listUsers(query);
+  }
+
+  /**
+   * Removes the CALLER's share row ("Remove from my list") and refreshes the
+   * list. Deliberately does NOT close an open session on that dashboard —
+   * navigation is the host's decision. Errors propagate.
+   */
+  async leave(dashboardId: number): Promise<void> {
+    await this.api.leaveDashboard(dashboardId);
+    void this.loadList();
+  }
 }
 
 /* ----------------------------------------------------- cross-filter merging
@@ -1666,6 +1927,11 @@ const toOpen = (detail: DashboardDetail): OpenDashboard => ({
   modelId: detail.modelId,
   isShared: detail.isShared,
   ownerIsMe: detail.ownerIsMe,
+  isSystem: detail.isSystem ?? false,
+  ownerDisplayName: detail.ownerDisplayName ?? null,
+  // Pre-0.8 servers omit myAccess — owner gets full rights, others view-only.
+  myAccess: dashboardAccessOf(detail),
+  shareCount: detail.shareCount ?? 0,
   expectedUpdatedAtUtc: detail.updatedAtUtc,
   layout: migratePages(migrateSlicers(detail.layout?.tiles ? detail.layout : emptyLayout())),
 });
@@ -1742,5 +2008,5 @@ const safeImageSrc = (src: string): string => {
   return /^data:image\//i.test(trimmed) || /^https:\/\//i.test(trimmed) ? trimmed : '';
 };
 
-const messageOf = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
+/** Error text for store state: RcdApiError-aware (friendly code fallbacks). */
+const messageOf = (error: unknown): string => rcdErrorMessage(error);

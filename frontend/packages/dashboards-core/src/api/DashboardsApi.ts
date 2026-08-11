@@ -10,13 +10,16 @@ import type {
   QueryResult,
 } from '../types/query';
 import type {
+  ActivityEntry,
   AlertFiring,
   AlertTestResult,
   DashboardAlert,
   DashboardDetail,
   DashboardLayoutDoc,
+  DashboardShare,
   DashboardSubscription,
   DashboardSummary,
+  RcdUser,
   SaveAlertBody,
   SaveSubscriptionBody,
 } from '../types/dashboard';
@@ -50,6 +53,27 @@ export interface SaveDashboardBody {
   layout: DashboardLayoutDoc;
   isShared?: boolean;
   expectedUpdatedAtUtc?: string | null;
+}
+
+/** One grant of PUT dashboards/{id}/shares (all flags false = view-only). */
+export interface DashboardShareInput {
+  userId: string;
+  canEditLayout: boolean;
+  canManagePages: boolean;
+  canEditCharts: boolean;
+}
+
+/** Body of PUT dashboards/{id}/shares — REPLACES the dashboard's full grant set. */
+export interface SaveDashboardSharesBody {
+  shares: DashboardShareInput[];
+}
+
+/** Paging options of GET dashboards/{id}/activity. */
+export interface ListActivityOptions {
+  /** Server default 100. */
+  limit?: number;
+  /** Return entries with id strictly below this ("Load more" cursor). */
+  beforeId?: number;
 }
 
 export interface ValidationOutcome {
@@ -214,6 +238,63 @@ export class DashboardsApi {
 
   duplicateDashboard(id: number): Promise<DashboardDetail> {
     return this.fetcher(this.url(`/dashboards/${id}/duplicate`), { method: 'POST' });
+  }
+
+  /* ------------------------------------------------- shares/activity/users */
+
+  /** The dashboard's per-user grant rows — owner/admin only. */
+  async listDashboardShares(id: number, signal?: AbortSignal): Promise<DashboardShare[]> {
+    const result = await this.fetcher<{ shares: DashboardShare[] }>(
+      this.url(`/dashboards/${id}/shares`),
+      { signal },
+    );
+    return result.shares ?? [];
+  }
+
+  /**
+   * REPLACES the dashboard's full grant set (owner/admin, non-system). The
+   * owner/caller as a target is rejected server-side
+   * ('rcd.dashboard.share_target_invalid'). Response body, if any, is ignored
+   * — callers re-list to refresh.
+   */
+  saveDashboardShares(id: number, body: SaveDashboardSharesBody): Promise<void> {
+    return this.fetcher(this.url(`/dashboards/${id}/shares`), { method: 'PUT', body });
+  }
+
+  /** Removes the CALLER's share row ("Remove from my list"). */
+  leaveDashboard(id: number): Promise<void> {
+    return this.fetcher(this.url(`/dashboards/${id}/leave`), { method: 'POST' });
+  }
+
+  /**
+   * Activity log, newest first — owner/admin/grantees holding any edit flag.
+   * Page backwards with `beforeId` (the last received entry's id).
+   */
+  async listDashboardActivity(
+    id: number,
+    options: ListActivityOptions = {},
+    signal?: AbortSignal,
+  ): Promise<ActivityEntry[]> {
+    const params = new URLSearchParams();
+    if (options.limit !== undefined) params.set('limit', String(options.limit));
+    if (options.beforeId !== undefined) params.set('beforeId', String(options.beforeId));
+    const query = params.toString();
+    const result = await this.fetcher<{ entries: ActivityEntry[] }>(
+      this.url(`/dashboards/${id}/activity${query === '' ? '' : `?${query}`}`),
+      { signal },
+    );
+    return result.entries ?? [];
+  }
+
+  /**
+   * The host's user directory (share-picker search). An empty array with no
+   * query means the host has no IUserDirectory configured — UIs show their
+   * "user directory not configured" state.
+   */
+  listUsers(query?: string, signal?: AbortSignal): Promise<RcdUser[]> {
+    const suffix =
+      query === undefined || query === '' ? '' : `?query=${encodeURIComponent(query)}`;
+    return this.fetcher(this.url(`/users${suffix}`), { signal });
   }
 
   /* --------------------------------------------------- email subscriptions */

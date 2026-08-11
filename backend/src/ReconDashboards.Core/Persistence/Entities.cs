@@ -33,6 +33,49 @@ public sealed class DashboardRecord
     public DateTime UpdatedAtUtc { get; set; }
 }
 
+/// <summary>
+/// rcd_dashboard_shares — a named-user grant on one dashboard. All three flags
+/// false = view-only. UserId/GrantedByUserId are opaque host ids, same
+/// convention as OwnerUserId. One row per (DashboardId, UserId).
+/// </summary>
+public sealed class DashboardShareRecord
+{
+    public int Id { get; set; }
+    public int DashboardId { get; set; }
+    public string UserId { get; set; } = "";
+
+    /// <summary>Move/resize tiles, doc-level settings, slicer/text/image tiles.</summary>
+    public bool CanEditLayout { get; set; }
+
+    /// <summary>Add/remove/rename/reorder/recolor pages.</summary>
+    public bool CanManagePages { get; set; }
+
+    /// <summary>Add/remove tiles, edit chart specs/format.</summary>
+    public bool CanEditCharts { get; set; }
+
+    public string GrantedByUserId { get; set; } = "";
+    public DateTime CreatedAtUtc { get; set; }
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
+/// <summary>
+/// rcd_dashboard_activity — append-only log per dashboard, trimmed to the
+/// newest 500 rows after every insert. DetailJson carries the layout-change
+/// summary ("saved") or {"targetUserIds":[...]} (share actions), camelCase.
+/// </summary>
+public sealed class DashboardActivityRecord
+{
+    public long Id { get; set; }
+    public int DashboardId { get; set; }
+    public string UserId { get; set; } = "";
+
+    /// <summary>created | saved | renamed | shared | unshared | shareChanged | left | deleted | duplicated.</summary>
+    public string Action { get; set; } = "";
+
+    public string? DetailJson { get; set; }
+    public DateTime AtUtc { get; set; }
+}
+
 /// <summary>How a subscription's next run is derived. Stored as small discriminated columns, never cron strings. Wire names: "interval", "daily", "weekly".</summary>
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SubscriptionScheduleKind>))]
 public enum SubscriptionScheduleKind

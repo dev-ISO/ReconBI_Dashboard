@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Copy, Download, Network, Plus, RefreshCw, Share2, Trash2, Upload, User } from 'lucide-react';
+import { Copy, Download, Lock, Network, Plus, RefreshCw, Share2, Trash2, Upload, User } from 'lucide-react';
 import { RcdApiError } from '@recon/dashboards-core';
 import type { ModelExportDocument, ModelSummary } from '@recon/dashboards-core';
 import { useModelState, useRuntime } from '../provider/DashboardsProvider';
@@ -272,6 +272,14 @@ export function ModelListPanel({ onOpen, onNew, readOnly = false }: ModelListPan
                   <td className="px-4 py-2.5 text-rcd-text-2">{model.dataSourceName}</td>
                   <td className="px-4 py-2.5">
                     <span className="flex flex-wrap items-center gap-1.5">
+                      {model.isSystem && (
+                        <span
+                          className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2"
+                          title="Built-in content managed by the application. Make a copy to edit it."
+                        >
+                          <Lock size={11} /> Built-in
+                        </span>
+                      )}
                       {model.ownerIsMe && (
                         <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
                           <User size={11} /> Yours
@@ -292,8 +300,9 @@ export function ModelListPanel({ onOpen, onNew, readOnly = false }: ModelListPan
                     <div className="flex items-center justify-end gap-1">
                       {authoring && (
                         <RcdIconButton
-                          aria-label={`Duplicate ${model.name}`}
-                          title="Duplicate"
+                          aria-label={`Make a copy of ${model.name}`}
+                          // Built-ins are copy-to-edit; the copy is the caller's.
+                          title={model.isSystem ? 'Make a copy' : 'Duplicate'}
                           disabled={busyId === model.id}
                           onClick={() => void handleDuplicate(model)}
                         >

@@ -20,6 +20,7 @@ import {
   isSlicerTile,
   isTextTile,
   newId,
+  rcdErrorMessage,
   slicerClauseOf,
   slicerPresetOf,
   stableStringify,
@@ -40,8 +41,10 @@ import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuil
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
-import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
+import { ConfirmDialog, RcdButton, RcdDialog, RcdSelect, RcdSpinner } from '../primitives';
+import { ActivityPanel } from './ActivityPanel';
 import { AddSlicerDialog } from './AddSlicerDialog';
+import { ShareDialog } from './ShareDialog';
 import { AlertDialog, type AlertSource } from './AlertDialog';
 import { ChartContextMenu } from './ChartContextMenu';
 import { DashboardChartTile, type TileEffectiveState } from './DashboardChartTile';
@@ -96,6 +99,18 @@ export interface DashboardViewProps {
   dashboardId: number;
   /** Hides all editing affordances (host capability-driven). */
   readonly?: boolean;
+  /**
+   * Navigate to another dashboard (used after "Make a copy"). Without it the
+   * copy is announced via the notice chip and reachable from the list.
+   */
+  onOpenDashboard?: (id: number) => void;
+  /**
+   * Called after this dashboard was deleted or removed from the caller's
+   * list, so the host can navigate away.
+   */
+  onDeleted?: () => void;
+  /** Host-injected toolbar actions (threaded to the toolbar's extraActions). */
+  extraActions?: ReactNode;
 }
 
 const messageOf = (error: unknown): string =>
@@ -239,12 +254,20 @@ const SLOT_LABELS: Record<FilterIndicatorPlacement, string> = {
 };
 
 /** The embeddable entry point: toolbar + tile grid, view/edit modes. */
-export function DashboardView({ dashboardId, readonly = false }: DashboardViewProps) {
+export function DashboardView({
+  dashboardId,
+  readonly = false,
+  onOpenDashboard,
+  onDeleted,
+  extraActions,
+}: DashboardViewProps) {
   const runtime = useRuntime();
 
   const current = useDashboardState((state) => state.current);
   const mode = useDashboardState((state) => state.mode);
   const dirty = useDashboardState((state) => state.dirty);
+  const canUndo = useDashboardState((state) => state.canUndo);
+  const canRedo = useDashboardState((state) => state.canRedo);
   const saveStatus = useDashboardState((state) => state.saveStatus);
   const storeError = useDashboardState((state) => state.error);
   const slicerValues = useDashboardState((state) => state.slicerValues);
@@ -307,6 +330,15 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const [paramsOpen, setParamsOpen] = useState(false);
   /** Subscriptions dialog (view mode, ⋯ > Subscribe…). */
   const [subscribeOpen, setSubscribeOpen] = useState(false);
+  /** Share dialog (toolbar Share button; owner/admin). */
+  const [shareOpen, setShareOpen] = useState(false);
+  /** Activity log dialog (⋯ > Activity; edit-rights holders). */
+  const [activityOpen, setActivityOpen] = useState(false);
+  /** Linked-model picker (⋯ > Linked model…; owner/admin, edit mode). */
+  const [linkedModelOpen, setLinkedModelOpen] = useState(false);
+  /** Pending destructive confirms for the overflow menu's Delete / Leave. */
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmLeave, setConfirmLeave] = useState(false);
   /** Alert dialog + the chart context it was invoked from. */
   const [alertSource, setAlertSource] = useState<AlertSource | null>(null);
   /** Recent alert firings (bell); null until the first successful poll. */
@@ -380,6 +412,78 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
   const tiles = activePage?.tiles ?? [];
   const editable = mode === 'edit' && !readonly;
+
+  /* ------------------------------------------------ access rights (0.8.0)
+   * `myAccess` is server-authoritative (the store defaults it for pre-0.8
+   * servers: owner = full, everyone else view-only). This is honest UX only —
+   * every write is re-checked server-side. Owner/admin arrive with all three
+   * class flags set, so nothing changes for them.
+   */
+  const access = current?.id === dashboardId ? current.myAccess : null;
+  const isSystem = current?.id === dashboardId ? current.isSystem : false;
+  /** Can this user enter edit mode at all? (Built-ins are copy-to-edit.) */
+  const canEnterEdit = !readonly && !isSystem && (access?.canEdit ?? false);
+  /** Owner or CanManageShared admin (a grantee's access is viaShare). */
+  const canManageShares =
+    !readonly && access !== null && (access.isOwner || (access.canEdit && !access.viaShare));
+  const canEditLayout = editable && (access?.canEditLayout ?? false);
+  const canManagePages = editable && (access?.canManagePages ?? false);
+  const canEditCharts = editable && (access?.canEditCharts ?? false);
+
+  // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z while editing. Document-level (key events
+  // only reach the view root when focus happens to sit inside it) but gated on
+  // THIS view's edit mode, and ignored whenever focus is in a text control —
+  // those own their native undo.
+  useEffect(() => {
+    if (!editable) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'z' && key !== 'y') return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target && (target.isContentEditable || target.closest('input, textarea, select'))) return;
+      event.preventDefault();
+      if (key === 'y' || (key === 'z' && event.shiftKey)) runtime.dashboards.redo();
+      else runtime.dashboards.undo();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [editable, runtime]);
+
+  /** ⋯ > Make a copy: caller-owned duplicate of the visible dashboard. */
+  const makeCopy = useCallback(async () => {
+    try {
+      const copy = await runtime.api.duplicateDashboard(dashboardId);
+      void runtime.dashboards.loadList();
+      if (onOpenDashboard) onOpenDashboard(copy.id);
+      else setNotice(`Copy created: "${copy.name}" — find it in your dashboards list.`);
+    } catch (error) {
+      setNotice(`Copy failed: ${rcdErrorMessage(error)}`);
+    }
+  }, [runtime, dashboardId, onOpenDashboard]);
+
+  /** ⋯ > Delete (owner/admin): soft delete, then hand navigation to the host. */
+  const deleteDashboard = useCallback(async () => {
+    try {
+      await runtime.api.deleteDashboard(dashboardId);
+      void runtime.dashboards.loadList();
+      if (onDeleted) onDeleted();
+      else setNotice('Dashboard deleted.');
+    } catch (error) {
+      setNotice(`Delete failed: ${rcdErrorMessage(error)}`);
+    }
+  }, [runtime, dashboardId, onDeleted]);
+
+  /** ⋯ > Remove from my list (grantee): drops only the caller's share row. */
+  const leaveDashboard = useCallback(async () => {
+    try {
+      await runtime.dashboards.leave(dashboardId);
+      if (onDeleted) onDeleted();
+      else setNotice('Removed from your list.');
+    } catch (error) {
+      setNotice(`Remove failed: ${rcdErrorMessage(error)}`);
+    }
+  }, [runtime, dashboardId, onDeleted]);
 
   // Per-chart slicer + cross-filter + filter-card clauses. The memo depends on
   // the SUBSCRIBED tiles + slicerValues + crossFilter + filterCards (+ their
@@ -1054,7 +1158,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       setIndicatorDragPos(null);
       if (slot === null) return;
       const state = runtime.dashboards.store.getState();
-      if (state.mode === 'edit') {
+      // Doc write needs layout rights; anyone else's drag is a session tweak.
+      if (state.mode === 'edit' && state.current?.myAccess.canEditLayout) {
         runtime.dashboards.setFilterIndicator({ placement: slot });
         // A stale session override must not mask the freshly authored slot
         // once the edit is saved and view mode returns.
@@ -1447,7 +1552,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           tileId={tile.id}
           spec={tile.slicer}
           modelId={modelId}
-          editable={editable}
+          // Slicer tile CONFIG edits are layout-class changes (the differ's
+          // doctrine) — grantees without layout rights get the view-mode tile.
+          editable={canEditLayout}
           chartTiles={chartTileInfos}
         />
       );
@@ -1455,12 +1562,13 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
 
     // Text/image tiles: frameless content in view mode, standard TileFrame
     // chrome (title-bar dragging + config card) in edit mode — handled inside.
+    // Their content edits are layout-class changes, hence canEditLayout.
     if (isTextTile(tile)) {
-      return <TextTile tileId={tile.id} spec={tile.text} editable={editable} />;
+      return <TextTile tileId={tile.id} spec={tile.text} editable={canEditLayout} />;
     }
 
     if (isImageTile(tile)) {
-      return <ImageTile tileId={tile.id} spec={tile.image} editable={editable} />;
+      return <ImageTile tileId={tile.id} spec={tile.image} editable={canEditLayout} />;
     }
 
     if (!isChartTile(tile)) return null;
@@ -1474,7 +1582,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         tileId={tile.id}
         chart={chart}
         modelId={modelId}
-        editable={editable}
+        // Chart spec/format edits + tile delete are charts-class changes.
+        editable={canEditCharts}
         selected={selectedTileId === tile.id}
         refreshKey={`${refreshToken}:${tileRefreshTokens[tile.id] ?? 0}`}
         filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
@@ -1489,7 +1598,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         // Context card replaces the native menu in EDIT mode only; view mode
         // gets the POINT context menu (drillthrough/export) on chart points.
         onTileContextMenu={
-          editable
+          canEditCharts
             ? (position) => setChartMenu({ tileId: tile.id, position })
             : undefined
         }
@@ -1625,21 +1734,48 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       <DashboardToolbar
         name={current.name}
         isShared={current.isShared}
+        isSystem={isSystem}
         mode={mode}
         dirty={dirty}
         saving={saveStatus === 'loading'}
         error={saveStatus === 'error' ? storeError : null}
-        readonly={readonly}
+        // Rights-aware: view-only users (and built-ins) get no Edit affordance.
+        readonly={!canEnterEdit}
         onEnterEdit={() => runtime.dashboards.enterEdit()}
         onAddChart={openAddChart}
         onAddText={() => runtime.dashboards.addTextTile()}
         onAddImage={() => setAddImageOpen(true)}
         onAddSlicer={() => setAddSlicerOpen(true)}
         addSlicerDisabled={modelId === null}
+        canAddTiles={canEditCharts}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onUndo={editable ? () => runtime.dashboards.undo() : undefined}
+        onRedo={editable ? () => runtime.dashboards.redo() : undefined}
+        onShare={canManageShares && !isSystem ? () => setShareOpen(true) : undefined}
+        onActivity={
+          !readonly && (access?.canEdit ?? false) ? () => setActivityOpen(true) : undefined
+        }
+        onLinkedModel={
+          canManageShares && mode === 'edit' ? () => setLinkedModelOpen(true) : undefined
+        }
+        onMakeCopy={() => void makeCopy()}
+        onDelete={canManageShares && !isSystem ? () => setConfirmDelete(true) : undefined}
+        onLeave={
+          access !== null && !access.isOwner && access.viaShare
+            ? () => setConfirmLeave(true)
+            : undefined
+        }
+        extraActions={extraActions}
         refreshSeconds={refreshSeconds}
-        onChangeRefreshSeconds={(seconds) => runtime.dashboards.setRefreshSeconds(seconds)}
+        onChangeRefreshSeconds={
+          // Auto-refresh is a doc setting (layout-class change).
+          mode === 'edit' && !canEditLayout
+            ? undefined
+            : (seconds) => runtime.dashboards.setRefreshSeconds(seconds)
+        }
         onRefresh={refreshTiles}
         refreshing={refreshing}
         lastRefreshAt={lastRefreshAt}
@@ -1649,7 +1785,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         activeFilterCount={activeFilterCount}
         bookmarks={(bookmarks ?? []).map((b) => ({ id: b.id, name: b.name }))}
         lastAppliedBookmarkId={lastAppliedBookmarkId}
-        canManageBookmarks={!readonly}
+        // Bookmark management writes the doc (settings class -> layout right).
+        canManageBookmarks={!readonly && !isSystem && (access?.canEditLayout ?? false)}
         onApplyBookmark={(id) => {
           runtime.dashboards.applyBookmark(id);
           // Bookmarks capture relative-date PRESETS; recompute their dates so
@@ -1660,13 +1797,19 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         onUpdateBookmark={(id) => runtime.dashboards.updateBookmark(id)}
         onRenameBookmark={(id, name) => runtime.dashboards.renameBookmark(id, name)}
         onDeleteBookmark={(id) => runtime.dashboards.deleteBookmark(id)}
-        onManageParameters={() => setParamsOpen(true)}
+        // Field parameters are doc settings (layout-class change).
+        onManageParameters={canEditLayout ? () => setParamsOpen(true) : undefined}
         onSubscribe={readonly ? undefined : () => setSubscribeOpen(true)}
         alertFirings={alertFirings ?? undefined}
         mobileLayoutOpen={mobileEditOpen}
-        onToggleMobileLayout={() => setMobileEditOpen((open) => !open)}
+        // The phone layout lives on the page (pages-class change).
+        onToggleMobileLayout={
+          mode === 'edit' && !canManagePages
+            ? undefined
+            : () => setMobileEditOpen((open) => !open)
+        }
         onConfigureFilterIndicator={
-          editable ? (position) => setIndicatorMenu(position) : undefined
+          canEditLayout ? (position) => setIndicatorMenu(position) : undefined
         }
         viewFit={effectiveViewFit}
         // View menu: transient session choice in view mode; the persisted doc
@@ -1676,7 +1819,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
           isMobileView
             ? undefined
             : mode === 'edit'
-              ? editable
+              ? canEditLayout // doc default is a layout-class change
                 ? (fit) => runtime.dashboards.setDefaultViewFit(fit)
                 : undefined
               : (fit) => runtime.dashboards.setViewFitOverride(fit)
@@ -1807,7 +1950,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               <span className="flex h-16 w-16 items-center justify-center rounded-full bg-[color-mix(in_srgb,var(--rcd-accent)_10%,transparent)]">
                 <LayoutDashboard size={28} className="text-rcd-accent" />
               </span>
-              {editable ? (
+              {canEditCharts ? (
                 <>
                   <div className="flex flex-col gap-1">
                     <p className="text-sm font-medium text-rcd-text">Nothing here yet</p>
@@ -1823,7 +1966,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               ) : (
                 <p className="text-sm text-rcd-muted">
                   This dashboard has no charts yet.
-                  {!readonly && ' Click Edit to add one.'}
+                  {canEnterEdit && mode === 'view' && ' Click Edit to add one.'}
                 </p>
               )}
             </div>
@@ -1856,6 +1999,9 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
               <DashboardGrid
                 items={gridItems}
                 editable={editable}
+                // Grantees without layout rights get a static grid (honest
+                // UX; the differ + server reject their moves regardless).
+                locked={!canEditLayout}
                 onLayoutChange={handleLayoutChange}
                 renderItem={renderTile}
                 draggableHandle=".rcd-tile-drag-handle"
@@ -1870,7 +2016,8 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
             pageId={activePage?.id ?? null}
             tiles={tiles}
             modelId={modelId}
-            editable={editable}
+            // Filter cards are doc settings — layout-class changes.
+            editable={canEditLayout}
             onClose={() => setFiltersPaneOpen(false)}
           />
         )}
@@ -1898,10 +2045,10 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       )}
 
       {/* Excel-style page tabs, docked under the scroll area in BOTH modes. */}
-      <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={editable} />
+      <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={canManagePages} />
 
       {chartMenu &&
-        editable &&
+        canEditCharts &&
         chartMenuTile &&
         isChartTile(chartMenuTile) &&
         // Portal past the transformed grid items: position:fixed inside a
@@ -1940,7 +2087,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         )}
 
       {indicatorMenu &&
-        editable &&
+        canEditLayout &&
         // Same portal doctrine as every other floating card in this view.
         createPortal(
           <div className="rcd-root bg-transparent">
@@ -2106,6 +2253,58 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         }}
       />
 
+      <ShareDialog
+        open={shareOpen}
+        dashboardId={dashboardId}
+        onClose={() => setShareOpen(false)}
+        // The frontend has no dedicated admin signal, so owner-or-admin sees
+        // the publish toggle; a non-admin owner's flip is refused server-side.
+        canPublish={canManageShares}
+        isShared={current.isShared}
+      />
+
+      <ActivityPanel
+        open={activityOpen}
+        dashboardId={dashboardId}
+        onClose={() => setActivityOpen(false)}
+      />
+
+      <LinkedModelDialog
+        open={linkedModelOpen}
+        modelId={current.modelId}
+        onClose={() => setLinkedModelOpen(false)}
+        onPick={(id) => {
+          runtime.dashboards.setModelId(id);
+          setLinkedModelOpen(false);
+        }}
+      />
+
+      <ConfirmDialog
+        title="Delete dashboard"
+        message={`Delete "${current.name}"? Everyone loses access. This cannot be undone.`}
+        confirmLabel="Delete"
+        danger
+        open={confirmDelete}
+        onConfirm={() => {
+          setConfirmDelete(false);
+          void deleteDashboard();
+        }}
+        onCancel={() => setConfirmDelete(false)}
+      />
+
+      <ConfirmDialog
+        title="Remove from my list"
+        message={`Remove "${current.name}" from your list? Only your access is removed — the dashboard itself is untouched.`}
+        confirmLabel="Remove"
+        danger
+        open={confirmLeave}
+        onConfirm={() => {
+          setConfirmLeave(false);
+          void leaveDashboard();
+        }}
+        onCancel={() => setConfirmLeave(false)}
+      />
+
       <PrintConfigDialog
         open={printConfigOpen}
         onClose={() => setPrintConfigOpen(false)}
@@ -2124,5 +2323,73 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         <DashboardPrintView options={printOptions} onClose={() => setPrintOptions(null)} />
       )}
     </div>
+  );
+}
+
+/**
+ * "Linked model…" picker (owner/admin, edit mode): a small dialog listing the
+ * caller's visible models. The pick writes `modelId` into the DRAFT via the
+ * store — it persists through the normal Save path like any other edit.
+ */
+function LinkedModelDialog({
+  open,
+  modelId,
+  onClose,
+  onPick,
+}: {
+  open: boolean;
+  modelId: number | null;
+  onClose: () => void;
+  onPick: (modelId: number | null) => void;
+}) {
+  const runtime = useRuntime();
+  const models = useModelState((state) => state.models);
+  const modelsStatus = useModelState((state) => state.modelsStatus);
+  const [choice, setChoice] = useState<string>(modelId === null ? '' : String(modelId));
+
+  useEffect(() => {
+    if (!open) return;
+    setChoice(modelId === null ? '' : String(modelId));
+    void runtime.models.loadModels();
+  }, [open, modelId, runtime]);
+
+  return (
+    <RcdDialog
+      title="Linked model"
+      open={open}
+      onClose={onClose}
+      footer={
+        <>
+          <RcdButton onClick={onClose}>Cancel</RcdButton>
+          <RcdButton
+            variant="primary"
+            onClick={() => onPick(choice === '' ? null : Number(choice))}
+          >
+            Apply
+          </RcdButton>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+          Semantic model
+          <RcdSelect value={choice} onChange={(event) => setChoice(event.target.value)}>
+            <option value="">No model</option>
+            {models.map((model) => (
+              <option key={model.id} value={String(model.id)}>
+                {model.name}
+              </option>
+            ))}
+          </RcdSelect>
+          {modelsStatus === 'loading' && (
+            <span className="text-xs text-rcd-muted">Loading models…</span>
+          )}
+        </label>
+        <p className="text-xs text-rcd-muted">
+          Applies to the draft — Save the dashboard to keep it. Existing charts keep their field
+          references; switching models can break charts whose fields the new model lacks.
+        </p>
+      </div>
+    </RcdDialog>
   );
 }

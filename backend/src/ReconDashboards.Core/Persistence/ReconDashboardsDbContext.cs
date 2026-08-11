@@ -18,6 +18,8 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
 {
     public DbSet<DataModelRecord> DataModels => Set<DataModelRecord>();
     public DbSet<DashboardRecord> Dashboards => Set<DashboardRecord>();
+    public DbSet<DashboardShareRecord> DashboardShares => Set<DashboardShareRecord>();
+    public DbSet<DashboardActivityRecord> DashboardActivity => Set<DashboardActivityRecord>();
     public DbSet<QueryAuditRecord> QueryAudit => Set<QueryAuditRecord>();
     public DbSet<SubscriptionRecord> Subscriptions => Set<SubscriptionRecord>();
     public DbSet<AlertRecord> Alerts => Set<AlertRecord>();
@@ -65,6 +67,39 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             entity.HasIndex(e => new { e.OwnerUserId, e.Name })
                 .IsUnique()
                 .HasFilter(notDeletedFilter);
+        });
+
+        modelBuilder.Entity<DashboardShareRecord>(entity =>
+        {
+            entity.ToTable("rcd_dashboard_shares");
+            entity.Property(e => e.UserId).HasMaxLength(128);
+            entity.Property(e => e.GrantedByUserId).HasMaxLength(128);
+            entity.Property(e => e.CanEditLayout).HasDefaultValue(false);
+            entity.Property(e => e.CanManagePages).HasDefaultValue(false);
+            entity.Property(e => e.CanEditCharts).HasDefaultValue(false);
+            entity.HasOne<DashboardRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.DashboardId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(e => new { e.DashboardId, e.UserId }).IsUnique();
+            entity.HasIndex(e => e.UserId);
+        });
+
+        modelBuilder.Entity<DashboardActivityRecord>(entity =>
+        {
+            entity.ToTable("rcd_dashboard_activity");
+            entity.Property(e => e.UserId).HasMaxLength(128);
+            entity.Property(e => e.Action).HasMaxLength(64);
+            if (jsonColumnType is not null)
+            {
+                entity.Property(e => e.DetailJson).HasColumnType(jsonColumnType);
+            }
+
+            entity.HasOne<DashboardRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.DashboardId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(e => new { e.DashboardId, e.AtUtc }).IsDescending(false, true);
         });
 
         modelBuilder.Entity<SubscriptionRecord>(entity =>

@@ -2,6 +2,7 @@
 using System;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Storage.ValueConversion;
 using Npgsql.EntityFrameworkCore.PostgreSQL.Metadata;
 using ReconDashboards.Core.Persistence;
@@ -11,9 +12,11 @@ using ReconDashboards.Core.Persistence;
 namespace ReconDashboards.Postgres.Migrations
 {
     [DbContext(typeof(ReconDashboardsDbContext))]
-    partial class ReconDashboardsDbContextModelSnapshot : ModelSnapshot
+    [Migration("20260811182420_DashboardSharesAndActivity")]
+    partial class DashboardSharesAndActivity
     {
-        protected override void BuildModel(ModelBuilder modelBuilder)
+        /// <inheritdoc />
+        protected override void BuildTargetModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
             modelBuilder

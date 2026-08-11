@@ -76,7 +76,8 @@ public sealed record ModelSummaryResponse(
     string DataSourceName,
     bool IsShared,
     bool OwnerIsMe,
-    DateTime UpdatedAtUtc);
+    DateTime UpdatedAtUtc,
+    bool IsSystem);
 
 public sealed record ModelResponse(
     int Id,
@@ -87,6 +88,7 @@ public sealed record ModelResponse(
     bool OwnerIsMe,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
+    bool IsSystem,
     JsonElement Definition);
 
 public sealed record SaveModelRequest(
@@ -121,6 +123,16 @@ public sealed record ImportModelRequest(
     string DataSourceName,
     JsonElement Definition);
 
+/// <summary>The caller's rights on one dashboard (canEdit = owner || admin || any flag).</summary>
+public sealed record DashboardAccessResponse(
+    bool IsOwner,
+    bool CanEdit,
+    bool CanEditLayout,
+    bool CanManagePages,
+    bool CanEditCharts,
+    bool ViaShare,
+    bool ViaPublish);
+
 public sealed record DashboardSummaryResponse(
     int Id,
     string Name,
@@ -128,7 +140,11 @@ public sealed record DashboardSummaryResponse(
     int? ModelId,
     bool IsShared,
     bool OwnerIsMe,
-    DateTime UpdatedAtUtc);
+    DateTime UpdatedAtUtc,
+    bool IsSystem,
+    string? OwnerDisplayName,
+    DashboardAccessResponse MyAccess,
+    int ShareCount);
 
 public sealed record DashboardResponse(
     int Id,
@@ -139,6 +155,10 @@ public sealed record DashboardResponse(
     bool OwnerIsMe,
     DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc,
+    bool IsSystem,
+    string? OwnerDisplayName,
+    DashboardAccessResponse MyAccess,
+    int ShareCount,
     JsonElement Layout);
 
 public sealed record SaveDashboardRequest(
@@ -148,6 +168,38 @@ public sealed record SaveDashboardRequest(
     JsonElement Layout,
     bool IsShared = false,
     DateTime? ExpectedUpdatedAtUtc = null);
+
+public sealed record DashboardShareResponse(
+    string UserId,
+    string? DisplayName,
+    bool CanEditLayout,
+    bool CanManagePages,
+    bool CanEditCharts,
+    DateTime UpdatedAtUtc);
+
+public sealed record DashboardSharesResponse(IReadOnlyList<DashboardShareResponse> Shares);
+
+public sealed record ShareGrantRequest(
+    string UserId,
+    bool CanEditLayout,
+    bool CanManagePages,
+    bool CanEditCharts);
+
+/// <summary>PUT dashboards/{id}/shares body: REPLACES the full grant set.</summary>
+public sealed record SaveDashboardSharesRequest(IReadOnlyList<ShareGrantRequest> Shares);
+
+/// <summary>Detail is the stored DetailJson re-emitted verbatim (camelCase), or null.</summary>
+public sealed record ActivityEntryResponse(
+    long Id,
+    string UserId,
+    string? DisplayName,
+    string Action,
+    JsonElement? Detail,
+    DateTime AtUtc);
+
+public sealed record DashboardActivityResponse(IReadOnlyList<ActivityEntryResponse> Entries);
+
+public sealed record RcdUserResponse(string Id, string DisplayName, string? Email);
 
 /// <summary>POST /query/underlying body. MaxRows defaults to 1000 and clamps to [1, 10000].</summary>
 public sealed record UnderlyingRequest(ChartQuerySpec Spec, int? MaxRows = null);
@@ -205,13 +257,13 @@ public static class DtoMapping
             schema.ConnectionName, schema.VersionHash, schema.FetchedAtUtc, tables, foreignKeys, suggestions);
     }
 
-    public static ModelResponse ToModelResponse(SemanticModel model, string currentUserId)
+    public static ModelResponse ToModelResponse(SemanticModel model, string currentUserId, bool isSystem)
     {
         using var doc = JsonDocument.Parse(ModelJson.Serialize(model.Definition));
         return new ModelResponse(
             model.Id, model.Name, model.Description, model.DataSourceName, model.IsShared,
             string.Equals(model.OwnerUserId, currentUserId, StringComparison.Ordinal),
-            model.CreatedAtUtc, model.UpdatedAtUtc,
+            model.CreatedAtUtc, model.UpdatedAtUtc, isSystem,
             doc.RootElement.Clone());
     }
 

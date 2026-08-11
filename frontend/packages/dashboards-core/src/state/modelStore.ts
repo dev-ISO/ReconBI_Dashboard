@@ -27,6 +27,8 @@ export interface EditableModel {
   isShared: boolean;
   expectedUpdatedAtUtc: string | null;
   ownerIsMe: boolean;
+  /** Built-in (seeded) content — read-only for everyone; copy to edit. */
+  isSystem: boolean;
   definition: ModelDefinition;
 }
 
@@ -139,6 +141,7 @@ export class ModelStore {
         isShared: false,
         expectedUpdatedAtUtc: null,
         ownerIsMe: true,
+        isSystem: false,
         definition: emptyDefinition(),
       },
       dirty: true,
@@ -381,6 +384,7 @@ const toEditable = (detail: ModelDetail): EditableModel => ({
   isShared: detail.isShared,
   expectedUpdatedAtUtc: detail.updatedAtUtc,
   ownerIsMe: detail.ownerIsMe,
+  isSystem: detail.isSystem ?? false,
   definition: detail.definition,
 });
 

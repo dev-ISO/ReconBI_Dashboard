@@ -1,6 +1,6 @@
 import './styles/rcd.css';
 
-export const RCD_UI_VERSION = '0.7.0';
+export const RCD_UI_VERSION = '0.8.0';
 
 export {
   DashboardsProvider,
@@ -56,3 +56,7 @@ export { DashboardListPanel } from './dashboard/DashboardListPanel';
 export type { DashboardListPanelProps } from './dashboard/DashboardListPanel';
 export { ModelListPanel } from './model-list/ModelListPanel';
 export type { ModelListPanelProps } from './model-list/ModelListPanel';
+export { ShareDialog } from './dashboard/ShareDialog';
+export type { ShareDialogProps } from './dashboard/ShareDialog';
+export { ActivityPanel } from './dashboard/ActivityPanel';
+export type { ActivityPanelProps } from './dashboard/ActivityPanel';

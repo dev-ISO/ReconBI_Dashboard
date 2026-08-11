@@ -1,6 +1,17 @@
-import { useEffect, useState } from 'react';
-import { AlertTriangle, Copy, LayoutDashboard, Plus, RefreshCw, Share2, Trash2 } from 'lucide-react';
-import type { DashboardSummary } from '@recon/dashboards-core';
+import { useEffect, useMemo, useState } from 'react';
+import {
+  AlertTriangle,
+  Copy,
+  LayoutDashboard,
+  Lock,
+  Plus,
+  RefreshCw,
+  Share2,
+  Trash2,
+  UserMinus,
+  Users,
+} from 'lucide-react';
+import { dashboardAccessOf, rcdErrorMessage, type DashboardSummary } from '@recon/dashboards-core';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import {
   ConfirmDialog,
@@ -28,8 +39,7 @@ const formatUpdated = (iso: string): string => {
   return Number.isNaN(parsed.getTime()) ? iso : updatedFormat.format(parsed);
 };
 
-const messageOf = (error: unknown): string =>
-  error instanceof Error ? error.message : String(error);
+const messageOf = (error: unknown): string => rcdErrorMessage(error);
 
 /** Own + shared dashboards with create/duplicate/delete. */
 export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProps) {
@@ -48,8 +58,30 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
   const [name, setName] = useState('');
   const [modelChoice, setModelChoice] = useState('');
   const [pendingDelete, setPendingDelete] = useState<DashboardSummary | null>(null);
+  const [pendingLeave, setPendingLeave] = useState<DashboardSummary | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  /**
+   * Sections: my dashboards, dashboards shared with me by name, and published
+   * ("Everyone") content — built-ins land in Everyone. Pre-0.8 servers send no
+   * myAccess, so dashboardAccessOf routes their non-owned rows to Everyone.
+   */
+  const sections = useMemo(() => {
+    const mine: DashboardSummary[] = [];
+    const sharedWithMe: DashboardSummary[] = [];
+    const everyone: DashboardSummary[] = [];
+    for (const dashboard of list) {
+      if (dashboard.ownerIsMe) mine.push(dashboard);
+      else if (dashboardAccessOf(dashboard).viaShare) sharedWithMe.push(dashboard);
+      else everyone.push(dashboard);
+    }
+    return [
+      { key: 'mine', label: 'Mine', rows: mine },
+      { key: 'shared', label: 'Shared with me', rows: sharedWithMe },
+      { key: 'everyone', label: 'Everyone', rows: everyone },
+    ].filter((section) => section.rows.length > 0);
+  }, [list]);
 
   useEffect(() => {
     void runtime.dashboards.loadList();
@@ -106,6 +138,20 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
     }
   };
 
+  /** "Remove from my list": drops only the caller's share row. */
+  const handleLeave = async (dashboard: DashboardSummary) => {
+    setPendingLeave(null);
+    setBusyId(dashboard.id);
+    setActionError(null);
+    try {
+      await runtime.dashboards.leave(dashboard.id);
+    } catch (error) {
+      setActionError(messageOf(error));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-rcd-bg">
       <div className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-4 p-6">
@@ -153,73 +199,119 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
             </RcdButton>
           </div>
         ) : (
-          <div className="rcd-card overflow-hidden">
-            <div className="overflow-x-auto">
-              <table className="w-full border-collapse text-sm">
-                <thead>
-                  <tr className="border-b border-rcd-border text-left text-xs uppercase tracking-wide text-rcd-muted">
-                    <th className="px-3 py-2 font-medium">Name</th>
-                    <th className="px-3 py-2 font-medium">Model</th>
-                    <th className="px-3 py-2 font-medium">Sharing</th>
-                    <th className="px-3 py-2 font-medium">Updated</th>
-                    <th className="px-3 py-2" aria-label="Actions" />
-                  </tr>
-                </thead>
-                <tbody>
-                  {list.map((dashboard) => (
-                    <tr
-                      key={dashboard.id}
-                      className="cursor-pointer border-b border-rcd-border last:border-b-0 hover:bg-black/5 dark:hover:bg-white/10"
-                      onClick={() => onOpen(dashboard.id)}
-                    >
-                      <td className="px-3 py-2.5 font-medium text-rcd-text">{dashboard.name}</td>
-                      <td className="px-3 py-2.5 text-rcd-text-2">{modelName(dashboard.modelId)}</td>
-                      <td className="px-3 py-2.5">
-                        <div className="flex flex-wrap items-center gap-1">
-                          {dashboard.ownerIsMe && (
-                            <span className="rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
-                              Yours
-                            </span>
-                          )}
-                          {dashboard.isShared && (
-                            <span className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2">
-                              <Share2 size={11} />
-                              Shared
-                            </span>
-                          )}
-                        </div>
-                      </td>
-                      <td className="px-3 py-2.5 text-rcd-text-2 tabular-nums">
-                        {formatUpdated(dashboard.updatedAtUtc)}
-                      </td>
-                      <td className="px-2 py-1.5" onClick={(event) => event.stopPropagation()}>
-                        <div className="flex items-center justify-end gap-1">
-                          <RcdIconButton
-                            aria-label={`Duplicate ${dashboard.name}`}
-                            title="Duplicate"
-                            disabled={busyId === dashboard.id}
-                            onClick={() => void handleDuplicate(dashboard)}
+          sections.map((section) => (
+            <div key={section.key} className="flex flex-col gap-2">
+              <h2 className="text-xs font-semibold uppercase tracking-wide text-rcd-muted">
+                {section.label}
+              </h2>
+              <div className="rcd-card overflow-hidden">
+                <div className="overflow-x-auto">
+                  <table className="w-full border-collapse text-sm">
+                    <thead>
+                      <tr className="border-b border-rcd-border text-left text-xs uppercase tracking-wide text-rcd-muted">
+                        <th className="px-3 py-2 font-medium">Name</th>
+                        <th className="px-3 py-2 font-medium">Model</th>
+                        <th className="px-3 py-2 font-medium">Sharing</th>
+                        <th className="px-3 py-2 font-medium">Updated</th>
+                        <th className="px-3 py-2" aria-label="Actions" />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {section.rows.map((dashboard) => {
+                        const access = dashboardAccessOf(dashboard);
+                        const shareCount = dashboard.shareCount ?? 0;
+                        return (
+                          <tr
+                            key={dashboard.id}
+                            className="cursor-pointer border-b border-rcd-border last:border-b-0 hover:bg-black/5 dark:hover:bg-white/10"
+                            onClick={() => onOpen(dashboard.id)}
                           >
-                            <Copy size={15} />
-                          </RcdIconButton>
-                          {dashboard.ownerIsMe && (
-                            <RcdIconButton
-                              aria-label={`Delete ${dashboard.name}`}
-                              title="Delete"
-                              disabled={busyId === dashboard.id}
-                              onClick={() => setPendingDelete(dashboard)}
-                            >
-                              <Trash2 size={15} />
-                            </RcdIconButton>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                            <td className="px-3 py-2.5 font-medium text-rcd-text">
+                              {dashboard.name}
+                            </td>
+                            <td className="px-3 py-2.5 text-rcd-text-2">
+                              {modelName(dashboard.modelId)}
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <div className="flex flex-wrap items-center gap-1">
+                                {dashboard.isSystem && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2"
+                                    title="Built-in content managed by the application. Make a copy to edit it."
+                                  >
+                                    <Lock size={11} />
+                                    Built-in
+                                  </span>
+                                )}
+                                {dashboard.ownerIsMe && shareCount > 0 && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2"
+                                    title={`Shared with ${shareCount} ${shareCount === 1 ? 'person' : 'people'}`}
+                                  >
+                                    <Users size={11} />
+                                    {shareCount}
+                                  </span>
+                                )}
+                                {dashboard.isShared && (
+                                  <span
+                                    className="inline-flex items-center gap-1 rounded-md border border-rcd-border px-2 py-0.5 text-[11px] font-medium text-rcd-text-2"
+                                    title="Published: visible to everyone"
+                                  >
+                                    <Share2 size={11} />
+                                    Everyone
+                                  </span>
+                                )}
+                                {!dashboard.ownerIsMe && dashboard.ownerDisplayName && (
+                                  <span className="text-[11px] text-rcd-muted">
+                                    by {dashboard.ownerDisplayName}
+                                  </span>
+                                )}
+                              </div>
+                            </td>
+                            <td className="px-3 py-2.5 text-rcd-text-2 tabular-nums">
+                              {formatUpdated(dashboard.updatedAtUtc)}
+                            </td>
+                            <td className="px-2 py-1.5" onClick={(event) => event.stopPropagation()}>
+                              <div className="flex items-center justify-end gap-1">
+                                <RcdIconButton
+                                  aria-label={`Make a copy of ${dashboard.name}`}
+                                  title="Make a copy"
+                                  disabled={busyId === dashboard.id}
+                                  onClick={() => void handleDuplicate(dashboard)}
+                                >
+                                  <Copy size={15} />
+                                </RcdIconButton>
+                                {!dashboard.ownerIsMe && access.viaShare && (
+                                  <RcdIconButton
+                                    aria-label={`Remove ${dashboard.name} from my list`}
+                                    title="Remove from my list"
+                                    disabled={busyId === dashboard.id}
+                                    onClick={() => setPendingLeave(dashboard)}
+                                  >
+                                    <UserMinus size={15} />
+                                  </RcdIconButton>
+                                )}
+                                {dashboard.ownerIsMe && !dashboard.isSystem && (
+                                  <RcdIconButton
+                                    aria-label={`Delete ${dashboard.name}`}
+                                    title="Delete"
+                                    disabled={busyId === dashboard.id}
+                                    onClick={() => setPendingDelete(dashboard)}
+                                  >
+                                    <Trash2 size={15} />
+                                  </RcdIconButton>
+                                )}
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
             </div>
-          </div>
+          ))
         )}
       </div>
 
@@ -289,6 +381,20 @@ export function DashboardListPanel({ onOpen, onCreated }: DashboardListPanelProp
         open={pendingDelete !== null}
         onConfirm={() => pendingDelete && void handleDelete(pendingDelete)}
         onCancel={() => setPendingDelete(null)}
+      />
+
+      <ConfirmDialog
+        title="Remove from my list"
+        message={
+          pendingLeave
+            ? `Remove "${pendingLeave.name}" from your list? Only your access is removed — the dashboard itself is untouched.`
+            : 'Remove this dashboard from your list?'
+        }
+        confirmLabel="Remove"
+        danger
+        open={pendingLeave !== null}
+        onConfirm={() => pendingLeave && void handleLeave(pendingLeave)}
+        onCancel={() => setPendingLeave(null)}
       />
     </div>
   );

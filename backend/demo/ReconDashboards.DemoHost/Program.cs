@@ -86,6 +86,8 @@ builder.Services.AddReconDashboardsScheduling(builder.Configuration);
 
 builder.Services.AddHttpContextAccessor();
 builder.Services.AddScoped<ICurrentUserProvider, DemoCurrentUserProvider>();
+// Share-picker directory over the canned demo users (hosts: your Users table).
+builder.Services.AddSingleton<IUserDirectory, DemoUserDirectory>();
 // Row-level scoping demo: alice only ever sees Gulf Coast sites. FAIL CLOSED.
 builder.Services.AddScoped<IRowFilterContributor, DemoRowFilterContributor>();
 

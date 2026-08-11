@@ -14,7 +14,8 @@ public sealed record ModelSummary(
     string DataSourceName,
     bool IsShared,
     bool OwnerIsMe,
-    DateTime UpdatedAtUtc);
+    DateTime UpdatedAtUtc,
+    bool IsSystem);
 
 public sealed record ModelSaveRequest(
     string Name,
@@ -57,14 +58,21 @@ public sealed class DataModelService(
     public async Task<IReadOnlyList<ModelSummary>> ListVisibleAsync(CancellationToken ct)
     {
         var userId = currentUser.GetUserId();
+        var systemOwner = options.SystemOwnerUserId;
         return await db.DataModels.AsNoTracking()
             .Where(m => !m.IsDeleted && (m.OwnerUserId == userId || m.IsShared))
             .OrderBy(m => m.Name)
             .Select(m => new ModelSummary(
                 m.Id, m.Name, m.Description, m.DataSourceName, m.IsShared,
-                m.OwnerUserId == userId, m.UpdatedAtUtc))
+                m.OwnerUserId == userId, m.UpdatedAtUtc,
+                systemOwner != null && systemOwner != "" && m.OwnerUserId == systemOwner))
             .ToListAsync(ct);
     }
+
+    /// <summary>True when the model is built-in (seeded) content, read-only through the API.</summary>
+    public bool IsSystemOwner(string ownerUserId) =>
+        !string.IsNullOrEmpty(options.SystemOwnerUserId)
+        && string.Equals(ownerUserId, options.SystemOwnerUserId, StringComparison.Ordinal);
 
     public async Task<ServiceResult<SemanticModel>> GetAsync(int id, CancellationToken ct)
     {
@@ -148,6 +156,11 @@ public sealed class DataModelService(
                 ServiceErrorKind.NotFound, "rcd.model.not_found", $"Model {id} does not exist or is not visible to you.");
         }
 
+        if (IsSystemOwner(record.OwnerUserId))
+        {
+            return SystemReadOnly<SemanticModel>();
+        }
+
         if (record.OwnerUserId != userId && !currentUser.CanManageShared)
         {
             return ServiceResult<SemanticModel>.Fail(
@@ -200,6 +213,11 @@ public sealed class DataModelService(
         {
             return ServiceResult<bool>.Fail(
                 ServiceErrorKind.NotFound, "rcd.model.not_found", $"Model {id} does not exist or is not visible to you.");
+        }
+
+        if (IsSystemOwner(record.OwnerUserId))
+        {
+            return SystemReadOnly<bool>();
         }
 
         if (record.OwnerUserId != userId && !currentUser.CanManageShared)
@@ -386,6 +404,11 @@ public sealed class DataModelService(
                 && (excludeId == null || m.Id != excludeId),
             ct);
     }
+
+    private static ServiceResult<T> SystemReadOnly<T>() =>
+        ServiceResult<T>.Fail(
+            ServiceErrorKind.Forbidden, "rcd.model.system_readonly",
+            "This is a built-in item managed by the application. Make a copy to edit it.");
 
     private static ServiceResult<SemanticModel> SharingForbidden() =>
         ServiceResult<SemanticModel>.Fail(

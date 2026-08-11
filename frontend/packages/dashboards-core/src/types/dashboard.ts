@@ -455,6 +455,108 @@ export const isImageTile = (
 ): tile is DashboardTile & { kind: 'image'; image: ImageTileSpec } =>
   tile.kind === 'image' && tile.image !== undefined;
 
+/* ------------------------------------------------------- sharing (0.8.0)
+ * Real per-user shares + activity log. Every field here is ADDITIVE on the
+ * wire — pre-0.8 servers simply omit them, and readers derive sensible
+ * defaults via dashboardAccessOf.
+ */
+
+/** The caller's computed rights on one dashboard (server-authoritative). */
+export interface DashboardAccess {
+  isOwner: boolean;
+  /** owner || CanManageShared admin || any granted edit flag. */
+  canEdit: boolean;
+  /** Move/resize tiles, doc settings, slicer/text/image tile edits. */
+  canEditLayout: boolean;
+  /** Add/remove/rename/reorder/recolor pages (+ mobile layout, drillthrough). */
+  canManagePages: boolean;
+  /** Add/remove tiles, edit chart specs/format. */
+  canEditCharts: boolean;
+  /** Access comes from a per-user share row. */
+  viaShare: boolean;
+  /** Access comes from the legacy publish ("Everyone") flag. */
+  viaPublish: boolean;
+}
+
+/** One per-user grant row (GET dashboards/{id}/shares). */
+export interface DashboardShare {
+  userId: string;
+  displayName: string | null;
+  canEditLayout: boolean;
+  canManagePages: boolean;
+  canEditCharts: boolean;
+  updatedAtUtc: string;
+}
+
+/** `saved` activity detail: the DashboardLayoutDiffer summary, camelCased. */
+export interface LayoutChangeSummaryJson {
+  layoutChanged?: boolean;
+  pagesChanged?: boolean;
+  chartsChanged?: boolean;
+  pagesAdded?: string[];
+  pagesRemoved?: string[];
+  pagesRenamed?: { from: string; to: string }[];
+  tilesAdded?: number;
+  tilesRemoved?: number;
+  /** Titles of charts whose spec/format changed. */
+  chartsModified?: string[];
+  settingsChanged?: boolean;
+}
+
+/** shared/unshared/shareChanged activity detail. */
+export interface ShareDetailJson {
+  targetUserIds?: string[];
+}
+
+/** One row of GET dashboards/{id}/activity. */
+export interface ActivityEntry {
+  id: number;
+  userId: string;
+  displayName: string | null;
+  /** created | saved | renamed | shared | unshared | shareChanged | left | deleted | duplicated */
+  action: string;
+  detail: LayoutChangeSummaryJson | ShareDetailJson | null;
+  atUtc: string;
+}
+
+/** One directory entry of GET users (the share-picker's data source). */
+export interface RcdUser {
+  id: string;
+  displayName: string;
+  email: string | null;
+}
+
+/**
+ * The caller's access to a dashboard row, tolerating pre-0.8 servers that
+ * send no `myAccess`: the owner gets full rights, anyone else view-only
+ * (publish visibility is all a pre-shares server could have granted them).
+ */
+export const dashboardAccessOf = (row: {
+  ownerIsMe: boolean;
+  isShared: boolean;
+  myAccess?: DashboardAccess;
+}): DashboardAccess =>
+  row.myAccess ??
+  (row.ownerIsMe
+    ? {
+        isOwner: true,
+        canEdit: true,
+        canEditLayout: true,
+        canManagePages: true,
+        canEditCharts: true,
+        viaShare: false,
+        viaPublish: false,
+      }
+    : {
+        isOwner: false,
+        canEdit: false,
+        canEditLayout: false,
+        canManagePages: false,
+        canEditCharts: false,
+        viaShare: false,
+        viaPublish: row.isShared,
+      });
+
 export interface DashboardSummary {
   id: number;
   name: string;
@@ -463,6 +565,14 @@ export interface DashboardSummary {
   isShared: boolean;
   ownerIsMe: boolean;
   updatedAtUtc: string;
+  /** Built-in (seeded) read-only content (0.8.0+; absent on older servers). */
+  isSystem?: boolean;
+  /** Owner's directory display name (0.8.0+; null when unresolvable). */
+  ownerDisplayName?: string | null;
+  /** The caller's computed rights (0.8.0+; use dashboardAccessOf when absent). */
+  myAccess?: DashboardAccess;
+  /** Per-user grant count; 0 unless the caller is owner/admin (0.8.0+). */
+  shareCount?: number;
 }
 
 export interface DashboardDetail {
@@ -475,6 +585,14 @@ export interface DashboardDetail {
   createdAtUtc: string;
   updatedAtUtc: string;
   layout: DashboardLayoutDoc;
+  /** Built-in (seeded) read-only content (0.8.0+; absent on older servers). */
+  isSystem?: boolean;
+  /** Owner's directory display name (0.8.0+; null when unresolvable). */
+  ownerDisplayName?: string | null;
+  /** The caller's computed rights (0.8.0+; use dashboardAccessOf when absent). */
+  myAccess?: DashboardAccess;
+  /** Per-user grant count; 0 unless the caller is owner/admin (0.8.0+). */
+  shareCount?: number;
 }
 
 export const emptyLayout = (): DashboardLayoutDoc => ({ version: 1, tiles: [], slicers: [] });
