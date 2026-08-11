@@ -2832,28 +2832,35 @@ function SmallMultiplesChart({
   const showTitles = sm.showPanelTitles !== false;
   const stacked = spec.type === 'stackedColumn' || spec.type === 'stackedBar';
   // At least one panel always renders (a 0/negative maxPanels would blank the tile).
-  const shown = panels.slice(0, Math.max(1, sm.maxPanels ?? 12));
-  const droppedPanels = panels.length - shown.length;
+  const maxShown = Math.max(1, sm.maxPanels ?? 12);
 
   // Canonical series: shape ALL rows (SM column already stripped from every
   // panel) once, so a legend value keeps one color and one position in every
   // panel — per-panel shaping would re-index colors by local appearance.
   // Panels then render the canonical series against their own rows; a series
   // missing from a panel simply draws nothing there.
-  const combined: QueryResult = {
-    columns: shown[0]!.result.columns,
-    rows: panels.flatMap((p) => p.result.rows),
-    meta: shown[0]!.result.meta,
-  };
-  const canonical = shapeChartData(combined, spec);
-  const panelShaped = shown.map((panel) => ({
-    panel,
-    shaped: {
-      ...shapeChartData(panel.result, spec),
-      series: canonical.series,
-      hasLegend: canonical.hasLegend,
-    },
-  }));
+  // Memoized on [panels, spec, maxShown]: per-panel data identities must
+  // survive re-renders (hover dimming) or every panel re-lays out (see the
+  // shaping memos in ChartRenderer).
+  const { shown, canonical, panelShaped } = useMemo(() => {
+    const shown = panels.slice(0, maxShown);
+    const combined: QueryResult = {
+      columns: shown[0]!.result.columns,
+      rows: panels.flatMap((p) => p.result.rows),
+      meta: shown[0]!.result.meta,
+    };
+    const canonical = shapeChartData(combined, spec);
+    const panelShaped = shown.map((panel) => ({
+      panel,
+      shaped: {
+        ...shapeChartData(panel.result, spec),
+        series: canonical.series,
+        hasLegend: canonical.hasLegend,
+      },
+    }));
+    return { shown, canonical, panelShaped };
+  }, [panels, spec, maxShown]);
+  const droppedPanels = panels.length - shown.length;
 
   // sharedY: one value-axis domain over every panel, from the VISIBLE series
   // only, so legend toggles re-scale exactly like a single chart would.
@@ -3040,6 +3047,40 @@ export default function ChartRenderer({
   const hover = useThrottledPointHover(
     format.hoverHighlight !== false ? onPointHover : undefined,
   );
+  /**
+   * Shaped data memoized on [result, spec] — the contract GanttChart already
+   * follows. A renderer re-render with unchanged result/spec must hand
+   * recharts the SAME data arrays: a fresh identity reads as brand-new data
+   * and forces a full re-layout of every mark. This matters on the
+   * hover-highlight receive path, where a tile re-renders once per hovered
+   * category purely to update dimmed fills (and both identities are stable
+   * upstream: results come from the query cache, specs are memoized in
+   * DashboardChartTile). One memo per family; non-matching types stay null.
+   */
+  const cartesianShaped = useMemo(
+    () =>
+      spec.type === 'column' ||
+      spec.type === 'bar' ||
+      spec.type === 'stackedColumn' ||
+      spec.type === 'stackedBar' ||
+      spec.type === 'line' ||
+      spec.type === 'area'
+        ? shapeChartData(result, spec)
+        : null,
+    [result, spec],
+  );
+  const cartesianPanels = useMemo(
+    () => (cartesianShaped !== null ? splitSmallMultiples(result, spec) : null),
+    [cartesianShaped, result, spec],
+  );
+  const pieShaped = useMemo(
+    () => (spec.type === 'pie' || spec.type === 'donut' ? shapePieData(result, spec) : null),
+    [result, spec],
+  );
+  const scatterShaped = useMemo(
+    () => (spec.type === 'scatter' ? shapeScatterData(result, spec) : null),
+    [result, spec],
+  );
   // When the legend is non-interactive every series renders, even if hidden
   // state lingers from before the flag was flipped.
   const hidden = format.legendInteractive === false ? NO_HIDDEN : hiddenSeries;
@@ -3117,7 +3158,7 @@ export default function ChartRenderer({
       const y2Titles = !horizontal && (format.secondaryAxisKeys?.length ?? 0) > 0;
       // Small multiples: the third ordered dimension splits the chart into a
       // panel grid (cartesian family only — other types ignore it).
-      const panels = splitSmallMultiples(result, spec);
+      const panels = cartesianPanels;
       if (panels && panels.length > 0) {
         // The title frame wraps the WHOLE grid: one shared x/y title pair.
         return (
@@ -3142,7 +3183,7 @@ export default function ChartRenderer({
         <AxisTitleFrame format={format} y2={y2Titles}>
           <CartesianChart
             spec={spec}
-            shaped={shapeChartData(result, spec)}
+            shaped={cartesianShaped!}
             formatValue={formatValue}
             legend={legendControl}
             onDatumClick={onDatumClick}
@@ -3160,7 +3201,7 @@ export default function ChartRenderer({
 
     case 'pie':
     case 'donut': {
-      const { slices } = shapePieData(result, spec);
+      const { slices } = pieShaped!;
       // A measure with NO ROWS shapes to zero slices too (any cross-filter can
       // empty a pie), so distinguish the two: only a missing measure is a spec
       // problem — the other is just a filter with no matches.
@@ -3322,7 +3363,7 @@ export default function ChartRenderer({
     }
 
     case 'scatter': {
-      const scatter = shapeScatterData(result, spec);
+      const scatter = scatterShaped!;
       const xColumn = scatter.xColumn;
       const yColumn = scatter.yColumn;
       if (!xColumn || !yColumn) {

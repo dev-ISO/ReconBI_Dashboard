@@ -97,7 +97,9 @@ export interface DashboardToolbarProps {
   onConfigureFilterIndicator?: (position: { x: number; y: number }) => void;
   /**
    * Content rendered in the toolbar's flexible middle — the filter
-   * indicator's 'header' docking slot (compact chips, out of the way).
+   * indicator's 'header' docking slot, which is the DEFAULT placement: active
+   * cross-filter/slicer chips live in this row rather than floating over the
+   * tiles. Must be single-line and self-clipping (HeaderFilterBar is).
    */
   centerContent?: ReactNode;
   /** Current view sizing shown by the View menu (control hidden when the handler is absent). */
@@ -184,10 +186,13 @@ export function DashboardToolbar({
         <span className="shrink-0 text-xs text-rcd-muted">Unsaved changes</span>
       )}
 
-      {/* Flexible middle: hosts the filter indicator's 'header' slot. */}
-      <div className="flex min-w-0 flex-1 items-center justify-center overflow-hidden">
-        {centerContent}
-      </div>
+      {/* Flexible middle: the DEFAULT home of the active-filter chips. Its
+          width comes from the flex line (flex-1 + basis 0), never from its
+          content, and it is hard-clipped — so however many chips arrive, the
+          row cannot wrap, grow taller, or push the controls on the right out
+          of view. The chip bar measures this box and collapses the remainder
+          into "+N filters". */}
+      <div className="flex min-w-0 flex-1 items-center overflow-hidden">{centerContent}</div>
 
       {error && (
         <span className="truncate text-xs text-[var(--rcd-status-critical)]" title={error}>

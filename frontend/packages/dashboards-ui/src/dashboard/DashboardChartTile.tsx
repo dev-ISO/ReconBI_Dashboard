@@ -768,7 +768,24 @@ export function DashboardChartTile({
   /* ------------------------------------------------------- hover highlight */
 
   const hoverEnabled = chart.format.hoverHighlight !== false;
-  const hoverHighlight = useDashboardState((state) => state.hoverHighlight);
+  /**
+   * Receiver-side subscription, reduced to a PRIMITIVE inside the selector:
+   * the label THIS tile should dim against (null = no dimming). Subscribing
+   * to the raw hoverHighlight object re-rendered EVERY tile on the page on
+   * every hovered-category change (the payload's identity changes per write);
+   * a string/null snapshot compares by value, so a hover broadcast re-renders
+   * only the tiles whose effective highlight actually changed — the source
+   * tile and non-matching tiles skip entirely.
+   */
+  const drilledAxis = drilledChart.query.axis ?? null;
+  const drilledLegend = drilledChart.query.legend ?? null;
+  const highlightLabel = useDashboardState((state) => {
+    const hh = state.hoverHighlight;
+    if (!hoverEnabled || hh === null || hh.sourceTileId === tileId) return null;
+    const matches = (dim: DimensionRef | null): boolean =>
+      dim !== null && dim.table === hh.dimension.table && dim.column === hh.dimension.column;
+    return matches(drilledAxis) || matches(drilledLegend) ? hh.label : null;
+  });
 
   // Fresh effective dims per render, read by stable callbacks through a ref.
   const hoverDimsRef = useRef<{ chart: ChartSpec }>({ chart: drilledChart });
@@ -826,17 +843,11 @@ export function DashboardChartTile({
 
   // Receiver side: dim non-matching categories while ANOTHER tile hovers a
   // category whose dimension matches this chart's effective axis or legend.
-  const highlightCategory = useMemo(() => {
-    if (!hoverEnabled || hoverHighlight === null || hoverHighlight.sourceTileId === tileId) {
-      return null;
-    }
-    const { dimension } = hoverHighlight;
-    const matches = (dim: DimensionRef | null | undefined): boolean =>
-      dim != null && dim.table === dimension.table && dim.column === dimension.column;
-    return matches(drilledChart.query.axis) || matches(drilledChart.query.legend)
-      ? { label: hoverHighlight.label }
-      : null;
-  }, [hoverEnabled, hoverHighlight, tileId, drilledChart.query.axis, drilledChart.query.legend]);
+  // Identity is stable while the label is unchanged (renderer prop equality).
+  const highlightCategory = useMemo(
+    () => (highlightLabel === null ? null : { label: highlightLabel }),
+    [highlightLabel],
+  );
 
   /* ------------------------------------------------ own selection / ranges */
 

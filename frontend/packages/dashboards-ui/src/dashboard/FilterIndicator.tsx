@@ -1,5 +1,16 @@
-import { useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
-import { Filter, FilterX, GripVertical, SlidersHorizontal, X } from 'lucide-react';
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type Ref,
+} from 'react';
+import { createPortal } from 'react-dom';
+import { ChevronDown, Filter, FilterX, GripVertical, SlidersHorizontal, X } from 'lucide-react';
 import type { FilterIndicatorStyle } from '@recon/dashboards-core';
 
 /**
@@ -24,8 +35,17 @@ export type FilterIndicatorPlacement = NonNullable<FilterIndicatorStyle['placeme
 export type FilterIndicatorVariant = NonNullable<FilterIndicatorStyle['variant']>;
 export type FilterIndicatorSize = NonNullable<FilterIndicatorStyle['size']>;
 
+/**
+ * Defaults for a dashboard that never configured the indicator.
+ *
+ * PLACEMENT DEFAULT = 'header' (the toolbar row). The floating docks cover
+ * tiles — doubly so under fit-to-page, where they render as overlays — so they
+ * are OPT-IN now: only a doc that explicitly saved a floating placement keeps
+ * one. `variant`/`size` still describe the floating and footer looks; the
+ * toolbar always renders its own compact chip bar (see HeaderFilterBar).
+ */
 export const DEFAULT_FILTER_INDICATOR = {
-  placement: 'top-center',
+  placement: 'header',
   variant: 'pill',
   size: 'md',
   badgeTiles: true,
@@ -291,8 +311,10 @@ export interface FilterIndicatorProps {
 }
 
 /**
- * Active cross-filter / slicer indicator. Three looks, all driven by the
- * layout doc's `filterIndicator`:
+ * Active cross-filter / slicer indicator for the NON-default placements. The
+ * default 'header' placement does not come through here at all — the caller
+ * renders HeaderFilterBar inside the toolbar row for that. Three looks, all
+ * driven by the layout doc's `filterIndicator`:
  *
  *  - 'pill'   — one compact floating chip per filter, docked at `placement`
  *               (the historic look, restyled to actually be noticeable);
@@ -399,6 +421,492 @@ export function FilterIndicator({
         >
           <ClearAllButton size={size} onClick={onClearAll} accent={accentColor} />
         </span>
+      )}
+    </div>
+  );
+}
+
+/* --------------------------------------------------- toolbar ('header') bar */
+
+/** Accent tint helper — works for both a hex accent and the theme var. */
+const tint = (accent: string, percent: number): string =>
+  `color-mix(in srgb, ${accent} ${percent}%, transparent)`;
+
+interface HeaderScale {
+  height: string;
+  text: string;
+  icon: number;
+  /** Cap on the value text so one long selection can't eat the whole row. */
+  valueMax: string;
+}
+
+/**
+ * Toolbar chip metrics. Deliberately capped well under the 48px toolbar row —
+ * the chips must never be able to grow it (a taller toolbar would shrink the
+ * fitted area below and re-scale the page).
+ */
+const HEADER_SIZES: Record<FilterIndicatorSize, HeaderScale> = {
+  sm: { height: 'h-6', text: 'text-[11px]', icon: 11, valueMax: 'max-w-[9rem]' },
+  md: { height: 'h-7', text: 'text-xs', icon: 12, valueMax: 'max-w-[11rem]' },
+  lg: { height: 'h-8', text: 'text-xs', icon: 13, valueMax: 'max-w-[13rem]' },
+};
+
+/** Gap between toolbar chips, in px — must match the `gap-1.5` class below. */
+const HEADER_GAP = 6;
+
+/**
+ * A single toolbar chip: accent-tinted pill, kind glyph (funnel = cross-filter,
+ * sliders = slicer), "field:" caption, the bold value, and its own ✕. Lighter
+ * than the floating FilterChip on purpose — it sits among toolbar controls, so
+ * it reads as chrome rather than as a card dropped on top of the dashboard.
+ */
+function HeaderChip({
+  entry,
+  scale,
+  accent,
+  background,
+  textColor,
+  onContextMenu,
+}: {
+  entry: ActiveFilterEntry;
+  scale: HeaderScale;
+  accent: string;
+  background: string | null;
+  textColor: string | null;
+  onContextMenu?: (id: string, position: { x: number; y: number }) => void;
+}) {
+  const Icon = entry.kind === 'slicer' ? SlidersHorizontal : Filter;
+  const title =
+    entry.kind === 'slicer'
+      ? `Slicer — ${entry.field}: ${entry.value}`
+      : `Cross-filter — ${entry.field}: ${entry.value}`;
+  return (
+    <span
+      title={title}
+      onContextMenu={
+        onContextMenu
+          ? (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onContextMenu(entry.id, { x: event.clientX, y: event.clientY });
+            }
+          : undefined
+      }
+      className={`flex shrink-0 items-center gap-1 rounded-md border pl-1.5 pr-0.5 transition-colors ${scale.height} ${scale.text}`}
+      style={{
+        backgroundColor: background ?? tint(accent, 10),
+        borderColor: tint(accent, 30),
+        ...(textColor ? { color: textColor } : null),
+      }}
+    >
+      <Icon size={scale.icon} aria-hidden className="shrink-0" style={{ color: textColor ?? accent }} />
+      <span className="min-w-0 truncate text-rcd-text-2" style={textColor ? { color: textColor } : undefined}>
+        {entry.field}:
+      </span>
+      <span
+        className={`min-w-0 truncate font-semibold text-rcd-text ${scale.valueMax}`}
+        style={textColor ? { color: textColor } : undefined}
+      >
+        {entry.value}
+      </span>
+      <button
+        type="button"
+        aria-label={`Clear filter ${entry.field}: ${entry.value}`}
+        title="Clear this filter"
+        onClick={entry.onClear}
+        className="ml-0.5 shrink-0 rounded p-0.5 text-rcd-muted transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/15"
+      >
+        <X size={scale.icon} aria-hidden />
+      </button>
+    </span>
+  );
+}
+
+/** The "+N filters" overflow chip (also the sole chip when nothing else fits). */
+function OverflowChip({
+  hidden,
+  total,
+  scale,
+  accent,
+  open,
+  onToggle,
+  buttonRef,
+}: {
+  hidden: number;
+  total: number;
+  scale: HeaderScale;
+  accent: string;
+  open: boolean;
+  onToggle: (rect: DOMRect) => void;
+  buttonRef?: Ref<HTMLButtonElement>;
+}) {
+  // "+2" alongside visible chips; "3 filters" when it stands alone.
+  const standalone = hidden === total;
+  const label = standalone ? `${hidden} filter${hidden === 1 ? '' : 's'}` : `+${hidden}`;
+  return (
+    <button
+      ref={buttonRef}
+      type="button"
+      aria-haspopup="dialog"
+      aria-expanded={open}
+      aria-label={`Show all ${total} active filters`}
+      title={`${hidden} more active filter${hidden === 1 ? '' : 's'} — click to list them`}
+      onClick={(event) => onToggle(event.currentTarget.getBoundingClientRect())}
+      className={`flex shrink-0 items-center gap-0.5 rounded-md border px-1.5 font-medium transition-colors hover:brightness-95 ${scale.height} ${scale.text}`}
+      style={{
+        backgroundColor: tint(accent, open ? 22 : 14),
+        borderColor: tint(accent, 34),
+        color: 'var(--rcd-text)',
+      }}
+    >
+      {standalone && <Filter size={scale.icon} aria-hidden style={{ color: accent }} />}
+      {label}
+      {!standalone && <span className="text-rcd-text-2">filters</span>}
+      <ChevronDown size={scale.icon} aria-hidden className="text-rcd-muted" />
+    </button>
+  );
+}
+
+/**
+ * The overflow popover: every active filter, full text, each with its own ✕,
+ * plus a Clear all. Portaled to the body — the toolbar's flexible middle is
+ * `overflow-hidden` (that is what keeps the row from ever wrapping), so an
+ * absolutely-positioned card inside it would be clipped.
+ */
+function OverflowPopover({
+  entries,
+  anchor,
+  accent,
+  onClearAll,
+  onEntryContextMenu,
+  onClose,
+  triggerRef,
+}: {
+  entries: ActiveFilterEntry[];
+  anchor: DOMRect;
+  accent: string;
+  onClearAll: () => void;
+  onEntryContextMenu?: (id: string, position: { x: number; y: number }) => void;
+  onClose: () => void;
+  /**
+   * The "+N" chip that owns the open/closed toggle. Clicks on it are NOT
+   * "outside": this card is portaled, so the trigger sits outside `cardRef`,
+   * and closing on its mousedown would let the very next click re-open the
+   * card — the chip could then never be used to dismiss it.
+   */
+  triggerRef?: { current: HTMLButtonElement | null };
+}) {
+  const cardRef = useRef<HTMLDivElement>(null);
+  // Drop clear of the toolbar row rather than hugging the chip: a 6px gap
+  // would land the card's top edge inside the toolbar's bottom border.
+  const [pos, setPos] = useState({ x: anchor.left, y: anchor.bottom + 12 });
+
+  // Clamp into the viewport once measured (same doctrine as the config card).
+  useLayoutEffect(() => {
+    const card = cardRef.current;
+    if (!card) return;
+    const rect = card.getBoundingClientRect();
+    setPos({
+      x: Math.max(4, Math.min(anchor.left, window.innerWidth - rect.width - 4)),
+      y: Math.max(4, Math.min(anchor.bottom + 12, window.innerHeight - rect.height - 4)),
+    });
+  }, [anchor]);
+
+  useEffect(() => {
+    const onPointerDown = (event: MouseEvent) => {
+      if (!(event.target instanceof Node)) return;
+      if (cardRef.current === null || cardRef.current.contains(event.target)) return;
+      if (triggerRef?.current?.contains(event.target)) return;
+      onClose();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    document.addEventListener('mousedown', onPointerDown);
+    document.addEventListener('keydown', onKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', onPointerDown);
+      document.removeEventListener('keydown', onKeyDown);
+    };
+  }, [onClose, triggerRef]);
+
+  return createPortal(
+    // --rcd-* vars are scoped to .rcd-root; every body portal needs this wrapper.
+    <div className="rcd-root bg-transparent">
+      <div
+        ref={cardRef}
+        role="dialog"
+        aria-label="Active filters"
+        style={{ left: pos.x, top: pos.y }}
+        className="fixed z-50 flex max-h-[60vh] w-72 flex-col overflow-hidden rounded-md border border-rcd-border bg-rcd-surface shadow-[var(--rcd-shadow-2)]"
+      >
+        <p className="flex items-center gap-1.5 border-b border-rcd-border px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
+          <Filter size={11} aria-hidden style={{ color: accent }} />
+          Active filters ({entries.length})
+        </p>
+        <div className="min-h-0 flex-1 overflow-y-auto py-1">
+          {entries.map((entry) => {
+            const Icon = entry.kind === 'slicer' ? SlidersHorizontal : Filter;
+            return (
+              <div
+                key={entry.id}
+                className="flex items-center gap-2 px-3 py-1.5 hover:bg-black/5 dark:hover:bg-white/10"
+                onContextMenu={
+                  onEntryContextMenu
+                    ? (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onEntryContextMenu(entry.id, { x: event.clientX, y: event.clientY });
+                      }
+                    : undefined
+                }
+              >
+                <Icon size={12} aria-hidden className="shrink-0" style={{ color: accent }} />
+                <span className="min-w-0 flex-1 text-xs leading-snug">
+                  <span className="text-rcd-text-2">{entry.field}: </span>
+                  <span className="break-words font-semibold text-rcd-text">{entry.value}</span>
+                  {entry.kind === 'slicer' && (
+                    <span className="ml-1 text-[10px] uppercase tracking-wide text-rcd-muted">slicer</span>
+                  )}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`Clear filter ${entry.field}: ${entry.value}`}
+                  title="Clear this filter"
+                  onClick={entry.onClear}
+                  className="shrink-0 rounded p-1 text-rcd-muted transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/15"
+                >
+                  <X size={12} aria-hidden />
+                </button>
+              </div>
+            );
+          })}
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            onClose();
+            onClearAll();
+          }}
+          className="flex items-center gap-1.5 border-t border-rcd-border px-3 py-1.5 text-xs font-medium transition-colors hover:bg-black/5 dark:hover:bg-white/10"
+          style={{ color: accent }}
+        >
+          <FilterX size={12} aria-hidden />
+          Clear all
+        </button>
+      </div>
+    </div>,
+    document.body,
+  );
+}
+
+export interface HeaderFilterBarProps {
+  entries: ActiveFilterEntry[];
+  style: FilterIndicatorStyle | null | undefined;
+  onClearAll: () => void;
+  onEntryContextMenu?: (id: string, position: { x: number; y: number }) => void;
+  /** Grabbing the grip starts the caller's drag-to-dock (toolbar → float). */
+  onGripPointerDown?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+}
+
+/**
+ * THE DEFAULT LOOK: active filters as compact chips living INSIDE the existing
+ * dashboard toolbar row, right after the name/Shared cluster. Nothing floats,
+ * so nothing can ever cover a tile.
+ *
+ * The row is single-line and hard-clipped, and it only ever occupies the
+ * toolbar's flexible middle (a `flex-1 min-w-0` box whose width comes from the
+ * flex line, NOT from its content) — so the chips can neither wrap the toolbar,
+ * push the right-hand controls off, nor change the toolbar's height. What does
+ * not fit collapses into a "+N filters" chip whose popover lists every filter.
+ *
+ * Overflow is measured, not guessed: a hidden mirror row renders every chip at
+ * natural width, and the largest prefix that fits (reserving the grip, the
+ * "+N" chip and Clear all) becomes the visible set.
+ */
+export function HeaderFilterBar({
+  entries,
+  style,
+  onClearAll,
+  onEntryContextMenu,
+  onGripPointerDown,
+}: HeaderFilterBarProps) {
+  const resolved = resolveIndicatorStyle(style);
+  const scale = HEADER_SIZES[resolved.size];
+  const accent = resolved.accentColor ?? 'var(--rcd-accent)';
+  const hostRef = useRef<HTMLDivElement>(null);
+  const mirrorRef = useRef<HTMLDivElement>(null);
+  const overflowRef = useRef<HTMLButtonElement>(null);
+  /** How many chips are rendered for real; the rest hide behind "+N". */
+  const [visibleCount, setVisibleCount] = useState(entries.length);
+  const [popoverAnchor, setPopoverAnchor] = useState<DOMRect | null>(null);
+  const appeared = useAppeared();
+
+  const total = entries.length;
+  // Re-measure whenever the chip TEXT changes, not just the count.
+  const entriesKey = useMemo(
+    () => entries.map((entry) => `${entry.id}${entry.field}${entry.value}`).join(''),
+    [entries],
+  );
+
+  const measure = useCallback(() => {
+    const host = hostRef.current;
+    const mirror = mirrorRef.current;
+    if (!host || !mirror) return;
+    const available = host.clientWidth;
+    const nodes = Array.from(mirror.children) as HTMLElement[];
+    const widthOf = (kind: string) =>
+      nodes.find((node) => node.dataset.m === kind)?.getBoundingClientRect().width ?? 0;
+    const chipWidths = nodes
+      .filter((node) => node.dataset.m === 'chip')
+      .map((node) => node.getBoundingClientRect().width);
+
+    // Fixed costs: the lead rule (+ grip), the overflow chip, Clear all.
+    const lead = widthOf('lead') + HEADER_GAP;
+    const plus = widthOf('plus') + HEADER_GAP;
+    const clear = total > 1 ? widthOf('clear') + HEADER_GAP : 0;
+
+    // Largest prefix of chips that fits; sub-pixel slack avoids flapping.
+    const prefix: number[] = [0];
+    for (const width of chipWidths) {
+      prefix.push(prefix[prefix.length - 1]! + width + HEADER_GAP);
+    }
+    let best = 0;
+    for (let k = total; k >= 1; k -= 1) {
+      const need = lead + clear + prefix[k]! + (k < total ? plus : 0);
+      if (need <= available + 0.5) {
+        best = k;
+        break;
+      }
+    }
+    setVisibleCount((count) => (count === best ? count : best));
+  }, [total]);
+
+  // Measure before paint, and again whenever the row is resized (window /
+  // sidebar / a longer dashboard name). The host's width comes from the flex
+  // line rather than from its children, so re-measuring cannot feed itself.
+  useLayoutEffect(() => {
+    measure();
+    const host = hostRef.current;
+    if (!host || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => measure());
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [measure, entriesKey]);
+
+  const shown = Math.min(visibleCount, total);
+  const hidden = total - shown;
+
+  // A stale popover must not outlive the "+N" chip that opened it: the chip
+  // disappears both when the filters are cleared AND when the row widens
+  // enough to show every chip for real, and an anchored card with no anchor
+  // (nothing to toggle it shut, nothing it belongs to) must not survive that.
+  useEffect(() => {
+    if (hidden === 0) setPopoverAnchor(null);
+  }, [hidden]);
+
+  if (total === 0) return null;
+
+  const chipOf = (entry: ActiveFilterEntry) => (
+    <HeaderChip
+      entry={entry}
+      scale={scale}
+      accent={accent}
+      background={resolved.background}
+      textColor={resolved.textColor}
+      onContextMenu={onEntryContextMenu}
+    />
+  );
+
+  const leadCluster = (
+    <>
+      <span aria-hidden className="h-5 w-px shrink-0 bg-rcd-border" />
+      {onGripPointerDown && <DragGrip size={resolved.size} onPointerDown={onGripPointerDown} />}
+    </>
+  );
+
+  const clearAll = (
+    <button
+      type="button"
+      onClick={onClearAll}
+      title="Clear every active filter"
+      className={`flex shrink-0 items-center gap-1 rounded-md px-1.5 font-medium transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${scale.height} ${scale.text}`}
+      style={{ color: accent }}
+    >
+      <FilterX size={scale.icon} aria-hidden />
+      Clear all
+    </button>
+  );
+
+  return (
+    <div
+      ref={hostRef}
+      role="status"
+      aria-label={`${total} active filter${total === 1 ? '' : 's'}`}
+      className={`group relative flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-hidden transition-opacity duration-200 ease-out ${
+        appeared ? 'opacity-100' : 'opacity-0'
+      }`}
+    >
+      {leadCluster}
+      {entries.slice(0, shown).map((entry) => (
+        <span key={entry.id} className="flex min-w-0 shrink-0">
+          {chipOf(entry)}
+        </span>
+      ))}
+      {hidden > 0 && (
+        <OverflowChip
+          buttonRef={overflowRef}
+          hidden={hidden}
+          total={total}
+          scale={scale}
+          accent={accent}
+          open={popoverAnchor !== null}
+          onToggle={(rect) => setPopoverAnchor((open) => (open ? null : rect))}
+        />
+      )}
+      {total > 1 && clearAll}
+
+      {/* Hidden mirror: every chip at natural width, measured but never seen.
+          `invisible` (not `hidden`) so it still lays out; absolute so it adds
+          nothing to the real row. */}
+      <div
+        ref={mirrorRef}
+        aria-hidden
+        className="pointer-events-none invisible absolute left-0 top-0 flex flex-nowrap items-center gap-1.5"
+      >
+        <span data-m="lead" className="flex items-center gap-1.5">
+          {leadCluster}
+        </span>
+        {entries.map((entry) => (
+          <span key={entry.id} data-m="chip" className="flex shrink-0">
+            {chipOf(entry)}
+          </span>
+        ))}
+        <span data-m="plus" className="flex shrink-0">
+          <OverflowChip
+            hidden={total}
+            total={total}
+            scale={scale}
+            accent={accent}
+            open={false}
+            onToggle={() => {}}
+          />
+        </span>
+        <span data-m="clear" className="flex shrink-0">
+          {clearAll}
+        </span>
+      </div>
+
+      {popoverAnchor && (
+        <OverflowPopover
+          entries={entries}
+          anchor={popoverAnchor}
+          accent={accent}
+          onClearAll={onClearAll}
+          onEntryContextMenu={onEntryContextMenu}
+          onClose={() => setPopoverAnchor(null)}
+          triggerRef={overflowRef}
+        />
       )}
     </div>
   );

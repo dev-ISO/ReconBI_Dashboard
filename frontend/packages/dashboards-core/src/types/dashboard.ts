@@ -68,14 +68,22 @@ export interface DateRangeOptions {
 }
 
 /**
- * Look/placement of the active cross-filter indicator. Absent = the default
- * pill. Dashboard-level (layout doc `filterIndicator`).
+ * Look/placement of the active cross-filter indicator. Dashboard-level (layout
+ * doc `filterIndicator`); the whole key is absent until an author configures
+ * something, and every field falls back independently.
  */
 export interface FilterIndicatorStyle {
   /**
-   * Where the indicator docks (default 'top-center'). The five classic slots
-   * float over the tile area; 'header' renders compact chips inline in the
-   * dashboard toolbar row; 'footer' is a slim in-flow bar at the bottom edge.
+   * Where the indicator docks. DEFAULT (absent) = 'header': compact chips
+   * inline in the dashboard toolbar row, beside the name — the placement that
+   * cannot cover a tile, and the reason this field is normally unset.
+   *
+   * 'footer' is a slim in-flow bar at the bottom edge. The five classic slots
+   * ('top-center'/'top-left'/'top-right'/'bottom-left'/'bottom-right') FLOAT
+   * OVER the tile area and are opt-in: they are only ever reached by an
+   * explicit value here (authored in the Filters & indicator card, or by
+   * dragging the chips onto a floating dock). Docs that saved one keep it —
+   * changing the default only moved where an ABSENT value lands.
    */
   placement?:
     | 'top-center'
@@ -86,9 +94,11 @@ export interface FilterIndicatorStyle {
     | 'header'
     | 'footer';
   /**
-   * 'pill' = compact floating chip (old look, restyled); 'banner' = full-width
-   * accent bar listing every active filter; 'stack' = one chip per filter,
-   * stacked at the docked corner.
+   * The look of the FLOATING and footer placements: 'pill' = compact floating
+   * chip (old look, restyled); 'banner' = full-width accent bar listing every
+   * active filter; 'stack' = one chip per filter, stacked at the docked
+   * corner. The default 'header' placement ignores this — the toolbar row has
+   * its own compact chip treatment.
    */
   variant?: 'pill' | 'banner' | 'stack';
   size?: 'sm' | 'md' | 'lg';

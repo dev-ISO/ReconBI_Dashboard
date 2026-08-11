@@ -20,14 +20,20 @@ const ACCENTS: { value: string | null; label: string }[] = [
   { value: '#0f172a', label: 'Slate' },
 ];
 
+/**
+ * Docking slots, DEFAULT FIRST. The in-flow slots (toolbar/footer) lead
+ * because they never cover a tile; the five floating slots are opt-in and say
+ * "over tiles" in their own labels so the trade-off is visible at the point of
+ * choosing rather than after the fact.
+ */
 const PLACEMENTS: { value: NonNullable<FilterIndicatorStyle['placement']>; label: string }[] = [
-  { value: 'top-center', label: 'Top center' },
-  { value: 'top-left', label: 'Top left' },
-  { value: 'top-right', label: 'Top right' },
-  { value: 'bottom-left', label: 'Bottom left' },
-  { value: 'bottom-right', label: 'Bottom right' },
-  { value: 'header', label: 'Header (toolbar row)' },
-  { value: 'footer', label: 'Footer (bottom bar)' },
+  { value: 'header', label: 'Toolbar (default)' },
+  { value: 'footer', label: 'Footer bar (below the tiles)' },
+  { value: 'top-center', label: 'Floating — top center (over tiles)' },
+  { value: 'top-left', label: 'Floating — top left (over tiles)' },
+  { value: 'top-right', label: 'Floating — top right (over tiles)' },
+  { value: 'bottom-left', label: 'Floating — bottom left (over tiles)' },
+  { value: 'bottom-right', label: 'Floating — bottom right (over tiles)' },
 ];
 
 const SCOPES: { value: CrossFilterScope; label: string }[] = [
@@ -139,23 +145,15 @@ export function FilterIndicatorMenu({ style, position, onClose }: FilterIndicato
         </p>
       )}
 
-      <Field label="Style">
-        <RcdSelect
-          aria-label="Indicator style"
-          value={resolved.variant}
-          onChange={(event) =>
-            patch({ variant: event.target.value as NonNullable<FilterIndicatorStyle['variant']> })
-          }
-        >
-          {VARIANTS.map((option) => (
-            <option key={option.value} value={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </RcdSelect>
-      </Field>
-
-      <Field label={resolved.variant === 'banner' ? 'Edge' : 'Placement'}>
+      <Field
+        label={
+          // The toolbar outranks the banner variant, so it is a placement
+          // choice there — 'Edge' only means something for a real banner.
+          resolved.variant === 'banner' && resolved.placement !== 'header'
+            ? 'Edge'
+            : 'Where filters appear'
+        }
+      >
         <RcdSelect
           aria-label="Indicator placement"
           value={resolved.placement}
@@ -172,14 +170,49 @@ export function FilterIndicatorMenu({ style, position, onClose }: FilterIndicato
           ))}
         </RcdSelect>
       </Field>
-      {resolved.variant === 'banner' && (
+      {resolved.placement === 'header' ? (
+        <p className="text-[11px] leading-4 text-rcd-muted">
+          Active filters show as compact chips in this dashboard&apos;s toolbar row, beside the
+          name — nothing is drawn over your tiles. Extra chips collapse into a
+          &ldquo;+N filters&rdquo; button.
+        </p>
+      ) : (
+        <p className="text-[11px] leading-4 text-rcd-muted">
+          {resolved.placement === 'footer'
+            ? 'A bar below the tiles. It takes its own strip of space — it never covers a tile.'
+            : 'Floats on top of the tiles and can cover part of a chart. Pick “Toolbar” to keep the dashboard clear.'}
+        </p>
+      )}
+
+      <Field label="Style">
+        <RcdSelect
+          aria-label="Indicator style"
+          value={resolved.variant}
+          onChange={(event) =>
+            patch({ variant: event.target.value as NonNullable<FilterIndicatorStyle['variant']> })
+          }
+        >
+          {VARIANTS.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </RcdSelect>
+      </Field>
+      {resolved.variant === 'banner' && resolved.placement !== 'header' && (
         <p className="text-[11px] leading-4 text-rcd-muted">
           A banner docks across the whole width — only the top/bottom half of the placement
-          applies (header renders at the top edge, footer at the bottom).
+          applies (top edge, or the bottom for footer).
+        </p>
+      )}
+      {resolved.placement === 'header' && (
+        <p className="text-[11px] leading-4 text-rcd-muted">
+          The toolbar always uses its own chip row; this style applies if you move the filters to
+          a floating or footer slot.
         </p>
       )}
       <p className="text-[11px] leading-4 text-rcd-muted">
-        Tip: you can also drag the indicator by its grip and drop it on a slot.
+        Tip: you can also drag the chips by their grip and drop them on a slot.
       </p>
 
       <Field label="Size">

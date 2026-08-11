@@ -52,6 +52,7 @@ import { FieldParameterDialog } from './FieldParameterDialog';
 import { FilterChipMenu } from './FilterChipMenu';
 import {
   FilterIndicator,
+  HeaderFilterBar,
   isBottomPlacement,
   isFlowPlacement,
   resolveIndicatorStyle,
@@ -214,15 +215,19 @@ function useClickModifierTracker(): void {
   }, []);
 }
 
-/** Human labels for the drag-to-dock slots (drag ghost caption). */
+/**
+ * Human labels for the drag-to-dock slots (drag ghost caption). The floating
+ * slots say so out loud — dropping there is a deliberate move OFF the default
+ * toolbar row and back over the tiles.
+ */
 const SLOT_LABELS: Record<FilterIndicatorPlacement, string> = {
-  'top-center': 'Top center',
-  'top-left': 'Top left',
-  'top-right': 'Top right',
-  'bottom-left': 'Bottom left',
-  'bottom-right': 'Bottom right',
-  header: 'Toolbar',
-  footer: 'Footer',
+  'top-center': 'Floating — top center',
+  'top-left': 'Floating — top left',
+  'top-right': 'Floating — top right',
+  'bottom-left': 'Floating — bottom left',
+  'bottom-right': 'Floating — bottom right',
+  header: 'Toolbar (default)',
+  footer: 'Footer bar',
 };
 
 /** The embeddable entry point: toolbar + tile grid, view/edit modes. */
@@ -1482,20 +1487,28 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   /** Chart tile the context card targets (undefined once the tile is gone). */
   const chartMenuTile = chartMenu ? tiles.find((t) => t.id === chartMenu.tileId) : undefined;
 
-  // Where the indicator renders: a banner leaves the tile area entirely (in
-  // flow, above or below the grid row — 'header' counts as top, 'footer' as
-  // bottom); a top-center pill/stack joins the existing chip column so the
-  // two never stack on top of each other; 'header' renders compact chips in
-  // the toolbar row, 'footer' a slim in-flow bar at the bottom edge; every
-  // other placement floats on its own inside the grid row.
+  // Where the indicator renders. 'header' is the DEFAULT (an absent placement
+  // resolves to it) AND it outranks every variant: whenever the filters belong
+  // in the toolbar they render as toolbar chips, so out of the box NOTHING is
+  // ever painted over a tile. That ordering matters — 'banner' used to win,
+  // which is how a doc placed at 'header' still ended up as a full-width bar
+  // laid over the top row of tiles under fit-to-page.
+  //
+  // Every other placement is opt-in, reachable only through an explicit doc
+  // value or a drag-to-dock: a banner leaves the tile area entirely (in flow,
+  // above or below the grid row — 'footer' counts as bottom); a top-center
+  // pill/stack joins the existing chip column so the two never stack on top of
+  // each other; 'footer' is a slim in-flow bar at the bottom edge; the four
+  // corners plus top-center float inside the grid row.
   const hasActiveFilters = filterEntries.length > 0;
-  const bannerIndicator = hasActiveFilters && indicator.variant === 'banner';
+  const headerIndicator = hasActiveFilters && indicator.placement === 'header';
+  const bannerIndicator =
+    hasActiveFilters && !headerIndicator && indicator.variant === 'banner';
   const bannerAtBottom = isBottomPlacement(indicator.placement);
-  const headerIndicator =
-    hasActiveFilters && !bannerIndicator && indicator.placement === 'header';
   const footerIndicator =
     hasActiveFilters && !bannerIndicator && indicator.placement === 'footer';
-  const inlineIndicator = hasActiveFilters && !bannerIndicator && indicator.placement === 'top-center';
+  const inlineIndicator =
+    hasActiveFilters && !bannerIndicator && indicator.placement === 'top-center';
   const floatingIndicator =
     hasActiveFilters &&
     !bannerIndicator &&
@@ -1510,7 +1523,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
     onGripPointerDown: startIndicatorDrag,
   };
 
-  /** Header slot keeps chips compact unless the doc explicitly sizes them. */
+  /**
+   * Toolbar chips stay compact unless the doc explicitly sizes them — every
+   * header size is capped below the 48px toolbar row, so the row's height (and
+   * therefore the height left for the fitted page) never moves when filters
+   * come and go.
+   */
   const headerIndicatorStyle: FilterIndicatorStyle = {
     ...effectiveIndicatorStyle,
     size: effectiveIndicatorStyle.size ?? 'sm',
@@ -1582,13 +1600,14 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
                 : undefined
               : (fit) => runtime.dashboards.setViewFitOverride(fit)
         }
-        // 'header' docking slot: compact chips inline in the toolbar row.
+        // 'header' = THE DEFAULT: compact chips inline in this toolbar row,
+        // measured against the row's flexible middle and collapsing into a
+        // "+N filters" popover rather than ever wrapping the toolbar.
         centerContent={
           headerIndicator ? (
-            <FilterIndicator
+            <HeaderFilterBar
               entries={filterEntries}
               style={headerIndicatorStyle}
-              inline
               {...indicatorHandlers}
             />
           ) : undefined
