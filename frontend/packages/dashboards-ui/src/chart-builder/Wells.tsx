@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   DndContext,
@@ -9,9 +9,24 @@ import {
   useSensors,
   type DragEndEvent,
 } from '@dnd-kit/core';
-import { SortableContext, arrayMove, rectSortingStrategy, useSortable } from '@dnd-kit/sortable';
+import {
+  SortableContext,
+  arrayMove,
+  useSortable,
+  verticalListSortingStrategy,
+} from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
-import { Check, Filter, GripVertical, Sigma, TrendingUp, Variable, X } from 'lucide-react';
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  Filter,
+  GripVertical,
+  Sigma,
+  TrendingUp,
+  Variable,
+  X,
+} from 'lucide-react';
 import {
   isTemporalType,
   type Aggregation,
@@ -24,8 +39,9 @@ import {
   type MeasureCalc,
   type MeasureRef,
   type ModelDefinition,
+  type SortSpec,
 } from '@recon/dashboards-core';
-import { RcdSelect } from '../primitives';
+import { RcdInput, RcdSelect } from '../primitives';
 import {
   aggregationOptionsFor,
   canAccept,
@@ -34,8 +50,8 @@ import {
   columnTypeOf,
   FILTERS_WELL,
   filterSummary,
+  hasDrillSubArea,
   measureLabel,
-  supportsDrill,
   wellsFor,
   type BuilderParameter,
   type FieldDragData,
@@ -172,7 +188,12 @@ const calcBadge = (calc: MeasureCalc): string => {
 const calcLabel = (calc: MeasureCalc, axisBucket: DateBucket | null): string =>
   calcMenuItems(axisBucket).find((item) => sameCalc(item.calc, calc))?.label ?? 'Quick calculation';
 
-/** Per-type wells (axis/legend/values/small multiples) plus the universal Filters well. */
+/**
+ * Per-type wells, Power BI style: each chart type shows its own labeled slots
+ * (X axis / Y axis, Slices / Values, X value / Y value, …) with a helper
+ * caption, all writing the same ChartQuery underneath. The universal "Filters
+ * on this chart" well and a Sort / Top N section follow.
+ */
 export function Wells({
   chartType,
   query,
@@ -210,13 +231,31 @@ export function Wells({
   const parameterName = (id: string) =>
     parameters?.find((parameter) => parameter.id === id)?.name ?? id;
 
+  const valueChip = (measure: MeasureRef, index: number) => (
+    <ValueChip
+      key={`${measure.measureId ?? `${measure.table ?? ''}.${measure.column ?? ''}.${measure.aggregation ?? ''}`}-${index}`}
+      measure={measure}
+      model={model}
+      catalog={catalog}
+      hasAxis={hasAxis}
+      axisBucket={axisBucket}
+      onAggregation={(aggregation) => setAggregation(index, aggregation)}
+      onCalc={(calc) => setCalc(index, calc)}
+      onRemove={() => removeMeasure(index)}
+    />
+  );
+
+  /** True for the first values well only — the binding chip renders once. */
+  const firstValuesKey = wellsFor(chartType).find((w) => w.id === 'values')?.key;
+
   const renderWell = (def: WellDef) => {
     if (def.id === 'values') {
-      // A measure-parameter binding replaces the measure list display; removing
-      // the binding chip restores the (untouched) measures underneath.
+      // A measure-parameter binding replaces the measure display; removing the
+      // binding chip restores the (untouched) measures underneath.
       if (measuresBinding != null) {
+        if (def.key !== firstValuesKey) return null;
         return (
-          <Well key={def.id} def={def} empty={false}>
+          <Well key={def.key} def={def} empty={false}>
             <ParamBindingChip
               name={parameterName(measuresBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'measures'))}
@@ -224,31 +263,54 @@ export function Wells({
           </Well>
         );
       }
+      if (def.slot !== undefined) {
+        // Slot well (scatter X/Y, KPI value/comparison, gantt Start/End):
+        // presents exactly one measure index of the same wire measures array.
+        const measure = query.measures[def.slot];
+        // Type-aware hint (gantt Start/End): a known NON-temporal column in a
+        // date-expecting well gets a soft warning instead of a hard block —
+        // numeric epochs still work, so the drop stays valid.
+        let typeHint: string | null = null;
+        if (def.temporalHint && measure && measure.measureId == null) {
+          const type = columnTypeOf(catalog, measure.table ?? '', measure.column ?? '');
+          if (type !== null && !isTemporalType(type)) {
+            typeHint = `${def.label} expects a date column — “${columnLabelOf(
+              model,
+              measure.table ?? '',
+              measure.column ?? '',
+            )}” is ${type}.`;
+          }
+        }
+        return (
+          <Well
+            key={def.key}
+            def={def}
+            empty={measure === undefined}
+            footer={
+              typeHint !== null ? (
+                <p className="pt-1 text-[11px] leading-snug text-[var(--rcd-status-warn)]">
+                  {typeHint}
+                </p>
+              ) : undefined
+            }
+          >
+            {measure !== undefined && valueChip(measure, def.slot)}
+          </Well>
+        );
+      }
       return (
-        <Well key={def.id} def={def} empty={query.measures.length === 0}>
-          {query.measures.map((measure, index) => (
-            <ValueChip
-              key={`${measure.measureId ?? `${measure.table ?? ''}.${measure.column ?? ''}.${measure.aggregation ?? ''}`}-${index}`}
-              measure={measure}
-              model={model}
-              catalog={catalog}
-              hasAxis={hasAxis}
-              axisBucket={axisBucket}
-              onAggregation={(aggregation) => setAggregation(index, aggregation)}
-              onCalc={(calc) => setCalc(index, calc)}
-              onRemove={() => removeMeasure(index)}
-            />
-          ))}
+        <Well key={def.key} def={def} empty={query.measures.length === 0}>
+          {query.measures.map(valueChip)}
         </Well>
       );
     }
 
-    if (def.id === 'axis' && supportsDrill(chartType)) {
+    if (def.id === 'axis') {
       // An axis binding shows INSTEAD of the axis/drill chips (and gates the
       // drill-levels UI); removing it clears only the binding, not the axis.
       if (axisBinding != null) {
         return (
-          <Well key={def.id} def={def} empty={false}>
+          <Well key={def.key} def={def} empty={false}>
             <ParamBindingChip
               name={parameterName(axisBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'axis'))}
@@ -256,38 +318,70 @@ export function Wells({
           </Well>
         );
       }
+      if (def.capacity === 'many') {
+        // Table "Rows": ordered multi-field list (row 1, 2, 3, …) — stored as
+        // [axis, ...drillLevels] on the wire, no drill framing in the UI.
+        return (
+          <Well key={def.key} def={def} empty={!query.axis}>
+            {query.axis && (
+              <OrderedDimensionList
+                idPrefix="row"
+                levels={[query.axis, ...(query.drillLevels ?? [])]}
+                model={model}
+                catalog={catalog}
+                onLevels={(next) =>
+                  onChange({
+                    ...query,
+                    axis: next[0] ?? null,
+                    drillLevels: next.length > 1 ? next.slice(1) : undefined,
+                  })
+                }
+              />
+            )}
+          </Well>
+        );
+      }
+      // Cartesian axis: ONE field; extra granularity lives in the explicit
+      // "Drill-down levels" sub-area below.
       return (
-        <Well key={def.id} def={def} empty={!query.axis}>
+        <Well
+          key={def.key}
+          def={def}
+          empty={!query.axis}
+          footer={
+            hasDrillSubArea(chartType) ? (
+              <DrillSection query={query} model={model} catalog={catalog} onChange={onChange} />
+            ) : undefined
+          }
+        >
           {query.axis && (
-            <HierarchyChips query={query} model={model} catalog={catalog} onChange={onChange} />
+            <DimensionChip
+              dimension={query.axis}
+              model={model}
+              catalog={catalog}
+              showBucket
+              onBucket={(dateBucket) => onChange({ ...query, axis: { ...query.axis!, dateBucket } })}
+              onRemove={() => onChange({ ...query, axis: null })}
+            />
           )}
         </Well>
       );
     }
 
-    const dimension =
-      def.id === 'axis'
-        ? query.axis
-        : def.id === 'smallMultiples'
-          ? query.smallMultiples
-          : query.legend;
+    const dimension = def.id === 'smallMultiples' ? query.smallMultiples : query.legend;
     const setDimension = (next: DimensionRef | null) =>
       onChange(
-        def.id === 'axis'
-          ? { ...query, axis: next }
-          : def.id === 'smallMultiples'
-            ? { ...query, smallMultiples: next }
-            : { ...query, legend: next },
+        def.id === 'smallMultiples' ? { ...query, smallMultiples: next } : { ...query, legend: next },
       );
 
     return (
-      <Well key={def.id} def={def} empty={!dimension}>
+      <Well key={def.key} def={def} empty={!dimension}>
         {dimension && (
           <DimensionChip
             dimension={dimension}
             model={model}
             catalog={catalog}
-            showBucket={def.id === 'axis' || def.id === 'smallMultiples'}
+            showBucket={def.id === 'smallMultiples'}
             onBucket={(dateBucket) => setDimension({ ...dimension, dateBucket })}
             onRemove={() => setDimension(null)}
           />
@@ -297,7 +391,7 @@ export function Wells({
   };
 
   return (
-    <div className="flex flex-col gap-2.5">
+    <div className="flex flex-col gap-3">
       {wellsFor(chartType).map(renderWell)}
 
       <Well def={FILTERS_WELL} empty={query.filters.length === 0}>
@@ -311,14 +405,27 @@ export function Wells({
           />
         ))}
       </Well>
+
+      <SortLimitSection query={query} model={model} onChange={onChange} />
     </div>
   );
 }
 
-function Well({ def, empty, children }: { def: WellDef; empty: boolean; children: React.ReactNode }) {
+function Well({
+  def,
+  empty,
+  children,
+  footer,
+}: {
+  def: WellDef;
+  empty: boolean;
+  children: React.ReactNode;
+  /** Rendered under the drop box, inside the well group (drill sub-area). */
+  footer?: React.ReactNode;
+}) {
   const { setNodeRef, isOver, active } = useDroppable({
-    id: `well-${def.id}`,
-    data: { wellId: def.id },
+    id: `well-${def.key}`,
+    data: { wellId: def.id, slot: def.slot },
   });
 
   const dragData = (active?.data.current as FieldDragData | undefined) ?? null;
@@ -337,30 +444,41 @@ function Well({ def, empty, children }: { def: WellDef; empty: boolean; children
 
   return (
     <div>
-      <div className="pb-1.5 text-xs font-medium text-rcd-muted">{def.label}</div>
+      <div className="flex items-baseline gap-1.5 pb-0.5">
+        <span className="text-xs font-medium text-rcd-text">{def.label}</span>
+        {def.required && empty && (
+          <span className="text-[10px] font-medium text-[var(--rcd-status-warn)]">Required</span>
+        )}
+      </div>
+      <div className="pb-1.5 text-[11px] leading-snug text-rcd-muted">{def.caption}</div>
       <div
         ref={setNodeRef}
         className={`flex min-h-[2.75rem] flex-col justify-center gap-1 rounded-lg border ${
           empty ? 'border-dashed' : ''
         } p-1.5 transition-colors ${borderClass}`}
       >
-        {empty ? <span className="px-1 text-xs text-rcd-muted">{def.hint}</span> : children}
+        {empty ? (
+          <span className="px-1 text-xs text-rcd-muted">{def.placeholder}</span>
+        ) : (
+          children
+        )}
       </div>
+      {footer}
     </div>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Axis / drill hierarchy
+// Drill-down levels (cartesian axis sub-area)
 // ---------------------------------------------------------------------------
 
 /**
- * Ordered hierarchy chips: [axis, ...drillLevels] joined by "▸". A nested
- * DndContext (isolated from the builder's field-drag context) makes the chips
- * sortable via their grip handles; dropping writes axis + drillLevels back so
- * the first chip is always the level-0 axis.
+ * Explicit drill UI under the axis well: a collapsible "Drill-down levels"
+ * sub-area with numbered chips (1, 2, 3, …) and a "+ Add level" drop target.
+ * Writes the SAME query.drillLevels array the old append-to-axis behavior
+ * wrote — presentation only. Collapsed, the header row itself accepts drops.
  */
-function HierarchyChips({
+function DrillSection({
   query,
   model,
   catalog,
@@ -371,42 +489,145 @@ function HierarchyChips({
   catalog: Catalog | null;
   onChange: (query: ChartQuery) => void;
 }) {
-  const levels: DimensionRef[] = [
-    ...(query.axis ? [query.axis] : []),
-    ...(query.drillLevels ?? []),
-  ];
+  const levels = query.drillLevels ?? [];
+  const [open, setOpen] = useState(levels.length > 0);
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  // Auto-expand when a drop adds the first level while collapsed (never
+  // fights a manual collapse — only fires when the count GROWS).
+  const prevCount = useRef(levels.length);
+  useEffect(() => {
+    if (levels.length > prevCount.current) setOpen(true);
+    prevCount.current = levels.length;
+  }, [levels.length]);
+
+  const { setNodeRef, isOver, active } = useDroppable({
+    id: 'well-drill',
+    data: { wellId: 'drill' },
+  });
+
+  const dragData = (active?.data.current as FieldDragData | undefined) ?? null;
+  const validTarget = dragData ? canAccept('drill', dragData) : null;
+  const dropClass =
+    isOver && validTarget === true
+      ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)]'
+      : validTarget === true
+        ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_5%,transparent)]'
+        : 'border-rcd-border';
 
   const setLevels = (next: DimensionRef[]) =>
-    onChange({
-      ...query,
-      axis: next[0] ?? null,
-      drillLevels: next.length > 1 ? next.slice(1) : undefined,
-    });
+    onChange({ ...query, drillLevels: next.length > 0 ? next : undefined });
+
+  return (
+    <div className="mt-1.5 border-l-2 border-rcd-border pl-2">
+      {open ? (
+        <>
+          <button
+            type="button"
+            aria-expanded
+            onClick={() => setOpen(false)}
+            className="flex items-center gap-1 rounded px-0.5 py-0.5 text-[11px] font-medium text-rcd-text-2 hover:text-rcd-text"
+          >
+            <ChevronDown size={12} className="shrink-0 text-rcd-muted" />
+            Drill-down levels
+            {levels.length > 0 && (
+              <span className="rounded bg-black/10 px-1 text-[10px] font-semibold leading-4 text-rcd-text-2 dark:bg-white/10">
+                {levels.length}
+              </span>
+            )}
+          </button>
+          <p className="pb-1 pl-4 pt-0.5 text-[11px] leading-snug text-rcd-muted">
+            Right-click a data point to drill into the next level.
+          </p>
+          {levels.length > 0 && (
+            <div className="pb-1 pl-4">
+              <OrderedDimensionList
+                idPrefix="drill"
+                levels={levels}
+                model={model}
+                catalog={catalog}
+                onLevels={setLevels}
+              />
+            </div>
+          )}
+          <div
+            ref={setNodeRef}
+            className={`ml-4 flex min-h-[1.9rem] items-center rounded-md border border-dashed px-2 transition-colors ${dropClass}`}
+          >
+            <span className="text-[11px] text-rcd-muted">+ Add level — drag a field here</span>
+          </div>
+        </>
+      ) : (
+        <button
+          type="button"
+          ref={setNodeRef}
+          aria-expanded={false}
+          onClick={() => setOpen(true)}
+          title="Extra fields become drill levels: right-click a data point to drill down"
+          className={`flex w-full items-center gap-1 rounded-md border border-dashed px-1.5 py-1 text-left text-[11px] font-medium text-rcd-text-2 transition-colors hover:text-rcd-text ${
+            validTarget === true ? dropClass : 'border-transparent'
+          }`}
+        >
+          <ChevronRight size={12} className="shrink-0 text-rcd-muted" />
+          Drill-down levels
+          {levels.length > 0 ? (
+            <span className="rounded bg-black/10 px-1 text-[10px] font-semibold leading-4 text-rcd-text-2 dark:bg-white/10">
+              {levels.length}
+            </span>
+          ) : (
+            <span className="font-normal text-rcd-muted">— optional, click or drop a field</span>
+          )}
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Ordered dimension list (table rows + drill levels)
+// ---------------------------------------------------------------------------
+
+/**
+ * Numbered, reorderable dimension rows (1, 2, 3, …). A nested DndContext
+ * (isolated from the builder's field-drag context) makes the rows sortable
+ * via their grip handles.
+ */
+function OrderedDimensionList({
+  idPrefix,
+  levels,
+  model,
+  catalog,
+  onLevels,
+}: {
+  idPrefix: string;
+  levels: DimensionRef[];
+  model: ModelDefinition;
+  catalog: Catalog | null;
+  onLevels: (levels: DimensionRef[]) => void;
+}) {
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
   const setLevel = (index: number, dimension: DimensionRef) =>
-    setLevels(levels.map((level, i) => (i === index ? dimension : level)));
+    onLevels(levels.map((level, i) => (i === index ? dimension : level)));
 
-  const removeLevel = (index: number) => setLevels(levels.filter((_, i) => i !== index));
+  const removeLevel = (index: number) => onLevels(levels.filter((_, i) => i !== index));
 
-  const ids = levels.map((_, index) => `level-${index}`);
+  const ids = levels.map((_, index) => `${idPrefix}-${index}`);
 
   const handleDragEnd = (event: DragEndEvent) => {
     const from = ids.indexOf(String(event.active.id));
     const to = event.over ? ids.indexOf(String(event.over.id)) : -1;
     if (from < 0 || to < 0 || from === to) return;
-    setLevels(arrayMove(levels, from, to));
+    onLevels(arrayMove(levels, from, to));
   };
 
   return (
     <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={ids} strategy={rectSortingStrategy}>
-        <div className="flex flex-wrap items-center gap-1">
+      <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+        <div className="flex flex-col gap-1">
           {levels.map((level, index) => (
-            <SortableLevelChip
-              key={`level-${index}`}
-              id={`level-${index}`}
+            <SortableLevelRow
+              key={`${idPrefix}-${index}`}
+              id={`${idPrefix}-${index}`}
               index={index}
               sortable={levels.length > 1}
               dimension={level}
@@ -422,7 +643,7 @@ function HierarchyChips({
   );
 }
 
-function SortableLevelChip({
+function SortableLevelRow({
   id,
   index,
   sortable,
@@ -451,33 +672,148 @@ function SortableLevelChip({
       style={{ transform: CSS.Translate.toString(transform), transition }}
       className={`flex min-w-0 max-w-full items-center gap-1 ${isDragging ? 'relative z-10 opacity-80' : ''}`}
     >
-      {index > 0 && (
-        <span aria-hidden className="text-[10px] text-rcd-muted">
-          ▸
-        </span>
-      )}
-      <DimensionChip
-        dimension={dimension}
-        model={model}
-        catalog={catalog}
-        showBucket
-        onBucket={onBucket}
-        onRemove={onRemove}
-        leading={
-          sortable ? (
-            <button
-              type="button"
-              aria-label={`Reorder drill level ${index + 1}`}
-              title="Drag to reorder"
-              {...attributes}
-              {...listeners}
-              className="-ml-0.5 shrink-0 cursor-grab touch-none rounded p-0.5 text-rcd-muted hover:text-rcd-text"
-            >
-              <GripVertical size={11} />
-            </button>
-          ) : undefined
-        }
-      />
+      <span
+        aria-hidden
+        className="w-3.5 shrink-0 text-center text-[10px] font-semibold tabular-nums text-rcd-muted"
+      >
+        {index + 1}
+      </span>
+      <div className="min-w-0 flex-1">
+        <DimensionChip
+          dimension={dimension}
+          model={model}
+          catalog={catalog}
+          showBucket
+          onBucket={onBucket}
+          onRemove={onRemove}
+          leading={
+            sortable ? (
+              <button
+                type="button"
+                aria-label={`Reorder level ${index + 1}`}
+                title="Drag to reorder"
+                {...attributes}
+                {...listeners}
+                className="-ml-0.5 shrink-0 cursor-grab touch-none rounded p-0.5 text-rcd-muted hover:text-rcd-text"
+              >
+                <GripVertical size={11} />
+              </button>
+            ) : undefined
+          }
+        />
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sort / Top N
+// ---------------------------------------------------------------------------
+
+type SortChoice = 'auto' | 'custom' | `dim-asc` | `dim-desc` | `m${number}-asc` | `m${number}-desc`;
+
+const currentSortChoice = (query: ChartQuery): SortChoice => {
+  const sort = query.sort ?? [];
+  if (sort.length === 0) return 'auto';
+  if (sort.length > 1) return 'custom';
+  const rule = sort[0]!;
+  if (rule.target.kind === 'dimension') {
+    return rule.target.index === 0 ? (`dim-${rule.direction}` as SortChoice) : 'custom';
+  }
+  if (rule.target.index < query.measures.length) {
+    return `m${rule.target.index}-${rule.direction}` as SortChoice;
+  }
+  return 'custom';
+};
+
+const sortSpecFor = (choice: SortChoice): SortSpec[] | undefined => {
+  if (choice === 'auto' || choice === 'custom') return undefined;
+  const [target, direction] = choice.split('-') as [string, 'asc' | 'desc'];
+  if (target === 'dim') return [{ target: { kind: 'dimension', index: 0 }, direction }];
+  return [{ target: { kind: 'measure', index: Number(target.slice(1)) }, direction }];
+};
+
+/**
+ * Plain-labeled Sort and Top N controls over the EXISTING query.sort /
+ * query.limit fields (nothing new on the wire) — previously these were
+ * invisible in the builder. "Highest X first" + a row limit = a Top N chart.
+ */
+function SortLimitSection({
+  query,
+  model,
+  onChange,
+}: {
+  query: ChartQuery;
+  model: ModelDefinition;
+  onChange: (query: ChartQuery) => void;
+}) {
+  // The first wire dimension is what sorting "by category" orders: the axis,
+  // or (pie/donut) the slice dimension.
+  const firstDimension = query.axis ?? query.legend ?? null;
+  const dimLabel = firstDimension
+    ? columnLabelOf(model, firstDimension.table, firstDimension.column)
+    : null;
+  const choice = currentSortChoice(query);
+
+  const apply = (next: SortChoice) => {
+    if (next === 'custom') return; // display-only marker for multi-rule specs
+    onChange({ ...query, sort: sortSpecFor(next) });
+  };
+
+  const limitText = query.limit != null ? String(query.limit) : '';
+  const applyLimit = (raw: string) => {
+    const trimmed = raw.trim();
+    if (trimmed === '') {
+      onChange({ ...query, limit: undefined });
+      return;
+    }
+    const parsed = Number.parseInt(trimmed, 10);
+    if (!Number.isFinite(parsed)) return;
+    onChange({ ...query, limit: Math.max(1, parsed) });
+  };
+
+  return (
+    <div className="flex flex-col gap-2 border-t border-rcd-border pt-2.5">
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-rcd-text">Sort</span>
+        <RcdSelect value={choice} onChange={(event) => apply(event.target.value as SortChoice)}>
+          <option value="auto">Automatic</option>
+          {dimLabel !== null && (
+            <>
+              <option value="dim-asc">{dimLabel} — A to Z / oldest first</option>
+              <option value="dim-desc">{dimLabel} — Z to A / newest first</option>
+            </>
+          )}
+          {query.measures.map((measure, index) => {
+            const label = measureLabel(model, measure);
+            return (
+              <optgroup key={`m${index}`} label={label}>
+                <option value={`m${index}-desc`}>Highest {label} first</option>
+                <option value={`m${index}-asc`}>Lowest {label} first</option>
+              </optgroup>
+            );
+          })}
+          {choice === 'custom' && <option value="custom">Custom (multiple rules)</option>}
+        </RcdSelect>
+      </label>
+
+      <label className="flex flex-col gap-1">
+        <span className="text-xs font-medium text-rcd-text">Top N</span>
+        <div className="flex items-center gap-2">
+          <RcdInput
+            type="number"
+            min={1}
+            value={limitText}
+            onChange={(event) => applyLimit(event.target.value)}
+            placeholder="All rows"
+            className="w-24"
+            aria-label="Top N row limit"
+          />
+          <span className="text-[11px] leading-snug text-rcd-muted">
+            Keep only the first N rows — pick “Highest … first” above for a true Top N.
+          </span>
+        </div>
+      </label>
     </div>
   );
 }

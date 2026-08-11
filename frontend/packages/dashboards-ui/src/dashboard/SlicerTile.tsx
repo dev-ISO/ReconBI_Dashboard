@@ -413,7 +413,7 @@ function DropdownSlicer({
         aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
-        className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
+        className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
         } ${active ? 'border-[var(--rcd-accent-interactive)]' : 'border-rcd-border'}`}
       >
@@ -494,7 +494,7 @@ function DropdownMultiSlicer({
         aria-expanded={open}
         title={active ? `${spec.label}: ${summary}` : `${spec.label}: all values`}
         onClick={() => (open ? close() : setOpen(true))}
-        className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 dark:hover:bg-white/10 ${
+        className={`flex w-full max-w-[18rem] items-center justify-between gap-1.5 rounded-md border bg-rcd-bg text-rcd-text transition-colors hover:bg-black/5 focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] dark:hover:bg-white/10 ${
           compact ? 'px-2 py-0.5 text-xs' : 'px-2.5 py-1.5 text-sm'
         } ${active ? 'border-[var(--rcd-accent-interactive)]' : 'border-rcd-border'}`}
       >

@@ -103,6 +103,12 @@ export interface RcdDialogProps {
   /** Bottom-right corner handle resizes the panel. */
   resizable?: boolean;
   /**
+   * Panel always takes its full height (85vh, or the user-resized height)
+   * instead of hugging its content, giving the body a definite height so
+   * flexible content (the chart builder) can reflow with the dialog.
+   */
+  fillHeight?: boolean;
+  /**
    * Overrides the default dimmed backdrop classes (bg-black/40 + blur), e.g.
    * "bg-black/10" for a light wash that keeps the content behind readable.
    * Click-to-close is unaffected.
@@ -150,6 +156,7 @@ export function RcdDialog({
   wide,
   draggable,
   resizable,
+  fillHeight,
   backdropClassName,
 }: RcdDialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -313,7 +320,7 @@ export function RcdDialog({
         aria-label={title}
         tabIndex={-1}
         style={panelStyle}
-        className={`relative z-10 flex max-h-[85vh] ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-xl border border-rcd-border bg-rcd-surface shadow-lg outline-none`}
+        className={`relative z-10 flex max-h-[85vh] ${fillHeight ? 'h-[85vh]' : ''} ${wide ? 'w-[56rem]' : 'w-[28rem]'} max-w-[92vw] flex-col rounded-xl border border-rcd-border bg-rcd-surface shadow-lg outline-none`}
       >
         <div
           className={`flex items-center justify-between border-b border-rcd-border py-4 pl-6 pr-4 ${

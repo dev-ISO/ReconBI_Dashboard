@@ -390,6 +390,127 @@ export function shapeScatterData(result: QueryResult, spec: ChartSpec): ShapedSc
   return { series, xColumn, yColumn, droppedSeries: droppedKeys.size };
 }
 
+// ---------------------------------------------------------------------------
+// Gantt shaping
+// ---------------------------------------------------------------------------
+
+export interface GanttTask {
+  /** RAW (pre-format) task-dimension cell — click-to-filter identity. */
+  raw: CellValue;
+  /** Formatted task label (the category-axis text). */
+  label: string;
+  /** Bar span in epoch ms (start <= end; reversed inputs are swapped). */
+  startMs: number;
+  endMs: number;
+  /** FORMATTED group value; null when the query has no group dimension. */
+  group: string | null;
+  /** RAW group cell (legend cross-filter identity). */
+  groupRaw: CellValue;
+  /** Normalized completion 0..1 (accepts 0-1 or 0-100 input); null = none. */
+  progress: number | null;
+}
+
+export interface GanttGroup {
+  label: string;
+  raw: CellValue;
+  /** Theme-palette slot color (colorOverrides keyed by group label win). */
+  color: string;
+}
+
+export interface ShapedGanttData {
+  /** Valid tasks, default-sorted by start when the spec carries no sort. */
+  tasks: GanttTask[];
+  /** Distinct groups in first-appearance order; empty without a group dim. */
+  groups: GanttGroup[];
+  /** measures[0] / measures[1] / measures[2] wire columns (null = missing). */
+  startColumn: QueryColumn | null;
+  endColumn: QueryColumn | null;
+  progressColumn: QueryColumn | null;
+  /** Rows dropped because start or end was null/unparseable. */
+  skipped: number;
+}
+
+/** Epoch ms from a wire cell: ISO strings parse, numbers pass through. */
+const toEpochMs = (value: CellValue): number | null => {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value === 'string' && value !== '') {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+};
+
+/** Progress cell → 0..1 (values above 1 are read as 0-100 percent). */
+const toProgressFraction = (value: CellValue): number | null => {
+  const n = toNumber(value);
+  if (n === null) return null;
+  const fraction = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, fraction));
+};
+
+/**
+ * Shapes a gantt result. Wire contract (toWireSpec): dimensions arrive
+ * [axis = task, legend? = group]; measures [start, end, progress?] — start/end
+ * are Min/Max over date columns and arrive as ISO strings (numeric columns are
+ * accepted as epoch ms). Rows whose start OR end is null/unparseable are
+ * skipped and counted; reversed spans are swapped rather than dropped. When
+ * the spec has no explicit sort the tasks order by start ascending — the
+ * conventional gantt reading order — otherwise engine row order is kept.
+ */
+export function shapeGanttData(result: QueryResult, spec: ChartSpec): ShapedGanttData {
+  const dimensionColumns = result.columns.filter((c) => c.role === 'dimension');
+  const measureColumns = result.columns.filter((c) => c.role === 'measure');
+  const taskColumn = dimensionColumns[0] ?? null;
+  const groupColumn = spec.query.legend ? (dimensionColumns[1] ?? null) : null;
+  const startColumn = measureColumns[0] ?? null;
+  const endColumn = measureColumns[1] ?? null;
+  const progressColumn = measureColumns[2] ?? null;
+  if (!startColumn || !endColumn) {
+    return { tasks: [], groups: [], startColumn, endColumn, progressColumn, skipped: 0 };
+  }
+
+  const taskIndex = taskColumn ? result.columns.indexOf(taskColumn) : -1;
+  const groupIndex = groupColumn ? result.columns.indexOf(groupColumn) : -1;
+  const startIndex = result.columns.indexOf(startColumn);
+  const endIndex = result.columns.indexOf(endColumn);
+  const progressIndex = progressColumn ? result.columns.indexOf(progressColumn) : -1;
+
+  const tasks: GanttTask[] = [];
+  const groups: GanttGroup[] = [];
+  let skipped = 0;
+  for (const row of result.rows) {
+    const start = toEpochMs(row[startIndex] ?? null);
+    const end = toEpochMs(row[endIndex] ?? null);
+    if (start === null || end === null) {
+      skipped++;
+      continue;
+    }
+    const groupRaw = groupColumn ? (row[groupIndex] ?? null) : null;
+    const group = groupColumn ? formatCellValue(groupRaw, groupColumn) : null;
+    if (group !== null && !groups.some((g) => g.label === group)) {
+      groups.push({
+        label: group,
+        raw: groupRaw,
+        color: seriesColor(groups.length, group, spec.format.colorOverrides, spec.format.theme),
+      });
+    }
+    tasks.push({
+      raw: taskColumn ? (row[taskIndex] ?? null) : null,
+      label: taskColumn
+        ? formatCellValue(row[taskIndex] ?? null, taskColumn)
+        : startColumn.label,
+      startMs: Math.min(start, end),
+      endMs: Math.max(start, end),
+      group,
+      groupRaw,
+      progress: progressIndex >= 0 ? toProgressFraction(row[progressIndex] ?? null) : null,
+    });
+  }
+
+  if (!spec.query.sort?.length) tasks.sort((a, b) => a.startMs - b.startMs);
+  return { tasks, groups, startColumn, endColumn, progressColumn, skipped };
+}
+
 export interface SmallMultiplePanel {
   /** RAW small-multiples dimension cell (panel identity for events/filters). */
   value: CellValue;

@@ -130,7 +130,7 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
   const current = useDashboardState((state) => state.current);
   const activePageId = useDashboardState((state) => state.activePageId);
   const slicerValues = useDashboardState((state) => state.slicerValues);
-  const crossFilter = useDashboardState((state) => state.crossFilter);
+  const crossFilters = useDashboardState((state) => state.crossFilters);
 
   const pages = current?.layout.pages ?? [];
   const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
@@ -144,8 +144,8 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
         : current.name;
 
   // Same construction as DashboardView's filtersByTile: subscribed slices
-  // (tiles/slicerValues/crossFilter) drive recomputation, filtersForTile reads
-  // the exact same store state — never stale.
+  // (tiles/slicerValues/crossFilters) drive recomputation, filtersForTile
+  // reads the exact same store state — never stale.
   const filtersByTile = useMemo(() => {
     const map = new Map<string, FilterClause[]>();
     for (const tile of tiles) {
@@ -153,12 +153,12 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
       map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
     }
     return map;
-  }, [runtime, tiles, slicerValues, crossFilter]);
+  }, [runtime, tiles, slicerValues, crossFilters]);
 
   // Page count + thumbnail scale from the SAME pure layout the preview uses.
   const hasFilterSummary = useMemo(
-    () => filterSummaryFor(tiles, slicerValues, crossFilter).length > 0,
-    [tiles, slicerValues, crossFilter],
+    () => filterSummaryFor(tiles, slicerValues, crossFilters).length > 0,
+    [tiles, slicerValues, crossFilters],
   );
   const layout = useMemo(
     () => computePrintLayout(tiles, draft, hasFilterSummary),

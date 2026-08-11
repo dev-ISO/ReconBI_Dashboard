@@ -18,93 +18,194 @@ import {
   type ModelDefinition,
 } from '@recon/dashboards-core';
 
-export type WellId = 'axis' | 'legend' | 'smallMultiples' | 'values' | 'filters';
+/**
+ * 'drill' is a presentation-only target: the "+ Add level" sub-area under a
+ * cartesian X/Y axis well. It writes query.drillLevels — the same array the
+ * old append-to-axis behavior wrote — so specs are byte-identical.
+ */
+export type WellId = 'axis' | 'drill' | 'legend' | 'smallMultiples' | 'values' | 'filters';
 
 export interface WellDef {
+  /** Semantic target — decides which ChartQuery part a drop writes. */
   id: WellId;
+  /** Unique per chart type; the droppable id + React key ('values-x', …). */
+  key: string;
   label: string;
   /** 'one' wells hold a single chip (drop replaces); 'many' wells append. */
   capacity: 'one' | 'many';
   /** Max chips for a 'many' well; a drop at capacity replaces the last chip. */
   max?: number;
-  hint: string;
+  /**
+   * For 'values' wells that present exactly ONE measure index (scatter X/Y,
+   * KPI value/comparison). The well displays query.measures[slot]; a drop
+   * replaces that index (or appends when the list is still shorter).
+   */
+  slot?: number;
+  /** One-line muted helper under the label explaining what to drop. */
+  caption: string;
+  /** Empty-state text inside the drop box. */
+  placeholder: string;
+  /** Needed for a meaningful chart — empty required wells get a subtle tag. */
+  required?: boolean;
+  /**
+   * Aggregation a COLUMN drop into this slot well defaults to, overriding the
+   * type-based default (gantt Start = Min, End = Max — the engine allows
+   * Min/Max on temporal columns and returns ISO strings).
+   */
+  defaultAggregation?: Aggregation;
+  /**
+   * The well semantically expects a date/timestamp column; the Wells UI shows
+   * a type-aware hint when a non-temporal column lands here.
+   */
+  temporalHint?: boolean;
 }
 
-/**
- * Drill-capable axis: the first chip is the axis (level 0), every further
- * dropped dimension appends to query.drillLevels below it.
- */
-const DRILL_AXIS: WellDef = {
-  id: 'axis',
-  label: 'Axis / drill hierarchy',
-  capacity: 'many',
-  hint: 'Drop a column — more columns build a drill hierarchy',
-};
-const LEGEND: WellDef = {
-  id: 'legend',
-  label: 'Legend',
-  capacity: 'one',
-  hint: 'Drop a column to split series',
-};
-const VALUES: WellDef = {
-  id: 'values',
-  label: 'Values',
-  capacity: 'many',
-  hint: 'Drop measures or columns',
-};
+const PLACEHOLDER = 'Drag a field here, or click + in the field list';
+const PLACEHOLDER_MEASURE = 'Drag a number field here, or click + in the field list';
 
-const SMALL_MULTIPLES: WellDef = {
-  id: 'smallMultiples',
-  label: 'Small multiples',
-  capacity: 'one',
-  hint: 'Drop a column to split into panels',
-};
+const def = (
+  id: WellId,
+  key: string,
+  label: string,
+  capacity: 'one' | 'many',
+  caption: string,
+  extra?: Partial<WellDef>,
+): WellDef => ({
+  id,
+  key,
+  label,
+  capacity,
+  caption,
+  placeholder: id === 'values' ? PLACEHOLDER_MEASURE : PLACEHOLDER,
+  ...extra,
+});
 
-/** The filters well is universal — rendered under Values for every chart type. */
-export const FILTERS_WELL: WellDef = {
-  id: 'filters',
-  label: 'Filters',
-  capacity: 'many',
-  hint: 'Drop a column to filter by',
-};
+/** The filters well is universal — rendered under the type wells for every chart. */
+export const FILTERS_WELL: WellDef = def(
+  'filters',
+  'filters',
+  'Filters on this chart',
+  'many',
+  'Only affects this visual — page and dashboard filters stack on top',
+);
 
-/**
- * Unrestricted cartesian wells: a legend dimension AND multiple values may
- * coexist (the renderer supports legend × measures for line/area/scatter).
- * Only the stacked types constrain the combo (legend required, one measure).
- */
-const CARTESIAN: readonly WellDef[] = [DRILL_AXIS, LEGEND, VALUES, SMALL_MULTIPLES];
+const SMALL_MULTIPLES = def(
+  'smallMultiples',
+  'smallMultiples',
+  'Small multiples',
+  'one',
+  'Optional: repeat the chart as one mini-panel per value',
+);
 
-const STACKED: readonly WellDef[] = [
-  DRILL_AXIS,
-  { ...LEGEND, hint: 'Drop a column to stack by (required)' },
-  { ...VALUES, max: 1, hint: 'Drop one measure' },
+/** Vertical cartesians: category along the bottom, values up the side. */
+const COLUMNAR = (stacked: boolean): readonly WellDef[] => [
+  def('axis', 'axis', 'X axis', 'one', 'Category or date along the bottom', { required: true }),
+  def('values', 'values', 'Y axis — values', 'many', 'What to measure — numbers default to Sum', {
+    required: true,
+    ...(stacked ? { max: 1 } : null),
+  }),
+  def(
+    'legend',
+    'legend',
+    'Legend',
+    'one',
+    stacked ? 'Stack by this field — each value is a colored segment' : 'Optional: one line/series per value of this field',
+    stacked ? { required: true } : undefined,
+  ),
+  SMALL_MULTIPLES,
+];
+
+/** Horizontal cartesians: category down the side, values along the bottom. */
+const BARRED = (stacked: boolean): readonly WellDef[] => [
+  def('axis', 'axis', 'Y axis', 'one', 'Category listed down the side', { required: true }),
+  def('values', 'values', 'X axis — values', 'many', 'Bar length — numbers default to Sum', {
+    required: true,
+    ...(stacked ? { max: 1 } : null),
+  }),
+  def(
+    'legend',
+    'legend',
+    'Legend',
+    'one',
+    stacked ? 'Stack by this field — each value is a colored segment' : 'Optional: one series per value of this field',
+    stacked ? { required: true } : undefined,
+  ),
   SMALL_MULTIPLES,
 ];
 
 const RADIAL: readonly WellDef[] = [
-  { ...LEGEND, hint: 'Drop a column to slice by' },
-  { ...VALUES, max: 1, hint: 'Drop one measure' },
+  def('legend', 'legend', 'Slices', 'one', 'One slice per value of this field', { required: true }),
+  def('values', 'values', 'Values', 'many', 'Slice size — one measure', {
+    max: 1,
+    required: true,
+  }),
 ];
 
 export const WELL_CONFIG: Record<ChartType, readonly WellDef[]> = {
-  column: CARTESIAN,
-  bar: CARTESIAN,
-  stackedColumn: STACKED,
-  stackedBar: STACKED,
-  line: CARTESIAN,
-  area: CARTESIAN,
+  column: COLUMNAR(false),
+  stackedColumn: COLUMNAR(true),
+  line: COLUMNAR(false),
+  area: COLUMNAR(false),
+  bar: BARRED(false),
+  stackedBar: BARRED(true),
   pie: RADIAL,
   donut: RADIAL,
   scatter: [
-    { ...VALUES, label: 'X / Y values', max: 2, hint: 'Drop two measures — first is X, second is Y' },
-    { ...LEGEND, hint: 'Optional: drop a column to color points' },
+    def('values', 'values-x', 'X value', 'one', 'Measure along the horizontal axis', {
+      slot: 0,
+      required: true,
+    }),
+    def('values', 'values-y', 'Y value', 'one', 'Measure along the vertical axis', {
+      slot: 1,
+      required: true,
+    }),
+    def('legend', 'legend', 'Details / color', 'one', 'Optional: color the points by this field'),
   ],
-  kpi: [{ ...VALUES, max: 2, hint: 'Drop 1–2 measures' }],
+  gantt: [
+    def('axis', 'axis', 'Tasks', 'one', 'One timeline bar per value of this field', {
+      required: true,
+    }),
+    def('values', 'values-start', 'Start date', 'one', 'When each bar begins — dates default to Min', {
+      slot: 0,
+      required: true,
+      defaultAggregation: 'min',
+      temporalHint: true,
+      placeholder: 'Drag a date field here',
+    }),
+    def('values', 'values-end', 'End date', 'one', 'When each bar ends — dates default to Max', {
+      slot: 1,
+      required: true,
+      defaultAggregation: 'max',
+      temporalHint: true,
+      placeholder: 'Drag a date field here',
+    }),
+    def('legend', 'legend', 'Group / color', 'one', 'Optional: color the bars by this field'),
+    def(
+      'values',
+      'values-progress',
+      'Progress',
+      'one',
+      'Optional: completion as 0–1 or 0–100 — drawn as an inner fill',
+      { slot: 2 },
+    ),
+  ],
+  kpi: [
+    def('values', 'values-main', 'Value', 'one', 'The big number', { slot: 0, required: true }),
+    def(
+      'values',
+      'values-secondary',
+      'Comparison',
+      'one',
+      'Optional: shown under the value — e.g. a target or prior period',
+      { slot: 1 },
+    ),
+  ],
   table: [
-    { ...DRILL_AXIS, label: 'Rows', hint: 'Drop a column — more columns build a drill hierarchy' },
-    { ...LEGEND, label: 'Columns', hint: 'Optional: drop a column to pivot' },
-    VALUES,
+    def('axis', 'axis', 'Rows', 'many', 'Fields that define the rows, in this order', {
+      required: true,
+    }),
+    def('legend', 'legend', 'Columns', 'one', 'Optional: pivot — one column per value'),
+    def('values', 'values', 'Values', 'many', 'Measure columns', { required: true }),
   ],
 };
 
@@ -114,11 +215,28 @@ const hasWell = (type: ChartType, id: WellId): boolean =>
   wellsFor(type).some((well) => well.id === id);
 
 /**
- * Types whose axis well is the multi-level drill hierarchy — every cartesian
- * type plus the table's "Rows" well (Region → Site → Priority row drilling).
+ * Cartesians get the explicit "Drill-down levels" sub-area under their axis
+ * well (axis chip is level 0; the sub-area lists query.drillLevels).
+ */
+export const hasDrillSubArea = (type: ChartType): boolean =>
+  wellsFor(type).some((well) => well.id === 'axis' && well.capacity === 'one');
+
+/**
+ * Types that keep query.drillLevels: cartesians (drill sub-area) plus the
+ * table, whose multi-field "Rows" well stores rows 2..n in the same array
+ * (Region → Site → Priority row drilling). Wire shape is unchanged.
  */
 export const supportsDrill = (type: ChartType): boolean =>
+  hasDrillSubArea(type) ||
   wellsFor(type).some((well) => well.id === 'axis' && well.capacity === 'many');
+
+/** Total measures the type can hold (slot count, or the values well's max). */
+const valuesMaxFor = (type: ChartType): number => {
+  const wells = wellsFor(type).filter((well) => well.id === 'values');
+  const slots = wells.filter((well) => well.slot !== undefined);
+  if (slots.length > 0) return slots.length;
+  return wells[0]?.max ?? Number.POSITIVE_INFINITY;
+};
 
 export const supportsSmallMultiples = (type: ChartType): boolean =>
   hasWell(type, 'smallMultiples');
@@ -126,7 +244,7 @@ export const supportsSmallMultiples = (type: ChartType): boolean =>
 /** Columns can land in any well; the values well converts them to countDistinct. */
 export const acceptsDimension = (_well: WellId): boolean => true;
 
-/** Measures only ever land in the values well (filters are column-based). */
+/** Measures only ever land in values wells (filters/drill are column-based). */
 export const acceptsMeasure = (well: WellId): boolean => well === 'values';
 
 /**
@@ -151,6 +269,7 @@ export const canAccept = (well: WellId, data: FieldDragData): boolean => {
   if (data.kind === 'parameter') {
     return data.paramKind === 'dimension' ? well === 'axis' : well === 'values';
   }
+  if (well === 'drill') return data.kind === 'column';
   return data.kind === 'column' ? acceptsDimension(well) : acceptsMeasure(well);
 };
 
@@ -168,17 +287,23 @@ const toDimension = (data: Extract<FieldDragData, { kind: 'column' }>): Dimensio
 const looksLikeIdentifier = (column: string): boolean =>
   /(^|_)(id|key|code|num|number|no)$/i.test(column) || /^id$/i.test(column);
 
-const toValueMeasure = (data: Exclude<FieldDragData, { kind: 'parameter' }>): MeasureRef =>
+const toValueMeasure = (
+  data: Exclude<FieldDragData, { kind: 'parameter' }>,
+  /** Well-level default (WellDef.defaultAggregation) — wins for column drops. */
+  defaultAggregation?: Aggregation,
+): MeasureRef =>
   data.kind === 'measure'
     ? { measureId: data.measureId }
     : {
         table: data.table,
         column: data.column,
-        aggregation: !isNumericType(data.type)
-          ? 'countDistinct'
-          : looksLikeIdentifier(data.column)
-            ? 'count'
-            : 'sum',
+        aggregation:
+          defaultAggregation ??
+          (!isNumericType(data.type)
+            ? 'countDistinct'
+            : looksLikeIdentifier(data.column)
+              ? 'count'
+              : 'sum'),
       };
 
 const sameMeasure = (a: MeasureRef, b: MeasureRef): boolean => {
@@ -188,16 +313,27 @@ const sameMeasure = (a: MeasureRef, b: MeasureRef): boolean => {
   return a.table === b.table && a.column === b.column && a.aggregation === b.aggregation;
 };
 
+const sameDimension = (a: DimensionRef, b: DimensionRef): boolean =>
+  a.table === b.table && a.column === b.column && (a.dateBucket ?? null) === (b.dateBucket ?? null);
+
+/** Axis + drill levels as one ordered list (the wire keeps them split). */
+const axisLevels = (query: ChartQuery): DimensionRef[] => [
+  ...(query.axis ? [query.axis] : []),
+  ...(query.drillLevels ?? []),
+];
+
 /**
  * Applies a validated drop to the query; invalid combinations are a no-op.
  * Filters-well drops are handled by ChartBuilder (they open the editor), so
- * they are a no-op here.
+ * they are a no-op here. `slot` (from a slot-well droppable) targets one
+ * measure index — scatter X/Y and the KPI value/comparison wells.
  */
 export const applyDrop = (
   type: ChartType,
   query: ChartQuery,
   well: WellId,
   data: FieldDragData,
+  slot?: number,
 ): ChartQuery => {
   if (well === 'filters' || !canAccept(well, data)) return query;
 
@@ -214,9 +350,21 @@ export const applyDrop = (
   }
 
   if (well === 'values') {
-    const ref = toValueMeasure(data);
+    const slotDef =
+      slot !== undefined
+        ? wellsFor(type).find((w) => w.id === 'values' && w.slot === slot)
+        : undefined;
+    const ref = toValueMeasure(data, slotDef?.defaultAggregation);
     if (query.measures.some((existing) => sameMeasure(existing, ref))) return query;
-    const max = wellsFor(type).find((w) => w.id === 'values')?.max ?? Number.POSITIVE_INFINITY;
+    if (slot !== undefined) {
+      // Slot wells replace their own index; a drop past the current list
+      // length appends (measure lists never carry holes on the wire).
+      const measures = [...query.measures];
+      if (slot < measures.length) measures[slot] = ref;
+      else measures.push(ref);
+      return { ...query, measures };
+    }
+    const max = valuesMaxFor(type);
     const measures =
       query.measures.length >= max
         ? [...query.measures.slice(0, max - 1), ref]
@@ -227,21 +375,24 @@ export const applyDrop = (
   if (data.kind !== 'column') return query;
   const ref = toDimension(data);
 
+  if (well === 'drill') {
+    // "+ Add level" under a cartesian axis: appends to query.drillLevels
+    // (exact duplicates of the axis or an existing level are a no-op). With
+    // no axis yet, the field becomes the axis itself.
+    if (!query.axis) return { ...query, axis: ref };
+    if (axisLevels(query).some((level) => sameDimension(level, ref))) return query;
+    return { ...query, drillLevels: [...(query.drillLevels ?? []), ref] };
+  }
+
   if (well === 'axis') {
-    // Drill-capable types append further dimensions below the axis (level 0);
-    // exact duplicates (same column AND bucket) are a no-op. Other types keep
-    // the classic replace-on-drop behavior.
-    if (supportsDrill(type) && query.axis) {
-      const levels = [query.axis, ...(query.drillLevels ?? [])];
-      const duplicate = levels.some(
-        (level) =>
-          level.table === ref.table &&
-          level.column === ref.column &&
-          (level.dateBucket ?? null) === (ref.dateBucket ?? null),
-      );
-      if (duplicate) return query;
+    const rowsWell = wellsFor(type).find((w) => w.id === 'axis')?.capacity === 'many';
+    if (rowsWell && query.axis) {
+      // Multi-field rows well (table): drops append the next row field.
+      if (axisLevels(query).some((level) => sameDimension(level, ref))) return query;
       return { ...query, drillLevels: [...(query.drillLevels ?? []), ref] };
     }
+    // Single-slot axis: replace, but never duplicate an existing drill level.
+    if ((query.drillLevels ?? []).some((level) => sameDimension(level, ref))) return query;
     return { ...query, axis: ref };
   }
 
@@ -257,15 +408,54 @@ export const clearParamBinding = (query: ChartQuery, key: 'axis' | 'measures'): 
   return { ...query, paramBindings: hasAny ? next : undefined };
 };
 
-/** Click-to-add routing: measures/numeric → values; temporal → axis; else first free dimension well. */
-export const defaultWellFor = (type: ChartType, query: ChartQuery, data: FieldDragData): WellId => {
-  if (data.kind === 'parameter') return data.paramKind === 'dimension' ? 'axis' : 'values';
-  if (data.kind === 'measure' || isNumericType(data.type)) return 'values';
-  if (isTemporalType(data.type) && hasWell(type, 'axis')) return 'axis';
-  if (hasWell(type, 'axis') && !query.axis) return 'axis';
-  if (hasWell(type, 'legend')) return 'legend';
-  if (hasWell(type, 'axis')) return 'axis';
-  return 'values';
+/** Where a click-to-add lands: a well plus (for slot wells) the measure index. */
+export interface DropTarget {
+  well: WellId;
+  slot?: number;
+}
+
+/**
+ * Click-to-add routing: measures/numeric → first free values slot; temporal →
+ * empty axis; other dimensions fill axis, then legend, then drill/rows.
+ */
+export const defaultWellFor = (
+  type: ChartType,
+  query: ChartQuery,
+  data: FieldDragData,
+): DropTarget => {
+  if (data.kind === 'parameter') {
+    return { well: data.paramKind === 'dimension' ? 'axis' : 'values' };
+  }
+  // Gantt routes DATE columns to the Start then End slots first — its axis is
+  // categorical (tasks) and the timeline is built from the two date measures.
+  if (type === 'gantt' && data.kind === 'column' && isTemporalType(data.type)) {
+    const dateSlots = wellsFor(type).filter(
+      (well) => well.id === 'values' && well.slot !== undefined && well.temporalHint,
+    );
+    const free = dateSlots.find((well) => (well.slot ?? 0) >= query.measures.length);
+    if (free) return { well: 'values', slot: free.slot };
+    if (!query.axis) return { well: 'axis' };
+    const last = dateSlots[dateSlots.length - 1];
+    if (last) return { well: 'values', slot: last.slot };
+  }
+  if (data.kind === 'measure' || isNumericType(data.type)) {
+    const slots = wellsFor(type).filter((well) => well.id === 'values' && well.slot !== undefined);
+    if (slots.length > 0) {
+      // First unfilled slot (the list has no holes, so "free" = past the end);
+      // when every slot is taken the LAST one is replaced.
+      const free = slots.find((well) => (well.slot ?? 0) >= query.measures.length);
+      return { well: 'values', slot: (free ?? slots[slots.length - 1]!).slot };
+    }
+    return { well: 'values' };
+  }
+  const axisEmpty = hasWell(type, 'axis') && !query.axis;
+  if (isTemporalType(data.type) && axisEmpty) return { well: 'axis' };
+  if (axisEmpty) return { well: 'axis' };
+  if (hasWell(type, 'legend') && !query.legend) return { well: 'legend' };
+  if (hasDrillSubArea(type)) return { well: 'drill' };
+  if (hasWell(type, 'axis')) return { well: 'axis' };
+  if (hasWell(type, 'legend')) return { well: 'legend' };
+  return { well: 'values' };
 };
 
 /**
@@ -278,6 +468,13 @@ export const normalizeQueryForType = (type: ChartType, query: ChartQuery): Chart
   if ((type === 'pie' || type === 'donut') && next.axis && !next.legend) {
     next = { ...next, legend: next.axis, axis: null };
   }
+  // The reverse carry: arriving at an axis-bearing type from pie/donut/scatter
+  // (axis empty, a slice/color dimension set) puts that dimension on the axis
+  // — switching pie → column keeps the chart whole instead of dropping to a
+  // single unlabeled bar.
+  if (hasWell(type, 'axis') && !next.axis && next.legend) {
+    next = { ...next, axis: next.legend, legend: null };
+  }
   if (!hasWell(type, 'axis') && next.axis) next = { ...next, axis: null };
   if (!hasWell(type, 'axis') && next.paramBindings?.axis != null) {
     next = clearParamBinding(next, 'axis');
@@ -289,14 +486,19 @@ export const normalizeQueryForType = (type: ChartType, query: ChartQuery): Chart
   if (!supportsSmallMultiples(type) && next.smallMultiples) {
     next = { ...next, smallMultiples: null };
   }
-  const max = wellsFor(type).find((w) => w.id === 'values')?.max;
-  if (max !== undefined && next.measures.length > max) {
+  const max = valuesMaxFor(type);
+  if (Number.isFinite(max) && next.measures.length > max) {
     next = { ...next, measures: next.measures.slice(0, max) };
   }
   return next;
 };
 
-/** Aggregations offered for an inline value chip; null type (no catalog) offers everything. */
+/**
+ * Aggregations offered for an inline value chip; null type (no catalog) offers
+ * everything. Temporal columns include Min/Max — the engine supports them on
+ * dates/timestamps (they return ISO strings; the gantt Start/End wells depend
+ * on this).
+ */
 export const aggregationOptionsFor = (type: ColumnType | null): readonly Aggregation[] =>
   type === null || isNumericType(type)
     ? ([
@@ -310,7 +512,9 @@ export const aggregationOptionsFor = (type: ColumnType | null): readonly Aggrega
         'count',
         'countDistinct',
       ] as const)
-    : (['count', 'countDistinct'] as const);
+    : isTemporalType(type)
+      ? (['min', 'max', 'count', 'countDistinct'] as const)
+      : (['count', 'countDistinct'] as const);
 
 // ---------------------------------------------------------------------------
 // Shared column/measure lookups

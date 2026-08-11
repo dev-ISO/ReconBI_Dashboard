@@ -1667,8 +1667,11 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             case BinaryNode binary:
                 var left = Render(binary.Left);
                 var right = Render(binary.Right);
+                // Decimal-cast the numerator: COUNT(*)/COUNT(*) would otherwise
+                // integer-divide to 0 or 1 (matches PERCENTOFTOTAL and
+                // periodChangePct, which already cast).
                 return binary.Operator == '/'
-                    ? $"({left} / NULLIF({right}, 0))"
+                    ? $"(CAST({left} AS decimal) / NULLIF({right}, 0))"
                     : $"({left} {binary.Operator} {right})";
 
             case ComparisonNode comparison:
@@ -1708,9 +1711,11 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             case DivideNode divide:
                 var numerator = Render(divide.Numerator);
                 var denominator = Render(divide.Denominator);
+                // Same decimal cast as bare '/': integer/integer must not
+                // integer-divide (DIVIDE([Closed], [Total]) was 0-or-1).
                 return divide.Alternate is null
-                    ? $"({numerator} / NULLIF({denominator}, 0))"
-                    : $"CASE WHEN {denominator} IS NULL OR {denominator} = 0 THEN {Render(divide.Alternate)} ELSE ({numerator} / {denominator}) END";
+                    ? $"(CAST({numerator} AS decimal) / NULLIF({denominator}, 0))"
+                    : $"CASE WHEN {denominator} IS NULL OR {denominator} = 0 THEN {Render(divide.Alternate)} ELSE (CAST({numerator} AS decimal) / {denominator}) END";
 
             case ScalarCallNode scalar:
                 var arguments = string.Join(", ", scalar.Arguments.Select(Render));

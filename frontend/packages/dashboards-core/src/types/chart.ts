@@ -21,6 +21,7 @@ export type ChartType =
   | 'pie'
   | 'donut'
   | 'scatter'
+  | 'gantt'
   | 'kpi'
   | 'table';
 
@@ -118,6 +119,39 @@ export interface TableOptions {
   density?: 'compact' | 'normal' | 'relaxed';
   /** Body font size px (default theme). */
   fontSize?: number;
+}
+
+/**
+ * Gantt-chart options (type 'gantt'). The query shape is: axis = the task
+ * dimension (one bar per value), measures[0] = start (typically Min of a
+ * date/timestamp column), measures[1] = end (Max), optional legend = group /
+ * color, optional measures[2] = progress. Progress accepts a 0-1 fraction OR
+ * a 0-100 percent — values above 1 are treated as percent and everything is
+ * clamped to 0..1. Every field is optional; defaults are noted per field.
+ */
+export interface GanttOptions {
+  /** Bar thickness px; undefined lets the chart fit bars to the row band. */
+  barSize?: number;
+  /** Bar corner radius px (default 3). */
+  cornerRadius?: number;
+  /**
+   * Where task names render: 'axis' = category axis rail (default);
+   * 'inside' = inside the bar (axis rail hidden); 'adjacent' = right after
+   * the bar end (axis rail hidden); 'off' = nowhere (axis rail hidden).
+   */
+  taskLabels?: 'axis' | 'inside' | 'adjacent' | 'off';
+  /** Vertical marker at the current date-time (default false). */
+  showToday?: boolean;
+  /** Today-line color (default a signal red). */
+  todayColor?: string;
+  /** Inner completion fill from the progress measure (default true when present). */
+  showProgress?: boolean;
+  /** Zebra row banding behind alternating tasks (default false). */
+  rowBanding?: boolean;
+  /** Paint every bar one color even when a group dimension is set (default false). */
+  singleColor?: boolean;
+  /** The bar color used in single-color mode / when there is no group. */
+  color?: string;
 }
 
 /** Date axis label presets for bucketed dimensions. */
@@ -329,6 +363,8 @@ export interface ChartFormat {
   selectionHighlight?: boolean;
   /** Table-chart behavior/layout (sorting, paging, totals, columns). */
   table?: TableOptions;
+  /** Gantt-chart behavior/looks (type 'gantt'; other types ignore it). */
+  gantt?: GanttOptions;
   /** Per-series line style, keyed like colorOverrides (line/area charts). */
   lineStyles?: Record<string, SeriesLineStyle>;
   tooltip?: TooltipStyle;

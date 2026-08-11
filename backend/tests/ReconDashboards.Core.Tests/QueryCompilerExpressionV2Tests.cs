@@ -125,7 +125,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT (SUM("t0"."order_total") / NULLIF(COUNT(*), 0)) AS "meas0"
+SELECT (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -138,7 +138,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT CASE WHEN COUNT(*) IS NULL OR COUNT(*) = 0 THEN 0 ELSE (SUM("t0"."order_total") / COUNT(*)) END AS "meas0"
+SELECT CASE WHEN COUNT(*) IS NULL OR COUNT(*) = 0 THEN 0 ELSE (CAST(SUM("t0"."order_total") AS decimal) / COUNT(*)) END AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -169,7 +169,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT ((POWER(ABS(SUM("t0"."order_total")), 2) / NULLIF(SQRT(COUNT(*)), 0)) + FLOOR(CEILING(EXP(LN(COUNT(*)))))) AS "meas0"
+SELECT ((CAST(POWER(ABS(SUM("t0"."order_total")), 2) AS decimal) / NULLIF(SQRT(COUNT(*)), 0)) + FLOOR(CEILING(EXP(LN(COUNT(*)))))) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -219,7 +219,7 @@ LIMIT @p1
         var compiled = Compile(SpecFor(outer), model);
 
         AssertSql("""
-SELECT ((SUM("t0"."order_total") / NULLIF(SUM("t1"."credit_limit"), 0)) * 100) AS "meas0"
+SELECT ((CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0)) * 100) AS "meas0"
 FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 LIMIT @p0

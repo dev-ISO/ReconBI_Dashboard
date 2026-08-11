@@ -139,6 +139,19 @@ const buildMatcher = (
   };
 };
 
+/**
+ * Flattens the renderer's multi-level sort echo (primary level + `thenBy`
+ * tie-breakers) into ordered levels; [] = unsorted. Mirrors TableChart's
+ * tableSortLevels — kept local so this dialog's imports from the renderer
+ * stay TYPE-ONLY and its lazy chunk split survives.
+ */
+const sortLevelsOf = (
+  sort: TableSortState | null,
+): { column: string; direction: 'asc' | 'desc' }[] =>
+  sort === null
+    ? []
+    : [{ column: sort.column, direction: sort.direction }, ...(sort.thenBy ?? [])];
+
 /** Ascending value order: numbers numerically, text by locale, blanks last. */
 const compareCells = (a: CellValue, b: CellValue): number => {
   if (a === null) return b === null ? 0 : 1;
@@ -188,7 +201,10 @@ export function SeeDataDialog({
   const runtime = useRuntime();
   const [fetchState, setFetchState] = useState<FetchState>({ status: 'loading' });
   const [retryToken, setRetryToken] = useState(0);
-  /** Dialog-scoped Excel-style column filters + sort (client-side, transient). */
+  /**
+   * Dialog-scoped Excel-style column filters + MULTI-LEVEL sort (client-side,
+   * transient): shift+click a header to add a level, exactly as in the tile.
+   */
   const [clientFilters, setClientFilters] = useState<TableColumnFilter[]>([]);
   const [clientSort, setClientSort] = useState<TableSortState | null>(null);
 
@@ -258,14 +274,24 @@ export function SeeDataDialog({
         .filter((m): m is (row: CellValue[]) => boolean => m !== null);
       if (matchers.length > 0) rows = rows.filter((row) => matchers.every((m) => m(row)));
     }
-    if (clientSort !== null) {
-      const index = baseResult.columns.findIndex((c) => c.name === clientSort.column);
-      if (index !== -1) {
-        const sign = clientSort.direction === 'desc' ? -1 : 1;
-        rows = [...rows].sort(
-          (ra, rb) => sign * compareCells(ra[index] ?? null, rb[index] ?? null),
-        );
-      }
+    // Multi-level sort: the renderer hands back every level (primary +
+    // `thenBy`), and each one becomes a term of the comparator CHAIN —
+    // later levels only decide ties left by the earlier ones. Array#sort is
+    // stable, so rows tied on every level keep their loaded order.
+    const chain = sortLevelsOf(clientSort)
+      .map((level) => ({
+        index: baseResult.columns.findIndex((c) => c.name === level.column),
+        sign: level.direction === 'desc' ? -1 : 1,
+      }))
+      .filter((term) => term.index !== -1);
+    if (chain.length > 0) {
+      rows = [...rows].sort((ra, rb) => {
+        for (const { index, sign } of chain) {
+          const order = sign * compareCells(ra[index] ?? null, rb[index] ?? null);
+          if (order !== 0) return order;
+        }
+        return 0;
+      });
     }
     return rows === baseResult.rows ? baseResult : { ...baseResult, rows };
   }, [baseResult, clientFilters, clientSort]);

@@ -20,6 +20,7 @@ import {
   type ConditionalRule,
   type ContainerStyle,
   type DateFormatPreset,
+  type GanttOptions,
   type ReferenceLineSpec,
   type SeriesLineStyle,
   type SmallMultiplesFormat,
@@ -38,8 +39,13 @@ export interface FormatPanelProps {
   onChange(format: ChartFormat): void;
 }
 
-/** Chart types with no cartesian axes; the Axes section hides for them. */
-const AXISLESS_TYPES: ReadonlyArray<ChartType> = ['pie', 'donut', 'kpi', 'table'];
+/**
+ * Chart types with no cartesian Axes/Analytics sections. Gantt belongs here
+ * even though it draws axes: its value axis is TIME derived from the data
+ * (no scale/format knobs apply) and its time-axis label controls live in the
+ * dedicated Gantt section instead.
+ */
+const AXISLESS_TYPES: ReadonlyArray<ChartType> = ['pie', 'donut', 'kpi', 'table', 'gantt'];
 
 /**
  * The category-axis cartesian family (ChartRenderer's CartesianChart path).
@@ -1396,7 +1402,16 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   });
 
   const container = format.container;
-  const showLegend = format.showLegend ?? seriesKeys.length >= 2;
+  // Mirrors the renderer's STABLE LEGEND defaults: dimension-labelled pies and
+  // legend-dimension charts legend themselves regardless of surviving series
+  // count; measure-series charts default on only with 2+ series.
+  const showLegend =
+    format.showLegend ??
+    (((spec.type === 'pie' || spec.type === 'donut') &&
+      (spec.query.axis != null || spec.query.legend != null)) ||
+    Boolean(spec.query.legend)
+      ? true
+      : seriesKeys.length >= 2);
   const legendInteractive = format.legendInteractive ?? true;
   const legendMode = format.legendMode ?? 'toggle';
   const hasAxes = !AXISLESS_TYPES.includes(spec.type);
@@ -1415,19 +1430,22 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const isScatter = spec.type === 'scatter';
   const isPieType = spec.type === 'pie' || spec.type === 'donut';
   const isTable = spec.type === 'table';
+  const isGantt = spec.type === 'gantt';
+  /** Gantt group colors come from the palette only while a group field is set. */
+  const ganttHasGroup = isGantt && spec.query.legend != null;
   /** Palette consumers (seriesColor/slice colors). KPI/table color via rules only. */
-  const showThemeSection = isCartesian || isScatter || isPieType;
-  /** Types that render a legend. Table's legendStyle/hoverHighlight uses live in its own section. */
-  const showLegendSection = isCartesian || isScatter || isPieType;
+  const showThemeSection = isCartesian || isScatter || isPieType || isGantt;
+  /** Types that render a legend. Gantt only grows one once a group field is set. */
+  const showLegendSection = isCartesian || isScatter || isPieType || ganttHasGroup;
   /** Zoom tools exist on vertical category-axis charts only (renderer: !horizontal, scatter has none). */
   const showZoomSection = isCartesian && !horizontal;
-  /** Table cells format via measure hints; format.valueFormat/showDataLabels are ignored there. */
-  const showValuesSection = !isTable;
+  /** Table/gantt ignore format.valueFormat + showDataLabels (dates, not numbers). */
+  const showValuesSection = !isTable && !isGantt;
   /** Series color swatches; KPI/table consume seriesLabels (names) only. */
-  const showSeriesColors = isCartesian || isScatter || isPieType;
+  const showSeriesColors = isCartesian || isScatter || isPieType || ganttHasGroup;
   const showSmallMultiplesSection = supportsSmallMultiples(spec.type);
-  /** Clicked-point emphasis: cartesian marks, slices and scatter groups. */
-  const showSelectionHighlight = isCartesian || isScatter || isPieType;
+  /** Clicked-point emphasis: cartesian marks, slices, scatter groups, gantt bars. */
+  const showSelectionHighlight = isCartesian || isScatter || isPieType || isGantt;
   // Renderer gridline defaults: lines from the VALUE axis on, category-axis
   // lines off; scatter (two value axes) draws both rule sets.
   const gridXDefault = isScatter ? true : horizontal;
@@ -1693,6 +1711,24 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.sharedY === false) next.sharedY = false;
     if (merged.showPanelTitles === false) next.showPanelTitles = false;
     patch({ smallMultiples: Object.keys(next).length > 0 ? next : undefined });
+  };
+
+  // --- Gantt (type 'gantt' behavior/looks; merge + prune like the others) ---
+  const setGantt = (partial: Partial<GanttOptions>) => {
+    const merged = { ...format.gantt, ...partial };
+    const next: GanttOptions = {};
+    if (merged.barSize !== undefined) next.barSize = merged.barSize;
+    if (merged.cornerRadius !== undefined) next.cornerRadius = merged.cornerRadius;
+    if (merged.taskLabels !== undefined && merged.taskLabels !== 'axis') {
+      next.taskLabels = merged.taskLabels;
+    }
+    if (merged.showToday) next.showToday = true;
+    if (merged.todayColor != null) next.todayColor = merged.todayColor;
+    if (merged.showProgress === false) next.showProgress = false;
+    if (merged.rowBanding) next.rowBanding = true;
+    if (merged.singleColor) next.singleColor = true;
+    if (merged.color != null) next.color = merged.color;
+    patch({ gantt: Object.keys(next).length > 0 ? next : undefined });
   };
 
   return (
@@ -2417,6 +2453,131 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           onChange={setCustomValueFormat}
         />
       </CollapsibleSection>
+      )}
+
+      {isGantt && (
+        <CollapsibleSection title="Gantt" {...sectionProps('gantt')}>
+          <h4 className={SUBHEAD_CLASS}>Bars</h4>
+          <NumberRow
+            label="Bar thickness"
+            min={4}
+            max={64}
+            placeholder="auto"
+            value={format.gantt?.barSize}
+            onChange={(next) => setGantt({ barSize: next })}
+          />
+          <NumberRow
+            label="Corner radius"
+            min={0}
+            max={16}
+            placeholder="3"
+            value={format.gantt?.cornerRadius}
+            onChange={(next) => setGantt({ cornerRadius: next })}
+          />
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Task labels
+            <RcdSelect
+              aria-label="Gantt task labels"
+              className="w-36 shrink-0"
+              value={format.gantt?.taskLabels ?? 'axis'}
+              onChange={(event) =>
+                setGantt({
+                  taskLabels: event.target.value as NonNullable<GanttOptions['taskLabels']>,
+                })
+              }
+            >
+              <option value="axis">Beside the axis</option>
+              <option value="inside">Inside the bar</option>
+              <option value="adjacent">After the bar</option>
+              <option value="off">Hidden</option>
+            </RcdSelect>
+          </label>
+          <CheckboxRow
+            label="Row banding"
+            checked={format.gantt?.rowBanding ?? false}
+            onChange={(checked) => setGantt({ rowBanding: checked || undefined })}
+          />
+          <CheckboxRow
+            label="Single color"
+            checked={format.gantt?.singleColor ?? false}
+            onChange={(checked) => setGantt({ singleColor: checked || undefined })}
+          />
+          {(Boolean(format.gantt?.singleColor) || spec.query.legend == null) && (
+            <ColorRow
+              label="Bar color"
+              value={format.gantt?.color}
+              fallback={DEFAULT_SWATCH}
+              onChange={(next) => setGantt({ color: next })}
+            />
+          )}
+          <p className="text-xs text-rcd-muted">
+            {spec.query.legend == null
+              ? 'Without a Group / color field every bar shares one color.'
+              : 'Single color ignores the group palette; per-group colors live under Series.'}
+          </p>
+
+          <h4 className={SUBHEAD_CLASS}>Overlays</h4>
+          <CheckboxRow
+            label="Today line"
+            checked={format.gantt?.showToday ?? false}
+            onChange={(checked) => setGantt({ showToday: checked || undefined })}
+          />
+          {Boolean(format.gantt?.showToday) && (
+            <ColorRow
+              label="Today color"
+              value={format.gantt?.todayColor}
+              fallback="#ef4444"
+              onChange={(next) => setGantt({ todayColor: next })}
+            />
+          )}
+          <CheckboxRow
+            label="Progress fill"
+            checked={format.gantt?.showProgress ?? true}
+            onChange={(checked) => setGantt({ showProgress: checked ? undefined : false })}
+          />
+          <p className="text-xs text-rcd-muted">
+            Needs a Progress field (0–1 or 0–100); drawn as a darker inner fill.
+          </p>
+
+          <h4 className={SUBHEAD_CLASS}>Time axis labels</h4>
+          <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+            Date labels
+            <RcdSelect
+              aria-label="Gantt time axis date format"
+              value={format.dateFormat ?? 'auto'}
+              onChange={(event) =>
+                patch({
+                  dateFormat:
+                    event.target.value === 'auto'
+                      ? undefined
+                      : (event.target.value as DateFormatPreset),
+                })
+              }
+            >
+              {DATE_FORMAT_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </RcdSelect>
+          </label>
+          <RcdInput
+            className="min-w-0 font-mono"
+            value={format.dateFormatPattern ?? ''}
+            placeholder="Custom mask, e.g. d MMM yy"
+            aria-label="Gantt time axis custom date mask"
+            onChange={(event) => patch({ dateFormatPattern: event.target.value || undefined })}
+          />
+          {Boolean(format.dateFormatPattern) && (
+            <p className="font-mono text-xs text-rcd-muted">
+              Today → {safeDatePattern(new Date(), format.dateFormatPattern ?? '')}
+            </p>
+          )}
+          <p className="text-xs text-rcd-muted">
+            Auto picks a tick unit from the date span (days → months → years); a preset or mask
+            overrides its labels.
+          </p>
+        </CollapsibleSection>
       )}
 
       {spec.type === 'table' && (

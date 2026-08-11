@@ -8,6 +8,8 @@ import {
   isSlicerTile,
   slicerClauseOf,
   type CrossFilter,
+  type CrossFilterScope,
+  type CrossFilterValue,
   type DashboardDetail,
   type DashboardLayoutDoc,
   type DashboardBookmark,
@@ -69,8 +71,14 @@ export interface DashboardStoreState {
    * live on the target tile's page.
    */
   slicerValues: SlicerValues;
-  /** Transient click-to-highlight filter; NOT persisted; reset on page switch. */
-  crossFilter: CrossFilter | null;
+  /**
+   * Transient click-to-highlight filters, AT MOST ONE PER (table, column) —
+   * applyCrossFilter enforces the invariant (a new click on an already
+   * filtered field replaces or merges into that field's entry; Ctrl/Cmd-click
+   * adds fields/values). NOT persisted. Reset on page switch under the
+   * default 'page' crossFilterScope; kept across pages under 'dashboard'.
+   */
+  crossFilters: CrossFilter[];
   /**
    * Transient page-wide hover highlight raised by hovering a datum on a chart
    * tile: every OTHER chart on the page whose effective axis/legend dimension
@@ -363,7 +371,7 @@ const initialState: DashboardStoreState = {
   activePageId: null,
   selectedTileId: null,
   slicerValues: {},
-  crossFilter: null,
+  crossFilters: [],
   hoverHighlight: null,
   parameterSelections: {},
   drillthrough: null,
@@ -434,7 +442,7 @@ export class DashboardStore {
       activePageId: firstPageId(current.layout),
       selectedTileId: null,
       slicerValues: {},
-      crossFilter: null,
+      crossFilters: [],
       hoverHighlight: null,
       parameterSelections: defaultParameterSelections(current.layout),
       drillthrough: null,
@@ -484,7 +492,7 @@ export class DashboardStore {
       dirty: false,
       draftBackup: null,
       selectedTileId: null,
-      crossFilter: null,
+      crossFilters: [],
       // The restore may drop pages/bookmarks these transients reference.
       drillthrough: null,
       lastAppliedBookmarkId: null,
@@ -557,9 +565,9 @@ export class DashboardStore {
       const { [tileId]: _removed, ...rest } = this.state.slicerValues;
       this.set({ slicerValues: rest });
     }
-    // Same for a removed cross-filter source chart.
-    if (this.state.crossFilter?.sourceTileId === tileId) {
-      this.set({ crossFilter: null });
+    // Same for filters raised from a removed cross-filter source chart.
+    if (this.state.crossFilters.some((f) => f.sourceTileId === tileId)) {
+      this.set({ crossFilters: this.state.crossFilters.filter((f) => f.sourceTileId !== tileId) });
     }
     // …and a removed hover-highlight source.
     if (this.state.hoverHighlight?.sourceTileId === tileId) {
@@ -758,8 +766,15 @@ export class DashboardStore {
       dirty: true,
       activePageId: page.id,
       selectedTileId: null,
-      crossFilter: null,
+      // Page-scoped cross-filters die with the page switch; dashboard-scoped
+      // ones survive (same doctrine as setActivePage).
+      ...(this.scopeOf() === 'page' ? { crossFilters: [] } : {}),
     });
+  }
+
+  /** Effective cross-filter scope of the open dashboard (default 'page'). */
+  private scopeOf(): CrossFilterScope {
+    return this.state.current?.layout.crossFilterScope ?? 'page';
   }
 
   renamePage(pageId: string, name: string): void {
@@ -798,7 +813,6 @@ export class DashboardStore {
     const nextPages = pages.filter((p) => p.id !== pageId);
     const neighbor = nextPages[Math.min(index, nextPages.length - 1)] ?? nextPages[0];
     const removedIds = new Set(removed.tiles.map((t) => t.id));
-    const cross = this.state.crossFilter;
     const selected = this.state.selectedTileId;
     // The removed page's page-scope cards and visual-scope cards targeting its
     // tiles are orphans — drop them (all-pages cards survive, of course).
@@ -823,7 +837,7 @@ export class DashboardStore {
       slicerValues: Object.fromEntries(
         Object.entries(this.state.slicerValues).filter(([id]) => !removedIds.has(id)),
       ),
-      crossFilter: cross && removedIds.has(cross.sourceTileId) ? null : cross,
+      crossFilters: this.state.crossFilters.filter((f) => !removedIds.has(f.sourceTileId)),
       // Drillthrough context tied to the removed page (either end) is orphaned.
       drillthrough:
         this.state.drillthrough &&
@@ -836,9 +850,11 @@ export class DashboardStore {
   }
 
   /**
-   * Switches the visible page. The transient cross-filter resets (its source
-   * chart is no longer on screen); slicer selections persist per their tiles
-   * and re-apply when their page is revisited. Never dirties the draft.
+   * Switches the visible page. Under the default 'page' cross-filter scope
+   * the transient cross-filters reset (their source charts are no longer on
+   * screen); under 'dashboard' scope they survive and keep filtering the new
+   * page's tiles. Slicer selections persist per their tiles and re-apply when
+   * their page is revisited. Never dirties the draft.
    */
   setActivePage(pageId: string): void {
     if (pageId === this.state.activePageId) return;
@@ -847,7 +863,7 @@ export class DashboardStore {
     // Page changes diverge from the last-applied bookmark (it captures pageId).
     this.set({
       activePageId: pageId,
-      crossFilter: null,
+      ...(this.scopeOf() === 'page' ? { crossFilters: [] } : {}),
       hoverHighlight: null,
       selectedTileId: null,
       lastAppliedBookmarkId: null,
@@ -994,35 +1010,138 @@ export class DashboardStore {
   /* -------------------------------------------------------------- filtering */
 
   /**
-   * Activates the click-to-highlight cross-filter emitted by a chart tile.
-   * Clicking the SAME datum on the same source again (same source tile +
-   * structurally identical clause, compared via stableStringify) toggles it
-   * off; any other click replaces the active filter (one at a time, v1).
+   * Activates/merges the click-to-highlight cross-filter emitted by a chart
+   * tile. Modifier semantics (Power BI-like; the caller maps clicks to
+   * `mode`):
+   *
+   *  - 'replace' (plain click, Shift+click): the clicked point's filter
+   *    becomes the ONLY active cross-filter. Clicking the currently sole
+   *    active selection again toggles everything off (historic feel).
+   *  - 'add' (Ctrl/Cmd+click): a DIFFERENT field gains its own filter
+   *    alongside the existing ones (one per table.column, AND-composed); the
+   *    SAME field toggles the clicked value in/out of that field's
+   *    accumulated set (clause becomes 'in'; removing the last value removes
+   *    the filter). Date-bucket fields cannot OR disjoint ranges in an
+   *    AND-composed filter list, so a Ctrl-click on a second bucket extends
+   *    the field's range to the SPANNING range (min start – max end) and the
+   *    label says so ('Jul 2025 – Sep 2025'); Ctrl-clicking the exact active
+   *    range toggles it off. Blank (isNull) cannot OR with values either —
+   *    Ctrl-clicking blank replaces that field's set with the blank filter
+   *    (and vice versa).
+   *
    * `kind` records what was clicked on the source ('axis' datum by default;
    * 'legend' for legendMode 'crossFilter' selections) — the filtering path is
    * identical, only the source tile's emphasis rendering differs.
    */
-  setCrossFilter(
-    sourceTileId: string,
-    clause: FilterClause,
-    label: string,
-    categoryLabel: string,
-    kind: 'axis' | 'legend' = 'axis',
-  ): void {
-    const active = this.state.crossFilter;
-    if (
-      active &&
-      active.sourceTileId === sourceTileId &&
-      stableStringify(active.clause) === stableStringify(clause)
-    ) {
-      this.set({ crossFilter: null });
+  applyCrossFilter(input: {
+    sourceTileId: string;
+    clause: FilterClause;
+    label: string;
+    categoryLabel: string;
+    kind?: 'axis' | 'legend';
+    mode?: 'replace' | 'add';
+  }): void {
+    const { mode = 'replace' } = input;
+    const filters = this.state.crossFilters;
+    const next = buildCrossFilter(input);
+    if (mode === 'replace') {
+      const sole = filters.length === 1 ? filters[0] : undefined;
+      if (
+        sole &&
+        sole.sourceTileId === input.sourceTileId &&
+        stableStringify(sole.clause) === stableStringify(input.clause)
+      ) {
+        this.set({ crossFilters: [] });
+        return;
+      }
+      this.set({ crossFilters: [next] });
       return;
     }
-    this.set({ crossFilter: { sourceTileId, clause, label, categoryLabel, kind } });
+    const key = crossFilterFieldKey(input.clause);
+    const index = filters.findIndex((f) => crossFilterFieldKey(f.clause) === key);
+    if (index === -1) {
+      this.set({ crossFilters: [...filters, next] });
+      return;
+    }
+    const existing = filters[index]!;
+    if (stableStringify(existing.clause) === stableStringify(input.clause)) {
+      // Ctrl-click on the field's exact active selection: toggle the field off.
+      this.set({ crossFilters: filters.filter((_, i) => i !== index) });
+      return;
+    }
+    const merged = mergeCrossFilters(existing, next);
+    this.set({
+      crossFilters:
+        merged === null
+          ? filters.filter((_, i) => i !== index)
+          : filters.map((f, i) => (i === index ? merged : f)),
+    });
   }
 
-  clearCrossFilter(): void {
-    if (this.state.crossFilter !== null) this.set({ crossFilter: null });
+  /**
+   * Replaces one field's accumulated value set outright (the indicator chip's
+   * "Edit value…" popover). Writes through the same shape Ctrl-click
+   * accumulation produces; an empty set removes the field's filter. No-op
+   * when the field has no active cross-filter (the popover only edits
+   * existing chips).
+   */
+  setCrossFilterValues(table: string, column: string, values: CrossFilterValue[]): void {
+    const filters = this.state.crossFilters;
+    const index = filters.findIndex(
+      (f) => f.clause.table === table && f.clause.column === column,
+    );
+    const existing = index === -1 ? undefined : filters[index];
+    if (!existing) return;
+    if (values.length === 0) {
+      this.set({ crossFilters: filters.filter((_, i) => i !== index) });
+      return;
+    }
+    const replacement = crossFilterFromValues(existing, values);
+    this.set({
+      crossFilters: filters.map((f, i) => (i === index ? replacement : f)),
+    });
+  }
+
+  /** Clears the one cross-filter on (table, column), leaving the rest active. */
+  removeCrossFilter(table: string, column: string): void {
+    const filters = this.state.crossFilters;
+    const next = filters.filter((f) => !(f.clause.table === table && f.clause.column === column));
+    if (next.length !== filters.length) this.set({ crossFilters: next });
+  }
+
+  /**
+   * Clears the filters a specific source tile raised (optionally only one
+   * kind) — the legend-clear path: a chart clearing its own legend selection
+   * must never wipe another tile's filters.
+   */
+  clearCrossFiltersFromSource(sourceTileId: string, kind?: 'axis' | 'legend'): void {
+    const filters = this.state.crossFilters;
+    const next = filters.filter(
+      (f) => !(f.sourceTileId === sourceTileId && (kind === undefined || (f.kind ?? 'axis') === kind)),
+    );
+    if (next.length !== filters.length) this.set({ crossFilters: next });
+  }
+
+  /** Clears every active cross-filter. */
+  clearCrossFilters(): void {
+    if (this.state.crossFilters.length > 0) this.set({ crossFilters: [] });
+  }
+
+  /**
+   * Sets the dashboard-wide cross-filter scope (persisted with the layout).
+   * Narrowing back to 'page' drops any filters whose source tile does not
+   * live on the active page — they only existed because of the wider scope.
+   */
+  setCrossFilterScope(scope: CrossFilterScope): void {
+    const current = this.state.current;
+    if (!current || (current.layout.crossFilterScope ?? 'page') === scope) return;
+    this.mutateLayout((layout) => ({ ...layout, crossFilterScope: scope }));
+    if (scope === 'page') {
+      const activeIds = new Set(this.activeTiles().map((t) => t.id));
+      const filters = this.state.crossFilters;
+      const next = filters.filter((f) => activeIds.has(f.sourceTileId));
+      if (next.length !== filters.length) this.set({ crossFilters: next });
+    }
   }
 
   /** Selections of the ACTIVE page's slicer tiles (other pages' slicers do not leak). */
@@ -1078,8 +1197,18 @@ export class DashboardStore {
     if (drillthrough && page !== undefined && page.id === drillthrough.targetPageId) {
       clauses.push(...drillthrough.filters);
     }
-    const cross = this.state.crossFilter;
-    if (cross && cross.sourceTileId !== tileId) clauses.push(cross.clause);
+    // Cross-filters: every active one applies except those the tile itself
+    // raised. Structurally identical clauses are pushed once — a cross-filter
+    // duplicating an active slicer selection on the same column must not
+    // stack the same predicate twice.
+    const seen = new Set(clauses.map((c) => stableStringify(c)));
+    for (const cross of this.state.crossFilters) {
+      if (cross.sourceTileId === tileId) continue;
+      const key = stableStringify(cross.clause);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      clauses.push(cross.clause);
+    }
     return clauses;
   }
 
@@ -1098,7 +1227,10 @@ export class DashboardStore {
     this.set({
       activePageId: targetPageId,
       drillthrough: { sourcePageId, targetPageId, filters: [...filters], label },
-      crossFilter: null,
+      // Drillthrough is an explicit navigation with its own filter context —
+      // active cross-filters clear regardless of scope so the target page
+      // never double-filters.
+      crossFilters: [],
       selectedTileId: null,
       lastAppliedBookmarkId: null,
     });
@@ -1121,7 +1253,7 @@ export class DashboardStore {
       ...(sourceExists
         ? {
             activePageId: drillthrough.sourcePageId,
-            crossFilter: null,
+            crossFilters: [],
             selectedTileId: null,
           }
         : {}),
@@ -1174,8 +1306,9 @@ export class DashboardStore {
       slicerValues: structuredClone(bookmark.state.slicers),
       filterCardOverrides: structuredClone(bookmark.state.filterOverrides),
       // A bookmark restores its FULL captured filter context — transient
-      // cross-filter/drillthrough state would pollute it.
-      crossFilter: null,
+      // cross-filter/drillthrough state would pollute it. (Bookmarks capture
+      // slicers + filter-card overrides, never cross-filters — unchanged.)
+      crossFilters: [],
       drillthrough: null,
       selectedTileId: null,
       lastAppliedBookmarkId: id,
@@ -1282,6 +1415,149 @@ export class DashboardStore {
     this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
   }
 }
+
+/* ----------------------------------------------------- cross-filter merging
+ * One CrossFilter per (table, column) — these helpers own the invariant.
+ */
+
+const crossFilterFieldKey = (clause: FilterClause): string =>
+  `${clause.table}\u0000${clause.column}`;
+
+/** Two CrossFilterValue raws denote the same cell (null only matches null). */
+const sameRaw = (a: FilterValue | null, b: FilterValue | null): boolean =>
+  a === null || b === null ? a === b : typeof a === typeof b ? a === b : String(a) === String(b);
+
+/**
+ * A fresh CrossFilter from one click. Discrete clauses (eq/isNull) get their
+ * value set seeded so later Ctrl-clicks can toggle; 'between' (date bucket)
+ * clauses get endpoint labels so span extensions can label the merged range.
+ */
+const buildCrossFilter = (input: {
+  sourceTileId: string;
+  clause: FilterClause;
+  label: string;
+  categoryLabel: string;
+  kind?: 'axis' | 'legend';
+}): CrossFilter => {
+  const { sourceTileId, clause, label, categoryLabel, kind = 'axis' } = input;
+  const base: CrossFilter = { sourceTileId, clause, label, categoryLabel, kind };
+  if (clause.operator === 'eq') {
+    return { ...base, values: [{ raw: clause.values[0] ?? null, label: categoryLabel }] };
+  }
+  if (clause.operator === 'isNull') {
+    return { ...base, values: [{ raw: null, label: categoryLabel }] };
+  }
+  if (clause.operator === 'between') {
+    return { ...base, rangeLabels: { start: categoryLabel, end: categoryLabel } };
+  }
+  return base;
+};
+
+/** The discrete value set behind a filter (null = not a discrete filter). */
+const discreteValuesOf = (filter: CrossFilter): CrossFilterValue[] | null => {
+  if (filter.values !== undefined) return filter.values;
+  const { clause } = filter;
+  if (clause.operator === 'eq') {
+    return [{ raw: clause.values[0] ?? null, label: filter.categoryLabel }];
+  }
+  if (clause.operator === 'isNull') return [{ raw: null, label: filter.categoryLabel }];
+  if (clause.operator === 'in') {
+    return clause.values.map((raw) => ({ raw, label: String(raw) }));
+  }
+  return null;
+};
+
+/**
+ * Rebuilds a field's filter from an explicit discrete value set (Ctrl-click
+ * toggling and the "Edit value…" popover). The set is never empty here
+ * (callers remove the filter instead). A lone blank compiles to isNull; a
+ * blank mixed with values is unrepresentable (no OR in the clause
+ * vocabulary), so blanks are dropped when values are present.
+ */
+const crossFilterFromValues = (
+  template: CrossFilter,
+  values: CrossFilterValue[],
+): CrossFilter => {
+  const { table, column } = template.clause;
+  const nonNull = values.filter((v): v is CrossFilterValue & { raw: FilterValue } => v.raw !== null);
+  const kept = nonNull.length > 0 ? nonNull : values.slice(0, 1);
+  const categoryLabel = kept.map((v) => v.label).join(', ');
+  const clause: FilterClause =
+    nonNull.length === 0
+      ? { table, column, operator: 'isNull', values: [] }
+      : nonNull.length === 1
+        ? { table, column, operator: 'eq', values: [nonNull[0]!.raw] }
+        : { table, column, operator: 'in', values: nonNull.map((v) => v.raw) };
+  return {
+    sourceTileId: template.sourceTileId,
+    clause,
+    label: `${column}: ${categoryLabel}`,
+    categoryLabel,
+    kind: template.kind ?? 'axis',
+    values: kept,
+  };
+};
+
+/**
+ * Ctrl-click merge of an incoming single-click filter into the field's
+ * existing one (same table.column, clauses differ — identical clauses toggle
+ * off before this runs). Returns null when the merge empties the field.
+ *
+ *  - discrete + discrete: toggle the clicked value in/out of the set;
+ *  - between + between: extend to the SPANNING range (min start, max end) —
+ *    OR-of-disjoint-ranges is not expressible in the AND-composed filter
+ *    list, so the honest behavior is the labeled span;
+ *  - blank vs values / range vs discrete (bucket changed mid-session): the
+ *    incoming filter replaces the field's entry.
+ */
+const mergeCrossFilters = (existing: CrossFilter, incoming: CrossFilter): CrossFilter | null => {
+  if (existing.clause.operator === 'between' && incoming.clause.operator === 'between') {
+    const exStart = String(existing.clause.values[0] ?? '');
+    const exEnd = String(existing.clause.values[1] ?? '');
+    const inStart = String(incoming.clause.values[0] ?? '');
+    const inEnd = String(incoming.clause.values[1] ?? '');
+    // ISO date strings compare correctly as text.
+    const exLabels = existing.rangeLabels ?? {
+      start: existing.categoryLabel,
+      end: existing.categoryLabel,
+    };
+    const inLabels = incoming.rangeLabels ?? {
+      start: incoming.categoryLabel,
+      end: incoming.categoryLabel,
+    };
+    const start = inStart < exStart ? inStart : exStart;
+    const end = inEnd > exEnd ? inEnd : exEnd;
+    const startLabel = inStart < exStart ? inLabels.start : exLabels.start;
+    const endLabel = inEnd > exEnd ? inLabels.end : exLabels.end;
+    const categoryLabel = startLabel === endLabel ? startLabel : `${startLabel} – ${endLabel}`;
+    const { table, column } = incoming.clause;
+    return {
+      sourceTileId: incoming.sourceTileId,
+      clause: { table, column, operator: 'between', values: [start, end] },
+      label: `${column}: ${categoryLabel}`,
+      categoryLabel,
+      kind: incoming.kind ?? existing.kind ?? 'axis',
+      rangeLabels: { start: startLabel, end: endLabel },
+    };
+  }
+  const existingValues = discreteValuesOf(existing);
+  const incomingValues = discreteValuesOf(incoming);
+  const clicked = incomingValues?.[0];
+  if (existingValues === null || incomingValues === null || clicked === undefined) {
+    // Shape mismatch (range vs discrete) — the new click wins the field.
+    return incoming;
+  }
+  // Blank cannot OR with values: clicking blank over values (or a value over
+  // blank) replaces the field's selection.
+  if (clicked.raw === null || existingValues.some((v) => v.raw === null)) return incoming;
+  const index = existingValues.findIndex((v) => sameRaw(v.raw, clicked.raw));
+  const nextValues =
+    index === -1
+      ? [...existingValues, clicked]
+      : existingValues.filter((_, i) => i !== index);
+  if (nextValues.length === 0) return null;
+  return crossFilterFromValues(incoming, nextValues);
+};
 
 /** Clamp an option index into [0, count-1] (0 when the list is empty). */
 const clampIndex = (index: number, count: number): number =>

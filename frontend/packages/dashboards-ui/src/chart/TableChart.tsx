@@ -30,13 +30,42 @@ import {
 } from '@recon/dashboards-core';
 import { conditionalColor, matchRuleColor } from './analytics';
 import { textStyleToCss } from './textStyle';
-import type { ChartDatumClickInfo } from './ChartRenderer';
+import type { ChartDatumClickInfo, ChartSelection } from './ChartRenderer';
 
-/** Active header sort (column = result column NAME; null = unsorted). */
-export interface TableSortState {
+/** One sort level: a result column NAME plus its direction. */
+export interface TableSortLevel {
+  /** Result column NAME. */
   column: string;
   direction: 'asc' | 'desc';
 }
+
+/**
+ * Active header sort (null = unsorted). MULTI-LEVEL: the object itself is the
+ * PRIMARY level and `thenBy` carries the tie-breakers in priority order, so
+ * every consumer that only reads {column, direction} keeps seeing the primary
+ * sort exactly as before (the pass-through layers between this renderer and
+ * the tile are typed on that narrower shape and forward the value verbatim).
+ * Use `tableSortLevels` / `tableSortFromLevels` to work with the flat list.
+ */
+export interface TableSortState extends TableSortLevel {
+  /** Levels applied AFTER the primary one, in priority order (2nd, 3rd, …). */
+  thenBy?: TableSortLevel[];
+}
+
+/** Flattens a sort state into its ordered levels ([] = unsorted). */
+export const tableSortLevels = (sort: TableSortState | null | undefined): TableSortLevel[] =>
+  sort ? [{ column: sort.column, direction: sort.direction }, ...(sort.thenBy ?? [])] : [];
+
+/** Inverse of `tableSortLevels`: head + tail ([] = null = unsorted). */
+export const tableSortFromLevels = (levels: TableSortLevel[]): TableSortState | null => {
+  const [first, ...rest] = levels;
+  if (!first) return null;
+  return {
+    column: first.column,
+    direction: first.direction,
+    ...(rest.length > 0 ? { thenBy: rest } : null),
+  };
+};
 
 /** Partial layout change from a resize/reorder gesture; consumer merges it. */
 export interface TableLayoutPatch {
@@ -87,6 +116,27 @@ export type TableColumnFilter = { column: string } & (
   | { kind: 'condition'; operator: TableFilterOperator; values: (string | number)[] }
 );
 
+/**
+ * Echo of the cross-filter THIS table is currently driving, so the source row(s)
+ * can mark themselves. Structurally a SUPERSET of the renderer's ChartSelection
+ * (wave 12), so ChartRenderer forwards its own `selection` prop verbatim:
+ *
+ * - `category` / `legendValue` are the single-value facets. A table has one
+ *   interaction identity (its first dimension column), so EITHER facet matching
+ *   a row marks it — unlike the cartesian charts, where the two facets address
+ *   different axes and must both match.
+ * - `categories` carries a Ctrl-accumulated MULTI-value set; every row matching
+ *   any entry is marked. Optional: the consumer that only has the wave-12
+ *   single-value contract simply omits it.
+ *
+ * Matching uses the same rule the cartesian/pie selection uses — the formatted
+ * label, or a stringified RAW cell — so consumers may echo either form.
+ */
+export interface TableSelection extends ChartSelection {
+  /** Ctrl-accumulated multi-select; each entry matched like `category`. */
+  categories?: readonly string[] | null;
+}
+
 export interface TableChartProps {
   spec: ChartSpec;
   result: QueryResult;
@@ -97,9 +147,24 @@ export interface TableChartProps {
   onPointHover?: (e: ChartPointEvent | null) => void;
   /** Page-level hover highlight echo: NON-matching rows dim (see ChartRenderer). */
   highlightCategory?: { label: string } | null;
-  /** Echo of the tile's server-side sort; drives the header indicators only. */
+  /**
+   * The row value(s) driving THIS table's own active cross-filter. Matching
+   * rows render an accent left bar plus a tinted background for as long as the
+   * filter holds, and go back to normal the moment it clears. Opted out of by
+   * format.selectionHighlight === false, like every other selection marking.
+   */
+  selection?: TableSelection | null;
+  /**
+   * Echo of the tile's server-side sort (all levels); drives the header
+   * indicators only — arrows plus a priority badge while multi-level.
+   */
   tableSort?: TableSortState | null;
-  /** Header click cycles asc -> desc -> none. Gated by table.sortable !== false. */
+  /**
+   * Header click cycles asc -> desc -> none on that column ALONE (replacing
+   * every level); SHIFT+click appends it as the next level, or cycles that
+   * level asc -> desc -> removed while keeping its position. The menu's sort
+   * rows drive the same two actions explicitly. Gated by table.sortable.
+   */
   onTableSortChange?: (s: TableSortState | null) => void;
   /** 0-based page index the TILE is currently serving (default 0). */
   tablePage?: number;
@@ -144,6 +209,21 @@ const FALLBACK_COLUMN_WIDTH = 120;
 /** Theme-neutral zebra/hover overlay tint (works on light and dark surfaces). */
 const STRIPE_TINT = 'rgba(127, 127, 127, 0.07)';
 
+/**
+ * Row(s) driving this table's active cross-filter: a translucent accent wash
+ * that LAYERS over whatever the cell already paints (zebra stripe, pinned
+ * surface, conditional-format fill), so the mark never hides the data.
+ */
+const SELECTION_TINT = 'color-mix(in srgb, var(--rcd-accent-interactive) 16%, transparent)';
+
+/**
+ * The accent bar down the left edge of a selected row — same
+ * --rcd-accent-interactive the charts' selection ring uses, so a filtering
+ * table row and a filtering bar/slice read as one system. Painted as an inset
+ * shadow on the row's FIRST cell (a border would shift the column width).
+ */
+const SELECTION_BAR = 'inset 3px 0 0 var(--rcd-accent-interactive)';
+
 /** Row heights (px) per table.density. */
 const DENSITY_ROW_HEIGHTS = { compact: 28, normal: 36, relaxed: 44 } as const;
 
@@ -163,7 +243,16 @@ const COLUMN_VALUES_CAP = 200;
  * scrolled content bleed through. Non-pinned cells just take the tint.
  */
 const pinnedBackground = (tint: string | null): string =>
-  tint ? `linear-gradient(${tint}, ${tint}), var(--rcd-surface)` : 'var(--rcd-surface)';
+  tint ? tintOver(tint, 'var(--rcd-surface)') : 'var(--rcd-surface)';
+
+/**
+ * Layers a translucent tint over an existing paint. A flat two-stop gradient is
+ * the only way a `background` shorthand can stack a tint on top of another
+ * color/gradient; the base rides as the shorthand's final (color) layer.
+ */
+function tintOver(tint: string, base: string): string {
+  return `linear-gradient(${tint}, ${tint}), ${base}`;
+}
 
 interface ColumnLayout {
   column: QueryColumn;
@@ -209,9 +298,22 @@ interface HeaderMenuPanelProps {
   displayLabel: string;
   position: { top: number; left: number };
   onClose: () => void;
-  /** Sort section (null = column not sortable / no consumer). */
+  /** This column's direction in the active sort; null = not a sort level. */
   sorted: 'asc' | 'desc' | null;
-  onSortChange?: (s: TableSortState | null) => void;
+  /** 1-based priority of this column among the levels; 0 = not a level. */
+  sortPriority: number;
+  /** How many sort levels are active across the whole table. */
+  sortLevelCount: number;
+  /**
+   * Sort section (absent = column not sortable / no consumer). `additive`
+   * false replaces every level with this column; true adds it as the next
+   * level (or re-points its existing level, keeping the position).
+   */
+  onSort?: (direction: 'asc' | 'desc', additive: boolean) => void;
+  /** Drops THIS column's level, keeping the others. */
+  onRemoveSortLevel?: () => void;
+  /** Clears every level. */
+  onClearSort?: () => void;
   /** Filter section (undefined = no filter consumer -> sort-only menu). */
   filter?: TableColumnFilter | null;
   onCommitFilter?: (filter: TableColumnFilter | null) => void;
@@ -230,7 +332,11 @@ function HeaderMenuPanel({
   position,
   onClose,
   sorted,
-  onSortChange,
+  sortPriority,
+  sortLevelCount,
+  onSort,
+  onRemoveSortLevel,
+  onClearSort,
   filter = null,
   onCommitFilter,
   onRequestColumnValues,
@@ -384,6 +490,18 @@ function HeaderMenuPanel({
     onClose();
   };
 
+  // ---- sort section wording (Excel-like, type-aware) ------------------------
+  const ascWord = textual ? 'A→Z' : 'smallest to largest';
+  const descWord = textual ? 'Z→A' : 'largest to smallest';
+  /** This column is the ENTIRE sort — the plain "Sort …" rows describe it. */
+  const isSoleLevel = sortPriority === 1 && sortLevelCount === 1;
+  /**
+   * The add/extend rows only appear once they mean something: some sort is
+   * already active AND it is not just this column on its own.
+   */
+  const showAddRows = sortLevelCount > 0 && !isSoleLevel;
+  const addPrefix = sortPriority > 0 ? `Level ${sortPriority}: ` : 'Add to sort: ';
+
   const sortRow = (
     label: string,
     active: boolean,
@@ -439,18 +557,41 @@ function HeaderMenuPanel({
         style={{ top: position.top, left: position.left, maxHeight: 'calc(100vh - 16px)' }}
         className="fixed z-[71] flex w-64 flex-col overflow-hidden rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-lg"
       >
-        {onSortChange && (
+        {onSort && (
           <>
-            {sortRow('Sort A→Z', sorted === 'asc', () =>
-              onSortChange({ column: column.name, direction: 'asc' }),
+            {/* Replace-everything rows: checked only when this column IS the
+                whole sort (a lone level in that direction). */}
+            {sortRow(`Sort ${ascWord}`, isSoleLevel && sorted === 'asc', () => onSort('asc', false))}
+            {sortRow(`Sort ${descWord}`, isSoleLevel && sorted === 'desc', () => onSort('desc', false))}
+            {showAddRows && (
+              <>
+                <div className="my-1 border-t border-rcd-border" />
+                {sortRow(
+                  `${addPrefix}${ascWord}`,
+                  !isSoleLevel && sorted === 'asc',
+                  () => onSort('asc', true),
+                )}
+                {sortRow(
+                  `${addPrefix}${descWord}`,
+                  !isSoleLevel && sorted === 'desc',
+                  () => onSort('desc', true),
+                )}
+              </>
             )}
-            {sortRow('Sort Z→A', sorted === 'desc', () =>
-              onSortChange({ column: column.name, direction: 'desc' }),
+            {sortPriority > 0 && sortLevelCount > 1 && (
+              <>
+                {sortRow('Remove from sort', false, () => onRemoveSortLevel?.())}
+              </>
             )}
-            {sortRow('Clear sort', false, () => onSortChange(null), sorted === null)}
+            {sortRow(
+              sortLevelCount > 1 ? `Clear sort (${sortLevelCount} levels)` : 'Clear sort',
+              false,
+              () => onClearSort?.(),
+              sortLevelCount === 0,
+            )}
           </>
         )}
-        {onSortChange && onCommitFilter && <div className="my-1 border-t border-rcd-border" />}
+        {onSort && onCommitFilter && <div className="my-1 border-t border-rcd-border" />}
         {onCommitFilter && (
           <div className="flex min-h-0 flex-col gap-2 px-2.5 pb-1 pt-1.5">
             {canListValues && (
@@ -582,18 +723,28 @@ function HeaderMenuPanel({
   );
 }
 
-/** Estimated menu height for viewport clamping (values list makes it tall). */
-const menuEstimatedHeight = (hasValues: boolean, hasSort: boolean): number =>
-  (hasSort ? 92 : 0) + (hasValues ? 300 : 90);
+/**
+ * Estimated menu height for viewport clamping (values list makes it tall).
+ * `sortRows` = 0 when the column is not sortable; the multi-level rows make
+ * the sort section grow, so it is measured in rows rather than assumed.
+ */
+const menuEstimatedHeight = (hasValues: boolean, sortRows: number): number =>
+  (sortRows > 0 ? sortRows * 28 + 8 : 0) + (hasValues ? 300 : 90);
 
 interface HeaderMenuProps {
   column: QueryColumn;
   displayLabel: string;
   sorted: 'asc' | 'desc' | null;
+  /** 1-based sort priority of this column (0 = not a sort level). */
+  sortPriority: number;
+  /** Active sort levels across the table (drives the level-aware rows). */
+  sortLevelCount: number;
   filtered: boolean;
   sortEnabled: boolean;
   filter: TableColumnFilter | null;
-  onSortChange?: (s: TableSortState | null) => void;
+  onSort?: (direction: 'asc' | 'desc', additive: boolean) => void;
+  onRemoveSortLevel?: () => void;
+  onClearSort?: () => void;
   onCommitFilter?: (filter: TableColumnFilter | null) => void;
   onRequestColumnValues?: (column: string) => Promise<CellValue[]>;
 }
@@ -609,10 +760,14 @@ function HeaderMenu({
   column,
   displayLabel,
   sorted,
+  sortPriority,
+  sortLevelCount,
   filtered,
   sortEnabled,
   filter,
-  onSortChange,
+  onSort,
+  onRemoveSortLevel,
+  onClearSort,
   onCommitFilter,
   onRequestColumnValues,
 }: HeaderMenuProps) {
@@ -629,9 +784,17 @@ function HeaderMenu({
     const rect = triggerRef.current?.getBoundingClientRect();
     if (!rect) return;
     const width = 256; // w-64
+    // Rows: 2 replace + clear, + 2 add/extend rows once a sort exists that is
+    // not this column alone, + "Remove from sort" on a shared level.
+    const soleLevel = sortPriority === 1 && sortLevelCount === 1;
+    const sortRows = sortEnabled
+      ? 3 +
+        (sortLevelCount > 0 && !soleLevel ? 2 : 0) +
+        (sortPriority > 0 && sortLevelCount > 1 ? 1 : 0)
+      : 0;
     const estimatedHeight = menuEstimatedHeight(
       Boolean(onRequestColumnValues) && Boolean(onCommitFilter),
-      sortEnabled,
+      sortRows,
     );
     const left = Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8));
     const below = rect.bottom + 4;
@@ -672,7 +835,11 @@ function HeaderMenu({
           position={menuPos}
           onClose={() => setMenuPos(null)}
           sorted={sorted}
-          onSortChange={sortEnabled ? onSortChange : undefined}
+          sortPriority={sortPriority}
+          sortLevelCount={sortLevelCount}
+          onSort={sortEnabled ? onSort : undefined}
+          onRemoveSortLevel={sortEnabled ? onRemoveSortLevel : undefined}
+          onClearSort={sortEnabled ? onClearSort : undefined}
           filter={filter}
           onCommitFilter={onCommitFilter}
           onRequestColumnValues={onRequestColumnValues}
@@ -700,6 +867,7 @@ export function TableChart({
   onPointContextMenu,
   onPointHover,
   highlightCategory = null,
+  selection = null,
   tableSort = null,
   onTableSortChange,
   tablePage = 0,
@@ -855,17 +1023,68 @@ export function TableChart({
     onTableLayoutChange?.({ columnOrder: names });
   };
 
-  // ---- sorting -------------------------------------------------------------
+  // ---- sorting (multi-level) -----------------------------------------------
   const sortable = table.sortable !== false && Boolean(onTableSortChange);
-  const cycleSort = (name: string) => {
+  /** Active levels in priority order; index 0 = primary. */
+  const sortLevels = tableSortLevels(tableSort);
+  const sortIndexOf = (name: string): number =>
+    sortLevels.findIndex((level) => level.column === name);
+  const emitLevels = (levels: TableSortLevel[]) =>
+    onTableSortChange?.(tableSortFromLevels(levels));
+
+  /**
+   * Header click. `additive` (shift) EXTENDS the sort: an unsorted column
+   * becomes the next level, an existing level cycles asc -> desc -> removed
+   * in place. A plain click collapses back to a single level on this column,
+   * cycling asc -> desc -> unsorted only when it already IS the whole sort.
+   */
+  const cycleSort = (name: string, additive: boolean) => {
     if (!onTableSortChange) return;
-    if (!tableSort || tableSort.column !== name) {
-      onTableSortChange({ column: name, direction: 'asc' });
-    } else if (tableSort.direction === 'asc') {
-      onTableSortChange({ column: name, direction: 'desc' });
-    } else {
-      onTableSortChange(null);
+    const index = sortIndexOf(name);
+    const current = index === -1 ? null : (sortLevels[index] ?? null);
+    if (!additive) {
+      const sole = index === 0 && sortLevels.length === 1;
+      if (!sole || current === null) {
+        onTableSortChange({ column: name, direction: 'asc' });
+      } else if (current.direction === 'asc') {
+        onTableSortChange({ column: name, direction: 'desc' });
+      } else {
+        onTableSortChange(null);
+      }
+      return;
     }
+    if (current === null) {
+      emitLevels([...sortLevels, { column: name, direction: 'asc' }]);
+      return;
+    }
+    const next = [...sortLevels];
+    if (current.direction === 'asc') next[index] = { column: name, direction: 'desc' };
+    else next.splice(index, 1);
+    emitLevels(next);
+  };
+
+  /** Menu action: set this column's direction, replacing or extending. */
+  const setSortDirection = (name: string, direction: 'asc' | 'desc', additive: boolean) => {
+    if (!onTableSortChange) return;
+    if (!additive) {
+      onTableSortChange({ column: name, direction });
+      return;
+    }
+    const index = sortIndexOf(name);
+    if (index === -1) {
+      emitLevels([...sortLevels, { column: name, direction }]);
+      return;
+    }
+    const next = [...sortLevels];
+    next[index] = { column: name, direction };
+    emitLevels(next);
+  };
+
+  /** Menu action: drop just this column's level, keeping the others' order. */
+  const removeSortLevel = (name: string) => {
+    const index = sortIndexOf(name);
+    if (index === -1) return;
+    emitLevels(sortLevels.filter((_, i) => i !== index));
   };
 
   // ---- header-menu filters -------------------------------------------------
@@ -903,6 +1122,30 @@ export function TableChart({
         })
       : null;
   const clickable = Boolean(handleRowClick) || Boolean(rowEvent && onPointClick);
+
+  // ---- selection: the row(s) driving this table's own cross-filter ---------
+  // Facets are flattened once per render: the accumulated set first, then the
+  // two single-value facets (either may name the click column on a table — see
+  // TableSelection). Empty list = nothing selected, so no row work happens.
+  const selectionFacets: string[] =
+    format.selectionHighlight === false || selection === null || clickColumn === null
+      ? []
+      : [...(selection.categories ?? []), selection.category, selection.legendValue].filter(
+          (facet): facet is string => typeof facet === 'string',
+        );
+  /**
+   * Does this row's click-column value drive the active cross-filter? Same rule
+   * the cartesian/pie selection uses: the FORMATTED label, or a stringified RAW
+   * cell, so the consumer may echo back either form.
+   */
+  const rowSelected = (row: CellValue[]): boolean => {
+    if (selectionFacets.length === 0) return false;
+    const label = rowLabel(row);
+    const raw = row[clickIndex] ?? null;
+    return selectionFacets.some(
+      (facet) => facet === label || (raw !== null && String(raw) === facet),
+    );
+  };
 
   // ---- data bars: scale to the DISPLAYED rows' max |value| per column ------
   const dataBars = new Map<
@@ -994,7 +1237,8 @@ export function TableChart({
               {layout.map((l) => {
                 const { column } = l;
                 const pinned = l.pinnedLeft !== null;
-                const sorted = tableSort?.column === column.name ? tableSort.direction : null;
+                const sortIndex = sortIndexOf(column.name);
+                const sorted = sortLevels[sortIndex]?.direction ?? null;
                 const filter = filterFor(column.name);
                 return (
                   <th
@@ -1026,7 +1270,19 @@ export function TableChart({
                       setDragColumn(null);
                       setDropTarget(null);
                     }}
-                    onClick={sortable ? () => cycleSort(column.name) : undefined}
+                    // Shift+click extends the sort instead of replacing it
+                    // (the th is already select-none, so the modifier click
+                    // cannot start a text selection).
+                    onClick={sortable ? (e) => cycleSort(column.name, e.shiftKey) : undefined}
+                    aria-sort={
+                      !sortable
+                        ? undefined
+                        : sorted === 'asc'
+                          ? 'ascending'
+                          : sorted === 'desc'
+                            ? 'descending'
+                            : 'none'
+                    }
                     style={{
                       background: headerBackground,
                       color: headerColor,
@@ -1049,7 +1305,9 @@ export function TableChart({
                     className={`group sticky top-0 select-none px-3 py-2 text-xs ${
                       pinned ? 'z-30' : 'z-20'
                     } ${sortable ? 'cursor-pointer' : ''}`}
-                    title={sortable ? 'Click to sort' : undefined}
+                    title={
+                      sortable ? 'Click to sort · Shift+click to add a sort level' : undefined
+                    }
                   >
                     <span
                       className={`relative flex max-w-full items-center gap-1 ${
@@ -1063,8 +1321,25 @@ export function TableChart({
                       <span className={wrapText ? 'whitespace-normal break-words' : 'truncate'}>
                         {headerLabel(column)}
                       </span>
-                      {sorted === 'asc' && <ArrowUp size={12} className="shrink-0" />}
-                      {sorted === 'desc' && <ArrowDown size={12} className="shrink-0" />}
+                      {sorted !== null && (
+                        // Direction arrow, plus the 1-based priority badge
+                        // while more than one level is active.
+                        <span className="flex shrink-0 items-center gap-0.5">
+                          {sorted === 'asc' ? <ArrowUp size={12} /> : <ArrowDown size={12} />}
+                          {sortLevels.length > 1 && (
+                            <span
+                              title={`Sort level ${sortIndex + 1} of ${sortLevels.length}`}
+                              style={{
+                                background:
+                                  'color-mix(in srgb, var(--rcd-accent) 18%, transparent)',
+                              }}
+                              className="rounded-[3px] px-1 text-[9px] font-semibold leading-[14px] text-rcd-accent tabular-nums"
+                            >
+                              {sortIndex + 1}
+                            </span>
+                          )}
+                        </span>
+                      )}
                       {filter !== null && (
                         <FilterIcon
                           size={10}
@@ -1078,10 +1353,16 @@ export function TableChart({
                           column={column}
                           displayLabel={headerLabel(column)}
                           sorted={sorted}
+                          sortPriority={sortIndex + 1}
+                          sortLevelCount={sortLevels.length}
                           filtered={filter !== null}
                           sortEnabled={sortable}
                           filter={filter}
-                          onSortChange={onTableSortChange}
+                          onSort={(direction, additive) =>
+                            setSortDirection(column.name, direction, additive)
+                          }
+                          onRemoveSortLevel={() => removeSortLevel(column.name)}
+                          onClearSort={() => onTableSortChange?.(null)}
                           onCommitFilter={
                             commitFilter
                               ? (f) => commitFilter(column.name, f)
@@ -1119,9 +1400,14 @@ export function TableChart({
                 highlightCategory !== null && clickColumn !== null
                   ? rowLabel(row) === highlightCategory.label
                   : null;
+              // This row's value is (one of) the active cross-filter value(s).
+              const selected = rowSelected(row);
               return (
                 <tr
                   key={rowIndex}
+                  // Global attribute, so it is valid on a plain table row: it
+                  // announces WHICH row the page is filtered by.
+                  aria-current={selected ? true : undefined}
                   onClick={
                     handleRowClick || (rowEvent && onPointClick)
                       ? (e) => {
@@ -1144,10 +1430,12 @@ export function TableChart({
                   className={`${
                     clickable ? 'cursor-pointer ' : ''
                   }hover:bg-black/5 dark:hover:bg-white/10 ${
-                    rowMatchesHighlight === false ? 'opacity-40' : ''
+                    // Selection outranks the hover dim: a row the page is
+                    // filtered by never fades because someone hovered elsewhere.
+                    rowMatchesHighlight === false && !selected ? 'opacity-40' : ''
                   }`}
                 >
-                  {layout.map((l) => {
+                  {layout.map((l, columnIndex) => {
                     const { column } = l;
                     const raw = row[l.cellIndex] ?? null;
                     const isMeasure = column.role === 'measure';
@@ -1198,8 +1486,14 @@ export function TableChart({
                     // Background precedence: conditional rule > pinned surface
                     // (+ tint) > bare tint. Pinned cells always get a SOLID
                     // base so scrolled columns never bleed through them.
-                    const background =
+                    const baseBackground =
                       cellBackground ?? (pinned ? pinnedBackground(tint) : (tint ?? undefined));
+                    // The selection wash goes ON TOP of all of that (including
+                    // a conditional-format fill), so the filtering row reads as
+                    // selected without losing its own colors.
+                    const background = selected
+                      ? tintOver(SELECTION_TINT, baseBackground ?? 'transparent')
+                      : baseBackground;
                     return (
                       <td
                         key={column.name}
@@ -1212,6 +1506,11 @@ export function TableChart({
                           ...cellTextFit,
                           ...cellBorder,
                           ...(pinned ? { left: l.pinnedLeft ?? 0 } : null),
+                          // Accent bar on the row's leading cell only — the
+                          // Excel-style marker that this row is the filter.
+                          ...(selected && columnIndex === 0
+                            ? { boxShadow: SELECTION_BAR }
+                            : null),
                         }}
                         className={`px-3 py-1 text-rcd-text ${
                           pinned ? 'sticky z-10' : ''

@@ -26,10 +26,13 @@ import {
   type ChartHavingClause,
   type ChartLegendSelectEvent,
   type ChartTableLayoutPatch,
-  type ChartTableSort,
   type TableColumnFilter,
 } from '../chart/ChartTile';
-import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
+// TableSortState is the renderer's MULTI-LEVEL sort echo (primary level plus
+// `thenBy` tie-breakers). ChartTile/ChartRenderer type the same prop on the
+// narrower {column, direction} shape and forward the value verbatim, so the
+// extra levels ride through untouched — this tile reads them here.
+import type { ChartDatumClickInfo, TableSortState } from '../chart/ChartRenderer';
 import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdIconButton } from '../primitives';
 import { TileFilterBadge } from './FilterIndicator';
@@ -51,13 +54,38 @@ interface TileDrill {
 
 const DRILL_ROOT: TileDrill = { level: 0, path: [] };
 
-/** Transient interactive-table state (sort + page); resets with the query. */
+/** One level of the table's multi-level sort (renderer contract, flattened). */
+type TableSortLevel = { column: string; direction: 'asc' | 'desc' };
+
+/** Flattens the renderer's sort echo into ordered levels ([] = unsorted). */
+const sortLevelsOf = (sort: TableSortState | null): TableSortLevel[] =>
+  sort === null
+    ? []
+    : [{ column: sort.column, direction: sort.direction }, ...(sort.thenBy ?? [])];
+
+/** Rebuilds the renderer echo from ordered levels (head + `thenBy` tail). */
+const sortStateOf = (levels: TableSortLevel[]): TableSortState | null => {
+  const [first, ...rest] = levels;
+  if (!first) return null;
+  return { ...first, ...(rest.length > 0 ? { thenBy: rest } : null) };
+};
+
+/**
+ * Transient interactive-table state (sort + page); resets with the query.
+ * The sort is kept in BOTH forms: `sort` is the renderer's echo (all levels)
+ * and `sortSpecs` the wire ORDER BY terms it maps onto, aligned 1:1 and in
+ * the same priority order. Never persisted — sorting stays transient in edit
+ * mode too (only layout patches write to the doc).
+ */
 interface TileTableState {
-  sort: (ChartTableSort & { target: SortSpec['target'] }) | null;
+  sort: TableSortState | null;
+  sortSpecs: SortSpec[];
   page: number;
 }
 
-const TABLE_ROOT: TileTableState = { sort: null, page: 0 };
+const NO_SORT_SPECS: SortSpec[] = [];
+
+const TABLE_ROOT: TileTableState = { sort: null, sortSpecs: NO_SORT_SPECS, page: 0 };
 
 const NO_TABLE_FILTERS: TableColumnFilter[] = [];
 
@@ -199,6 +227,12 @@ export interface DashboardChartTileProps {
   filters: FilterClause[];
   /** Category label while this tile is the AXIS cross-filter source (dims others). */
   activeCategoryLabel: string | null;
+  /**
+   * Every selected label when this tile's axis cross-filter holds a
+   * Ctrl-accumulated multi-value set (activeCategoryLabel is then null —
+   * tables highlight all of them; charts ignore it).
+   */
+  activeCategories?: readonly string[] | null;
   /** Legend label while this tile is the LEGEND cross-filter source (emphasis). */
   selectedLegendLabel: string | null;
   /**
@@ -312,6 +346,7 @@ export function DashboardChartTile({
   refreshKey,
   filters,
   activeCategoryLabel,
+  activeCategories = null,
   selectedLegendLabel,
   filterBadgeLabel = null,
   filterBadgeAccent = null,
@@ -483,12 +518,31 @@ export function DashboardChartTile({
     return null;
   };
 
-  const handleTableSortChange = useCallback((sort: ChartTableSort | null) => {
+  /**
+   * Maps EVERY level of the renderer's sort onto wire SortSpecs (the engine
+   * composes them into one ORDER BY, in this order). Levels whose column can
+   * no longer be mapped are dropped; if nothing maps, the change is ignored
+   * (same guard as the single-level path). Any sort change goes back to the
+   * first page, multi-level included.
+   */
+  const handleTableSortChange = useCallback((sort: TableSortState | null) => {
     setTableState((prev) => {
-      if (sort === null) return { ...prev, sort: null, page: 0 };
-      const target = sortTargetFor(sort.column);
-      if (target === null) return prev;
-      return { sort: { ...sort, target }, page: 0 };
+      const levels = sortLevelsOf(sort);
+      if (levels.length === 0) {
+        return prev.sort === null
+          ? prev
+          : { sort: null, sortSpecs: NO_SORT_SPECS, page: 0 };
+      }
+      const kept: TableSortLevel[] = [];
+      const sortSpecs: SortSpec[] = [];
+      for (const level of levels) {
+        const target = sortTargetFor(level.column);
+        if (target === null) continue;
+        kept.push(level);
+        sortSpecs.push({ target, direction: level.direction });
+      }
+      if (sortSpecs.length === 0) return prev;
+      return { sort: sortStateOf(kept), sortSpecs, page: 0 };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- sortTargetFor reads a ref
   }, []);
@@ -628,20 +682,16 @@ export function DashboardChartTile({
    */
   const queryChart = useMemo<ChartSpec>(() => {
     if (!isTable) return drilledChart;
-    const needsSort = tableState.sort !== null;
+    const sortSpecs = tableState.sortSpecs;
+    const needsSort = sortSpecs.length > 0;
     const needsLayout = tableLayoutOverride !== null;
     if (!needsSort && !needsLayout && pageSize === null) return drilledChart;
     return {
       ...drilledChart,
       query: {
         ...drilledChart.query,
-        ...(needsSort
-          ? {
-              sort: [
-                { target: tableState.sort!.target, direction: tableState.sort!.direction },
-              ],
-            }
-          : {}),
+        // Every level, in priority order -> one composed ORDER BY.
+        ...(needsSort ? { sort: sortSpecs } : {}),
         ...(pageSize !== null ? { limit: pageSize } : {}),
       },
       ...(needsLayout
@@ -653,7 +703,7 @@ export function DashboardChartTile({
           }
         : {}),
     };
-  }, [isTable, drilledChart, tableState.sort, tableLayoutOverride, pageSize]);
+  }, [isTable, drilledChart, tableState.sortSpecs, tableLayoutOverride, pageSize]);
 
   /** Row offset for server-side table pagination (merged into the wire spec). */
   const tableOffset = pageSize !== null ? tableState.page * pageSize : null;
@@ -798,9 +848,12 @@ export function DashboardChartTile({
    */
   const selection = useMemo(() => {
     if (chart.format.selectionHighlight === false) return null;
-    if (activeCategoryLabel === null && selectedLegendLabel === null) return null;
-    return { category: activeCategoryLabel, legendValue: selectedLegendLabel };
-  }, [chart.format.selectionHighlight, activeCategoryLabel, selectedLegendLabel]);
+    const categories = activeCategories && activeCategories.length > 1 ? activeCategories : null;
+    if (activeCategoryLabel === null && selectedLegendLabel === null && categories === null) {
+      return null;
+    }
+    return { category: activeCategoryLabel, legendValue: selectedLegendLabel, categories };
+  }, [chart.format.selectionHighlight, activeCategoryLabel, activeCategories, selectedLegendLabel]);
 
   // Freshest effective chart + result columns for the stable range callback
   // (assignment every render, mirrors hoverDimsRef).

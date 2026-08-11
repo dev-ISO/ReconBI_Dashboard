@@ -125,11 +125,11 @@ export const describeClause = (clause: FilterClause): string => {
   }
 };
 
-/** Active slicer selections + cross-filter, as printable header chips. */
+/** Active slicer selections + cross-filters, as printable header chips. */
 export function filterSummaryFor(
   tiles: DashboardTile[],
   slicerValues: SlicerValues,
-  crossFilter: CrossFilter | null,
+  crossFilters: CrossFilter[],
 ): string[] {
   const parts: string[] = [];
   for (const tile of tiles) {
@@ -138,7 +138,7 @@ export function filterSummaryFor(
     if (!clause) continue;
     parts.push(`${tile.slicer.label}: ${describeClause(clause)}`);
   }
-  if (crossFilter) parts.push(`Highlighted by ${crossFilter.label}`);
+  for (const cross of crossFilters) parts.push(`Highlighted by ${cross.label}`);
   return parts;
 }
 

@@ -362,7 +362,7 @@ LIMIT @p1
             model);
 
         Assert.Contains(
-            "(SUM(\"t0\".\"order_total\") / NULLIF(COUNT(*), 0)) AS \"meas0\"",
+            "(CAST(SUM(\"t0\".\"order_total\") AS decimal) / NULLIF(COUNT(*), 0)) AS \"meas0\"",
             compiled.Sql, StringComparison.Ordinal);
         Assert.Contains(
             "SUM(\"meas0\") OVER (ORDER BY \"dim0\" ASC NULLS LAST ROWS UNBOUNDED PRECEDING) AS \"meas0\"",

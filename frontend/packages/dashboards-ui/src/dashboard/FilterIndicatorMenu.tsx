@@ -1,16 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { RotateCcw } from 'lucide-react';
-import type { FilterIndicatorStyle } from '@recon/dashboards-core';
-import { useRuntime } from '../provider/DashboardsProvider';
+import type { CrossFilterScope, FilterIndicatorStyle } from '@recon/dashboards-core';
+import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdSelect } from '../primitives';
 import { resolveIndicatorStyle } from './FilterIndicator';
 
 /**
  * Fixed-palette accents for the indicator (same doctrine as the tile
- * background swatches: persisted verbatim, null = theme accent).
+ * background swatches: persisted verbatim; null = derived — the active
+ * page's tab color when one is set, else the app accent).
  */
 const ACCENTS: { value: string | null; label: string }[] = [
-  { value: null, label: 'Theme accent' },
+  { value: null, label: 'Auto (page color / theme)' },
   { value: '#2563eb', label: 'Blue' },
   { value: '#f97316', label: 'Orange' },
   { value: '#16a34a', label: 'Green' },
@@ -25,6 +26,13 @@ const PLACEMENTS: { value: NonNullable<FilterIndicatorStyle['placement']>; label
   { value: 'top-right', label: 'Top right' },
   { value: 'bottom-left', label: 'Bottom left' },
   { value: 'bottom-right', label: 'Bottom right' },
+  { value: 'header', label: 'Header (toolbar row)' },
+  { value: 'footer', label: 'Footer (bottom bar)' },
+];
+
+const SCOPES: { value: CrossFilterScope; label: string }[] = [
+  { value: 'page', label: 'This page only' },
+  { value: 'dashboard', label: 'Whole dashboard' },
 ];
 
 const VARIANTS: { value: NonNullable<FilterIndicatorStyle['variant']>; label: string }[] = [
@@ -60,6 +68,9 @@ export function FilterIndicatorMenu({ style, position, onClose }: FilterIndicato
   const cardRef = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState(position);
   const resolved = resolveIndicatorStyle(style);
+  const scope = useDashboardState(
+    (state) => state.current?.layout.crossFilterScope ?? null,
+  );
 
   // Clamp into the viewport once measured (same as the tile config cards).
   useLayoutEffect(() => {
@@ -96,16 +107,37 @@ export function FilterIndicatorMenu({ style, position, onClose }: FilterIndicato
     <div
       ref={cardRef}
       role="dialog"
-      aria-label="Filter indicator settings"
+      aria-label="Filters and indicator settings"
       style={{ left: pos.x, top: pos.y }}
       className="fixed z-50 flex w-64 flex-col gap-2 rounded-md border border-rcd-border bg-rcd-surface p-3 shadow-[var(--rcd-shadow-2)]"
     >
       <p className="text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
-        Filter indicator
+        Filters &amp; indicator
       </p>
       <p className="text-[11px] leading-4 text-rcd-muted">
-        How active cross-filters and slicer selections are announced on this dashboard.
+        How cross-filters behave and how active filters are announced on this dashboard.
       </p>
+
+      <Field label="Cross-filter scope">
+        <RcdSelect
+          aria-label="Cross-filter scope"
+          value={scope ?? 'page'}
+          onChange={(event) =>
+            runtime.dashboards.setCrossFilterScope(event.target.value as CrossFilterScope)
+          }
+        >
+          {SCOPES.map((option) => (
+            <option key={option.value} value={option.value}>
+              {option.label}
+            </option>
+          ))}
+        </RcdSelect>
+      </Field>
+      {(scope ?? 'page') === 'dashboard' && (
+        <p className="text-[11px] leading-4 text-rcd-muted">
+          Click-filters stay active when switching pages; every page&apos;s tiles honor them.
+        </p>
+      )}
 
       <Field label="Style">
         <RcdSelect
@@ -143,9 +175,12 @@ export function FilterIndicatorMenu({ style, position, onClose }: FilterIndicato
       {resolved.variant === 'banner' && (
         <p className="text-[11px] leading-4 text-rcd-muted">
           A banner docks across the whole width — only the top/bottom half of the placement
-          applies.
+          applies (header renders at the top edge, footer at the bottom).
         </p>
       )}
+      <p className="text-[11px] leading-4 text-rcd-muted">
+        Tip: you can also drag the indicator by its grip and drop it on a slot.
+      </p>
 
       <Field label="Size">
         <RcdSelect

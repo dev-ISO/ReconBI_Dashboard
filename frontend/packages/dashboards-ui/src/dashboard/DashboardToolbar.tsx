@@ -88,10 +88,15 @@ export interface DashboardToolbarProps {
   mobileLayoutOpen?: boolean;
   onToggleMobileLayout?: () => void;
   /**
-   * Edit mode: opens the cross-filter INDICATOR settings card, anchored under
+   * Edit mode: opens the "Filters & indicator" settings card, anchored under
    * its button (dashboard chrome — deliberately not in the chart Format panel).
    */
   onConfigureFilterIndicator?: (position: { x: number; y: number }) => void;
+  /**
+   * Content rendered in the toolbar's flexible middle — the filter
+   * indicator's 'header' docking slot (compact chips, out of the way).
+   */
+  centerContent?: ReactNode;
 }
 
 const REFRESH_OPTIONS: { value: string; label: string }[] = [
@@ -142,6 +147,7 @@ export function DashboardToolbar({
   mobileLayoutOpen = false,
   onToggleMobileLayout,
   onConfigureFilterIndicator,
+  centerContent,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
 
@@ -165,7 +171,10 @@ export function DashboardToolbar({
         <span className="shrink-0 text-xs text-rcd-muted">Unsaved changes</span>
       )}
 
-      <div className="min-w-0 flex-1" />
+      {/* Flexible middle: hosts the filter indicator's 'header' slot. */}
+      <div className="flex min-w-0 flex-1 items-center justify-center overflow-hidden">
+        {centerContent}
+      </div>
 
       {error && (
         <span className="truncate text-xs text-[var(--rcd-status-critical)]" title={error}>
@@ -261,8 +270,8 @@ export function DashboardToolbar({
               )}
               {onConfigureFilterIndicator && (
                 <RcdIconButton
-                  aria-label="Filter indicator settings"
-                  title="Filter indicator (how active filters are shown)"
+                  aria-label="Filters and indicator settings"
+                  title="Filters & indicator (scope + how active filters are shown)"
                   aria-haspopup="dialog"
                   onClick={(event) => {
                     const rect = event.currentTarget.getBoundingClientRect();

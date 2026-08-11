@@ -72,8 +72,19 @@ export interface DateRangeOptions {
  * pill. Dashboard-level (layout doc `filterIndicator`).
  */
 export interface FilterIndicatorStyle {
-  /** Where the indicator docks over the dashboard (default 'top-center'). */
-  placement?: 'top-center' | 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right';
+  /**
+   * Where the indicator docks (default 'top-center'). The five classic slots
+   * float over the tile area; 'header' renders compact chips inline in the
+   * dashboard toolbar row; 'footer' is a slim in-flow bar at the bottom edge.
+   */
+  placement?:
+    | 'top-center'
+    | 'top-left'
+    | 'top-right'
+    | 'bottom-left'
+    | 'bottom-right'
+    | 'header'
+    | 'footer';
   /**
    * 'pill' = compact floating chip (old look, restyled); 'banner' = full-width
    * accent bar listing every active filter; 'stack' = one chip per filter,
@@ -379,7 +390,18 @@ export interface DashboardLayoutDoc {
    * Absent on older docs = none; readers treat null/absent as empty.
    */
   parameters?: DashboardParameter[] | null;
+  /**
+   * How far active cross-filters reach (v1-compatible evolution; absent =
+   * 'page'). 'page' clears them on page switch (historic behavior);
+   * 'dashboard' keeps them active across pages — every page's tiles honor
+   * them and the indicator shows them everywhere, while the SOURCE tile's
+   * click emphasis naturally only renders on its own page.
+   */
+  crossFilterScope?: CrossFilterScope | null;
 }
+
+/** Reach of active cross-filters (layout doc `crossFilterScope`). */
+export type CrossFilterScope = 'page' | 'dashboard';
 
 export const isSlicerTile = (
   tile: DashboardTile,
@@ -424,20 +446,40 @@ export interface DashboardDetail {
 export const emptyLayout = (): DashboardLayoutDoc => ({ version: 1, tiles: [], slicers: [] });
 
 /**
+ * One accumulated cross-filter value (Ctrl/Cmd-click multi-select): the RAW
+ * cell plus its formatted display label. `raw` null = the blank category
+ * (compiles to isNull, and only ever alone — the clause vocabulary cannot
+ * OR blanks with values).
+ */
+export interface CrossFilterValue {
+  raw: FilterValue | null;
+  label: string;
+}
+
+/**
  * Transient cross-filter raised by clicking a datum on a chart tile
  * (Power BI-style highlight). Runtime state only — it is NEVER serialized
  * into the layout document and resets whenever a dashboard opens/closes.
+ * The store holds an ARRAY of these, AT MOST ONE PER (table, column): a new
+ * click on an already-filtered field replaces/merges into that field's
+ * entry (never stacks a duplicate clause).
  */
 export interface CrossFilter {
-  /** Chart tile the click came from; that tile never filters itself. */
+  /** Chart tile the (last) click came from; that tile never filters itself. */
   sourceTileId: string;
-  /** Clause every OTHER chart tile must include ('eq' raw value, or 'isNull'). */
+  /**
+   * Clause every OTHER chart tile must include: 'eq' for one value, 'in' for
+   * an accumulated set, 'isNull' for the blank category, 'between' for a
+   * date-bucket range.
+   */
   clause: FilterClause;
-  /** Human chip text, e.g. "region: West". */
+  /** Human chip text, e.g. "region: West" or "region: West, Gulf Coast". */
   label: string;
   /**
-   * Plain formatted category label — the source chart's emphasis key: dimming
-   * for 'axis' clicks, persistent legend emphasis for 'legend' selections.
+   * Formatted display value(s) — the source chart's emphasis key while the
+   * filter holds a SINGLE value: dimming for 'axis' clicks, persistent legend
+   * emphasis for 'legend' selections. Multi-value sets join labels with ', '
+   * (and date spans render 'Jul 2025 – Sep 2025').
    */
   categoryLabel: string;
   /**
@@ -447,6 +489,18 @@ export interface CrossFilter {
    * the page-wide filtering path is identical.
    */
   kind?: 'axis' | 'legend';
+  /**
+   * The accumulated discrete values behind an eq/in/isNull clause (Ctrl-click
+   * toggling and the chip "Edit value…" popover mutate this set). Absent for
+   * date-range ('between') filters and for legacy single-clause state.
+   */
+  values?: CrossFilterValue[];
+  /**
+   * Display labels of a date-range filter's endpoint buckets, kept so a
+   * Ctrl-click span extension can label the merged range from its true edges
+   * ('Jul 2025 – Sep 2025'). Absent for discrete filters.
+   */
+  rangeLabels?: { start: string; end: string };
 }
 
 /**

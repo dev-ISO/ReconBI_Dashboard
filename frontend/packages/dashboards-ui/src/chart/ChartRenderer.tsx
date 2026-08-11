@@ -27,7 +27,12 @@ import {
   Scatter,
   ScatterChart,
   Tooltip,
+  useChartHeight,
+  useChartLayout,
+  useChartWidth,
   usePlotArea,
+  useXAxisScale,
+  useYAxisScale,
   XAxis,
   YAxis,
   type ActiveDotProps,
@@ -79,6 +84,10 @@ import {
 import { AxisFitTick, resolveLabelFit } from './axisFit';
 import { textStyleToCss } from './textStyle';
 import { TableChart, type TableColumnFilter } from './TableChart';
+// Intentional import cycle (module-eval safe: every cross-reference is inside
+// a function body): GanttChart reuses this file's tooltip card, legend and
+// selection primitives instead of forking them.
+import { GanttChart } from './GanttChart';
 import './chart.css';
 
 export type {
@@ -108,6 +117,12 @@ export interface ChartSelection {
   category?: string | null;
   /** Selected legend value; null/undefined = no legend facet. */
   legendValue?: string | null;
+  /**
+   * Every selected category label when a Ctrl-accumulated multi-value set is
+   * active (category then holds null). Tables highlight all of them; other
+   * charts currently ignore it.
+   */
+  categories?: readonly string[] | null;
 }
 
 /**
@@ -244,7 +259,7 @@ const TICK_MARGIN = 8;
 const legendWrapperStyle = { fontSize: 12, color: 'var(--rcd-text-2)' } as const;
 
 /** Recessive grid hairlines: SOLID at 50% of the border token (shadcn look). */
-const GRID_STROKE = 'color-mix(in srgb, var(--rcd-border) 50%, transparent)';
+export const GRID_STROKE = 'color-mix(in srgb, var(--rcd-border) 50%, transparent)';
 
 /** Rounded corners on the VALUE END of a bar (radius 4). */
 const barEndRadius = (horizontal: boolean): [number, number, number, number] =>
@@ -301,17 +316,33 @@ function useDebouncedSize(
  * cell) match this label/raw pair? Accepting either form keeps the renderer
  * agnostic about which one the consumer chose to echo back.
  */
-const selectionFacetMatches = (
+export const selectionFacetMatches = (
   facet: string,
   label: string | undefined,
   raw: CellValue | undefined,
 ): boolean => facet === label || (raw != null && String(raw) === facet);
 
+/**
+ * Does the selection's CATEGORY side match this label/raw pair? Covers both
+ * the single-label facet and a Ctrl-accumulated multi-value set (categories) —
+ * every selected category gets the emphasis treatment, not just the last one.
+ */
+export const selectionCategoryMatches = (
+  selection: ChartSelection,
+  label: string | undefined,
+  raw: CellValue | undefined,
+): boolean => {
+  if (selection.category != null && selectionFacetMatches(selection.category, label, raw)) {
+    return true;
+  }
+  return (selection.categories ?? []).some((facet) => selectionFacetMatches(facet, label, raw));
+};
+
 /** Opacity every non-selected / non-highlighted mark dims to (one system). */
-const DIM_OPACITY = 0.35;
+export const DIM_OPACITY = 0.35;
 
 /** Accent ring stroke marking the selected data point(s). */
-const SELECTION_STROKE = 'var(--rcd-accent-interactive)';
+export const SELECTION_STROKE = 'var(--rcd-accent-interactive)';
 
 /** Pixel threshold: a sub-4px drag counts as a click, never a zoom. */
 const DRAG_ZOOM_MIN_PX = 4;
@@ -439,7 +470,7 @@ function legendProps(format: ChartFormat) {
  * color. `raw`/`legendLabel` are present only when the entry is backed by a
  * legend-dimension value (or pie slice) — the identity crossFilter mode needs.
  */
-interface LegendItemDatum {
+export interface LegendItemDatum {
   key: string;
   label: string;
   color: string;
@@ -455,7 +486,7 @@ type LegendMode = NonNullable<ChartFormat['legendMode']>;
  * Handlers receive the full item list so isolate can compute "everything but
  * the clicked item" and crossFilter can resolve its identity fallback.
  */
-interface LegendControl {
+export interface LegendControl {
   /** Configured mode; crossFilter may still fall back per chart (see effectiveLegendMode). */
   mode: LegendMode;
   hidden: ReadonlySet<string>;
@@ -592,7 +623,7 @@ function InteractiveLegendContent({
  * recharts legend. Placement/text style (legendPosition/legendStyle) apply to
  * both variants.
  */
-function chartLegend(
+export function chartLegend(
   format: ChartFormat,
   items: LegendItemDatum[],
   control: LegendControl,
@@ -833,13 +864,270 @@ function guideReferenceLine(
 
 type TooltipCursor = 'fill' | 'dashed' | 'none';
 
+/**
+ * What the hovered datum LOOKS like on the plot — the shape the tooltip card
+ * has to dodge:
+ * - 'bars'   a whole category slot, from the value-axis baseline to the
+ *            tallest (or stacked) bar end: a column (or a row on horizontal
+ *            bars).
+ * - 'points' the marks of every series at the active category (line/area):
+ *            small discs sitting on one category slot.
+ * - 'point'  a single item AT the active coordinate (scatter): the coordinate
+ *            is the datum.
+ * - 'none'   nothing cartesian to dodge (pie/donut); only the pointer itself.
+ */
+type TooltipMarks = 'bars' | 'points' | 'point' | 'none';
+
+/** Default marks for a cursor style, so new chart kinds get sane placement. */
+const marksForCursor = (cursor: TooltipCursor): TooltipMarks =>
+  cursor === 'fill' ? 'bars' : cursor === 'dashed' ? 'points' : 'none';
+
 /** Shape of one recharts tooltip payload entry (the fields we read). */
-interface TooltipPayloadEntry {
+export interface TooltipPayloadEntry {
   name?: string | number;
   value?: unknown;
   color?: string;
   dataKey?: string | number;
   payload?: unknown;
+}
+
+/* -------------------------------------------------------------------------
+ * Smart tooltip placement
+ *
+ * Everything below works in ONE coordinate space: pixels relative to the chart
+ * container (recharts' `.recharts-wrapper`), which is the space of the tooltip
+ * `coordinate`, of usePlotArea() and of useChartWidth()/useChartHeight().
+ * ---------------------------------------------------------------------- */
+
+/** A pixel box in chart-container space. */
+interface TipBox {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+/** Gap kept between the card and the cursor / the data it is dodging. */
+const TIP_GAP = 12;
+/** Breathing room between the card and whatever it is clamped inside. */
+const TIP_EDGE = 4;
+/** Half-size of the "never sit under the pointer / the dot" box. */
+const TIP_PAD = 10;
+/** Assumed half-width of a bar slot when the axis can't report its band. */
+const TIP_BAND_FALLBACK = 20;
+/** Widest the card may get before wrapping (also capped by the container). */
+const TIP_MAX_W = 280;
+
+const tipOverlap = (a: TipBox, b: TipBox): number =>
+  Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left)) *
+  Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+
+/**
+ * A later candidate has to beat an earlier one by this much before it wins.
+ * Keeps the preference order sticky so the card doesn't hop between spots as
+ * the pointer drifts a few pixels.
+ */
+const TIP_STICKY = 400;
+
+/**
+ * Price (in px² of covered data) of moving the card one px further from the
+ * pointer. A tooltip that dodges every mark but lands in a far corner is worse
+ * than one that clips a neighbouring bar, so distance has to be paid for: at
+ * this rate a detour of 100px must save ~12% of the card's own area in
+ * coverage to be worth it, which keeps the corner pins as a real last resort.
+ */
+const TIP_NEAR = 12;
+
+/** Distance from a point to the nearest edge of a box (0 when inside). */
+const tipDistance = (box: TipBox, p: { x: number; y: number }): number =>
+  Math.hypot(
+    Math.max(box.left - p.x, 0, p.x - box.right),
+    Math.max(box.top - p.y, 0, p.y - box.bottom),
+  );
+
+/**
+ * Picks the top-left corner of the tooltip card. Candidates are tried in
+ * preference order:
+ *
+ *   1. above-right of the pointer, pushed clear of the active column
+ *   2. flip horizontally — above-left
+ *   3. below-right, 4. below-left
+ *   5-7. above the DATA itself (works where 1-4 can't: a short bar in a narrow
+ *        tile has no room beside it but plenty over it), centred then nudged
+ *        to either side
+ *   8. under the data
+ *   9-12. pinned to a plot-area corner — the "nothing fits" backstop
+ *
+ * Scoring is two-tier. `avoid` (the hovered marks plus the pointer) is a HARD
+ * constraint: a candidate covering any of it is only used when nothing else is
+ * left, and then the least-covering one wins. Among candidates that clear it,
+ * `neighbours` (every other rendered mark) breaks the tie, so the card prefers
+ * genuine whitespace over sitting on the bars next door — subject to TIP_STICKY
+ * so the ordering above still decides near-ties.
+ *
+ * Every candidate is clamped into `bounds` BEFORE it is scored, so a candidate
+ * that only fits by sliding back over the data loses to one that genuinely
+ * fits: clamping and dodging are decided together rather than in sequence.
+ */
+function placeTooltip(
+  cursor: { x: number; y: number },
+  size: { w: number; h: number },
+  /** The region the card must not cover (active marks + the pointer). */
+  avoid: TipBox,
+  plot: TipBox,
+  container: TipBox,
+  /** Other rendered marks, used only to break ties. Empty when unknown. */
+  neighbours: readonly TipBox[] = [],
+): { x: number; y: number } {
+  const { w, h } = size;
+  // Clamp inside the PLOT when the card fits there (keeps it off the axes,
+  // legend and brush); fall back to the whole container in tiny tiles, where
+  // insisting on the plot area would leave nowhere to stand.
+  const fitsPlot =
+    w + 2 * TIP_EDGE <= plot.right - plot.left && h + 2 * TIP_EDGE <= plot.bottom - plot.top;
+  const bounds = fitsPlot ? plot : container;
+  const minX = bounds.left + TIP_EDGE;
+  const minY = bounds.top + TIP_EDGE;
+  const maxX = Math.max(minX, bounds.right - TIP_EDGE - w);
+  const maxY = Math.max(minY, bounds.bottom - TIP_EDGE - h);
+
+  // Horizontal anchors clear the active column (a bar slot is wide, and the
+  // coordinate sits at its CENTRE — offsetting from the cursor alone is what
+  // parks the card on top of the bars). Vertical anchors follow the pointer so
+  // the card still tracks the mouse.
+  const xRight = Math.max(cursor.x, avoid.right) + TIP_GAP;
+  const xLeft = Math.min(cursor.x, avoid.left) - TIP_GAP - w;
+  const xCentre = cursor.x - w / 2;
+  const yAbove = cursor.y - TIP_GAP - h;
+  const yBelow = cursor.y + TIP_GAP;
+  const yOver = avoid.top - TIP_GAP - h;
+  const yUnder = avoid.bottom + TIP_GAP;
+
+  const candidates: ReadonlyArray<readonly [number, number]> = [
+    [xRight, yAbove],
+    [xLeft, yAbove],
+    [xRight, yBelow],
+    [xLeft, yBelow],
+    [xCentre, yOver],
+    [xRight, yOver],
+    [xLeft, yOver],
+    [xCentre, yUnder],
+    [plot.right - TIP_EDGE - w, plot.top + TIP_EDGE],
+    [plot.left + TIP_EDGE, plot.top + TIP_EDGE],
+    [plot.right - TIP_EDGE - w, plot.bottom - TIP_EDGE - h],
+    [plot.left + TIP_EDGE, plot.bottom - TIP_EDGE - h],
+  ];
+
+  let clear: { x: number; y: number } | null = null;
+  let clearCost = Number.POSITIVE_INFINITY;
+  let fallback = { x: minX, y: minY };
+  let fallbackCost = Number.POSITIVE_INFINITY;
+  for (const [rawX, rawY] of candidates) {
+    const x = Math.min(Math.max(rawX, minX), maxX);
+    const y = Math.min(Math.max(rawY, minY), maxY);
+    const box: TipBox = { left: x, top: y, right: x + w, bottom: y + h };
+    const reach = TIP_NEAR * tipDistance(box, cursor);
+    const hard = tipOverlap(box, avoid);
+    if (hard > 0) {
+      const cost = hard + reach;
+      if (cost < fallbackCost - TIP_STICKY || fallbackCost === Number.POSITIVE_INFINITY) {
+        fallbackCost = cost;
+        fallback = { x, y };
+      }
+      continue;
+    }
+    let cost = reach;
+    for (const mark of neighbours) cost += tipOverlap(box, mark);
+    if (cost < clearCost - TIP_STICKY || clear === null) {
+      clearCost = cost;
+      clear = { x, y };
+    }
+  }
+  return clear ?? fallback;
+}
+
+/**
+ * Measures the tooltip card once per SIZE change (ResizeObserver) instead of
+ * reading layout on every pointer move — recharts re-renders tooltip content
+ * on every mousemove, so a getBoundingClientRect in the render path would
+ * thrash. The last size survives the card unmounting, so re-entering a chart
+ * lands correctly on the first frame instead of flashing at a stale spot.
+ */
+function useTooltipCardSize(
+  ref: RefObject<HTMLDivElement | null>,
+  mounted: boolean,
+): { w: number; h: number } | null {
+  const [size, setSize] = useState<{ w: number; h: number } | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!mounted || el === null) return;
+    const read = () => {
+      const w = el.offsetWidth;
+      const h = el.offsetHeight;
+      if (w <= 0 || h <= 0) return;
+      setSize((prev) =>
+        prev !== null && Math.abs(prev.w - w) < 0.5 && Math.abs(prev.h - h) < 0.5
+          ? prev
+          : { w, h },
+      );
+    };
+    // Read once up front: without a measurement there is no placement, and the
+    // card stays hidden — so this must not depend on ResizeObserver existing.
+    read();
+    if (typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(read);
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref, mounted]);
+  return size;
+}
+
+/** Past this many rendered bars the chart has no whitespace worth hunting. */
+const TIP_MAX_NEIGHBOURS = 400;
+
+/**
+ * Rectangles of the rendered bars, in chart-container px, so placement can
+ * prefer whitespace over the bars NEXT TO the hovered one (the user-visible
+ * failure: a card parked on the neighbouring column). Bars are the only marks
+ * read here — a line/area is one path whose bounding box is the whole series,
+ * which would say "everything is covered" and help nobody.
+ *
+ * Bar geometry only moves when the chart is re-laid out, so this reads once
+ * per hover session (and again if the plot resizes) rather than per pointer
+ * move; measurement happens in an effect, never during render.
+ */
+function useNeighbourMarks(
+  ref: RefObject<HTMLDivElement | null>,
+  enabled: boolean,
+  plotKey: string,
+): readonly TipBox[] {
+  const [marks, setMarks] = useState<readonly TipBox[]>([]);
+  useEffect(() => {
+    const wrapper = ref.current?.closest('.recharts-wrapper');
+    if (!enabled || wrapper == null) {
+      setMarks((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    const nodes = wrapper.querySelectorAll('.recharts-bar-rectangle');
+    if (nodes.length === 0 || nodes.length > TIP_MAX_NEIGHBOURS) {
+      setMarks((prev) => (prev.length === 0 ? prev : []));
+      return;
+    }
+    const origin = wrapper.getBoundingClientRect();
+    const next: TipBox[] = [];
+    nodes.forEach((node) => {
+      const r = node.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) return;
+      next.push({
+        left: r.left - origin.left,
+        top: r.top - origin.top,
+        right: r.right - origin.left,
+        bottom: r.bottom - origin.top,
+      });
+    });
+    setMarks(next);
+  }, [ref, enabled, plotKey]);
+  return marks;
 }
 
 /** Series color for a tooltip row: entry.color, else the datum's own (pie). */
@@ -859,37 +1147,196 @@ const tooltipEntryColor = (entry: TooltipPayloadEntry): string => {
  * header; one row per series with a colored left accent bar (accentBorder,
  * default) or a small square swatch, secondary series name, and the formatted
  * value leading in weight. showPercent appends the share of the VISIBLE total.
- * active/payload/label are injected by recharts when it clones the element.
+ * active/payload/label/coordinate are injected by recharts when it clones the
+ * element.
+ *
+ * PLACEMENT lives here rather than on <Tooltip> because only the content knows
+ * its own rendered size: recharts' wrapper is pinned to the container origin
+ * (position={TIP_ORIGIN}) and the card translates itself. See placeTooltip for
+ * the decision order; the active-data region is derived from the axis scales,
+ * so the math is pure arithmetic — no DOM probing on the hover path.
  */
-function RcdChartTooltip({
+export function RcdChartTooltip({
   active,
   payload,
   label,
+  coordinate,
   styleSpec,
   formatEntry,
   showPercent = false,
   percentTotal,
+  marks = 'none',
+  stacked = false,
 }: {
   active?: boolean;
   payload?: TooltipPayloadEntry[];
   label?: string | number;
+  /** Active point in chart-container px (recharts-injected). */
+  coordinate?: { x?: number; y?: number };
   styleSpec: TooltipStyle | undefined;
   formatEntry: (value: unknown, dataKey: string | undefined) => string;
   showPercent?: boolean;
   /** Percent denominator override (pie: visible-slice total); else payload sum. */
   percentTotal?: number;
+  /** Shape of the hovered datum, for the dodge math. */
+  marks?: TooltipMarks;
+  /** Stacked series: the mark ends at the CUMULATIVE value, not each value. */
+  stacked?: boolean;
 }) {
-  if (!active || !payload || payload.length === 0) return null;
+  const cardRef = useRef<HTMLDivElement>(null);
+  const visible = active === true && payload != null && payload.length > 0;
+  const cardSize = useTooltipCardSize(cardRef, visible);
+
+  // Chart geometry straight from the recharts store (this component renders
+  // inside the chart's context, through recharts' own portal): no DOM reads,
+  // and every value is already in chart-container pixels.
+  const plotArea = usePlotArea();
+  const chartWidth = useChartWidth();
+  const chartHeight = useChartHeight();
+  const layout = useChartLayout();
+  const xScale = useXAxisScale();
+  const yScale = useYAxisScale();
+  const y2Scale = useYAxisScale('y2');
+  // Horizontal bars ('vertical' layout): categories run down the Y axis and
+  // values along X, so the two spans below swap axes.
+  const rowsVertical = layout === 'vertical';
+  // Re-read bar geometry only when the plot itself moves or resizes.
+  const neighbours = useNeighbourMarks(
+    cardRef,
+    visible && marks === 'bars',
+    `${plotArea?.x ?? 0}:${plotArea?.y ?? 0}:${plotArea?.width ?? 0}:${plotArea?.height ?? 0}`,
+  );
+
+  /**
+   * Where the active marks sit, per axis, in container px:
+   * - `value` spans baseline→bar end (bars) or dot→dot (points);
+   * - `cross` is the category band, read exactly off the band scale via the
+   *   'start'/'end' band positions rather than guessed from tick spacing.
+   * Depends on the payload, not on the pointer, so it survives mouse moves
+   * inside one category.
+   */
+  const span = useMemo(() => {
+    const valueScales = (rowsVertical ? [xScale] : [yScale, y2Scale]).filter(
+      (s): s is NonNullable<typeof s> => s != null,
+    );
+    let value: { min: number; max: number } | null = null;
+    if ((marks === 'bars' || marks === 'points') && payload != null && valueScales.length > 0) {
+      const numbers = payload
+        .map((entry) => entry.value)
+        .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+      // Stacked marks end at the running total; grouped/overlaid marks each
+      // end at their own value. Dual axis: union both mappings (we can't tell
+      // from the payload which axis an entry belongs to, and a region that is
+      // slightly too big only makes the card dodge a little further).
+      const ends = stacked ? [numbers.reduce((sum, v) => sum + v, 0)] : numbers;
+      const points: number[] = [];
+      for (const scale of valueScales) {
+        for (const end of ends) {
+          const px = scale(end);
+          if (typeof px === 'number' && Number.isFinite(px)) points.push(px);
+        }
+        // Bars are anchored to the zero baseline, so the column is the whole
+        // span from baseline to end, not just the end.
+        if (marks === 'bars') {
+          const zero = scale(0);
+          if (typeof zero === 'number' && Number.isFinite(zero)) points.push(zero);
+        }
+      }
+      if (points.length > 0) {
+        const pad = marks === 'points' ? TIP_PAD : 0;
+        value = { min: Math.min(...points) - pad, max: Math.max(...points) + pad };
+      }
+    }
+    let cross: { min: number; max: number } | null = null;
+    const catScale = rowsVertical ? yScale : xScale;
+    if (marks === 'bars' && catScale != null && label !== undefined) {
+      const start = catScale(label, { position: 'start' });
+      const end = catScale(label, { position: 'end' });
+      if (
+        typeof start === 'number' &&
+        typeof end === 'number' &&
+        Number.isFinite(start) &&
+        Number.isFinite(end) &&
+        Math.abs(end - start) > 1
+      ) {
+        cross = { min: Math.min(start, end), max: Math.max(start, end) };
+      }
+    }
+    return { value, cross };
+  }, [payload, label, marks, stacked, rowsVertical, xScale, yScale, y2Scale]);
+
+  // Resolve the boxes, then place. Until the card has been measured once we
+  // render it hidden rather than guessing a size and jumping.
+  const cx = coordinate?.x;
+  const cy = coordinate?.y;
+  let placement: { x: number; y: number } | null = null;
+  let boundsWidth: number | undefined;
+  let boundsHeight: number | undefined;
+  if (cardSize !== null && typeof cx === 'number' && typeof cy === 'number') {
+    const hasPlot = plotArea != null && plotArea.width > 0 && plotArea.height > 0;
+    const plot: TipBox = hasPlot
+      ? {
+          left: plotArea.x,
+          top: plotArea.y,
+          right: plotArea.x + plotArea.width,
+          bottom: plotArea.y + plotArea.height,
+        }
+      : { left: 0, top: 0, right: chartWidth ?? 0, bottom: chartHeight ?? 0 };
+    const container: TipBox = {
+      left: 0,
+      top: 0,
+      right: chartWidth != null && chartWidth > 0 ? chartWidth : plot.right,
+      bottom: chartHeight != null && chartHeight > 0 ? chartHeight : plot.bottom,
+    };
+    boundsWidth = container.right;
+    boundsHeight = container.bottom;
+    // Category band around the pointer; a bare pointer pad when there is no
+    // band to speak of (scatter items, pie sectors, numeric line axes).
+    const crossAt = rowsVertical ? cy : cx;
+    const cross = span.cross ?? {
+      min: crossAt - (marks === 'bars' ? TIP_BAND_FALLBACK : TIP_PAD),
+      max: crossAt + (marks === 'bars' ? TIP_BAND_FALLBACK : TIP_PAD),
+    };
+    const valueAt = rowsVertical ? cx : cy;
+    const value = span.value ?? { min: valueAt - TIP_PAD, max: valueAt + TIP_PAD };
+    const marksBox: TipBox = rowsVertical
+      ? { left: value.min, top: cross.min, right: value.max, bottom: cross.max }
+      : { left: cross.min, top: value.min, right: cross.max, bottom: value.max };
+    // Clip to the plot (a scale can project a baseline far outside it) and
+    // union the pointer itself, so the card never lands under the cursor.
+    const avoid: TipBox = {
+      left: Math.min(Math.max(marksBox.left, plot.left), cx - TIP_PAD),
+      top: Math.min(Math.max(marksBox.top, plot.top), cy - TIP_PAD),
+      right: Math.max(Math.min(marksBox.right, plot.right), cx + TIP_PAD),
+      bottom: Math.max(Math.min(marksBox.bottom, plot.bottom), cy + TIP_PAD),
+    };
+    placement = placeTooltip({ x: cx, y: cy }, cardSize, avoid, plot, container, neighbours);
+  }
+
+  if (!visible) return null;
   const accent = styleSpec?.accentBorder !== false;
   const card: CSSProperties = {
     background: styleSpec?.background || 'var(--rcd-surface)',
     color: styleSpec?.textColor || 'var(--rcd-text)',
+    // Capping against the container is what makes "always fits" true rather
+    // than best-effort: a card wider/taller than the tile can't be clamped
+    // into it, so it is never allowed to get that big in the first place.
+    maxWidth:
+      boundsWidth != null && boundsWidth > 0
+        ? Math.min(TIP_MAX_W, Math.max(120, boundsWidth - 2 * TIP_EDGE))
+        : TIP_MAX_W,
+    ...(boundsHeight != null && boundsHeight > 0
+      ? { maxHeight: Math.max(48, boundsHeight - 2 * TIP_EDGE), overflow: 'hidden' }
+      : null),
+    transform: placement ? `translate(${placement.x}px, ${placement.y}px)` : undefined,
+    visibility: placement ? undefined : 'hidden',
   };
   const total =
     percentTotal ??
     payload.reduce((sum, e) => sum + (typeof e.value === 'number' ? e.value : 0), 0);
   return (
     <div
+      ref={cardRef}
       className="max-w-[280px] rounded-lg border border-rcd-border px-3 py-2 text-xs shadow-md"
       style={card}
     >
@@ -935,15 +1382,25 @@ function RcdChartTooltip({
 }
 
 /**
+ * Pins recharts' tooltip wrapper to the chart container's origin so the card
+ * can position itself (see RcdChartTooltip). Module-level for a stable
+ * identity — the wrapper is memoized on its props.
+ */
+export const TIP_ORIGIN: { x: number; y: number } = { x: 0, y: 0 };
+
+/**
  * Tooltip element for one chart (all types share it); null when
  * format.tooltip.enabled === false. `percent` marks the chart shapes where
  * showPercent applies (pie/donut/stacked) and optionally pins the denominator.
+ * `marks` overrides the mark shape the placement math dodges when the cursor
+ * style doesn't imply it (scatter: a dashed cursor, but a single item).
  */
 function themedTooltip(
   formatEntry: (value: unknown, dataKey: string | undefined) => string,
   format: ChartFormat,
   cursor: TooltipCursor,
   percent?: { active: boolean; total?: number },
+  marks?: TooltipMarks,
 ): ReactNode {
   if (format.tooltip?.enabled === false) return null;
   // Hover affordances, shadcn-style: bars get a soft muted rectangle behind
@@ -958,15 +1415,24 @@ function themedTooltip(
     <Tooltip
       cursor={cursorProp}
       isAnimationActive={false}
-      // Flip ABOVE the cursor (default x keeps it to the right) so the card
-      // never covers the datum; still clamps inside the chart.
-      reverseDirection={{ y: true }}
+      // Recharts' own placement (offset from the cursor, flipped at the view
+      // box edge) can't see the bars it is covering and clamps to the plot box
+      // only. We take it over: the wrapper is parked at the container origin
+      // with zero offset, and RcdChartTooltip translates the card to a spot
+      // computed from the tooltip's measured size, the plot area and the
+      // active marks. The card still tends above/right of the pointer.
+      position={TIP_ORIGIN}
+      offset={0}
       content={
         <RcdChartTooltip
           styleSpec={format.tooltip}
           formatEntry={formatEntry}
           showPercent={percent?.active === true && format.tooltip?.showPercent === true}
           percentTotal={percent?.total}
+          marks={marks ?? marksForCursor(cursor)}
+          // The one caller that passes `percent.active` on a cartesian chart
+          // is the stacked path; pie is 'none' and has no stacking.
+          stacked={percent?.active === true && cursor !== 'none'}
         />
       }
     />
@@ -1048,7 +1514,7 @@ function DonutCenterTotal({ text }: { text: string }) {
   );
 }
 
-function Placeholder({ children }: { children: ReactNode }) {
+export function Placeholder({ children }: { children: ReactNode }) {
   return (
     <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
       {children}
@@ -1148,7 +1614,16 @@ function CartesianChart({
   const htmlXTitle = Boolean(format.xAxisLabelHtml);
   const htmlYTitle = Boolean(format.yAxisLabelHtml);
   // Panels never render their own legend — the grid shares ONE legend.
-  const showLegend = !panel && (format.showLegend ?? shaped.series.length > 1);
+  // STABLE LEGEND (see the pie): series backed by a LEGEND DIMENSION collapse
+  // to a single survivor under a cross-filter, and `> 1` then deleted the
+  // legend mid-interaction along with the only label that series has. Legend-
+  // dimension charts legend themselves whenever they have any series; measure-
+  // series charts keep the old rule (one measure needs no legend).
+  const legendItems = seriesLegendItems(shaped.series);
+  const hasLegendDimension = legendItems.some((i) => i.legendLabel !== undefined);
+  const showLegend =
+    !panel &&
+    (format.showLegend ?? (hasLegendDimension ? legendItems.length > 0 : shaped.series.length > 1));
   const visibleSeries = shaped.series.filter((s) => !hidden.has(s.key));
   const labelPosition = stacked ? 'center' : horizontal ? 'right' : 'top';
   const showDataLabels = Boolean(format.showDataLabels) && !panel?.hideDataLabels;
@@ -1209,19 +1684,20 @@ function CartesianChart({
   // read as one system — and SELECTION WINS over hover while both are
   // present. Unlike the legacy activeCategory dim, this path covers multi-
   // series and stacked bars too (each matching segment rings individually).
+  const selHasCategories = (selection?.categories?.length ?? 0) > 0;
   const selectionOn =
     format.selectionHighlight !== false &&
     selection != null &&
-    (selection.category != null || selection.legendValue != null);
+    (selection.category != null || selection.legendValue != null || selHasCategories);
   const selSeriesMatches = (s: ChartSeries): boolean =>
     !selectionOn ||
     selection?.legendValue == null ||
     selectionFacetMatches(selection.legendValue, s.legendLabel ?? s.label, s.legendRaw);
   const selRowMatches = (row: Record<string, CellValue>): boolean =>
     !selectionOn ||
-    selection?.category == null ||
-    selectionFacetMatches(
-      selection.category,
+    (selection?.category == null && !selHasCategories) ||
+    selectionCategoryMatches(
+      selection!,
       String(row[shaped.axisKey] ?? ''),
       row[RAW_AXIS_KEY],
     );
@@ -1813,7 +2289,7 @@ function CartesianChart({
           />
         )}
         {themedTooltip(formatSeriesValue, format, isBars ? 'fill' : 'dashed', stacked ? { active: true } : undefined)}
-        {showLegend && chartLegend(format, seriesLegendItems(shaped.series), legend)}
+        {showLegend && chartLegend(format, legendItems, legend)}
         {visibleSeries.map((series) => {
           const yAxisId = y2Keys.has(series.key) ? 'y2' : undefined;
           // Highlight (series mode) dims non-matching series whole; the
@@ -2169,7 +2645,14 @@ function SmallMultiplesChart({
     : Number.POSITIVE_INFINITY;
   const hideDataLabels = panelWidth < SM_MIN_LABEL_WIDTH;
 
-  const showLegend = format.showLegend ?? canonical.series.length > 1;
+  // STABLE LEGEND (see CartesianChart): the grid's shared legend survives a
+  // cross-filter that leaves one series standing.
+  const smLegendItems = seriesLegendItems(canonical.series);
+  const showLegend =
+    format.showLegend ??
+    (smLegendItems.some((i) => i.legendLabel !== undefined)
+      ? smLegendItems.length > 0
+      : canonical.series.length > 1);
   const legendRight = format.legendPosition === 'right';
   const legendTop = format.legendPosition === 'top';
   // The shared legend lives OUTSIDE the recharts trees, so the plain-<Legend>
@@ -2185,7 +2668,7 @@ function SmallMultiplesChart({
       style={{ ...legendWrapperStyle, ...textStyleToCss(format.legendStyle) }}
     >
       <InteractiveLegendContent
-        items={seriesLegendItems(canonical.series)}
+        items={smLegendItems}
         control={legend}
         layout={legendRight ? 'vertical' : 'horizontal'}
         interactive={format.legendInteractive !== false}
@@ -2423,11 +2906,29 @@ export default function ChartRenderer({
     case 'pie':
     case 'donut': {
       const { slices } = shapePieData(result, spec);
-      if (slices.length === 0) return <Placeholder>Pie needs a measure.</Placeholder>;
-      const showLegend = format.showLegend ?? slices.length > 1;
+      // A measure with NO ROWS shapes to zero slices too (any cross-filter can
+      // empty a pie), so distinguish the two: only a missing measure is a spec
+      // problem — the other is just a filter with no matches.
+      if (slices.length === 0) {
+        return (
+          <Placeholder>
+            {result.columns.some((c) => c.role === 'measure')
+              ? 'No data for this filter.'
+              : 'Pie needs a measure.'}
+          </Placeholder>
+        );
+      }
       // Slices carry a legend identity (crossFilter) only when a dimension
       // labels them; a dimensionless pie is a single measure-named slice.
       const hasSliceDimension = result.columns.some((c) => c.role === 'dimension');
+      // STABLE LEGEND: the default must not depend on how many slices SURVIVE
+      // the page's cross-filters. `slices.length > 1` deleted the legend the
+      // moment a filter left one category standing — and a pie has no axis, so
+      // the remaining ring was left unlabelled. A dimension-labelled pie now
+      // legends itself whenever it has any slice at all; a dimensionless pie
+      // (one measure-named slice) keeps the old rule. Explicit showLegend still
+      // wins in both directions.
+      const showLegend = format.showLegend ?? (hasSliceDimension || slices.length > 1);
       const sliceLegendItems: LegendItemDatum[] = slices.map((s) => ({
         key: s.label,
         label: s.label,
@@ -2488,14 +2989,16 @@ export default function ChartRenderer({
       // Selection highlight on slices: a slice's label is both its category
       // and its legend identity, so either facet may name it. The selected
       // slice keeps full opacity + an accent ring; the rest dim to 0.35.
+      const pieHasCategories = (selection?.categories?.length ?? 0) > 0;
       const pieSelectionOn =
         format.selectionHighlight !== false &&
         selection != null &&
-        (selection.category != null || selection.legendValue != null);
+        (selection.category != null || selection.legendValue != null || pieHasCategories);
       const sliceSelected = (slice: PieSlice): boolean =>
         pieSelectionOn &&
-        (selection?.category == null ||
-          selectionFacetMatches(selection.category, slice.label, slice.raw)) &&
+        (selection?.category == null && !pieHasCategories
+          ? true
+          : selectionCategoryMatches(selection!, slice.label, slice.raw)) &&
         (selection?.legendValue == null ||
           selectionFacetMatches(selection.legendValue, slice.label, slice.raw));
       return (
@@ -2575,12 +3078,16 @@ export default function ChartRenderer({
         if (format.valueFormat) return valueFormatText(value, format.valueFormat);
         return formatCellValue(value, dataKey === 'y' ? yColumn : xColumn);
       };
-      const showLegend = format.showLegend ?? scatter.series.length > 1;
       const visibleSeries = scatter.series.filter((s) => !hidden.has(s.key));
       // The split carries a legend identity (crossFilter) only when it IS the
       // legend dimension; an axis-only split still colors groups but has
       // nothing to cross-filter by.
       const splitIsLegend = Boolean(spec.query.legend);
+      // STABLE LEGEND (see CartesianChart): a legend-split scatter keeps its
+      // legend when a cross-filter leaves a single group.
+      const showLegend =
+        format.showLegend ??
+        (splitIsLegend ? scatter.series.length > 0 : scatter.series.length > 1);
       const scatterLegendItems: LegendItemDatum[] = scatter.series.map((s) => ({
         key: s.key,
         label: s.label,
@@ -2647,14 +3154,15 @@ export default function ChartRenderer({
       // Selection highlight: the split value IS the point identity here, so
       // either selection facet may name a series; matching groups keep full
       // opacity + an accent ring, the rest dim to the shared 0.35.
+      const scatterHasCategories = (selection?.categories?.length ?? 0) > 0;
       const scatterSelectionOn =
         format.selectionHighlight !== false &&
         selection != null &&
-        (selection.category != null || selection.legendValue != null);
+        (selection.category != null || selection.legendValue != null || scatterHasCategories);
       const scatterSelected = (series: (typeof scatter.series)[number]): boolean =>
         scatterSelectionOn &&
-        ((selection?.category != null &&
-          selectionFacetMatches(selection.category, series.label, series.raw)) ||
+        (((selection?.category != null || scatterHasCategories) &&
+          selectionCategoryMatches(selection!, series.label, series.raw)) ||
           (selection?.legendValue != null &&
             selectionFacetMatches(selection.legendValue, series.label, series.raw)));
       return (
@@ -2707,7 +3215,10 @@ export default function ChartRenderer({
                     : yAxisLabelProps(format.yAxisLabel ?? yColumn.label, format.axisTitleStyle)
                 }
               />
-              {themedTooltip(formatPoint, format, 'dashed')}
+              {/* Scatter tooltips are per-ITEM: the coordinate is the dot, and
+                  the payload's x/y entries don't map through one value scale,
+                  so the card dodges the dot rather than a category slot. */}
+              {themedTooltip(formatPoint, format, 'dashed', undefined, 'point')}
               {showLegend && chartLegend(format, scatterLegendItems, legendControl)}
               {visibleSeries.map((series) => (
                 <Scatter
@@ -2802,6 +3313,25 @@ export default function ChartRenderer({
       );
     }
 
+    case 'gantt':
+      // Timeline bars over the shared legend/selection/tooltip system; the
+      // gantt file reuses (imports) this file's primitives rather than
+      // forking them.
+      return (
+        <GanttChart
+          spec={spec}
+          result={result}
+          legend={legendControl}
+          onDatumClick={onDatumClick}
+          onPointClick={onPointClick}
+          onPointContextMenu={onPointContextMenu}
+          onPointHover={hover}
+          activeCategory={activeCategory}
+          highlightCategory={highlightCategory}
+          selection={selection}
+        />
+      );
+
     case 'kpi': {
       const row = result.rows[0];
       const primary = measureColumns[0];
@@ -2868,6 +3398,7 @@ export default function ChartRenderer({
           onPointContextMenu={onPointContextMenu}
           onPointHover={hover}
           highlightCategory={highlightCategory}
+          selection={selection}
           tableSort={tableSort}
           onTableSortChange={onTableSortChange}
           tablePage={tablePage}

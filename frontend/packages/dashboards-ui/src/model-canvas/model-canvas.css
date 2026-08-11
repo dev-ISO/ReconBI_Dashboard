@@ -53,3 +53,14 @@
 .rcd-model-canvas .react-flow__controls-button:last-child {
   border-bottom: none;
 }
+
+/* Edge/node label buttons sit outside xyflow's own outline suppression —
+   pointer/script focus must not paint the browser's black ring; keyboard
+   focus keeps a token ring. */
+.rcd-model-canvas button:focus:not(:focus-visible) {
+  outline: none;
+}
+.rcd-model-canvas button:focus-visible {
+  outline: 2px solid var(--rcd-accent-interactive);
+  outline-offset: 1px;
+}

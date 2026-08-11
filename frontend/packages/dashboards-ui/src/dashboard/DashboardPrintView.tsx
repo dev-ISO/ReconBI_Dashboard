@@ -108,13 +108,30 @@ export function PrintSheets({
   showPageNumbers = true,
 }: PrintSheetsProps) {
   const slicerValues = useDashboardState((state) => state.slicerValues);
-  const crossFilter = useDashboardState((state) => state.crossFilter);
+  const crossFilters = useDashboardState((state) => state.crossFilters);
   const [timestamp] = useState(() => new Date().toLocaleString());
 
   const filterSummary = useMemo(
-    () => filterSummaryFor(tiles, slicerValues, crossFilter),
-    [tiles, slicerValues, crossFilter],
+    () => filterSummaryFor(tiles, slicerValues, crossFilters),
+    [tiles, slicerValues, crossFilters],
   );
+
+  /**
+   * Source-tile emphasis on paper mirrors the on-screen doctrine: only a
+   * SINGLE-value filter marks its source (the renderer contract takes one
+   * label; a multi-value set would mis-dim the other selected categories).
+   */
+  const sourceEmphasisFor = (tileId: string) => {
+    let category: string | null = null;
+    let legend: string | null = null;
+    for (const cross of crossFilters) {
+      if (cross.sourceTileId !== tileId) continue;
+      const label = (cross.values?.length ?? 1) === 1 ? cross.categoryLabel : null;
+      if ((cross.kind ?? 'axis') === 'axis') category = label;
+      else legend = label;
+    }
+    return { category, legend };
+  };
 
   const layout = useMemo(
     () => computePrintLayout(tiles, options, filterSummary.length > 0),
@@ -157,17 +174,11 @@ export function PrintSheets({
             modelId={modelId}
             filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
             activeCategory={
-              crossFilter &&
-              crossFilter.sourceTileId === tile.id &&
-              (crossFilter.kind ?? 'axis') === 'axis'
-                ? { label: crossFilter.categoryLabel }
+              sourceEmphasisFor(tile.id).category !== null
+                ? { label: sourceEmphasisFor(tile.id).category! }
                 : null
             }
-            selectedLegendLabel={
-              crossFilter && crossFilter.sourceTileId === tile.id && crossFilter.kind === 'legend'
-                ? crossFilter.categoryLabel
-                : null
-            }
+            selectedLegendLabel={sourceEmphasisFor(tile.id).legend}
           />
         )}
       </PrintTileBox>

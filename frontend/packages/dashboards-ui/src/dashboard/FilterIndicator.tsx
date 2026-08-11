@@ -1,14 +1,16 @@
-import { useEffect, useState, type CSSProperties } from 'react';
-import { Filter, FilterX, X } from 'lucide-react';
+import { useEffect, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react';
+import { Filter, FilterX, GripVertical, SlidersHorizontal, X } from 'lucide-react';
 import type { FilterIndicatorStyle } from '@recon/dashboards-core';
 
 /**
  * One transient filter the indicator advertises: a cross-filter raised by a
  * datum/legend click, or a slicer selection on the active page. Both are
- * runtime-only state, both are individually clearable.
+ * runtime-only state, both are individually clearable. The two kinds render
+ * DISTINCTLY (filter glyph vs slider glyph + "Slicer" caption) so the same
+ * field:value can never look like a doubled filter.
  */
 export interface ActiveFilterEntry {
-  /** Stable key (tile id for slicers, 'crossFilter' for the click filter). */
+  /** Stable key (slicer tile id, or 'xf:<table>.<column>' for cross-filters). */
   id: string;
   kind: 'crossFilter' | 'slicer';
   /** Field/slicer name, e.g. "name" or "Technician". */
@@ -41,7 +43,14 @@ export const resolveIndicatorStyle = (style: FilterIndicatorStyle | null | undef
 
 /** True when the indicator docks at the BOTTOM of the dashboard. */
 export const isBottomPlacement = (placement: FilterIndicatorPlacement): boolean =>
-  placement === 'bottom-left' || placement === 'bottom-right';
+  placement === 'bottom-left' || placement === 'bottom-right' || placement === 'footer';
+
+/**
+ * True for the in-flow slots the CALLER hosts (toolbar row / bottom bar) —
+ * the indicator renders `inline` there instead of docking itself.
+ */
+export const isFlowPlacement = (placement: FilterIndicatorPlacement): boolean =>
+  placement === 'header' || placement === 'footer';
 
 /* --------------------------------------------------------------- size scale */
 
@@ -64,8 +73,10 @@ const SIZES: Record<FilterIndicatorSize, SizeScale> = {
  * Absolute docking classes for the floating variants (pill/stack). The parent
  * is the dashboard's relative content row, so the indicator floats over the
  * tiles and never reaches the toolbar row (where the refresh caption lives).
+ * 'header'/'footer' never float — the caller hosts them in flow (they fall
+ * back to top-center if one ever reaches this map).
  */
-const PLACEMENT_CLASSES: Record<FilterIndicatorPlacement, string> = {
+const PLACEMENT_CLASSES: Partial<Record<FilterIndicatorPlacement, string>> = {
   'top-center': 'left-1/2 top-2 -translate-x-1/2 items-center',
   'top-left': 'left-3 top-2 items-start',
   'top-right': 'right-3 top-2 items-end',
@@ -123,10 +134,12 @@ function ClearButton({
 }
 
 /**
- * The indicator's atom: accent leading bar, filter glyph, "field:" caption and
- * the BOLD selected value, then its own dismiss. Deliberately louder than the
- * old ghost pill — border + surface + drop shadow so it reads as chrome, not
- * as a tooltip.
+ * The indicator's atom: accent leading bar, kind glyph (filter for
+ * cross-filters, sliders for slicer selections — the visible distinction that
+ * keeps "region: Gulf Coast" from ever reading as the same filter twice),
+ * "field:" caption and the BOLD selected value, then its own dismiss.
+ * Right-click opens the chip menu (Edit value… / Clear) when the caller wires
+ * `onContextMenu`.
  */
 function FilterChip({
   entry,
@@ -134,22 +147,38 @@ function FilterChip({
   accent,
   background,
   textColor,
+  onContextMenu,
 }: {
   entry: ActiveFilterEntry;
   size: FilterIndicatorSize;
   accent: string | null;
   background: string | null;
   textColor: string | null;
+  onContextMenu?: (id: string, position: { x: number; y: number }) => void;
 }) {
   const scale = SIZES[size];
   const style: CSSProperties = {
     ...(background ? { backgroundColor: background } : null),
     ...(textColor ? { color: textColor } : null),
   };
+  const Icon = entry.kind === 'slicer' ? SlidersHorizontal : Filter;
+  const title =
+    entry.kind === 'slicer'
+      ? `Slicer — ${entry.field}: ${entry.value}`
+      : `${entry.field}: ${entry.value}`;
   return (
     <div
       className={`pointer-events-auto flex max-w-full items-stretch overflow-hidden rounded-lg border border-rcd-border bg-rcd-surface shadow-[var(--rcd-shadow-2)] ${scale.height} ${scale.text}`}
       style={style}
+      onContextMenu={
+        onContextMenu
+          ? (event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onContextMenu(entry.id, { x: event.clientX, y: event.clientY });
+            }
+          : undefined
+      }
     >
       {/* Accent leading bar — the "this dashboard is filtered" signal. */}
       <span
@@ -158,13 +187,13 @@ function FilterChip({
         style={accent ? { backgroundColor: accent } : undefined}
       />
       <span className={`flex min-w-0 items-center pl-2 ${scale.padding} ${scale.gap}`}>
-        <Filter
+        <Icon
           size={scale.icon}
           aria-hidden
           className="shrink-0 text-rcd-accent"
           style={accent ? { color: accent } : undefined}
         />
-        <span className="min-w-0 truncate" title={`${entry.field}: ${entry.value}`}>
+        <span className="min-w-0 truncate" title={title}>
           <span className="text-rcd-text-2" style={textColor ? { color: textColor } : undefined}>
             {entry.field}:{' '}
           </span>
@@ -180,6 +209,34 @@ function FilterChip({
         />
       </span>
     </div>
+  );
+}
+
+/**
+ * The drag affordance: a grip revealed on hover; grabbing it starts the
+ * caller's drag-to-dock interaction (snap to one of the seven slots).
+ */
+function DragGrip({
+  size,
+  onPointerDown,
+}: {
+  size: FilterIndicatorSize;
+  onPointerDown: (event: ReactPointerEvent<HTMLButtonElement>) => void;
+}) {
+  const scale = SIZES[size];
+  return (
+    <button
+      type="button"
+      aria-label="Move the filter indicator (drag to a docking slot)"
+      title="Drag to move"
+      onPointerDown={(event) => {
+        event.preventDefault();
+        onPointerDown(event);
+      }}
+      className="pointer-events-auto flex shrink-0 cursor-grab items-center self-center rounded-md p-1 text-rcd-muted opacity-0 transition-opacity hover:bg-black/5 focus-visible:opacity-100 group-hover:opacity-100 dark:hover:bg-white/10"
+    >
+      <GripVertical size={scale.icon} aria-hidden />
+    </button>
   );
 }
 
@@ -217,9 +274,20 @@ export interface FilterIndicatorProps {
   /**
    * Drop the absolute docking wrapper and render just the chips — used when
    * the caller already owns a docked chip column (the top-center strip that
-   * also carries drillthrough/notice chips), so the two never overlap.
+   * also carries drillthrough/notice chips, or the header/footer flow slots),
+   * so the two never overlap.
    */
   inline?: boolean;
+  /**
+   * Right-click on a chip (id + viewport position) — opens the caller's chip
+   * context menu (Edit value… / Clear this filter / Clear all).
+   */
+  onEntryContextMenu?: (id: string, position: { x: number; y: number }) => void;
+  /**
+   * Grabbing the hover-revealed grip starts the caller's drag-to-dock
+   * interaction. Absent = no grip (print view, plain embeds).
+   */
+  onGripPointerDown?: (event: ReactPointerEvent<HTMLButtonElement>) => void;
 }
 
 /**
@@ -237,7 +305,14 @@ export interface FilterIndicatorProps {
  * and are pointer-transparent except on their own controls. Nothing renders
  * without at least one active filter.
  */
-export function FilterIndicator({ entries, style, onClearAll, inline = false }: FilterIndicatorProps) {
+export function FilterIndicator({
+  entries,
+  style,
+  onClearAll,
+  inline = false,
+  onEntryContextMenu,
+  onGripPointerDown,
+}: FilterIndicatorProps) {
   const resolved = resolveIndicatorStyle(style);
   const appeared = useAppeared();
 
@@ -247,12 +322,12 @@ export function FilterIndicator({ entries, style, onClearAll, inline = false }: 
   const scale = SIZES[size];
   const bottom = isBottomPlacement(placement);
 
-  if (variant === 'banner') {
+  if (variant === 'banner' && !inline) {
     return (
       <div
         role="status"
         aria-label="Active filters"
-        className={`z-20 flex w-full shrink-0 items-center gap-2 overflow-x-auto border-rcd-border bg-rcd-surface px-3 py-1.5 shadow-[var(--rcd-shadow-1)] transition-all duration-200 ease-out ${
+        className={`group z-20 flex w-full shrink-0 items-center gap-2 overflow-x-auto border-rcd-border bg-rcd-surface px-3 py-1.5 shadow-[var(--rcd-shadow-1)] transition-all duration-200 ease-out ${
           bottom ? 'border-t' : 'border-b'
         } ${appeared ? 'opacity-100' : 'opacity-0'}`}
         style={{
@@ -262,6 +337,7 @@ export function FilterIndicator({ entries, style, onClearAll, inline = false }: 
           [bottom ? 'borderBottom' : 'borderTop']: `2px solid ${accentColor ?? 'var(--rcd-accent)'}`,
         }}
       >
+        {onGripPointerDown && <DragGrip size={size} onPointerDown={onGripPointerDown} />}
         <span
           className={`flex shrink-0 items-center gap-1.5 font-semibold ${scale.text}`}
           style={{ color: textColor ?? accentColor ?? 'var(--rcd-accent)' }}
@@ -278,6 +354,7 @@ export function FilterIndicator({ entries, style, onClearAll, inline = false }: 
               accent={accentColor}
               background={background}
               textColor={textColor}
+              onContextMenu={onEntryContextMenu}
             />
           ))}
         </span>
@@ -286,19 +363,25 @@ export function FilterIndicator({ entries, style, onClearAll, inline = false }: 
     );
   }
 
-  // pill / stack: floating, docked at `placement`. Both list EVERY active
-  // filter (each with its own ✕) — 'pill' wraps them into a compact row,
-  // 'stack' columns them down the corner.
+  // pill / stack: floating, docked at `placement` (or rendered bare in the
+  // caller's flow slot when `inline`). Both list EVERY active filter (each
+  // with its own ✕) — 'pill' wraps them into a compact row, 'stack' columns
+  // them down the corner.
   return (
     <div
       role="status"
       aria-label="Active filters"
-      className={`pointer-events-none flex max-w-full gap-1.5 transition-all duration-200 ease-out ${
-        variant === 'stack' ? 'flex-col' : 'flex-row flex-wrap'
-      } ${inline ? 'items-center justify-center' : `absolute z-20 max-w-[85%] ${PLACEMENT_CLASSES[placement]}`} ${
+      className={`group pointer-events-none flex max-w-full gap-1.5 transition-all duration-200 ease-out ${
+        variant === 'stack' && !inline ? 'flex-col' : 'flex-row flex-wrap'
+      } ${
+        inline
+          ? 'items-center justify-center'
+          : `absolute z-20 max-w-[85%] ${PLACEMENT_CLASSES[placement] ?? PLACEMENT_CLASSES['top-center']!}`
+      } ${
         appeared ? 'opacity-100 translate-y-0' : `opacity-0 ${bottom ? 'translate-y-1' : '-translate-y-1'}`
       }`}
     >
+      {onGripPointerDown && <DragGrip size={size} onPointerDown={onGripPointerDown} />}
       {entries.map((entry) => (
         <FilterChip
           key={entry.id}
@@ -307,6 +390,7 @@ export function FilterIndicator({ entries, style, onClearAll, inline = false }: 
           accent={accentColor}
           background={background}
           textColor={textColor}
+          onContextMenu={onEntryContextMenu}
         />
       ))}
       {entries.length > 1 && (

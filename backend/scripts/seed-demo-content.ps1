@@ -36,7 +36,16 @@
 # queries. Idempotent via deterministic md5 ids + name-matched re-PUT; then
 # verifies by GETting each dashboard back and running every chart tile's wire
 # query (params resolved to their default option).
-param([string]$BaseUrl = 'http://localhost:5040', [switch]$Restyle, [switch]$Showcase, [switch]$Full)
+# -Modernize: runs AFTER -Full. Additive, in-place refresh of the five -Full
+# company dashboards (ids 6-10) plus the -Showcase "Feature Showcase" so they
+# exercise the wave 12/13 capabilities: a gantt tile, brush/drag zoom and
+# drag-to-cross-filter, auto + log axis scales, trimEmptyEdges, gridX,
+# table paging + per-column alignment, measure-grammar v2 (IF / DIVIDE /
+# PERCENTOFTOTAL with formatString + displayFolder + description), a July
+# fiscal calendar, per-dashboard filter indicators and restyled slicers.
+# Idempotent by construction: GET -> patch by deterministic id -> PUT, so the
+# phase applied twice writes a byte-identical layout (asserted in-phase).
+param([string]$BaseUrl = 'http://localhost:5040', [switch]$Restyle, [switch]$Showcase, [switch]$Full, [switch]$Modernize)
 
 $ErrorActionPreference = 'Stop'
 $failures = 0
@@ -2178,6 +2187,888 @@ if ($Full) {
         exit 1
     }
     Write-Host "`nAll full-phase checks passed." -ForegroundColor Green
+    exit 0
+}
+
+# ===========================================================================
+# MODERNIZE PHASE (-Modernize): wave 12/13 refresh of the five -Full company
+# dashboards (ids 6-10) and the -Showcase "Feature Showcase" (id 5), applied
+# IN PLACE through the API. Run the plain seed, -Showcase and -Full first.
+#
+# Why patch instead of rebuild: the layout document is stored OPAQUELY by the
+# server (DashboardsController hands request.Layout.GetRawText() straight to
+# DashboardService, which persists the string verbatim), so a GET returns the
+# exact document -Full wrote, jsonb-canonicalised. Patching it by deterministic
+# tile id keeps this phase additive - it can never silently drop a -Full
+# feature - and makes re-running it converge: the second application reads its
+# own output and rewrites the same bytes.
+#
+# The three model measures use grammar v2 (MeasureExpressionParser): IF(),
+# DIVIDE() and PERCENTOFTOTAL(), each carrying formatString + displayFolder +
+# description. Unlike layouts, model definitions are STRICT
+# (ModelJson UnmappedMemberHandling.Disallow), so every model write is run
+# through POST /models/validate before the PUT.
+# ===========================================================================
+if ($Modernize) {
+
+    # ----------------------------------------------------------------- ids
+    # The -Full and -Showcase phases mint deterministic guids from md5 over a
+    # salted key. Re-deriving them here is how this phase addresses the tiles
+    # those phases created, without matching on fragile titles.
+    function DetIdSalted([string]$Salt, [string]$Key) {
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        try {
+            [guid]::new($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes("$Salt$Key"))).ToString()
+        } finally { $md5.Dispose() }
+    }
+    function FullId([string]$Key) { DetIdSalted 'rcd-full:' $Key }
+    function ShowId([string]$Key) { DetIdSalted 'rcd-showcase:' $Key }
+    function MzId([string]$Key) { DetIdSalted 'rcd-modernize:' $Key }
+
+    # /query is rate-limited (token bucket, QueriesPerMinutePerUser); this
+    # phase fires ~60 queries, so wait out 503s instead of failing.
+    function PostQueryBody([string]$Body) {
+        for ($attempt = 1; $attempt -le 36; $attempt++) {
+            try {
+                return Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/query" `
+                    -Headers $headers -ContentType 'application/json' -Body $Body
+            } catch {
+                $code = 0
+                if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode }
+                if ($code -eq 503 -and $attempt -lt 36) { Start-Sleep -Seconds 5; continue }
+                throw
+            }
+        }
+    }
+    function RunQueryM([hashtable]$Spec) { PostQueryBody ($Spec | ConvertTo-Json -Depth 12) }
+
+    # ------------------------------------------------------ document helpers
+    # Everything below works on HASHTABLES (ConvertFrom-Json -AsHashtable), so
+    # nested bags are mutable and mutating a tile mutates the document.
+    function MzFetch([string]$Name) {
+        $summary = Invoke-RestMethod -Uri "$BaseUrl/api/rcd/v1/dashboards" -Headers $headers |
+            ForEach-Object { $_ } |
+            Where-Object { $_.name -eq $Name } | Select-Object -First 1
+        if (-not $summary) { throw "Dashboard '$Name' not found - run the -Showcase and -Full phases first" }
+        $doc = (Invoke-WebRequest -Uri "$BaseUrl/api/rcd/v1/dashboards/$($summary.id)" -Headers $headers).Content |
+            ConvertFrom-Json -AsHashtable
+        $doc
+    }
+
+    # The raw GET body from '"layout":' to the end. `layout` is the last
+    # property of the envelope, so this is the persisted document with the
+    # volatile id/updatedAtUtc header sliced off - the byte-for-byte artifact
+    # the idempotency assertion compares.
+    function MzRawLayout([int]$Id) {
+        $raw = (Invoke-WebRequest -Uri "$BaseUrl/api/rcd/v1/dashboards/$Id" -Headers $headers).Content
+        $raw.Substring($raw.IndexOf('"layout":'))
+    }
+
+    function MzPage($Doc, [string]$Name) {
+        $page = @($Doc.layout.pages) | Where-Object { $_.name -eq $Name } | Select-Object -First 1
+        if (-not $page) { throw "page '$Name' not found on dashboard '$($Doc.name)'" }
+        $page
+    }
+    function MzTile($Page, [string]$TileId) {
+        $tile = @($Page.tiles) | Where-Object { $_.id -eq $TileId } | Select-Object -First 1
+        if (-not $tile) { throw "tile '$TileId' not found on page '$($Page.name)'" }
+        $tile
+    }
+    function MzMerge([hashtable]$Target, [hashtable]$Values) {
+        foreach ($key in $Values.Keys) { $Target[$key] = $Values[$key] }
+    }
+    # Merge into chart.format: additive, so every -Full setting survives.
+    function MzSetFormat($Tile, [hashtable]$Values) {
+        if ($null -eq $Tile.chart.format) { $Tile.chart['format'] = @{} }
+        MzMerge $Tile.chart.format $Values
+    }
+    function MzSetTable($Tile, [hashtable]$Values) {
+        if ($null -eq $Tile.chart.format) { $Tile.chart['format'] = @{} }
+        if ($null -eq $Tile.chart.format.table) { $Tile.chart.format['table'] = @{} }
+        MzMerge $Tile.chart.format.table $Values
+    }
+    # Slicer style/dateRange are REPLACED wholesale: the -Full styles they
+    # supersede (compact buttons, native pickers) must not linger.
+    function MzSetSlicerStyle($Tile, [hashtable]$Style) { $Tile.slicer['style'] = $Style }
+    function MzSetDateRange($Tile, [hashtable]$Options) { $Tile.slicer['dateRange'] = $Options }
+    function MzMove($Tile, [int]$X, [int]$Y, [int]$W, [int]$H) {
+        $Tile.layout = @{ x = $X; y = $Y; w = $W; h = $H }
+    }
+    # Replace by id, else append - the reason a re-run adds nothing.
+    function MzUpsertTile($Page, [hashtable]$Tile) {
+        $out = @()
+        $replaced = $false
+        foreach ($existing in @($Page.tiles)) {
+            if ($existing.id -eq $Tile.id) { $out += $Tile; $replaced = $true } else { $out += $existing }
+        }
+        if (-not $replaced) { $out += $Tile }
+        $Page.tiles = @($out)
+    }
+    # Phone stack: append ids the page gained so new tiles are not orphaned.
+    function MzSyncMobile($Page) {
+        if ($null -eq $Page.mobileLayout) { return }
+        $order = @($Page.mobileLayout.order)
+        foreach ($tile in @($Page.tiles)) { if ($order -notcontains $tile.id) { $order += $tile.id } }
+        $Page.mobileLayout['order'] = @($order)
+    }
+    function MzHero([string]$Title, [string]$Sub) {
+        @{
+            hideHeader = $true
+            innerTitleHtml = ('<p><b>{0}</b> <span style="color:#64748b">&mdash; {1}</span></p>' -f $Title, $Sub)
+        }
+    }
+    function MzChartTile([string]$Key, [string]$Type, [string]$Title, [hashtable]$Layout, [hashtable]$Query, [hashtable]$Format) {
+        @{
+            id = MzId "tile-$Key"; kind = 'chart'; layout = $Layout
+            chart = @{ id = MzId "chart-$Key"; type = $Type; title = $Title; query = $Query; format = $Format }
+        }
+    }
+    function MzTextTile([string]$Key, [hashtable]$Layout, [string]$Html, [string]$Background = $null) {
+        $text = @{ html = $Html; align = 'left' }
+        if ($Background) { $text.background = $Background }
+        @{ id = MzId "tile-$Key"; kind = 'text'; layout = $Layout; text = $text }
+    }
+
+    # =======================================================================
+    # MODEL: measure grammar v2 + a fiscal calendar on Maintenance Operations
+    # =======================================================================
+    Write-Host "`nModernize: fetching models"
+    $maintModel = GetModelByName 'Maintenance Operations'
+    $inspModel = GetModelByName 'Inspections'
+    $wfModel = GetModelByName 'Workforce'
+
+    # Per-site budget line, re-derived exactly as -Full derives it, so the
+    # IF() measure below splits on the same threshold the budget reference
+    # lines already use.
+    $siteRows = (RunQueryM @{
+        modelId = $maintModel.id
+        dimensions = @(@{ table = 'public.sites'; column = 'name' })
+        measures = @(@{ measureId = (MeasureId $maintModel 'Total Cost') })
+        filters = @(); sort = @()
+    }).rows
+    $budget = [math]::Round((((@($siteRows | ForEach-Object { [double]$_[1] })) | Measure-Object -Average).Average) / 1000) * 1000
+    Write-Host "  Per-site budget line: `$$budget"
+
+    # Upserts measures BY NAME, reusing any id already in the model so charts
+    # that reference them keep resolving. Validates before writing (model
+    # definitions are strict: an unknown field is a 400, not a silent drop).
+    function UpsertModelMeasures($Model, [object[]]$Wanted, [hashtable]$DateTableSettings = $null) {
+        $definition = $Model.definition | ConvertTo-Json -Depth 24 | ConvertFrom-Json -AsHashtable
+        $measures = @($definition.measures)
+        # NOTE the loop variable is $want, not $wanted: PowerShell variable
+        # names are case-insensitive, so `foreach ($wanted in $Wanted)` would
+        # clobber the parameter with its own last element.
+        foreach ($want in $Wanted) {
+            $found = $measures | Where-Object { $_.name -eq $want.name } | Select-Object -First 1
+            if ($found) { $want.id = $found.id }
+            $out = @()
+            $replaced = $false
+            foreach ($measure in $measures) {
+                if ($measure.name -eq $want.name) { $out += $want; $replaced = $true } else { $out += $measure }
+            }
+            if (-not $replaced) { $out += $want }
+            $measures = @($out)
+        }
+        $definition.measures = $measures
+        if ($DateTableSettings) {
+            foreach ($dateTable in @($definition.dateTables)) {
+                if ($dateTable.name -eq $DateTableSettings.name) { MzMerge $dateTable $DateTableSettings }
+            }
+        }
+
+        $validation = Invoke-RestMethod -Method Post -Uri "$BaseUrl/api/rcd/v1/models/validate" `
+            -Headers $headers -ContentType 'application/json' `
+            -Body (@{ dataSourceName = $Model.dataSourceName; definition = $definition } | ConvertTo-Json -Depth 24)
+        $errors = @($validation.issues | Where-Object { $_.severity -eq 'error' })
+        Assert ([bool]$validation.valid) "model '$($Model.name)': v2 definition validates ($($errors.Count) error(s): $((($errors | ForEach-Object { "$($_.code) $($_.message)" }) -join '; ')))"
+        if (-not $validation.valid) { throw 'model definition rejected by validation' }
+
+        $body = @{
+            name = $Model.name; description = $Model.description; dataSourceName = $Model.dataSourceName
+            definition = $definition; isShared = $Model.isShared; expectedUpdatedAtUtc = $Model.updatedAtUtc
+        } | ConvertTo-Json -Depth 24
+        $updated = Invoke-RestMethod -Method Put -Uri "$BaseUrl/api/rcd/v1/models/$($Model.id)" `
+            -Headers $headers -ContentType 'application/json' -Body $body
+        Write-Host "  UPDATE  model '$($Model.name)': $(($Wanted | ForEach-Object { $_.name }) -join ', ')" -ForegroundColor Yellow
+        return $updated
+    }
+
+    Write-Host "`nModernize: measure grammar v2 on 'Maintenance Operations'"
+    $maintModel = UpsertModelMeasures $maintModel @(
+        @{
+            id = MzId 'measure-completion-rate'; name = 'Completion Rate'
+            table = 'public.work_orders'; aggregation = 'sum'
+            # The leading 1.0 * is load-bearing, and is the same idiom the
+            # existing Open Rate measure uses: DIVIDE compiles to a bare
+            # (numerator / NULLIF(denominator, 0)) with NO decimal cast (unlike
+            # PERCENTOFTOTAL and the periodChangePct calc, which both cast), so
+            # two COUNT(*) bigints would divide integrally to 0 or 1.
+            expression = 'DIVIDE(1.0 * [Closed Orders], [Work Orders])'
+            formatString = '0.0%'; displayFolder = 'Delivery'
+            description = 'Share of the work orders in context that reached status closed. DIVIDE() yields blank rather than an error when no orders are in scope, so it is safe as a gantt progress measure; the 1.0 * keeps the count division in floating point.'
+        }
+        @{
+            id = MzId 'measure-pct-of-spend'; name = '% of Total Spend'
+            table = 'public.work_orders'; aggregation = 'sum'
+            expression = 'PERCENTOFTOTAL([Total Cost])'
+            formatString = '0.0%'; displayFolder = 'Spend'
+            description = "Each category's share of the spend in the whole result. PERCENTOFTOTAL may only wrap an entire measure; the engine compiles it to a SUM() OVER () window stage."
+        }
+        @{
+            id = MzId 'measure-over-budget'; name = 'Over-Budget Spend'
+            table = 'public.work_orders'; aggregation = 'sum'
+            expression = ('IF([Total Cost] > {0}, [Total Cost] - {0}, 0)' -f $budget)
+            formatString = '$#,##0'; displayFolder = 'Spend'
+            description = ('Spend above the ${0} per-site budget line, folded to zero at or under budget by IF(). Read it against a site axis - the budget is the average site spend.' -f $budget)
+        }
+    ) @{ name = 'Calendar'; fiscalYearStartMonth = 7; weekStartDay = 'sunday' }
+
+    $mTotalCost = MeasureId $maintModel 'Total Cost'
+    $mLaborHours = MeasureId $maintModel 'Labor Hours'
+    $mWorkOrders = MeasureId $maintModel 'Work Orders'
+    $mOpenOrders = MeasureId $maintModel 'Open Orders'
+    $mAvgCost = MeasureId $maintModel 'Avg Cost per Order'
+    $mPartsSpend = MeasureId $maintModel 'Parts Spend'
+    $mCompletion = MeasureId $maintModel 'Completion Rate'
+    $mPctSpend = MeasureId $maintModel '% of Total Spend'
+    $mOverBudget = MeasureId $maintModel 'Over-Budget Spend'
+
+    # ------------------------------------------------ data-derived constants
+    # The gantt window and the completion target come from the data, never the
+    # wall clock, so the phase stays byte-stable no matter what day it runs.
+    $maxOpened = [datetime]::Parse(
+        [string](RunQueryM @{
+            modelId = $maintModel.id; dimensions = @()
+            measures = @(@{ table = 'public.work_orders'; column = 'opened_on'; aggregation = 'max'; alias = 'Latest' })
+            filters = @(); sort = @()
+        }).rows[0][0], [cultureinfo]::InvariantCulture)
+    $ganttFrom = $maxOpened.AddMonths(-2).ToString('yyyy-MM-01', [cultureinfo]::InvariantCulture)
+    $ganttFromLabel = $maxOpened.AddMonths(-2).ToString('MMMM yyyy', [cultureinfo]::InvariantCulture)
+    $completionNow = [double](RunQueryM @{
+        modelId = $maintModel.id; dimensions = @()
+        measures = @(@{ measureId = $mCompletion }); filters = @(); sort = @()
+    }).rows[0][0]
+    $completionTarget = [math]::Round($completionNow * 0.98, 3)
+    Write-Host ("  Gantt window from {0}; completion target {1:P1}" -f $ganttFrom, $completionTarget)
+
+    $mzRed = '#dc2626'; $mzGreen = '#16a34a'
+    $ocean = '#1868ae'; $sunset = '#f2542d'; $berry = '#7b2cbf'; $forest = '#2d6a4f'; $slate = '#1f2937'
+
+    # Chart queries kept in variables so the tile spec and the wire-query
+    # verification below can never drift apart.
+    $qGantt = @{
+        axis = @{ table = 'public.units'; column = 'name' }
+        legend = @{ table = 'public.sites'; column = 'region' }
+        measures = @(
+            @{ table = 'public.work_orders'; column = 'opened_on'; aggregation = 'min'; alias = 'Campaign start' }
+            @{ table = 'public.work_orders'; column = 'closed_on'; aggregation = 'max'; alias = 'Campaign end' }
+            @{ measureId = $mCompletion }
+        )
+        filters = @(@{ table = 'public.work_orders'; column = 'opened_on'; operator = 'gte'; values = @($ganttFrom) })
+    }
+    $qFiscal = @{
+        axis = @{ table = '#date.Calendar'; column = 'fiscal_quarter' }
+        legend = @{ table = '#date.Calendar'; column = 'fiscal_year' }
+        measures = @(@{ measureId = $mTotalCost }); filters = @()
+    }
+    $qPctSpend = @{
+        legend = @{ table = 'public.sites'; column = 'region' }
+        measures = @(@{ measureId = $mPctSpend }); filters = @()
+    }
+    $qUnitCost = @{
+        axis = @{ table = 'public.parts'; column = 'part_number' }
+        legend = @{ table = 'public.parts'; column = 'category' }
+        measures = @(
+            @{ table = 'public.parts'; column = 'unit_cost'; aggregation = 'avg'; alias = 'Unit Cost' }
+            @{ table = 'public.work_order_parts'; column = 'quantity'; aggregation = 'sum'; alias = 'Qty Used' }
+        )
+        filters = @()
+    }
+    $qSiteSpend = @{
+        axis = @{ table = 'public.sites'; column = 'name' }
+        measures = @(
+            @{ table = 'public.sites'; column = 'region'; aggregation = 'min'; alias = 'Region' }
+            @{ measureId = $mTotalCost }
+            @{ measureId = $mAvgCost }
+            @{ measureId = $mOverBudget }
+        )
+        filters = @()
+        sort = @(@{ target = @{ kind = 'measure'; index = 1 }; direction = 'desc' })
+    }
+    $qCompletionKpi = @{ measures = @(@{ measureId = $mCompletion }); filters = @() }
+
+    # Shared table-presentation defaults for the wave-13 table work: a page-size
+    # picker, wrapped long text, centred headers and centred middle-aligned
+    # categorical columns.
+    $mzPageSizes = @(10, 25, 50)
+
+    # =======================================================================
+    # The transform. Returns dashboard name -> the raw persisted layout JSON,
+    # so the caller can apply it twice and compare bytes.
+    # =======================================================================
+    function ApplyModernize {
+        $result = [ordered]@{}
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 6: Executive Overview - header BANNER indicator, cross-filters
+        # that survive page switches, zoom on the hero, a trimmed YoY line and a
+        # fiscal-quarter rollup off the July calendar.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Executive Overview"
+        $doc = MzFetch 'Executive Overview'
+        $doc['description'] = 'C-suite view of maintenance spend. Wave 12/13: a full-width filter BANNER docked in the header, dashboard-wide cross-filter scope, brush + drag zoom on the cost trend, a YoY line with its 12-month warm-up trimmed away, and a fiscal-quarter rollup off the July fiscal calendar.'
+        $doc.layout['filterIndicator'] = @{ placement = 'header'; variant = 'banner'; size = 'md'; badgeTiles = $true }
+        $doc.layout['crossFilterScope'] = 'dashboard'
+
+        $page = MzPage $doc 'Company Pulse'
+        # The slicer row gains a grid row: large 2-column buttons need the height.
+        MzMove (MzTile $page (FullId 'tile-d1-sl-region')) 0 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d1-sl-priority')) 8 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d1-sl-opened')) 16 4 8 5
+        MzSetSlicerStyle (MzTile $page (FullId 'tile-d1-sl-priority')) @{ buttonSize = 'lg'; buttonFill = $true; buttonColumns = 2 }
+        MzSetDateRange (MzTile $page (FullId 'tile-d1-sl-opened')) @{ picker = 'calendar'; initialMonth = 'dataStart'; showAvailability = $true }
+
+        $hero = MzTile $page (FullId 'tile-d1-hero')
+        MzMove $hero 0 9 16 9
+        MzSetFormat $hero @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+            container = MzHero 'Cost trend' 'monthly spend against cumulative total on the right axis &mdash; drag a rectangle to zoom the view, or window it with the brush strip; double-click resets'
+        }
+        MzMove (MzTile $page (FullId 'tile-d1-donut')) 16 9 8 9
+        MzMove (MzTile $page (FullId 'tile-d1-mix')) 12 18 12 9
+
+        $sites = MzTile $page (FullId 'tile-d1-sites')
+        MzMove $sites 0 18 12 9
+        $sites.chart['title'] = 'Site Spend & Over-Budget Exposure'
+        $sites.chart['query'] = $qSiteSpend
+        MzSetTable $sites @{
+            stripes = $true; density = 'normal'
+            pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Region = 'center' }
+            columnVerticalAlign = @{ Region = 'middle'; 'Total Cost' = 'middle'; 'Avg Cost per Order' = 'middle'; 'Over-Budget Spend' = 'middle' }
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Growth & Seasonality'
+        MzSetFormat (MzTile $page (FullId 'tile-d1-yoy')) @{
+            trimEmptyEdges = $true
+            xLabelFit = @{ mode = 'angled' }
+            gridX = $true
+            container = MzHero 'Growth' 'monthly spend against the same month a year earlier &mdash; trimEmptyEdges drops the blank 12-month warm-up at the front, and angled labels keep every month legible'
+        }
+        MzUpsertTile $page (MzChartTile 'd1-fiscal' 'column' 'Spend by Fiscal Quarter' @{ x = 0; y = 21; w = 24; h = 8 } $qFiscal @{
+            theme = 'ocean'; valueFormat = '$#,0'; yAxisFormat = @{ kind = 'compact' }
+            gridX = $true; legendPosition = 'bottom'; legendInteractive = $true
+            tooltip = @{ accentBorder = $true }
+            container = MzHero 'Fiscal calendar' 'the Calendar date table now runs a July fiscal year on Sunday weeks, so Q1 is Jul&ndash;Sep and each fiscal year is labelled by the year it ENDS in'
+        })
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Regional Deep Dive'
+        MzSetFormat (MzTile $page (FullId 'tile-d1-p3-trend')) @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+        }
+        MzSetTable (MzTile $page (FullId 'tile-d1-p3-table')) @{
+            stripes = $true; pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ 'Total Cost' = 'right'; 'Avg Cost per Order' = 'right' }
+            columnVerticalAlign = @{ 'Total Cost' = 'middle'; 'Avg Cost per Order' = 'middle' }
+        }
+        MzSyncMobile $page
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Executive Overview'] = MzRawLayout $doc.id
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 7: Operations Command Center - the GANTT is the page anchor,
+        # a corner filter STACK, drag-to-cross-filter on the monthly mix and the
+        # DIVIDE() completion rate as the delivery KPI.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Operations Command Center"
+        $doc = MzFetch 'Operations Command Center'
+        $doc['description'] = 'Daily ops console. Wave 12/13: a gantt work-order timeline as the page anchor (today marker, row banding, progress fill from a DIVIDE() measure), a stacked filter indicator in the top-right corner, drag-across-months cross-filtering on the priority mix, and a paged order register with centred status columns.'
+        $doc.layout['filterIndicator'] = @{ placement = 'top-right'; variant = 'stack'; size = 'sm'; badgeTiles = $true }
+
+        $page = MzPage $doc 'Live Backlog'
+        # KPI 4 was a third copy of Avg Cost per Order (it already leads the
+        # Executive and Cost dashboards); ops needs the delivery number instead.
+        $kpi = MzTile $page (FullId 'tile-d2-k-avg')
+        $kpi.chart['title'] = 'Completion Rate'
+        $kpi.chart['query'] = $qCompletionKpi
+        $kpi.chart['format'] = @{
+            valueFormat = '0.0%'
+            seriesLabels = @{ 'Completion Rate' = 'closed / all orders' }
+            conditionalFormats = @(@{
+                id = MzId 'd2-cf-completion'; measureKey = 'Completion Rate'; style = 'kpi'
+                rules = @(
+                    @{ op = 'gte'; value = $completionTarget; color = $mzGreen }
+                    @{ op = 'lt'; value = $completionTarget; color = $mzRed }
+                )
+            })
+            container = @{
+                hideHeader = $true; borderColor = $sunset; borderWidth = 1; borderRadius = 12; shadow = 'sm'
+                innerTitleHtml = ('<p><b>Completion Rate</b> <span style="color:#64748b">target &ge; {0}% (DIVIDE)</span></p>' -f [math]::Round($completionTarget * 100, 1))
+            }
+        }
+
+        MzMove (MzTile $page (FullId 'tile-d2-sl-window')) 0 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d2-sl-status')) 8 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d2-sl-region')) 16 4 8 5
+        MzSetSlicerStyle (MzTile $page (FullId 'tile-d2-sl-status')) @{ buttonSize = 'lg'; buttonFill = $true; buttonColumns = 2 }
+
+        # h=14, not 11: the window yields 18 unit rows and a shorter tile makes
+        # the category axis start dropping task labels to avoid overlap.
+        MzUpsertTile $page (MzChartTile 'd2-gantt' 'gantt' 'Work Order Timeline' @{ x = 0; y = 9; w = 24; h = 14 } $qGantt @{
+            theme = 'sunset'; legendPosition = 'bottom'; legendInteractive = $true
+            gantt = @{
+                showToday = $true; todayColor = '#dc2626'; rowBanding = $true
+                cornerRadius = 4; barSize = 16; taskLabels = 'axis'; showProgress = $true
+            }
+            tooltip = @{ accentBorder = $true }
+            container = MzHero 'Work order timeline' ('one bar per plant unit, from its first order opened since {0} to its last order closed, coloured by region; the inner fill is the DIVIDE() completion rate and the red rule is today' -f $ganttFromLabel)
+        })
+        MzUpsertTile $page (MzTextTile 'd2-zoomnote' @{ x = 0; y = 23; w = 24; h = 2 } '<p><b>Two ways to explore the row below.</b> <span style="color:#64748b">Left: <i>Open Orders by Site</i> re-queries itself every 30 seconds. Right: drag across a span of months on <i>Monthly Orders by Priority</i> and the whole dashboard cross-filters to that date range (zoom dragAction = crossFilter); the brush strip under it windows the view without filtering, and a double-click clears the zoom.</span></p>' '#fff7ed')
+        MzMove (MzTile $page (FullId 'tile-d2-live')) 0 25 12 9
+        $priostack = MzTile $page (FullId 'tile-d2-priostack')
+        MzMove $priostack 12 25 12 9
+        MzSetFormat $priostack @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'crossFilter' }
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Site Performance'
+        MzSetFormat (MzTile $page (FullId 'tile-d2-drill')) @{ gridX = $true }
+        MzSetFormat (MzTile $page (FullId 'tile-d2-budget')) @{ gridX = $true }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Order Details'
+        MzSetTable (MzTile $page (FullId 'tile-d2-orders')) @{
+            borders = 'grid'; density = 'compact'; totals = $true; pinned = 1
+            filterable = $true; stripes = $true; headerBold = $true
+            pageSize = 25; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Opened = 'center'; Priority = 'center'; Status = 'center' }
+            columnVerticalAlign = @{ Opened = 'middle'; Priority = 'middle'; Status = 'middle'; Site = 'middle'; 'Assigned To' = 'middle' }
+        }
+        MzSyncMobile $page
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Operations Command Center'] = MzRawLayout $doc.id
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 8: Cost & Vendor Management - a custom-accent PILL indicator,
+        # the PERCENTOFTOTAL donut, auto-ranged scatter axes and a genuine log
+        # scale on the 37x unit-cost spread.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Cost & Vendor Management"
+        $doc = MzFetch 'Cost & Vendor Management'
+        $doc['description'] = 'Procurement view. Wave 12/13: a custom-accent filter pill, a PERCENTOFTOTAL() spend-share donut, brush + drag zoom on the spend trend, a paged part-consumption table with wrapped descriptions, and a cost-driver scatter pair - one auto-ranged, one on a log price axis.'
+        $doc.layout['filterIndicator'] = @{
+            placement = 'top-center'; variant = 'pill'; size = 'md'
+            accentColor = $berry; background = '#f5f3ff'; textColor = '#4c1d95'; badgeTiles = $true
+        }
+
+        $page = MzPage $doc 'Spend Overview'
+        # Three equal columns instead of two, so the share donut earns its slot.
+        MzMove (MzTile $page (FullId 'tile-d3-lens')) 0 8 8 9
+        MzMove (MzTile $page (FullId 'tile-d3-vendors')) 8 8 8 9
+        MzUpsertTile $page (MzChartTile 'd3-pct' 'donut' 'Share of Total Spend by Region' @{ x = 16; y = 8; w = 8; h = 9 } $qPctSpend @{
+            theme = 'berry'; legendPosition = 'bottom'
+            tooltip = @{ accentBorder = $true }
+            container = @{ shadow = 'md'; borderRadius = 16 }
+        })
+        MzSetFormat (MzTile $page (FullId 'tile-d3-trend')) @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Parts & Inventory'
+        MzSetTable (MzTile $page (FullId 'tile-d3-partstable')) @{
+            density = 'compact'; stripes = $true; borders = 'rows'; filterable = $true
+            pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Category = 'center' }
+            columnVerticalAlign = @{ Category = 'middle'; 'Parts Spend' = 'middle'; 'Qty Used' = 'middle' }
+        }
+        MzSetFormat (MzTile $page (FullId 'tile-d3-vregion')) @{ gridX = $true }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Cost Drivers'
+        MzSetFormat (MzTile $page (FullId 'tile-d3-scatter')) @{
+            gridX = $true
+            xAxisScale = @{ range = 'auto' }
+            yAxisScale = @{ range = 'auto' }
+            container = MzHero 'Cost vs labour' 'each point is a site x valve type, with both axes auto-ranged (range: auto) so the cluster fills the plot instead of being squashed against a forced zero'
+        }
+        MzUpsertTile $page (MzChartTile 'd3-unitcost' 'scatter' 'Unit Cost vs Consumption' @{ x = 0; y = 14; w = 24; h = 9 } $qUnitCost @{
+            theme = 'berry'; legendPosition = 'bottom'; gridX = $true
+            xAxisFormat = @{ kind = 'currency'; decimals = 0 }
+            xAxisScale = @{ range = 'auto'; log = $true }
+            yAxisScale = @{ range = 'auto' }
+            xAxisLabelHtml = '<b>Unit cost</b> <span style="color:#64748b">(USD, log10 scale)</span>'
+            yAxisLabelHtml = '<b>Quantity consumed</b> <span style="color:#64748b">(units)</span>'
+            tooltip = @{ accentBorder = $true }
+            container = MzHero 'Price vs consumption' 'catalogue prices span roughly 37x from cheapest to dearest SKU, so the price axis runs log10 &mdash; on a linear axis the cheap half collapses into the origin'
+        })
+        MzSyncMobile $page
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Cost & Vendor Management'] = MzRawLayout $doc.id
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 9: Workforce & Productivity - deliberately keeps the DEFAULT
+        # filter indicator so the stock pill stays on show somewhere.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Workforce & Productivity"
+        $doc = MzFetch 'Workforce & Productivity'
+        $doc['description'] = 'People view on the Workforce model. Wave 12/13: brush + drag zoom on the labour trend, large filled 2-column button slicers, and a paged assignment roster with centred role columns. This dashboard deliberately leaves filterIndicator unset, so cross-filters here show in the stock pill.'
+
+        $page = MzPage $doc 'Team Overview'
+        MzMove (MzTile $page (FullId 'tile-d4-sl-region')) 0 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d4-sl-title')) 8 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d4-sl-priority')) 16 4 8 5
+        MzSetSlicerStyle (MzTile $page (FullId 'tile-d4-sl-priority')) @{ buttonSize = 'lg'; buttonFill = $true; buttonColumns = 2 }
+        MzMove (MzTile $page (FullId 'tile-d4-workload')) 0 9 12 10
+        $labor = MzTile $page (FullId 'tile-d4-labor')
+        MzMove $labor 12 9 12 10
+        MzSetFormat $labor @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+            container = MzHero 'Labour trend' 'hours booked per month with a 3-month moving average &mdash; drag to zoom into a busy stretch, or window it with the brush strip'
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Assignments'
+        MzSetTable (MzTile $page (FullId 'tile-d4-roster')) @{
+            borders = 'grid'; density = 'compact'; totals = $true; pinned = 1
+            filterable = $true; stripes = $true
+            pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Role = 'center'; 'Home Site' = 'center' }
+            columnVerticalAlign = @{ Role = 'middle'; 'Home Site' = 'middle' }
+        }
+        MzSyncMobile $page
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Workforce & Productivity'] = MzRawLayout $doc.id
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 10: Asset Reliability - a footer BANNER indicator, the
+        # centred Pass Rate league table and a calendar date picker.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Asset Reliability"
+        $doc = MzFetch 'Asset Reliability'
+        $doc['description'] = 'Reliability engineering view of the valve fleet. Wave 12/13: a slim filter banner docked to the footer, a calendar date picker that opens on the last month with data, an auto-ranged pressure scatter, and a league table whose Pass Rate columns are centre-aligned and paged.'
+        $doc.layout['filterIndicator'] = @{ placement = 'footer'; variant = 'banner'; size = 'sm'; badgeTiles = $true }
+
+        $page = MzPage $doc 'Inspection Health'
+        MzMove (MzTile $page (FullId 'tile-d5-sl-result')) 0 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d5-sl-region')) 8 4 8 5
+        MzMove (MzTile $page (FullId 'tile-d5-sl-date')) 16 4 8 5
+        MzSetSlicerStyle (MzTile $page (FullId 'tile-d5-sl-result')) @{ buttonSize = 'lg'; buttonFill = $true; buttonColumns = 2 }
+        MzSetDateRange (MzTile $page (FullId 'tile-d5-sl-date')) @{ picker = 'calendar'; initialMonth = 'dataEnd'; showAvailability = $true }
+        MzMove (MzTile $page (FullId 'tile-d5-trend')) 0 9 14 9
+        MzMove (MzTile $page (FullId 'tile-d5-league')) 14 9 10 9
+        MzSetFormat (MzTile $page (FullId 'tile-d5-trend')) @{ gridX = $true }
+        MzSetTable (MzTile $page (FullId 'tile-d5-league')) @{
+            density = 'compact'; stripes = $true
+            pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ 'Inspection Count' = 'center'; 'Pass Rate' = 'center' }
+            columnVerticalAlign = @{ 'Inspection Count' = 'middle'; 'Pass Rate' = 'middle' }
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Valve Fleet'
+        MzSetFormat (MzTile $page (FullId 'tile-d5-scatter')) @{
+            gridX = $true
+            xAxisScale = @{ range = 'auto' }
+            yAxisScale = @{ range = 'auto' }
+            container = MzHero 'Pressure vs attention' 'each point is a valve: set pressure against inspections booked, both axes auto-ranged so the 150&ndash;1125 psi band fills the plot'
+        }
+        MzSyncMobile $page
+
+        $page = MzPage $doc 'Findings'
+        MzSetTable (MzTile $page (FullId 'tile-d5-log')) @{
+            borders = 'grid'; density = 'compact'; totals = $true; pinned = 1
+            filterable = $true; stripes = $true
+            pageSize = 25; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Date = 'center'; Result = 'center' }
+            columnVerticalAlign = @{ Date = 'middle'; Result = 'middle'; Inspector = 'middle'; Site = 'middle'; Valve = 'middle' }
+        }
+        MzSyncMobile $page
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Asset Reliability'] = MzRawLayout $doc.id
+
+        # -------------------------------------------------------------------
+        # DASHBOARD 5: Feature Showcase - the reference tour picks up the new
+        # view tools on the charts that motivated them.
+        # -------------------------------------------------------------------
+        Write-Host "`nModernize: Feature Showcase"
+        $doc = MzFetch 'Feature Showcase'
+        $doc['description'] = 'Every advanced feature on one dashboard: drill hierarchies, cross-filter spotlight, time intelligence, small multiples, conditional formatting, drillthrough and bookmarks - now with brush + drag zoom, trimEmptyEdges on the YoY warm-up, angled axis labels, gridlines, paged tables and a corner filter stack.'
+        $doc.layout['filterIndicator'] = @{ placement = 'bottom-right'; variant = 'stack'; size = 'md'; badgeTiles = $true }
+
+        $page = MzPage $doc 'Drill & Explore'
+        MzSetSlicerStyle (MzTile $page (ShowId 'tile-slicer-priority')) @{ buttonSize = 'lg'; buttonFill = $true; buttonColumns = 2 }
+        MzMove (MzTile $page (ShowId 'tile-slicer-region')) 0 3 7 5
+        MzMove (MzTile $page (ShowId 'tile-slicer-priority')) 7 3 9 5
+        MzMove (MzTile $page (ShowId 'tile-p1-note')) 16 3 8 5
+        MzMove (MzTile $page (ShowId 'tile-drill')) 0 8 12 9
+        MzMove (MzTile $page (ShowId 'tile-spotlight')) 12 8 12 9
+        MzSetFormat (MzTile $page (ShowId 'tile-drill')) @{ gridX = $true }
+
+        $page = MzPage $doc 'Time Intelligence'
+        MzSetFormat (MzTile $page (ShowId 'tile-running')) @{
+            gridX = $true
+            zoom = @{ brush = $true; dragZoom = $true; dragAction = 'view' }
+        }
+        MzSetFormat (MzTile $page (ShowId 'tile-yoy')) @{
+            trimEmptyEdges = $true
+            xLabelFit = @{ mode = 'angled' }
+            gridX = $true
+        }
+
+        $page = MzPage $doc 'Small Multiples & Analytics'
+        MzSetTable (MzTile $page (ShowId 'tile-scorecard')) @{
+            stripes = $true; pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnVerticalAlign = @{ 'Total Cost' = 'middle'; 'Avg Cost per Order' = 'middle' }
+        }
+
+        $page = MzPage $doc 'Order Details'
+        MzSetTable (MzTile $page (ShowId 'tile-orders-table')) @{
+            stripes = $true; density = 'compact'
+            pageSize = 10; pageSizeOptions = $mzPageSizes
+            headerAlign = 'center'; wrapText = $true; verticalAlign = 'middle'
+            columnAlign = @{ Opened = 'center'; Priority = 'center'; Status = 'center' }
+            columnVerticalAlign = @{ Opened = 'middle'; Priority = 'middle'; Status = 'middle' }
+        }
+
+        [void](PutDashboard $doc $doc.layout)
+        $result['Feature Showcase'] = MzRawLayout $doc.id
+
+        $result
+    }
+
+    # ------------------------------------------------------ apply (first pass)
+    $firstPass = ApplyModernize
+
+    # =======================================================================
+    # VERIFICATION 1: the new format fields round-tripped through the API.
+    # =======================================================================
+    Write-Host "`nModernize verification: persisted format fields"
+    $docs = @{}
+    foreach ($name in @('Executive Overview', 'Operations Command Center', 'Cost & Vendor Management',
+                        'Workforce & Productivity', 'Asset Reliability', 'Feature Showcase')) {
+        $docs[$name] = MzFetch $name
+    }
+    function VTile([string]$Dashboard, [string]$Page, [string]$TileId) { MzTile (MzPage $docs[$Dashboard] $Page) $TileId }
+
+    # --- model: measure grammar v2 + fiscal calendar ---
+    $checkModel = GetModelByName 'Maintenance Operations'
+    $mCompletionDef = $checkModel.definition.measures | Where-Object { $_.name -eq 'Completion Rate' } | Select-Object -First 1
+    $mPctDef = $checkModel.definition.measures | Where-Object { $_.name -eq '% of Total Spend' } | Select-Object -First 1
+    $mOverDef = $checkModel.definition.measures | Where-Object { $_.name -eq 'Over-Budget Spend' } | Select-Object -First 1
+    Assert ($mCompletionDef.expression -eq 'DIVIDE(1.0 * [Closed Orders], [Work Orders])') 'M1 Completion Rate: DIVIDE() expression persisted'
+    Assert ($completionNow -gt 0.0 -and $completionNow -lt 1.0) "M1 Completion Rate: evaluates to a real fraction, not integer division (got $([math]::Round($completionNow, 4)))"
+    Assert ($mCompletionDef.formatString -eq '0.0%' -and $mCompletionDef.displayFolder -eq 'Delivery' -and [bool]$mCompletionDef.description) 'M1 Completion Rate: formatString + displayFolder + description persisted'
+    Assert ($mPctDef.expression -eq 'PERCENTOFTOTAL([Total Cost])') 'M2 % of Total Spend: PERCENTOFTOTAL() expression persisted'
+    Assert ($mPctDef.formatString -eq '0.0%' -and $mPctDef.displayFolder -eq 'Spend') 'M2 % of Total Spend: formatString + displayFolder persisted'
+    Assert ($mOverDef.expression -eq ('IF([Total Cost] > {0}, [Total Cost] - {0}, 0)' -f $budget)) 'M3 Over-Budget Spend: IF() expression persisted'
+    Assert ($mOverDef.formatString -eq '$#,##0' -and $mOverDef.displayFolder -eq 'Spend') 'M3 Over-Budget Spend: formatString + displayFolder persisted'
+    $calendar = @($checkModel.definition.dateTables) | Where-Object { $_.name -eq 'Calendar' } | Select-Object -First 1
+    Assert ($calendar.fiscalYearStartMonth -eq 7 -and $calendar.effectiveFiscalYearStartMonth -eq 7) 'M4 Calendar: fiscalYearStartMonth 7 persisted'
+    Assert ($calendar.weekStartDay -eq 'sunday' -and -not $calendar.weekStartsMonday) 'M5 Calendar: weekStartDay sunday persisted'
+
+    # --- D6 Executive Overview ---
+    Assert ($docs['Executive Overview'].layout.filterIndicator.placement -eq 'header' -and $docs['Executive Overview'].layout.filterIndicator.variant -eq 'banner') 'D6 filterIndicator: header banner persisted'
+    Assert ($docs['Executive Overview'].layout.crossFilterScope -eq 'dashboard') 'D6 crossFilterScope dashboard persisted'
+    $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-hero')
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom -and $t.chart.format.zoom.dragAction -eq 'view') 'D6 hero: zoom brush + dragZoom + dragAction view persisted'
+    Assert ($t.chart.format.gridX -and $t.chart.format.secondaryAxisKeys.Count -eq 1) 'D6 hero: gridX added WITHOUT dropping the -Full dual axis'
+    $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-sites')
+    Assert ((@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50') 'D6 site table: pageSizeOptions 10/25/50 persisted'
+    Assert ($t.chart.format.table.headerAlign -eq 'center' -and $t.chart.format.table.wrapText -and $t.chart.format.table.columnAlign.Region -eq 'center') 'D6 site table: headerAlign center + wrapText + centred Region persisted'
+    Assert ($t.chart.format.table.columnVerticalAlign.'Over-Budget Spend' -eq 'middle') 'D6 site table: per-column vertical alignment persisted'
+    Assert (@($t.chart.query.measures | Where-Object { $_.measureId -eq $mOverBudget }).Count -eq 1) 'D6 site table: IF()-based Over-Budget Spend column bound'
+    $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-sl-priority')
+    Assert ($t.slicer.style.buttonSize -eq 'lg' -and $t.slicer.style.buttonFill -and $t.slicer.style.buttonColumns -eq 2) 'D6 priority slicer: lg + fill + 2 columns persisted'
+    $t = VTile 'Executive Overview' 'Company Pulse' (FullId 'tile-d1-sl-opened')
+    Assert ($t.slicer.dateRange.picker -eq 'calendar' -and $t.slicer.dateRange.initialMonth -eq 'dataStart') 'D6 opened slicer: calendar picker opening on dataStart persisted'
+    $t = VTile 'Executive Overview' 'Growth & Seasonality' (FullId 'tile-d1-yoy')
+    Assert ($t.chart.format.trimEmptyEdges -and $t.chart.format.xLabelFit.mode -eq 'angled') 'D6 YoY: trimEmptyEdges + angled labels persisted'
+    $t = VTile 'Executive Overview' 'Growth & Seasonality' (MzId 'tile-d1-fiscal')
+    Assert ($t.chart.query.axis.table -eq '#date.Calendar' -and $t.chart.query.axis.column -eq 'fiscal_quarter') 'D6 fiscal chart: plots the calendar fiscal_quarter column'
+    Assert ($t.chart.query.legend.column -eq 'fiscal_year') 'D6 fiscal chart: fiscal_year legend persisted'
+    $mobile = (MzPage $docs['Executive Overview'] 'Growth & Seasonality').mobileLayout
+    Assert (@($mobile.order) -contains (MzId 'tile-d1-fiscal')) 'D6 fiscal chart: added to the page phone stack'
+
+    # --- D7 Operations Command Center ---
+    Assert ($docs['Operations Command Center'].layout.filterIndicator.placement -eq 'top-right' -and $docs['Operations Command Center'].layout.filterIndicator.variant -eq 'stack') 'D7 filterIndicator: top-right stack persisted'
+    $gantt = VTile 'Operations Command Center' 'Live Backlog' (MzId 'tile-d2-gantt')
+    Assert ($gantt.chart.type -eq 'gantt') 'D7 gantt: tile type gantt persisted'
+    Assert ($gantt.chart.format.gantt.showToday -and $gantt.chart.format.gantt.rowBanding -and $gantt.chart.format.gantt.showProgress) 'D7 gantt: showToday + rowBanding + showProgress persisted'
+    Assert ($gantt.chart.format.gantt.taskLabels -eq 'axis' -and $gantt.chart.format.gantt.cornerRadius -eq 4 -and $gantt.chart.format.gantt.barSize -eq 16) 'D7 gantt: taskLabels/cornerRadius/barSize persisted'
+    Assert (@($gantt.chart.query.measures).Count -eq 3 -and $gantt.chart.query.measures[2].measureId -eq $mCompletion) 'D7 gantt: [start, end, progress] measures with the DIVIDE() progress'
+    Assert ($gantt.chart.query.legend.column -eq 'region' -and $gantt.chart.query.axis.column -eq 'name') 'D7 gantt: unit task axis + region group persisted'
+    Assert ($gantt.layout.w -eq 24 -and $gantt.layout.h -eq 14) 'D7 gantt: full-width anchor geometry persisted'
+    $t = VTile 'Operations Command Center' 'Live Backlog' (FullId 'tile-d2-priostack')
+    Assert ($t.chart.format.zoom.dragAction -eq 'crossFilter' -and $t.chart.format.zoom.brush) 'D7 priority mix: zoom dragAction crossFilter persisted'
+    Assert ($t.chart.format.legendMode -eq 'crossFilter') 'D7 priority mix: -Full legendMode crossFilter survived the patch'
+    Assert ($null -ne (VTile 'Operations Command Center' 'Live Backlog' (MzId 'tile-d2-zoomnote'))) 'D7 drag-to-filter caption tile present'
+    $t = VTile 'Operations Command Center' 'Live Backlog' (FullId 'tile-d2-k-avg')
+    Assert ($t.chart.title -eq 'Completion Rate' -and $t.chart.query.measures[0].measureId -eq $mCompletion) 'D7 KPI: retargeted to the DIVIDE() completion rate'
+    $t = VTile 'Operations Command Center' 'Live Backlog' (FullId 'tile-d2-sl-status')
+    Assert ($t.slicer.style.buttonSize -eq 'lg' -and $t.slicer.style.buttonColumns -eq 2) 'D7 status slicer: lg 2-column buttons persisted'
+    $t = VTile 'Operations Command Center' 'Order Details' (FullId 'tile-d2-orders')
+    Assert ((@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50' -and $t.chart.format.table.wrapText) 'D7 register: pageSizeOptions + wrapText persisted'
+    Assert ($t.chart.format.table.columnAlign.Priority -eq 'center' -and $t.chart.format.table.columnAlign.Status -eq 'center') 'D7 register: Priority + Status centred'
+    Assert ($t.chart.format.table.totals -and $t.chart.format.table.pinned -eq 1) 'D7 register: -Full totals + pinned column survived the patch'
+
+    # --- D8 Cost & Vendor Management ---
+    $fi = $docs['Cost & Vendor Management'].layout.filterIndicator
+    Assert ($fi.variant -eq 'pill' -and $fi.accentColor -eq $berry -and $fi.background -eq '#f5f3ff') 'D8 filterIndicator: custom-accent pill persisted'
+    $t = VTile 'Cost & Vendor Management' 'Spend Overview' (MzId 'tile-d3-pct')
+    Assert ($t.chart.query.measures[0].measureId -eq $mPctSpend -and $t.chart.type -eq 'donut') 'D8 share donut: bound to the PERCENTOFTOTAL() measure'
+    $t = VTile 'Cost & Vendor Management' 'Spend Overview' (FullId 'tile-d3-trend')
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.zoom.dragZoom) 'D8 spend trend: brush + drag zoom persisted'
+    $t = VTile 'Cost & Vendor Management' 'Cost Drivers' (FullId 'tile-d3-scatter')
+    Assert ($t.chart.format.xAxisScale.range -eq 'auto' -and $t.chart.format.yAxisScale.range -eq 'auto') 'D8 cost-vs-labour scatter: x + y axis range auto persisted'
+    $t = VTile 'Cost & Vendor Management' 'Cost Drivers' (MzId 'tile-d3-unitcost')
+    Assert ($t.chart.format.xAxisScale.log -and $t.chart.format.xAxisScale.range -eq 'auto') 'D8 unit-cost scatter: log10 x axis persisted'
+    $t = VTile 'Cost & Vendor Management' 'Parts & Inventory' (FullId 'tile-d3-partstable')
+    Assert ($t.chart.format.table.wrapText -and $t.chart.format.table.pageSize -eq 10) 'D8 part table: wrapText + author page size persisted'
+    Assert (@($t.chart.format.conditionalFormats).Count -eq 2) 'D8 part table: -Full dataBar + RAG conditional formats survived the patch'
+
+    # --- D9 Workforce & Productivity (default indicator on purpose) ---
+    Assert ($null -eq $docs['Workforce & Productivity'].layout.filterIndicator) 'D9 filterIndicator: left unset so the default pill is on show'
+    $t = VTile 'Workforce & Productivity' 'Team Overview' (FullId 'tile-d4-labor')
+    Assert ($t.chart.format.zoom.brush -and $t.chart.format.gridX) 'D9 labour trend: brush zoom + gridX persisted'
+    $t = VTile 'Workforce & Productivity' 'Assignments' (FullId 'tile-d4-roster')
+    Assert ($t.chart.format.table.columnAlign.Role -eq 'center' -and (@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50') 'D9 roster: centred Role + pageSizeOptions persisted'
+
+    # --- D10 Asset Reliability ---
+    Assert ($docs['Asset Reliability'].layout.filterIndicator.placement -eq 'footer' -and $docs['Asset Reliability'].layout.filterIndicator.variant -eq 'banner') 'D10 filterIndicator: footer banner persisted'
+    $t = VTile 'Asset Reliability' 'Inspection Health' (FullId 'tile-d5-league')
+    Assert ($t.chart.format.table.columnAlign.'Pass Rate' -eq 'center' -and $t.chart.format.table.headerAlign -eq 'center') 'D10 league: Pass Rate column + header centred'
+    Assert ($t.chart.format.table.columnVerticalAlign.'Pass Rate' -eq 'middle') 'D10 league: Pass Rate vertical alignment persisted'
+    $t = VTile 'Asset Reliability' 'Inspection Health' (FullId 'tile-d5-sl-date')
+    Assert ($t.slicer.dateRange.picker -eq 'calendar' -and $t.slicer.dateRange.initialMonth -eq 'dataEnd') 'D10 inspected slicer: calendar picker opening on dataEnd persisted'
+    $t = VTile 'Asset Reliability' 'Valve Fleet' (FullId 'tile-d5-scatter')
+    Assert ($t.chart.format.xAxisScale.range -eq 'auto' -and $t.chart.format.yAxisScale.range -eq 'auto') 'D10 pressure scatter: auto-ranged axes persisted'
+
+    # --- D5 Feature Showcase ---
+    Assert ($docs['Feature Showcase'].layout.filterIndicator.placement -eq 'bottom-right') 'D5 filterIndicator: bottom-right stack persisted'
+    $t = VTile 'Feature Showcase' 'Time Intelligence' (ShowId 'tile-yoy')
+    Assert ($t.chart.format.trimEmptyEdges -and $t.chart.format.xLabelFit.mode -eq 'angled') 'D5 YoY: trimEmptyEdges + angled labels persisted'
+    Assert (@($t.chart.format.referenceLines).Count -eq 1) 'D5 YoY: -Full zero reference line survived the patch'
+    $t = VTile 'Feature Showcase' 'Time Intelligence' (ShowId 'tile-running')
+    Assert ($t.chart.format.zoom.brush -and @($t.chart.format.trendlines).Count -eq 1) 'D5 running total: zoom added, -Full trendline kept'
+    $t = VTile 'Feature Showcase' 'Order Details' (ShowId 'tile-orders-table')
+    Assert ((@($t.chart.format.table.pageSizeOptions) -join ',') -eq '10,25,50' -and $t.chart.format.table.columnAlign.Status -eq 'center') 'D5 order table: pageSizeOptions + centred Status persisted'
+
+    # =======================================================================
+    # VERIFICATION 2: every NEW / RE-QUERIED chart returns rows on the wire.
+    # =======================================================================
+    Write-Host "`nModernize verification: wire queries"
+    function WireSpecM([int]$ModelId, [hashtable]$Query) {
+        $dims = @()
+        if ($Query.axis) { $dims += $Query.axis }
+        if ($Query.legend) { $dims += $Query.legend }
+        if ($Query.smallMultiples) { $dims += $Query.smallMultiples }
+        $spec = [ordered]@{ modelId = $ModelId; dimensions = $dims; measures = $Query.measures; filters = @(); sort = @() }
+        if ($Query.filters) { $spec.filters = @($Query.filters) }
+        if ($Query.sort) { $spec.sort = @($Query.sort) }
+        if ($null -ne $Query.limit) { $spec.limit = $Query.limit }
+        $spec
+    }
+    function WireCheckM([string]$Name, [int]$ModelId, [hashtable]$Query, [int]$MinRows = 1) {
+        try {
+            $r = PostQueryBody ((WireSpecM $ModelId $Query) | ConvertTo-Json -Depth 12)
+            $n = @($r.rows).Count
+            if ($n -ge $MinRows) {
+                Write-Host "  $([char]0x2713) $Name ($n rows)" -ForegroundColor Green
+                return $r
+            }
+            Write-Host "  $([char]0x2717) $Name (expected >= $MinRows rows, got $n)" -ForegroundColor Red
+            $script:failures++
+        } catch {
+            $detailMsg = if ($_.ErrorDetails.Message) { $_.ErrorDetails.Message } else { $_.Exception.Message }
+            Write-Host "  $([char]0x2717) $Name ($detailMsg)" -ForegroundColor Red
+            $script:failures++
+        }
+        return $null
+    }
+
+    $ganttResult = WireCheckM 'D7 Work Order Timeline (gantt: task, group, start, end, progress)' $maintModel.id $qGantt 12
+    if ($ganttResult) {
+        # Gantt contract (shapeGanttData): dimensions [task, group], measures
+        # [start, end, progress]; a row with a null start OR end is dropped, so
+        # prove the window really does yield drawable bars.
+        $drawable = @($ganttResult.rows | Where-Object { $_[2] -and $_[3] })
+        Assert ($drawable.Count -eq @($ganttResult.rows).Count) "D7 gantt: every row has a start AND an end (no bars dropped; $($drawable.Count)/$(@($ganttResult.rows).Count))"
+        $progress = @($ganttResult.rows | ForEach-Object { [double]$_[4] })
+        Assert ((($progress | Measure-Object -Maximum).Maximum -le 1.0) -and (($progress | Measure-Object -Minimum).Minimum -ge 0.0)) 'D7 gantt: DIVIDE() progress lands in the 0..1 fraction band'
+        # Guards the integer-division trap: a bare DIVIDE over two COUNT(*)
+        # measures compiles without a decimal cast and yields only 0 or 1, which
+        # would silently draw every progress fill as empty or full.
+        $partial = @($progress | Where-Object { $_ -gt 0.0 -and $_ -lt 1.0 })
+        Assert ($partial.Count -ge 1) "D7 gantt: progress is genuinely fractional, not integer division ($($partial.Count) of $($progress.Count) bars partly complete)"
+        $spans = @($ganttResult.rows | ForEach-Object { ([datetime]::Parse([string]$_[3], [cultureinfo]::InvariantCulture) - [datetime]::Parse([string]$_[2], [cultureinfo]::InvariantCulture)).Days })
+        Assert ((($spans | Select-Object -Unique).Count -gt 1)) 'D7 gantt: task spans actually vary (a timeline, not a block)'
+    }
+    [void](WireCheckM 'D6 Spend by Fiscal Quarter (#date.Calendar fiscal_quarter x fiscal_year)' $maintModel.id $qFiscal 4)
+    [void](WireCheckM 'D6 Site Spend & Over-Budget Exposure (IF measure)' $maintModel.id $qSiteSpend 6)
+    [void](WireCheckM 'D7 Completion Rate KPI (DIVIDE measure)' $maintModel.id $qCompletionKpi)
+    $pctResult = WireCheckM 'D8 Share of Total Spend by Region (PERCENTOFTOTAL measure)' $maintModel.id $qPctSpend 4
+    if ($pctResult) {
+        $share = (@($pctResult.rows | ForEach-Object { [double]$_[1] }) | Measure-Object -Sum).Sum
+        Assert ([math]::Abs($share - 1.0) -lt 0.001) "D8 PERCENTOFTOTAL shares sum to 100% (got $([math]::Round($share * 100, 2))%)"
+    }
+    [void](WireCheckM 'D8 Unit Cost vs Consumption (log-scale scatter)' $maintModel.id $qUnitCost 40)
+
+    # =======================================================================
+    # VERIFICATION 3: idempotency. Applying the phase a second time must write
+    # a byte-identical layout. The comparison is on the RAW GET body from
+    # '"layout":' onward - the persisted document itself, not a re-serialised
+    # PowerShell view of it.
+    # =======================================================================
+    Write-Host "`nModernize verification: second application (byte-identical idempotency)"
+    $secondPass = ApplyModernize
+    foreach ($name in $firstPass.Keys) {
+        $a = $firstPass[$name]; $b = $secondPass[$name]
+        if ($a -ceq $b) {
+            Assert $true "$($name): re-applied layout is byte-identical ($($a.Length) chars)"
+        } else {
+            $at = [math]::Min($a.Length, $b.Length)
+            $diff = 0
+            while ($diff -lt $at -and $a[$diff] -ceq $b[$diff]) { $diff++ }
+            Assert $false "$($name): re-applied layout DIFFERS at char $diff (lengths $($a.Length) vs $($b.Length)) -- '$($a.Substring([math]::Max(0, $diff - 60), [math]::Min(120, $a.Length - [math]::Max(0, $diff - 60))))' vs '$($b.Substring([math]::Max(0, $diff - 60), [math]::Min(120, $b.Length - [math]::Max(0, $diff - 60))))'"
+        }
+    }
+
+    # --- summary ---
+    Write-Host ''
+    Write-Host ('-' * 60)
+    foreach ($name in $firstPass.Keys) {
+        $doc = $docs[$name]
+        $counts = (@($doc.layout.pages) | ForEach-Object { "$($_.name)=$(@($_.tiles).Count)" }) -join ', '
+        Write-Host ("Modernize: {0} (id {1}) - {2}" -f $name, $doc.id, $counts)
+    }
+    Write-Host "Model 'Maintenance Operations' (id $($maintModel.id)): +Completion Rate (DIVIDE), +% of Total Spend (PERCENTOFTOTAL), +Over-Budget Spend (IF); Calendar FY starts month 7, weeks start Sunday"
+    if ($failures -gt 0) {
+        Write-Host "`n$failures modernize check(s) FAILED" -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "`nAll modernize checks passed." -ForegroundColor Green
     exit 0
 }
 

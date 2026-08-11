@@ -5,6 +5,7 @@ import {
   Filter,
   Hash,
   KeyRound,
+  Plus,
   Sigma,
   ToggleLeft,
   Type,
@@ -297,6 +298,13 @@ function FieldEntry({
         <span className="shrink-0 text-rcd-muted">{icon}</span>
         <span className="truncate">{label}</span>
         {badge}
+        {/* The "click +" the well placeholders point at — visual affordance
+            only; the whole row is already click-to-add. */}
+        <Plus
+          size={12}
+          aria-hidden
+          className={`${badge ? '' : 'ml-auto '}shrink-0 text-rcd-muted opacity-0 group-hover:opacity-100`}
+        />
       </button>
       {onFilter && (
         <button

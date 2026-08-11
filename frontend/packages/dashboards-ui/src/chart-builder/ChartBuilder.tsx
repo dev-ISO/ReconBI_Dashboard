@@ -93,7 +93,7 @@ export function ChartBuilder({
     [draft, initial],
   );
 
-  const addToWell = (well: WellId, data: FieldDragData) => {
+  const addToWell = (well: WellId, data: FieldDragData, slot?: number) => {
     if (well === 'filters') {
       if (data.kind === 'column') {
         setFilterTarget({ index: null, table: data.table, column: data.column });
@@ -102,7 +102,7 @@ export function ChartBuilder({
     }
     setDraft((current) => ({
       ...current,
-      query: applyDrop(current.type, current.query, well, data),
+      query: applyDrop(current.type, current.query, well, data, slot),
     }));
   };
 
@@ -113,8 +113,8 @@ export function ChartBuilder({
     setActiveDrag(null);
     lastDragEndAt.current = Date.now();
     const data = event.active.data.current as FieldDragData | undefined;
-    const wellId = (event.over?.data.current as { wellId?: WellId } | undefined)?.wellId;
-    if (data && wellId) addToWell(wellId, data);
+    const over = event.over?.data.current as { wellId?: WellId; slot?: number } | undefined;
+    if (data && over?.wellId) addToWell(over.wellId, data, over.slot);
   };
 
   const handleDragCancel = () => {
@@ -125,7 +125,8 @@ export function ChartBuilder({
   const handleClickAdd = (data: FieldDragData) => {
     // Ignore the synthetic click that follows a completed drag.
     if (Date.now() - lastDragEndAt.current < 250) return;
-    addToWell(defaultWellFor(draft.type, draft.query, data), data);
+    const target = defaultWellFor(draft.type, draft.query, data);
+    addToWell(target.well, data, target.slot);
   };
 
   const handleCancel = () => {
@@ -176,14 +177,20 @@ export function ChartBuilder({
   }, [draft, previewEntry, model]);
 
   return (
-    <div className="flex h-[34rem] flex-col gap-3">
+    // h-full: the hosting dialog (fillHeight + resizable) provides a definite
+    // height, so the whole builder reflows with it; min-h keeps a usable
+    // floor when it does not (standalone hosts).
+    <div className="flex h-full min-h-[26rem] flex-col gap-3">
       <DndContext
         sensors={sensors}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
       >
-        <div className="grid min-h-0 flex-1 grid-cols-[13rem_minmax(0,1fr)_minmax(0,1.1fr)] gap-3">
+        {/* Fluid columns: field list and the wells column narrow within their
+            minmax ranges; the preview takes every remaining pixel, so
+            resizing the dialog genuinely grows the chart on both axes. */}
+        <div className="grid min-h-0 flex-1 grid-cols-[minmax(6.5rem,11.5rem)_minmax(13rem,21rem)_minmax(8rem,1fr)] gap-3">
           <div className="min-h-0 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface">
             <FieldList
               model={model}
@@ -283,7 +290,7 @@ export function ChartBuilder({
             <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
               Preview
             </span>
-            <div className="min-h-0 flex-1 rounded-md border border-rcd-border bg-rcd-surface p-2">
+            <div className="min-h-[10rem] flex-1 rounded-md border border-rcd-border bg-rcd-surface p-2">
               <ChartTile spec={draft} modelId={modelId} debounceMs={300} />
             </div>
           </div>
@@ -307,7 +314,7 @@ export function ChartBuilder({
         <RcdButton
           variant="primary"
           disabled={!isRunnable(draft)}
-          title={isRunnable(draft) ? undefined : 'Add at least one measure to the Values well'}
+          title={isRunnable(draft) ? undefined : 'Add at least one field to a values well'}
           onClick={() => onSave(draft)}
         >
           Save chart

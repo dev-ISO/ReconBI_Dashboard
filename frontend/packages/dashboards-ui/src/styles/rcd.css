@@ -245,3 +245,10 @@ html[data-theme='dark'] .rcd-card:hover {
     height: auto !important;
   }
 }
+
+/* Global pointer-focus suppression: script/SVG focus after a mouse click must
+   never paint the browser's default black outline anywhere in the app.
+   Keyboard focus is untouched — components keep their focus-visible rings. */
+.rcd-root :focus:not(:focus-visible) {
+  outline: none;
+}
