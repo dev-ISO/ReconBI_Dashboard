@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Printer } from 'lucide-react';
-import { isChartTile, type FilterClause } from '@recon/dashboards-core';
-import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, Printer } from 'lucide-react';
 import { RcdButton, RcdDialog, RcdSelect } from '../primitives';
 import { PrintSheets } from './DashboardPrintView';
-import { computePrintLayout, filterSummaryFor } from './printLayout';
+import { computePrintJob } from './printLayout';
+import { usePrintSections } from './usePrintSections';
 
 /** Paper stock the print pipeline can size (valid CSS `@page size` keywords). */
 export type PrintPaper = 'letter' | 'a4' | 'legal' | 'tabloid';
@@ -17,6 +16,13 @@ export type PrintTileFlow = 'grid' | 'sequential';
 /** Where the composed content sits inside the printable area. */
 export type PrintAlignH = 'left' | 'center' | 'right';
 export type PrintAlignV = 'top' | 'middle' | 'bottom';
+
+/**
+ * Which dashboard pages the job includes (workbook-style printing):
+ * 'current' = today's behavior (the active page only), 'all' = every page tab
+ * in order, 'custom' = the checked subset of tabs (customPageIds).
+ */
+export type PrintPagesMode = 'current' | 'all' | 'custom';
 
 export interface PrintOptions {
   paper: PrintPaper;
@@ -37,6 +43,15 @@ export interface PrintOptions {
    */
   alignH: PrintAlignH;
   alignV: PrintAlignV;
+  /** Workbook scope: which dashboard pages join the job. */
+  pagesMode: PrintPagesMode;
+  /**
+   * Custom pick (pagesMode 'custom'): dashboard page ids to include. Consumed
+   * in TAB order regardless of check order; ids are intersected with the open
+   * dashboard's tabs (session memory may carry another dashboard's ids) and an
+   * empty intersection falls back to the current page.
+   */
+  customPageIds: string[];
   includeTitle: boolean;
   includeTimestamp: boolean;
   includeFilters: boolean;
@@ -49,6 +64,8 @@ const DEFAULT_OPTIONS: PrintOptions = {
   flow: 'grid',
   alignH: 'left',
   alignV: 'top',
+  pagesMode: 'current',
+  customPageIds: [],
   includeTitle: true,
   includeTimestamp: true,
   includeFilters: true,
@@ -83,6 +100,12 @@ const FLOW_OPTIONS: { value: PrintTileFlow; label: string }[] = [
   { value: 'sequential', label: 'Sequential (one tile per row)' },
 ];
 
+const PAGES_MODE_OPTIONS: { value: PrintPagesMode; label: string }[] = [
+  { value: 'current', label: 'Current page' },
+  { value: 'all', label: 'All dashboard pages' },
+  { value: 'custom', label: 'Custom…' },
+];
+
 const ALIGN_H_OPTIONS: { value: PrintAlignH; label: string }[] = [
   { value: 'left', label: 'Left' },
   { value: 'center', label: 'Center' },
@@ -111,10 +134,12 @@ export interface PrintConfigDialogProps {
  * confirming mounts DashboardPrintView, which renders a print-quality copy of
  * the dashboard and calls window.print() on demand (no dependencies added).
  *
- * The right pane is a LIVE thumbnail of printed page 1: the same
- * computePrintLayout + PrintSheets the full preview uses, transform-scaled
- * down and non-interactive, re-rendering as settings change (charts come from
- * the warm query cache, so this is cheap).
+ * The right pane is a LIVE, NAVIGABLE thumbnail of the printed job: the same
+ * usePrintSections + computePrintJob + PrintSheets the full preview uses,
+ * transform-scaled down and non-interactive. Any physical page of the job can
+ * be shown (arrows, ArrowLeft/ArrowRight while the preview is focused, or a
+ * typed page number), and the page count tracks every option live — including
+ * workbook jobs that span several dashboard pages.
  */
 export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialogProps) {
   const [draft, setDraft] = useState<PrintOptions>(() => ({ ...sessionOptions }));
@@ -124,53 +149,92 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
     if (open) setDraft({ ...sessionOptions });
   }, [open]);
 
-  // The thumbnail mirrors what DashboardView will hand the print view: the
-  // ACTIVE page's tiles, the dashboard's model and the live per-tile filters.
-  const runtime = useRuntime();
-  const current = useDashboardState((state) => state.current);
-  const activePageId = useDashboardState((state) => state.activePageId);
-  const slicerValues = useDashboardState((state) => state.slicerValues);
-  const crossFilters = useDashboardState((state) => state.crossFilters);
+  // The thumbnail mirrors what DashboardPrintView will print: the SAME hook
+  // resolves the included pages, per-section headers and per-tile filters.
+  const { sections, filtersByTile, modelId, pageTabs, activePageId } = usePrintSections(draft);
 
-  const pages = current?.layout.pages ?? [];
-  const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
-  const tiles = useMemo(() => activePage?.tiles ?? [], [activePage]);
-  const modelId = current?.modelId ?? null;
-  const title =
-    current === null
-      ? 'Dashboard'
-      : pages.length > 1 && activePage
-        ? `${current.name} — ${activePage.name}`
-        : current.name;
-
-  // Same construction as DashboardView's filtersByTile: subscribed slices
-  // (tiles/slicerValues/crossFilters) drive recomputation, filtersForTile
-  // reads the exact same store state — never stale.
-  const filtersByTile = useMemo(() => {
-    const map = new Map<string, FilterClause[]>();
-    for (const tile of tiles) {
-      if (!isChartTile(tile)) continue;
-      map.set(tile.id, runtime.dashboards.filtersForTile(tile.id));
-    }
-    return map;
-  }, [runtime, tiles, slicerValues, crossFilters]);
-
-  // Page count + thumbnail scale from the SAME pure layout the preview uses.
-  const hasFilterSummary = useMemo(
-    () => filterSummaryFor(tiles, slicerValues, crossFilters).length > 0,
-    [tiles, slicerValues, crossFilters],
-  );
-  const layout = useMemo(
-    () => computePrintLayout(tiles, draft, hasFilterSummary),
-    [tiles, draft, hasFilterSummary],
-  );
-  const { geometry } = layout;
+  // Page count + geometry from the SAME pure job the preview prints.
+  const job = useMemo(() => computePrintJob(sections, draft), [sections, draft]);
+  const totalPages = job.totalPages;
+  const { geometry } = job;
   const thumbScale = Math.min(
     THUMB_MAX_W / geometry.paperWidthPx,
     THUMB_MAX_H / geometry.paperHeightPx,
   );
 
+  /* ----------------------------------------------------- preview navigation
+   * previewPage is 1-based and ALWAYS valid: option changes clamp it into the
+   * new page count, and changing WHICH dashboard pages are included resets to
+   * page 1 (the job's content changed wholesale). pageText is the type-in
+   * buffer — it only commits on Enter/blur, clamped.
+   */
+  const [previewPage, setPreviewPage] = useState(1);
+  const [pageText, setPageText] = useState('1');
+
+  const goTo = (page: number) => {
+    const clamped = Math.min(Math.max(1, Math.round(page)), Math.max(1, totalPages));
+    setPreviewPage(clamped);
+    setPageText(String(clamped));
+  };
+
+  // Reset on open and whenever the included-pages set changes.
+  const sectionsKey = `${draft.pagesMode}|${sections.map((s) => s.pageId).join(',')}`;
+  const lastKey = useRef(sectionsKey);
+  useEffect(() => {
+    if (open) {
+      setPreviewPage(1);
+      setPageText('1');
+    }
+  }, [open]);
+  useEffect(() => {
+    if (lastKey.current !== sectionsKey) {
+      lastKey.current = sectionsKey;
+      setPreviewPage(1);
+      setPageText('1');
+    }
+  }, [sectionsKey]);
+
+  // Clamp when paper/orientation/scale/flow changes shrink the page count.
+  useEffect(() => {
+    if (previewPage > totalPages) {
+      setPreviewPage(Math.max(1, totalPages));
+      setPageText(String(Math.max(1, totalPages)));
+    }
+  }, [previewPage, totalPages]);
+
+  const commitPageText = () => {
+    const parsed = Number.parseInt(pageText, 10);
+    if (Number.isNaN(parsed)) setPageText(String(previewPage));
+    else goTo(parsed);
+  };
+
   const patch = (partial: Partial<PrintOptions>) => setDraft((prev) => ({ ...prev, ...partial }));
+
+  const setPagesMode = (mode: PrintPagesMode) => {
+    if (mode === 'custom') {
+      // Seed an empty/stale custom pick with the current page so the
+      // checklist never silently means "nothing".
+      const valid = draft.customPageIds.filter((id) => pageTabs.some((tab) => tab.id === id));
+      patch({
+        pagesMode: mode,
+        customPageIds:
+          valid.length > 0 ? valid : activePageId !== null ? [activePageId] : [],
+      });
+    } else {
+      patch({ pagesMode: mode });
+    }
+  };
+
+  const toggleCustomPage = (pageId: string, checked: boolean) => {
+    const set = new Set(draft.customPageIds);
+    if (checked) set.add(pageId);
+    else set.delete(pageId);
+    // Persist in TAB order — the job consumes tab order either way, but the
+    // stored option stays deterministic.
+    patch({ customPageIds: pageTabs.map((tab) => tab.id).filter((id) => set.has(id)) });
+  };
+
+  const customCount = pageTabs.filter((tab) => draft.customPageIds.includes(tab.id)).length;
 
   const confirm = () => {
     sessionOptions = { ...draft };
@@ -279,38 +343,85 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
               </RcdSelect>
             </Field>
 
-            <fieldset className="flex flex-col gap-2">
-              <legend className="mb-1 text-xs text-rcd-text-2">Content alignment</legend>
-              <div className="flex gap-2">
-                <Field label="Horizontal">
-                  <RcdSelect
-                    aria-label="Horizontal content alignment"
-                    value={draft.alignH}
-                    onChange={(event) => patch({ alignH: event.target.value as PrintAlignH })}
-                  >
-                    {ALIGN_H_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </RcdSelect>
-                </Field>
-                <Field label="Vertical">
-                  <RcdSelect
-                    aria-label="Vertical content alignment"
-                    value={draft.alignV}
-                    onChange={(event) => patch({ alignV: event.target.value as PrintAlignV })}
-                  >
-                    {ALIGN_V_OPTIONS.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </RcdSelect>
-                </Field>
+            {/* Workbook scope — only meaningful once the dashboard has tabs. */}
+            {pageTabs.length > 1 && (
+              <Field label="Pages to include">
+                <RcdSelect
+                  aria-label="Pages to include"
+                  value={draft.pagesMode}
+                  onChange={(event) => setPagesMode(event.target.value as PrintPagesMode)}
+                >
+                  {PAGES_MODE_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              </Field>
+            )}
+
+            {pageTabs.length > 1 && draft.pagesMode === 'custom' && (
+              <div className="flex flex-col gap-1">
+                <div
+                  className="flex max-h-36 flex-col gap-1 overflow-y-auto rounded-md border border-rcd-border p-2"
+                  role="group"
+                  aria-label="Dashboard pages to include"
+                >
+                  {pageTabs.map((tab) => (
+                    <label
+                      key={tab.id}
+                      className="flex cursor-pointer items-center gap-2 text-sm text-rcd-text"
+                    >
+                      <input
+                        type="checkbox"
+                        className="accent-[var(--rcd-accent)]"
+                        checked={draft.customPageIds.includes(tab.id)}
+                        onChange={(event) => toggleCustomPage(tab.id, event.target.checked)}
+                      />
+                      <span className="min-w-0 truncate">{tab.name}</span>
+                    </label>
+                  ))}
+                </div>
+                {customCount === 0 && (
+                  <p className="text-[11px] leading-4 text-rcd-muted">
+                    Nothing checked — the current page will print.
+                  </p>
+                )}
               </div>
-            </fieldset>
+            )}
           </div>
+
+          <fieldset className="flex flex-col gap-2">
+            <legend className="mb-1 text-xs text-rcd-text-2">Content alignment</legend>
+            <div className="flex gap-2">
+              <Field label="Horizontal">
+                <RcdSelect
+                  aria-label="Horizontal content alignment"
+                  value={draft.alignH}
+                  onChange={(event) => patch({ alignH: event.target.value as PrintAlignH })}
+                >
+                  {ALIGN_H_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              </Field>
+              <Field label="Vertical">
+                <RcdSelect
+                  aria-label="Vertical content alignment"
+                  value={draft.alignV}
+                  onChange={(event) => patch({ alignV: event.target.value as PrintAlignV })}
+                >
+                  {ALIGN_V_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </RcdSelect>
+              </Field>
+            </div>
+          </fieldset>
 
           <fieldset className="flex flex-col gap-1.5">
             <legend className="mb-1 text-xs text-rcd-text-2">Include</legend>
@@ -334,10 +445,62 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
 
         {/* Live preview column */}
         <div className="flex min-w-0 flex-1 flex-col gap-2">
-          <span className="text-xs text-rcd-text-2">
-            Preview — page 1 of {layout.pages.length}
-          </span>
-          <div className="flex flex-1 items-start justify-center overflow-auto rounded-md border border-rcd-border bg-[#26262a] p-3">
+          <div className="flex items-center gap-1.5">
+            <span className="text-xs text-rcd-text-2">Preview</span>
+            <div className="flex-1" />
+            <button
+              type="button"
+              aria-label="Previous page"
+              disabled={previewPage <= 1}
+              onClick={() => goTo(previewPage - 1)}
+              className="rounded-md border border-rcd-border p-1 text-rcd-text-2 hover:bg-rcd-surface hover:text-rcd-text disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <ChevronLeft size={14} />
+            </button>
+            <span className="text-xs text-rcd-text-2">Page</span>
+            <input
+              type="text"
+              inputMode="numeric"
+              aria-label="Preview page number"
+              value={pageText}
+              onChange={(event) => setPageText(event.target.value.replace(/[^\d]/g, ''))}
+              onBlur={commitPageText}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') {
+                  event.preventDefault();
+                  commitPageText();
+                }
+              }}
+              className="h-6 w-10 rounded-md border border-rcd-border bg-transparent text-center text-xs text-rcd-text outline-none focus:border-[var(--rcd-accent-interactive,var(--rcd-accent))]"
+            />
+            <span className="whitespace-nowrap text-xs text-rcd-text-2">of {totalPages}</span>
+            <button
+              type="button"
+              aria-label="Next page"
+              disabled={previewPage >= totalPages}
+              onClick={() => goTo(previewPage + 1)}
+              className="rounded-md border border-rcd-border p-1 text-rcd-text-2 hover:bg-rcd-surface hover:text-rcd-text disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+            >
+              <ChevronRight size={14} />
+            </button>
+          </div>
+          {/* Focusable so ArrowLeft/ArrowRight page the preview from the
+              keyboard; the sheet itself stays non-interactive. */}
+          <div
+            role="region"
+            aria-label={`Print preview, page ${previewPage} of ${totalPages}. Use arrow keys to change pages.`}
+            tabIndex={0}
+            onKeyDown={(event) => {
+              if (event.key === 'ArrowLeft') {
+                event.preventDefault();
+                goTo(previewPage - 1);
+              } else if (event.key === 'ArrowRight') {
+                event.preventDefault();
+                goTo(previewPage + 1);
+              }
+            }}
+            className="flex flex-1 items-start justify-center overflow-auto rounded-md border border-rcd-border bg-[#26262a] p-3 outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive,var(--rcd-accent))]"
+          >
             <div
               aria-hidden
               className="pointer-events-none select-none overflow-hidden"
@@ -354,20 +517,19 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
                 }}
               >
                 <PrintSheets
-                  title={title}
-                  tiles={tiles}
+                  sections={sections}
                   modelId={modelId}
                   filtersByTile={filtersByTile}
                   options={draft}
-                  maxPages={1}
+                  onlyPage={previewPage - 1}
                   showPageNumbers={false}
                 />
               </div>
             </div>
           </div>
           <p className="text-[11px] leading-4 text-rcd-muted">
-            The preview uses the exact printed page geometry — what you see here is page 1 of the
-            PDF.
+            The preview uses the exact printed page geometry — every page here matches the PDF,
+            page for page.
           </p>
           {/* Browsers give web pages no way to preselect a destination: an app
               "Printer" dropdown here could not do anything. Say so instead. */}

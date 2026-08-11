@@ -119,6 +119,19 @@ export interface TableOptions {
   density?: 'compact' | 'normal' | 'relaxed';
   /** Body font size px (default theme). */
   fontSize?: number;
+  /**
+   * What a click on a table BODY cell cross-filters by:
+   *
+   * - `'cell'` (DEFAULT): that cell's OWN dimension column + value — clicking
+   *   a Status cell filters by Status, clicking a Region cell filters by
+   *   Region. Clicking a MEASURE cell falls back to the row's FIRST dimension:
+   *   an aggregate is not a filterable identity.
+   * - `'firstColumn'`: legacy behavior — ANY click filters by the first
+   *   dimension column and that row's value, whichever cell was hit.
+   * - `'row'`: any click filters by ALL of the row's dimension values at once
+   *   (one clause per dimension column, AND-composed, applied as one action).
+   */
+  clickFilter?: 'cell' | 'firstColumn' | 'row';
 }
 
 /**

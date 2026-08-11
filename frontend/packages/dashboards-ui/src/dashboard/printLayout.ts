@@ -348,3 +348,69 @@ export function computePrintLayout(
 
   return { geometry, userScale, layoutWidth, contentWidth, headerHeight, pages };
 }
+
+/* -------------------------------------------------- workbook-style print job
+ * "Print the whole workbook": several dashboard pages concatenated into ONE
+ * print job. Each included dashboard page is paginated INDEPENDENTLY through
+ * computePrintLayout — identical geometry to printing that page alone — and
+ * the per-section page runs are then concatenated: every section starts on a
+ * fresh physical sheet and page numbers run continuously across the job.
+ *
+ * A single-section job is therefore byte-identical to today's single-page
+ * print (same function, same inputs) — the default 'current page' path cannot
+ * regress by construction.
+ *
+ * Band-packer audit notes (wave 18), for the record:
+ *  - A tile/band taller than a page's content box is SCALED TO FIT that page
+ *    (never clipped, never sliced mid-chart) — the honest-vector doctrine
+ *    prefers a slightly smaller but complete chart over splitting an SVG
+ *    across sheets. Documented in computePrintLayout.
+ *  - On page 1 the header consumes capacity first; an oversize FIRST band
+ *    shrinks under it rather than pushing to page 2 (a header-only page 1
+ *    would be uglier than a few percent of shrink). Deliberate.
+ *  - Pages are only created when a block lands on them, so trailing empty
+ *    pages are impossible; a chartless section yields exactly one sheet.
+ *  - Wide scales (125/150%) shrink layoutWidth so width never overflows;
+ *    heights that outgrow the page fall into the shrink-to-fit path above.
+ */
+
+/** One dashboard page's contribution to a print job (pure input). */
+export interface PrintSectionInput {
+  /** Dashboard page id ('' for a synthetic empty section). */
+  pageId: string;
+  /** Printed header title for this section (dashboard name — page name). */
+  title: string;
+  tiles: DashboardTile[];
+  /** Printed "Active filters" chips for this section's header line. */
+  filterSummary: string[];
+}
+
+export interface PrintJobSection extends PrintSectionInput {
+  /** This section's own pagination — computePrintLayout, verbatim. */
+  layout: PrintLayout;
+  /** Zero-based physical page index of the section's first sheet. */
+  startPage: number;
+}
+
+export interface PrintJob {
+  /** Shared paper geometry (all sections print on the same stock). */
+  geometry: PageGeometry;
+  sections: PrintJobSection[];
+  /** Physical sheet count across every included dashboard page. */
+  totalPages: number;
+}
+
+export function computePrintJob(sections: PrintSectionInput[], options: PrintOptions): PrintJob {
+  const list: PrintSectionInput[] =
+    sections.length > 0
+      ? sections
+      : [{ pageId: '', title: '', tiles: [], filterSummary: [] }];
+  const out: PrintJobSection[] = [];
+  let startPage = 0;
+  for (const section of list) {
+    const layout = computePrintLayout(section.tiles, options, section.filterSummary.length > 0);
+    out.push({ ...section, layout, startPage });
+    startPage += layout.pages.length; // computePrintLayout never returns 0 pages
+  }
+  return { geometry: out[0]!.layout.geometry, sections: out, totalPages: startPage };
+}

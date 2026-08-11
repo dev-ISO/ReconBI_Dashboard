@@ -32,7 +32,7 @@ import {
 } from '@recon/dashboards-core';
 import { conditionalColor, matchRuleColor } from './analytics';
 import { textStyleToCss } from './textStyle';
-import type { ChartDatumClickInfo, ChartSelection } from './ChartRenderer';
+import type { ChartDatumClickInfo, ChartDatumFacet, ChartSelection } from './ChartRenderer';
 
 /** One sort level: a result column NAME plus its direction. */
 export interface TableSortLevel {
@@ -137,6 +137,15 @@ export type TableColumnFilter = { column: string } & (
 export interface TableSelection extends ChartSelection {
   /** Ctrl-accumulated multi-select; each entry matched like `category`. */
   categories?: readonly string[] | null;
+  /**
+   * COLUMN-QUALIFIED facets (wave 18): the active filters tagged with the
+   * "table.column" each one filters, matched against the result column's
+   * `source`. Required to mark the right cell once clickFilter 'cell' lets a
+   * click filter on a column other than the first; when present they mark the
+   * matching CELLS (accent bar per cell) and the unqualified facets above are
+   * only a fallback for consumers that don't send them.
+   */
+  cells?: readonly { source: string | null; label: string }[] | null;
 }
 
 export interface TableChartProps {
@@ -1136,17 +1145,66 @@ export function TableChart({
       }
     : undefined;
 
-  // ---- row events (click / context / hover / highlight) --------------------
-  // Row interactions key off the FIRST dimension column (when present) — same
-  // contract as before the overhaul; column reorder does not change it.
-  const clickColumn = result.columns.find((c) => c.role === 'dimension') ?? null;
+  // ---- row / cell events (click / context / hover / highlight) -------------
+  // ROW IDENTITY (hover, right-click/drill, the point-event axis value) always
+  // keys off the FIRST dimension column — drill walks the axis hierarchy, so it
+  // must stay on the axis whatever a click cross-filters by.
+  //
+  // CROSS-FILTER identity is configurable (format.table.clickFilter):
+  //   'cell' (default) — the clicked cell's OWN dimension column + value;
+  //                      a MEASURE cell falls back to the first dimension.
+  //   'firstColumn'    — legacy: always the first dimension's value.
+  //   'row'            — every dimension of the row, in one action.
+  // Result dimension columns are in wire order ([axis, legend, smallMultiples]),
+  // so their ORDINAL is the dimension index the consumer maps back onto the spec.
+  const dimensionColumns = result.columns.filter((c) => c.role === 'dimension');
+  const clickColumn = dimensionColumns[0] ?? null;
   const clickIndex = clickColumn ? result.columns.indexOf(clickColumn) : -1;
+  const clickFilterMode = table.clickFilter ?? 'cell';
   const rowLabel = (row: CellValue[]): string =>
     clickColumn ? formatCellValue(row[clickIndex] ?? null, clickColumn) : '';
-  const handleRowClick =
+  /** The datum facet for one dimension column of a row. */
+  const facetFor = (row: CellValue[], column: QueryColumn): ChartDatumFacet => {
+    const value = row[result.columns.indexOf(column)] ?? null;
+    return {
+      dimensionIndex: dimensionColumns.indexOf(column),
+      source: column.source,
+      value,
+      label: formatCellValue(value, column),
+    };
+  };
+  /**
+   * What a click on `column` of `row` cross-filters by (null = the result has
+   * no dimension at all, so there is nothing to filter). The legacy
+   * {value,label} pair always describes the SINGLE clause a plain consumer
+   * would apply; 'row' additionally carries every dimension in `facets`.
+   */
+  const datumClickInfo = (
+    row: CellValue[],
+    column: QueryColumn | null,
+  ): ChartDatumClickInfo | null => {
+    if (!clickColumn) return null;
+    if (clickFilterMode === 'cell' && column?.role === 'dimension') return facetFor(row, column);
+    const first = facetFor(row, clickColumn);
+    return clickFilterMode === 'row'
+      ? { ...first, facets: dimensionColumns.map((c) => facetFor(row, c)) }
+      : first;
+  };
+  const handleCellClick =
     onDatumClick && clickColumn
-      ? (row: CellValue[]) => onDatumClick({ value: row[clickIndex] ?? null, label: rowLabel(row) })
+      ? (row: CellValue[], column: QueryColumn) => {
+          const info = datumClickInfo(row, column);
+          if (info) onDatumClick(info);
+        }
       : null;
+  /**
+   * Cell-level hover affordance: in 'cell' mode the click target IS the cell,
+   * so DIMENSION cells tint on hover (measure cells stay flat — they only fall
+   * back to the row's first dimension and shouldn't advertise otherwise). Row
+   * modes keep the plain row hover. Painted as an inset shadow so it layers
+   * over whatever background the cell already carries.
+   */
+  const cellHoverAffordance = clickFilterMode === 'cell' && Boolean(handleCellClick);
   const rowEvent =
     clickColumn && (onPointClick || onPointContextMenu || onPointHover)
       ? (row: CellValue[], e: { clientX: number; clientY: number }): ChartPointEvent => ({
@@ -1156,7 +1214,7 @@ export function TableChart({
           clientY: e.clientY,
         })
       : null;
-  const clickable = Boolean(handleRowClick) || Boolean(rowEvent && onPointClick);
+  const clickable = Boolean(handleCellClick) || Boolean(rowEvent && onPointClick);
 
   // ---- selection: the row(s) driving this table's own cross-filter ---------
   // Facets are flattened once per render: the accumulated set first, then the
@@ -1179,6 +1237,60 @@ export function TableChart({
     const raw = row[clickIndex] ?? null;
     return selectionFacets.some(
       (facet) => facet === label || (raw !== null && String(raw) === facet),
+    );
+  };
+
+  /**
+   * COLUMN-QUALIFIED selection (wave 18): with clickFilter 'cell' the active
+   * filter can sit on ANY dimension column, so the unqualified facets above
+   * would mark the wrong column (or nothing). These carry the filtered
+   * "table.column" alongside the label, so the mark lands on the CELL that is
+   * actually driving the page — and, in 'row' mode, on each of the row's
+   * filtered cells.
+   */
+  const selectionCells =
+    format.selectionHighlight === false || selection === null ? [] : (selection.cells ?? []);
+  /** Is THIS dimension cell one of the values driving the active cross-filter? */
+  const cellSelected = (row: CellValue[], column: QueryColumn): boolean => {
+    if (selectionCells.length === 0 || column.role !== 'dimension') return false;
+    const raw = row[result.columns.indexOf(column)] ?? null;
+    const label = formatCellValue(raw, column);
+    return selectionCells.some(
+      (cell) =>
+        // A facet without a source (or a result without one) cannot be pinned
+        // to a column, so it falls back to matching on the label alone.
+        (cell.source == null || column.source == null || cell.source === column.source) &&
+        (cell.label === label || (raw !== null && String(raw) === cell.label)),
+    );
+  };
+  /**
+   * The facets grouped BY FIELD, keeping only fields this table actually shows.
+   * Filters compose the same way the query does — OR within a field (a
+   * Ctrl-accumulated value set), AND across fields ('row' mode's clause per
+   * dimension) — so a row is marked only when EVERY filtered field matches it,
+   * exactly the rows the filter keeps. With one field (the common 'cell' case)
+   * this is just "any row carrying the value", as before.
+   */
+  const selectionGroups: { source: string | null; labels: string[] }[] = [];
+  for (const cell of selectionCells) {
+    // A field none of this table's dimensions carries can never match; ignoring
+    // it keeps the AND from blanking the marking entirely.
+    if (cell.source != null && !dimensionColumns.some((c) => c.source === cell.source)) continue;
+    const group = selectionGroups.find((g) => g.source === cell.source);
+    if (group) group.labels.push(cell.label);
+    else selectionGroups.push({ source: cell.source, labels: [cell.label] });
+  }
+  /** Does the row satisfy EVERY filtered field (see selectionGroups)? */
+  const rowSelectedByCells = (matched: Set<number>): boolean => {
+    if (selectionGroups.length === 0 || matched.size === 0) return false;
+    return selectionGroups.every((group) =>
+      [...matched].some((index) => {
+        const column = layout[index]?.column;
+        if (!column) return false;
+        return (
+          group.source == null || column.source == null || column.source === group.source
+        );
+      }),
     );
   };
 
@@ -1441,21 +1553,24 @@ export function TableChart({
                   ? rowLabel(row) === highlightCategory.label
                   : null;
               // This row's value is (one of) the active cross-filter value(s).
-              const selected = rowSelected(row);
+              // Two paths: the legacy first-column match, and the
+              // column-qualified cell match that follows a 'cell'/'row' click.
+              const selectedCells = new Set<number>();
+              if (selectionCells.length > 0) {
+                layout.forEach((l, i) => {
+                  if (cellSelected(row, l.column)) selectedCells.add(i);
+                });
+                // Only the rows the filter actually keeps stay marked; a row
+                // matching just one of several AND-ed fields loses its cells.
+                if (!rowSelectedByCells(selectedCells)) selectedCells.clear();
+              }
+              const selected = selectedCells.size > 0 || rowSelected(row);
               return (
                 <tr
                   key={rowIndex}
                   // Global attribute, so it is valid on a plain table row: it
                   // announces WHICH row the page is filtered by.
                   aria-current={selected ? true : undefined}
-                  onClick={
-                    handleRowClick || (rowEvent && onPointClick)
-                      ? (e) => {
-                          handleRowClick?.(row);
-                          if (rowEvent && onPointClick) onPointClick(rowEvent(row, e));
-                        }
-                      : undefined
-                  }
                   onContextMenu={
                     rowEvent && onPointContextMenu
                       ? (e) => {
@@ -1534,9 +1649,25 @@ export function TableChart({
                     const background = selected
                       ? tintOver(SELECTION_TINT, baseBackground ?? 'transparent')
                       : baseBackground;
+                    // Accent bar: on the CELL(S) actually driving the filter
+                    // when the selection is column-qualified, else on the
+                    // row's leading cell (the legacy first-column marker).
+                    const barHere = selected
+                      ? selectedCells.size > 0
+                        ? selectedCells.has(columnIndex)
+                        : columnIndex === 0
+                      : false;
                     return (
                       <td
                         key={column.name}
+                        onClick={
+                          handleCellClick || (rowEvent && onPointClick)
+                            ? (e) => {
+                                handleCellClick?.(row, column);
+                                if (rowEvent && onPointClick) onPointClick(rowEvent(row, e));
+                              }
+                            : undefined
+                        }
                         style={{
                           background,
                           color: cellText,
@@ -1546,15 +1677,19 @@ export function TableChart({
                           ...cellTextFit,
                           ...cellBorder,
                           ...(pinned ? { left: l.pinnedLeft ?? 0 } : null),
-                          // Accent bar on the row's leading cell only — the
-                          // Excel-style marker that this row is the filter.
-                          ...(selected && columnIndex === 0
-                            ? { boxShadow: SELECTION_BAR }
-                            : null),
+                          ...(barHere ? { boxShadow: SELECTION_BAR } : null),
                         }}
                         className={`px-3 py-1 text-rcd-text ${
                           pinned ? 'sticky z-10' : ''
-                        } ${isMeasure ? 'tabular-nums' : ''}`}
+                        } ${isMeasure ? 'tabular-nums' : ''} ${
+                          // Cell-level click target: tint the hovered cell (an
+                          // inset wash that layers over its own background).
+                          // Skipped on the cell already wearing the accent bar,
+                          // whose inline box-shadow would win anyway.
+                          cellHoverAffordance && !isMeasure && !barHere
+                            ? 'hover:shadow-[inset_0_0_0_9999px_rgba(127,127,127,0.10)]'
+                            : ''
+                        }`}
                       >
                         {content}
                       </td>

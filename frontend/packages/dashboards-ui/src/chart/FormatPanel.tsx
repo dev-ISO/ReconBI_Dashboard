@@ -1504,6 +1504,9 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.headerBold === false) next.headerBold = false;
     if (merged.density !== undefined && merged.density !== 'normal') next.density = merged.density;
     if (merged.fontSize !== undefined) next.fontSize = merged.fontSize;
+    if (merged.clickFilter !== undefined && merged.clickFilter !== 'cell') {
+      next.clickFilter = merged.clickFilter;
+    }
     patch({ table: Object.keys(next).length > 0 ? next : undefined });
   };
 
@@ -3109,6 +3112,28 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           <p className="text-xs text-rcd-muted">
             Hovering a row spotlights its category across the page (and page hovers dim
             non-matching rows here).
+          </p>
+          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+            Click filtering
+            <RcdSelect
+              aria-label="Table click filtering"
+              className="w-40 shrink-0"
+              value={format.table?.clickFilter ?? 'cell'}
+              onChange={(event) =>
+                setTable({
+                  clickFilter: event.target.value as NonNullable<TableOptions['clickFilter']>,
+                })
+              }
+            >
+              <option value="cell">Clicked cell (default)</option>
+              <option value="firstColumn">First column</option>
+              <option value="row">Whole row</option>
+            </RcdSelect>
+          </label>
+          <p className="text-xs text-rcd-muted">
+            What a click cross-filters the page by: that cell’s own column, always the first
+            column, or every column of the row at once (measure cells always fall back to the
+            first column).
           </p>
           <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
             Pinned columns

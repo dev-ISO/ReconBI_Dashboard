@@ -1,35 +1,25 @@
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Printer, X } from 'lucide-react';
-import {
-  isChartTile,
-  isImageTile,
-  isTextTile,
-  type DashboardTile,
-  type FilterClause,
-} from '@recon/dashboards-core';
+import { isChartTile, isImageTile, isTextTile, type FilterClause } from '@recon/dashboards-core';
 import { ChartTile } from '../chart/ChartTile';
 import { TextTileContent } from './TextTile';
 import { ImageTileContent } from './ImageTile';
 import { useDashboardState } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
 import type { PrintOptions } from './PrintConfigDialog';
+import { usePrintSections } from './usePrintSections';
 import {
-  computePrintLayout,
-  filterSummaryFor,
+  computePrintJob,
   pageGeometry,
   PAGE_MARGIN_MM,
   type ChartTileEntry,
   type PrintBlock,
+  type PrintJobSection,
+  type PrintSectionInput,
 } from './printLayout';
 
 export interface DashboardPrintViewProps {
-  /** Dashboard name for the optional printed header. */
-  title: string;
-  tiles: DashboardTile[];
-  modelId: number | null;
-  /** The SAME per-tile filters the on-screen tiles use — identical cache keys. */
-  filtersByTile: Map<string, FilterClause[]>;
   options: PrintOptions;
   onClose: () => void;
 }
@@ -79,42 +69,42 @@ const HORIZONTAL_ALIGN = {
 } as const;
 
 export interface PrintSheetsProps {
-  title: string;
-  tiles: DashboardTile[];
+  /** Included dashboard pages, in tab order (usePrintSections builds these). */
+  sections: PrintSectionInput[];
   modelId: number | null;
   filtersByTile: Map<string, FilterClause[]>;
   options: PrintOptions;
-  /** Render at most this many pages (the dialog thumbnail passes 1). */
-  maxPages?: number;
+  /**
+   * Render ONLY this zero-based physical page (the dialog thumbnail passes
+   * the selected preview page); absent = render the whole job.
+   */
+  onlyPage?: number;
   /** On-screen "Page n of N" captions under each sheet (hidden in print). */
   showPageNumbers?: boolean;
 }
 
 /**
  * The paginated stack of paper sheets, shared by the full-screen preview and
- * the config dialog's live thumbnail (same computePrintLayout — same pages).
+ * the config dialog's live thumbnail (same computePrintJob — same pages).
  * Every sheet is rendered at the paper's EXACT px size (96dpi) with the 12mm
  * margin as padding, so the on-screen preview is 1:1 with the printed page,
  * orientation included. Sheets are `pointer-events: none` — charts never
  * react to hover/click in a preview.
+ *
+ * Workbook jobs: each section (dashboard page) starts on a fresh sheet, its
+ * first sheet carries that page's own header (title/timestamp/filters per the
+ * Include options), and physical page numbers run continuously.
  */
 export function PrintSheets({
-  title,
-  tiles,
+  sections,
   modelId,
   filtersByTile,
   options,
-  maxPages,
+  onlyPage,
   showPageNumbers = true,
 }: PrintSheetsProps) {
-  const slicerValues = useDashboardState((state) => state.slicerValues);
   const crossFilters = useDashboardState((state) => state.crossFilters);
   const [timestamp] = useState(() => new Date().toLocaleString());
-
-  const filterSummary = useMemo(
-    () => filterSummaryFor(tiles, slicerValues, crossFilters),
-    [tiles, slicerValues, crossFilters],
-  );
 
   /**
    * Source-tile emphasis on paper mirrors the on-screen doctrine: only a
@@ -133,15 +123,8 @@ export function PrintSheets({
     return { category, legend };
   };
 
-  const layout = useMemo(
-    () => computePrintLayout(tiles, options, filterSummary.length > 0),
-    [tiles, options, filterSummary],
-  );
-  const { geometry } = layout;
-  const isEmpty = layout.pages.every((page) => page.blocks.length === 0);
-  const totalPages = layout.pages.length;
-  const visiblePages =
-    maxPages !== undefined ? layout.pages.slice(0, Math.max(1, maxPages)) : layout.pages;
+  const job = useMemo(() => computePrintJob(sections, options), [sections, options]);
+  const { geometry, totalPages } = job;
 
   const renderTileBody = (tile: ChartTileEntry) => {
     if (isTextTile(tile)) {
@@ -185,79 +168,99 @@ export function PrintSheets({
     );
   };
 
-  return (
-    <div className="rcd-print-pages" style={LIGHT_TOKENS}>
-      {visiblePages.map((page, pageIndex) => (
-        <div key={pageIndex} className="rcd-print-page mx-auto mb-6 w-fit last:mb-0">
-          {/* The white sheet: full paper px; the padding IS the 12mm margin
-              (visual 1:1). For print the padding/height are stripped — @page
-              applies the real margins and the content defines the height. */}
-          <section
-            aria-label={`Page ${pageIndex + 1} of ${totalPages}`}
-            className="rcd-print-sheet pointer-events-none select-none bg-white shadow-xl"
+  const renderSheet = (section: PrintJobSection, localIndex: number) => {
+    const { layout } = section;
+    const page = layout.pages[localIndex]!;
+    const pageIndex = section.startPage + localIndex; // zero-based, job-wide
+    const sectionIsEmpty = layout.pages.every((p) => p.blocks.length === 0);
+    return (
+      <div
+        key={`${section.pageId || 'section'}-${localIndex}`}
+        className="rcd-print-page mx-auto mb-6 w-fit last:mb-0"
+      >
+        {/* The white sheet: full paper px; the padding IS the 12mm margin
+            (visual 1:1). For print the padding/height are stripped — @page
+            applies the real margins and the content defines the height. */}
+        <section
+          aria-label={`Page ${pageIndex + 1} of ${totalPages}`}
+          className="rcd-print-sheet pointer-events-none select-none bg-white shadow-xl"
+          style={{
+            width: geometry.paperWidthPx,
+            height: geometry.paperHeightPx,
+            padding: geometry.marginPx,
+          }}
+        >
+          <div
+            className="rcd-print-sheet-inner flex flex-col overflow-hidden"
             style={{
-              width: geometry.paperWidthPx,
-              height: geometry.paperHeightPx,
-              padding: geometry.marginPx,
+              width: geometry.contentWidthPx,
+              height: geometry.contentHeightPx,
+              // Composed-content placement inside the printable area. The
+              // pagination math is unchanged (it measures from the top);
+              // this only distributes the leftover slack. In PRINT the sheet
+              // height goes auto, so DashboardPrintView injects a matching
+              // min-height whenever the vertical setting is not 'top'.
+              justifyContent: VERTICAL_ALIGN[options.alignV ?? 'top'],
+              alignItems: HORIZONTAL_ALIGN[options.alignH ?? 'left'],
             }}
           >
-            <div
-              className="rcd-print-sheet-inner flex flex-col overflow-hidden"
-              style={{
-                width: geometry.contentWidthPx,
-                height: geometry.contentHeightPx,
-                // Composed-content placement inside the printable area. The
-                // pagination math is unchanged (it measures from the top);
-                // this only distributes the leftover slack. In PRINT the sheet
-                // height goes auto, so DashboardPrintView injects a matching
-                // min-height whenever the vertical setting is not 'top'.
-                justifyContent: VERTICAL_ALIGN[options.alignV ?? 'top'],
-                alignItems: HORIZONTAL_ALIGN[options.alignH ?? 'left'],
-              }}
-            >
-              {pageIndex === 0 && layout.headerHeight > 0 && (
-                /* Fixed line heights + truncate: the header's height must match
-                   headerHeightPx exactly or pagination drifts. */
-                <header
-                  className="mb-4 flex w-full shrink-0 flex-col gap-1"
-                  style={{ textAlign: options.alignH ?? 'left' }}
-                >
-                  {options.includeTitle && (
-                    <h1 className="truncate text-xl font-semibold leading-7 text-rcd-text">
-                      {title}
-                    </h1>
-                  )}
-                  {options.includeTimestamp && (
-                    <p className="truncate text-xs leading-4 text-rcd-muted">Printed {timestamp}</p>
-                  )}
-                  {options.includeFilters && filterSummary.length > 0 && (
-                    <p
-                      className="truncate text-xs leading-4 text-rcd-text-2"
-                      title={filterSummary.join(' · ')}
-                    >
-                      <span className="font-medium">Active filters:</span>{' '}
-                      {filterSummary.join(' · ')}
-                    </p>
-                  )}
-                </header>
-              )}
-              {pageIndex === 0 && isEmpty && (
-                <p className="py-10 text-center text-sm text-rcd-muted">
-                  This dashboard has no chart tiles to print.
-                </p>
-              )}
-              {page.blocks.map((block) => (
-                <BlockBox key={block.key} block={block} render={renderTileBody} />
-              ))}
-            </div>
-          </section>
-          {showPageNumbers && (
-            <p className="rcd-print-pagenum mt-1.5 text-center text-xs text-white/60">
-              Page {pageIndex + 1} of {totalPages}
-            </p>
-          )}
-        </div>
-      ))}
+            {localIndex === 0 && layout.headerHeight > 0 && (
+              /* Fixed line heights + truncate: the header's height must match
+                 headerHeightPx exactly or pagination drifts. Every section's
+                 FIRST sheet carries its own header — the dashboard-page name
+                 rides the title line, so a workbook job labels each page run. */
+              <header
+                className="mb-4 flex w-full shrink-0 flex-col gap-1"
+                style={{ textAlign: options.alignH ?? 'left' }}
+              >
+                {options.includeTitle && (
+                  <h1 className="truncate text-xl font-semibold leading-7 text-rcd-text">
+                    {section.title}
+                  </h1>
+                )}
+                {options.includeTimestamp && (
+                  <p className="truncate text-xs leading-4 text-rcd-muted">Printed {timestamp}</p>
+                )}
+                {options.includeFilters && section.filterSummary.length > 0 && (
+                  <p
+                    className="truncate text-xs leading-4 text-rcd-text-2"
+                    title={section.filterSummary.join(' · ')}
+                  >
+                    <span className="font-medium">Active filters:</span>{' '}
+                    {section.filterSummary.join(' · ')}
+                  </p>
+                )}
+              </header>
+            )}
+            {localIndex === 0 && sectionIsEmpty && (
+              <p className="py-10 text-center text-sm text-rcd-muted">
+                {job.sections.length > 1
+                  ? 'This dashboard page has no chart tiles to print.'
+                  : 'This dashboard has no chart tiles to print.'}
+              </p>
+            )}
+            {page.blocks.map((block) => (
+              <BlockBox key={block.key} block={block} render={renderTileBody} />
+            ))}
+          </div>
+        </section>
+        {showPageNumbers && (
+          <p className="rcd-print-pagenum mt-1.5 text-center text-xs text-white/60">
+            Page {pageIndex + 1} of {totalPages}
+          </p>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="rcd-print-pages" style={LIGHT_TOKENS}>
+      {job.sections.map((section) =>
+        section.layout.pages.map((_, localIndex) => {
+          if (onlyPage !== undefined && section.startPage + localIndex !== onlyPage) return null;
+          return renderSheet(section, localIndex);
+        }),
+      )}
     </div>
   );
 }
@@ -327,19 +330,16 @@ function PrintTileBox({ title, children }: { title: string; children: ReactNode 
 /**
  * Full-screen print preview overlay, portaled directly under <body> so the
  * @media print rules in rcd.css can hide every OTHER body child while
- * `body.rcd-printing` is set. Tiles re-render fresh ChartTiles with the same
- * spec/filters as on screen — the shared query cache serves them instantly.
- * Slicer tiles are excluded from print (their selections appear in the header
- * summary instead).
+ * `body.rcd-printing` is set. Content (which dashboard pages, their tiles and
+ * filters) comes from usePrintSections — the exact hook the config dialog's
+ * thumbnail used, so this overlay always shows the job that was previewed.
+ * Tiles re-render fresh ChartTiles with the same spec/filters as on screen —
+ * the shared query cache serves them instantly. Slicer tiles are excluded from
+ * print (their selections appear in the header summary instead).
  */
-export function DashboardPrintView({
-  title,
-  tiles,
-  modelId,
-  filtersByTile,
-  options,
-  onClose,
-}: DashboardPrintViewProps) {
+export function DashboardPrintView({ options, onClose }: DashboardPrintViewProps) {
+  const { sections, filtersByTile, modelId } = usePrintSections(options);
+
   // Flag the document for the print stylesheet while the overlay is open.
   useEffect(() => {
     document.body.classList.add('rcd-printing');
@@ -395,7 +395,7 @@ export function DashboardPrintView({
       data-print="true"
       role="dialog"
       aria-modal="true"
-      aria-label={`Print preview: ${title}`}
+      aria-label={`Print preview: ${sections[0]?.title ?? 'Dashboard'}`}
     >
       {/* On-screen toolbar; hidden by the @media print rules. */}
       <div className="rcd-print-toolbar sticky top-0 z-10 flex items-center gap-3 bg-[#1c1c1f] px-4 py-2.5 shadow-md">
@@ -420,8 +420,7 @@ export function DashboardPrintView({
 
       <div className="rcd-print-stage p-6">
         <PrintSheets
-          title={title}
-          tiles={tiles}
+          sections={sections}
           modelId={modelId}
           filtersByTile={filtersByTile}
           options={options}

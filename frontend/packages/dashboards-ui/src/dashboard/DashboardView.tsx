@@ -152,14 +152,22 @@ function TransientChip({
  * actually applied. Result columns arrive in wire dimension order
  * [axis, legend, smallMultiples], the same order toWireSpec emits.
  */
+/**
+ * The chart's dimensions in WIRE order — the same order toWireSpec emits and
+ * therefore the order the result's dimension columns arrive in, so a renderer
+ * that reports a dimension INDEX (tables, wave 18) addresses this list.
+ */
+const wireDimensions = (chart: ChartSpec): DimensionRef[] =>
+  [chart.query.axis, chart.query.legend, chart.query.smallMultiples].filter(
+    (dim): dim is DimensionRef => dim != null,
+  );
+
 const dimensionMeta = (
   chart: ChartSpec,
   dimension: DimensionRef,
   columns: QueryColumn[] | null,
 ): CrossFilterClauseOptions => {
-  const wire = [chart.query.axis, chart.query.legend, chart.query.smallMultiples].filter(
-    (dim): dim is DimensionRef => dim != null,
-  );
+  const wire = wireDimensions(chart);
   const index = wire.findIndex(
     (dim) => dim.table === dimension.table && dim.column === dimension.column,
   );
@@ -550,24 +558,78 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   // routing: plain/Shift click = 'replace' (one filter, toggle-off on the
   // same sole datum); Ctrl/Cmd = 'add' (accumulate values on the field /
   // add another field alongside) — the store owns the merge semantics.
+  // A datum click may now name WHICH dimension it means (tables: clickFilter
+  // 'cell') and may carry SEVERAL at once (clickFilter 'row'); charts that
+  // send neither keep the historic "the chart's one category dimension" path.
   const handleDatumClick = useCallback(
     (tileId: string, chart: ChartSpec, info: ChartDatumClickInfo, columns: QueryColumn[] | null) => {
-      const dimension =
+      // The chart's own category dimension: what an unqualified click means.
+      const fallback =
         chart.type === 'pie' || chart.type === 'donut'
           ? (chart.query.legend ?? chart.query.axis ?? null)
           : (chart.query.axis ?? null);
-      if (!dimension) return;
-      const clause = crossFilterClauseFor(
-        dimension,
-        info.value,
-        dimensionMeta(chart, dimension, columns),
-      );
-      runtime.dashboards.applyCrossFilter({
-        sourceTileId: tileId,
-        clause,
-        label: `${dimension.column}: ${info.label}`,
-        categoryLabel: info.label,
-        mode: readAdditiveModifier() ? 'add' : 'replace',
+      const wire = wireDimensions(chart);
+      /** Positional dimension when the renderer named one, else the fallback. */
+      const dimensionAt = (index: number | undefined): DimensionRef | null =>
+        index === undefined || index < 0 ? fallback : (wire[index] ?? fallback);
+      const facets =
+        info.facets && info.facets.length > 0
+          ? info.facets
+          : [{ dimensionIndex: info.dimensionIndex, value: info.value, label: info.label }];
+      // One clause per named dimension, de-duplicated by field: the store keeps
+      // at most one cross-filter per (table, column) anyway.
+      const applied: { clause: FilterClause; dimension: DimensionRef; label: string }[] = [];
+      for (const facet of facets) {
+        const dimension = dimensionAt(facet.dimensionIndex);
+        if (!dimension) continue;
+        if (applied.some((a) => a.dimension.table === dimension.table && a.dimension.column === dimension.column)) {
+          continue;
+        }
+        applied.push({
+          clause: crossFilterClauseFor(dimension, facet.value, dimensionMeta(chart, dimension, columns)),
+          dimension,
+          label: facet.label,
+        });
+      }
+      if (applied.length === 0) return;
+      const additive = readAdditiveModifier();
+      // ONE user action, several clauses ('row'): the store's per-call
+      // 'replace' cannot express it — its toggle-off branch would EAT the
+      // first clause whenever that exact filter is already the sole active
+      // one, and each further call would wipe the previous. So a plain
+      // multi-clause click clears once and then adds every clause; the
+      // toggle-off symmetry a single-value click has is restored explicitly
+      // above it. Store state is read straight off the store so the callback
+      // stays dependency-free (and never stale), and React batches the writes
+      // into one commit, so no intermediate filter set ever paints or fetches.
+      if (applied.length > 1) {
+        const active = runtime.dashboards.store.getState().crossFilters;
+        if (!additive) {
+          const same =
+            active.length === applied.length &&
+            active.every(
+              (f, i) =>
+                f.sourceTileId === tileId &&
+                stableStringify(f.clause) === stableStringify(applied[i]!.clause),
+            );
+          // Same row clicked again -> release the whole set.
+          if (same) {
+            runtime.dashboards.clearCrossFilters();
+            return;
+          }
+          if (active.length > 0) runtime.dashboards.clearCrossFilters();
+        }
+      }
+      applied.forEach(({ clause, dimension, label }) => {
+        runtime.dashboards.applyCrossFilter({
+          sourceTileId: tileId,
+          clause,
+          label: `${dimension.column}: ${label}`,
+          categoryLabel: label,
+          // Single clause keeps the historic replace/toggle semantics; a
+          // multi-clause set has already been cleared, so every clause adds.
+          mode: additive || applied.length > 1 ? 'add' : 'replace',
+        });
       });
     },
     [runtime],
@@ -891,19 +953,37 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
   const sourceEmphasisByTile = useMemo(() => {
     const map = new Map<
       string,
-      { category: string | null; legend: string | null; categories: string[] | null }
+      {
+        category: string | null;
+        legend: string | null;
+        categories: string[] | null;
+        cells: { source: string | null; label: string }[];
+      }
     >();
     for (const cross of crossFilters) {
       const single = (cross.values?.length ?? 1) === 1;
       const label = single ? cross.categoryLabel : null;
-      const entry =
-        map.get(cross.sourceTileId) ?? { category: null, legend: null, categories: null };
+      const entry = map.get(cross.sourceTileId) ?? {
+        category: null,
+        legend: null,
+        categories: null,
+        cells: [],
+      };
       if ((cross.kind ?? 'axis') === 'axis') {
         entry.category = label;
         // Tables can mark EVERY selected row of a Ctrl-accumulated set (they
         // have one interaction identity per row); charts keep the single-label
         // rule above.
         entry.categories = cross.values?.map((v) => v.label) ?? null;
+        // COLUMN-QUALIFIED echo: a table whose clicks filter per CELL may hold
+        // several fields at once from one tile (clickFilter 'row'), and the
+        // single category slot above can only carry the last one. Every active
+        // value is echoed with the field it filters, so the table marks the
+        // exact cells — unlike the slots above, these ACCUMULATE across fields.
+        const source = `${cross.clause.table}.${cross.clause.column}`;
+        for (const value of cross.values ?? [{ label: cross.categoryLabel }]) {
+          entry.cells.push({ source, label: value.label });
+        }
       } else {
         entry.legend = label;
       }
@@ -1400,6 +1480,7 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
         filters={filtersByTile.get(tile.id) ?? NO_FILTERS}
         activeCategoryLabel={sourceEmphasisByTile.get(tile.id)?.category ?? null}
         activeCategories={sourceEmphasisByTile.get(tile.id)?.categories ?? null}
+        activeCells={sourceEmphasisByTile.get(tile.id)?.cells ?? null}
         selectedLegendLabel={sourceEmphasisByTile.get(tile.id)?.legend ?? null}
         onSelect={() => runtime.dashboards.selectTile(tile.id)}
         onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
@@ -2035,19 +2116,12 @@ export function DashboardView({ dashboardId, readonly = false }: DashboardViewPr
       />
 
       {printOptions !== null && (
-        <DashboardPrintView
-          // The ACTIVE page prints; its name joins the header title once the
-          // dashboard actually has multiple pages. Tiles print their BASE
-          // specs — transient per-tile drill state is deliberately ignored.
-          title={
-            pages.length > 1 && activePage ? `${current.name} — ${activePage.name}` : current.name
-          }
-          tiles={tiles}
-          modelId={modelId}
-          filtersByTile={filtersByTile}
-          options={printOptions}
-          onClose={() => setPrintOptions(null)}
-        />
+        // The print view resolves its own content (which dashboard pages the
+        // options include, their tiles, headers and per-tile filters) through
+        // usePrintSections — the same hook the config dialog previewed with.
+        // Tiles print their BASE specs — transient per-tile drill state is
+        // deliberately ignored.
+        <DashboardPrintView options={printOptions} onClose={() => setPrintOptions(null)} />
       )}
     </div>
   );

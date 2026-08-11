@@ -255,6 +255,13 @@ export interface DashboardChartTileProps {
    * tables highlight all of them; charts ignore it).
    */
   activeCategories?: readonly string[] | null;
+  /**
+   * The same active values as activeCategories, each tagged with the
+   * "table.column" it filters — TABLES need the column to mark the exact cell
+   * driving the page once clickFilter 'cell'/'row' lets a click filter on a
+   * column other than the first. Other chart types ignore it.
+   */
+  activeCells?: readonly { source: string | null; label: string }[] | null;
   /** Legend label while this tile is the LEGEND cross-filter source (emphasis). */
   selectedLegendLabel: string | null;
   /**
@@ -369,6 +376,7 @@ export function DashboardChartTile({
   filters,
   activeCategoryLabel,
   activeCategories = null,
+  activeCells = null,
   selectedLegendLabel,
   filterBadgeLabel = null,
   filterBadgeAccent = null,
@@ -942,11 +950,23 @@ export function DashboardChartTile({
   const selection = useMemo(() => {
     if (chart.format.selectionHighlight === false) return null;
     const categories = activeCategories && activeCategories.length > 1 ? activeCategories : null;
-    if (activeCategoryLabel === null && selectedLegendLabel === null && categories === null) {
+    const cells = activeCells && activeCells.length > 0 ? activeCells : null;
+    if (
+      activeCategoryLabel === null &&
+      selectedLegendLabel === null &&
+      categories === null &&
+      cells === null
+    ) {
       return null;
     }
-    return { category: activeCategoryLabel, legendValue: selectedLegendLabel, categories };
-  }, [chart.format.selectionHighlight, activeCategoryLabel, activeCategories, selectedLegendLabel]);
+    return { category: activeCategoryLabel, legendValue: selectedLegendLabel, categories, cells };
+  }, [
+    chart.format.selectionHighlight,
+    activeCategoryLabel,
+    activeCategories,
+    activeCells,
+    selectedLegendLabel,
+  ]);
 
   // Freshest effective chart + result columns for the stable range callback
   // (assignment every render, mirrors hoverDimsRef).

@@ -1,6 +1,6 @@
 {
   "name": "@recon/dashboards-core",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "description": "Headless core for ReconDashboards: types, API client, zustand runtime factory, query cache.",
   "type": "module",
   "main": "./dist/index.js",

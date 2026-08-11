@@ -97,12 +97,49 @@ export type {
   TableSortState,
 } from './TableChart';
 
-/** Payload of a cross-filter datum click. */
+/**
+ * One dimension the consumer should filter by, IDENTIFIED BY POSITION: result
+ * dimension columns arrive in wire order ([axis, legend, smallMultiples], the
+ * order toWireSpec emits), so `dimensionIndex` addresses the chart's own
+ * dimension without the renderer knowing anything about the query.
+ */
+export interface ChartDatumFacet {
+  /** 0-based index among the RESULT's dimension columns = wire dimension order. */
+  dimensionIndex: number;
+  /** "table.column" the result reports for that dimension (null when unknown). */
+  source: string | null;
+  /** RAW (pre-format) cell value; null = blank. */
+  value: CellValue;
+  /** Formatted display label. */
+  label: string;
+}
+
+/**
+ * Payload of a cross-filter datum click. `value`/`label` are the contract
+ * every chart has always emitted; the positional fields below are OPTIONAL
+ * refinements only the table currently sends (see TableOptions.clickFilter) —
+ * consumers that ignore them keep the pre-wave-18 behavior exactly.
+ */
 export interface ChartDatumClickInfo {
   /** RAW (pre-format) cell value of the clicked category; null = blank. */
   value: CellValue;
   /** Formatted display label of the clicked category. */
   label: string;
+  /**
+   * WHICH dimension `value`/`label` belong to, as an index among the result's
+   * dimension columns (wire order). Absent = the first dimension, which is
+   * what every non-table chart means.
+   */
+  dimensionIndex?: number;
+  /** "table.column" of that dimension when the result reports it. */
+  source?: string | null;
+  /**
+   * EVERY dimension to filter by in ONE user action (table clickFilter
+   * 'row'). When present the consumer applies one clause per entry,
+   * AND-composed; `value`/`label`/`dimensionIndex` still describe the FIRST
+   * entry so older consumers degrade to the legacy single-clause behavior.
+   */
+  facets?: ChartDatumFacet[];
 }
 
 /**
@@ -123,6 +160,15 @@ export interface ChartSelection {
    * charts currently ignore it.
    */
   categories?: readonly string[] | null;
+  /**
+   * COLUMN-QUALIFIED selection facets: the same active values as `categories`
+   * but each tagged with the "table.column" it filters. Tables use them to
+   * mark the exact CELL that is driving the filter (clickFilter 'cell' can
+   * select on any dimension column, so an unqualified label would mark the
+   * wrong column); charts ignore them. `source` null = column unknown, match
+   * on the label alone.
+   */
+  cells?: readonly { source: string | null; label: string }[] | null;
 }
 
 /**
