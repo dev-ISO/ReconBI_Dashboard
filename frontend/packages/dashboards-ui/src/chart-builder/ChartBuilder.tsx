@@ -8,13 +8,15 @@ import {
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import { Sigma, Variable } from 'lucide-react';
+import { AlertTriangle, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   isRunnable,
   stableStringify,
   toWireSpec,
+  validateChartSpec,
   type Catalog,
   type ChartFormat,
+  type ChartIssue,
   type ChartSpec,
   type FilterClause,
   type ModelDefinition,
@@ -102,6 +104,18 @@ export function ChartBuilder({
   const dirty = useMemo(
     () => stableStringify(draft) !== stableStringify(initial),
     [draft, initial],
+  );
+
+  // Client-side spec validation (mirrors the server's QueryCompiler rules).
+  // Errors block Save; warnings only advise. Memoized on the draft/model/
+  // catalog identities — the validator is pure.
+  const issues = useMemo<ChartIssue[]>(
+    () => validateChartSpec(draft, model, catalog ?? null),
+    [draft, model, catalog],
+  );
+  const validationErrors = useMemo(
+    () => issues.filter((issue) => issue.severity === 'error'),
+    [issues],
   );
 
   const addToWell = (well: WellId, data: FieldDragData, slot?: number) => {
@@ -336,6 +350,31 @@ export function ChartBuilder({
             <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
               Preview
             </span>
+            {issues.length > 0 && (
+              <div
+                role="status"
+                aria-label="Chart validation issues"
+                className="flex max-h-28 shrink-0 flex-col gap-1 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface px-2 py-1.5"
+              >
+                {issues.map((issue, index) => (
+                  <p
+                    key={index}
+                    className={`flex items-start gap-1.5 text-xs ${
+                      issue.severity === 'error'
+                        ? 'text-[var(--rcd-status-critical)]'
+                        : 'text-[var(--rcd-status-warn)]'
+                    }`}
+                  >
+                    {issue.severity === 'error' ? (
+                      <XCircle size={13} aria-label="Error" className="mt-[1px] shrink-0" />
+                    ) : (
+                      <AlertTriangle size={13} aria-label="Warning" className="mt-[1px] shrink-0" />
+                    )}
+                    <span className="min-w-0 break-words">{issue.message}</span>
+                  </p>
+                ))}
+              </div>
+            )}
             <div className="min-h-[10rem] flex-1 rounded-md border border-rcd-border bg-rcd-surface p-2">
               <ChartTile
                 spec={draft}
@@ -366,8 +405,14 @@ export function ChartBuilder({
         <RcdButton onClick={handleCancel}>Cancel</RcdButton>
         <RcdButton
           variant="primary"
-          disabled={!isRunnable(draft)}
-          title={isRunnable(draft) ? undefined : 'Add at least one field to a values well'}
+          disabled={!isRunnable(draft) || validationErrors.length > 0}
+          title={
+            validationErrors.length > 0
+              ? validationErrors.map((issue) => issue.message).join('\n')
+              : isRunnable(draft)
+                ? undefined
+                : 'Add at least one field to a values well'
+          }
           onClick={() => onSave(draft)}
         >
           Save chart

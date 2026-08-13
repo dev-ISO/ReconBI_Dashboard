@@ -391,16 +391,7 @@ public sealed class ChartQueryService(
         try
         {
             var executed = await executor.ExecuteAsync(compiled, executionOptions, ct);
-            // The statement asks for RowLimit + 1 (truncation probe); trim the
-            // probe row back off so callers never see more rows than requested
-            // (pagination pages, TopN) and report the overflow as truncation.
-            var rows = executed.Rows;
-            var truncated = executed.Truncated;
-            if (compiled.RowLimit is int rowLimit && rows.Count > rowLimit)
-            {
-                rows = [.. rows.Take(rowLimit)];
-                truncated = true;
-            }
+            var (rows, truncated) = ApplyRowAccounting(compiled, executed.Rows, executed.Truncated);
 
             await AuditAsync(spec, model, source, compiled, rows.Count, executed.ElapsedMs, null, ct);
             return ServiceResult<QueryOutcome>.Ok(
@@ -418,6 +409,33 @@ public sealed class ChartQueryService(
                 ServiceErrorKind.Upstream, "rcd.query.execution_failed",
                 "The query failed to execute. Check server logs for details.");
         }
+    }
+
+    /// <summary>
+    /// Applies the compiled statement's row accounting to raw executor output:
+    /// a trailing "__rcd_truncated" probe COLUMN (<see cref="CompiledQuery.HasTruncationProbe"/>)
+    /// is folded into the truncation flag and stripped off every row, then the
+    /// RowLimit + 1 probe ROW is trimmed back off so callers never see more
+    /// rows than requested (pagination pages, TopN) and the overflow reports
+    /// as truncation.
+    /// </summary>
+    public static (IReadOnlyList<object?[]> Rows, bool Truncated) ApplyRowAccounting(
+        CompiledQuery compiled, IReadOnlyList<object?[]> rows, bool truncated)
+    {
+        if (compiled.HasTruncationProbe && rows.Count > 0)
+        {
+            // The probe is constant across rows — read it once, strip it everywhere.
+            truncated = truncated || rows[0][^1] is true;
+            rows = [.. rows.Select(r => r[..^1])];
+        }
+
+        if (compiled.RowLimit is int rowLimit && rows.Count > rowLimit)
+        {
+            rows = [.. rows.Take(rowLimit)];
+            truncated = true;
+        }
+
+        return (rows, truncated);
     }
 
     private async Task AuditAsync(

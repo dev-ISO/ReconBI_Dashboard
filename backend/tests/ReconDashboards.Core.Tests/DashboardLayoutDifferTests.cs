@@ -191,7 +191,7 @@ public class DashboardLayoutDifferTests
     }
 
     [Fact]
-    public void TileRemoved_IsChartsOnly()
+    public void ChartTileRemoved_IsChartsOnly()
     {
         var newDoc = """
             {
@@ -199,9 +199,8 @@ public class DashboardLayoutDifferTests
                 {
                   "id": "p1", "name": "Overview", "color": "#ff0000",
                   "tiles": [
-                    { "id": "t1", "kind": "chart", "layout": { "x": 0, "y": 0, "w": 4, "h": 3 },
-                      "chart": { "id": "c1", "type": "column", "title": "Orders by Region",
-                                 "query": { "measures": [{ "name": "Total" }] }, "format": { "palette": "a" } } }
+                    { "id": "t2", "kind": "slicer", "layout": { "x": 4, "y": 0, "w": 2, "h": 1 },
+                      "slicer": { "table": "public.orders", "column": "status" } }
                   ]
                 },
                 { "id": "p2", "name": "Detail", "tiles": [] }
@@ -224,15 +223,97 @@ public class DashboardLayoutDifferTests
         AssertFlags(Diff(BaseDoc, newDoc), layout: true);
     }
 
+    // Finding 9: add/remove of slicer/text/image tiles is a LAYOUT-class
+    // change, same as editing one; only chart-kind tiles gate on canEditCharts.
+
+    [Theory]
+    [InlineData("slicer", """{ "id": "t9", "kind": "slicer", "slicer": { "table": "public.orders", "column": "region" } }""")]
+    [InlineData("text", """{ "id": "t9", "kind": "text", "text": { "html": "<p>hello</p>" } }""")]
+    [InlineData("image", """{ "id": "t9", "kind": "image", "image": { "src": "https://x/y.png", "fit": "contain" } }""")]
+    public void StaticTileAdded_IsLayoutOnly(string kind, string tileJson)
+    {
+        _ = kind;
+        var newDoc = BaseDoc.Replace(
+            """{ "id": "p2", "name": "Detail", "tiles": [] }""",
+            $$"""{ "id": "p2", "name": "Detail", "tiles": [{{tileJson}}] }""");
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, layout: true);
+        Assert.Equal(1, summary.TilesAdded);
+    }
+
     [Fact]
-    public void TileKindChanged_IsChartsClass()
+    public void SlicerTileRemoved_IsLayoutOnly()
+    {
+        var newDoc = """
+            {
+              "pages": [
+                {
+                  "id": "p1", "name": "Overview", "color": "#ff0000",
+                  "tiles": [
+                    { "id": "t1", "kind": "chart", "layout": { "x": 0, "y": 0, "w": 4, "h": 3 },
+                      "chart": { "id": "c1", "type": "column", "title": "Orders by Region",
+                                 "query": { "measures": [{ "name": "Total" }] }, "format": { "palette": "a" } } }
+                  ]
+                },
+                { "id": "p2", "name": "Detail", "tiles": [] }
+              ],
+              "refreshSeconds": 60,
+              "filterCards": [{ "id": "f1", "scope": "allPages" }]
+            }
+            """;
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, layout: true);
+        Assert.Equal(1, summary.TilesRemoved);
+    }
+
+    [Fact]
+    public void PageAddedWithOnlyStaticTiles_IsPagesAndLayout()
+    {
+        var newDoc = BaseDoc.Replace(
+            """{ "id": "p2", "name": "Detail", "tiles": [] }""",
+            """{ "id": "p2", "name": "Detail", "tiles": [] }, { "id": "p3", "name": "Costs", "tiles": [{ "id": "t9", "kind": "text", "text": { "html": "<p>x</p>" } }] }""");
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, layout: true, pages: true);
+        Assert.Equal(1, summary.TilesAdded);
+    }
+
+    [Fact]
+    public void TileKindChangedBetweenStaticKinds_IsLayoutClass()
     {
         var newDoc = BaseDoc.Replace("\"id\": \"t2\", \"kind\": \"slicer\"", "\"id\": \"t2\", \"kind\": \"text\"");
 
         var summary = Diff(BaseDoc, newDoc);
 
+        Assert.True(summary.LayoutChanged);
+        Assert.False(summary.ChartsChanged);
+        Assert.False(summary.PagesChanged);
+    }
+
+    [Fact]
+    public void TileKindChangedFromChart_IsChartsClass()
+    {
+        var newDoc = BaseDoc.Replace("\"id\": \"t1\", \"kind\": \"chart\"", "\"id\": \"t1\", \"kind\": \"text\"");
+
+        var summary = Diff(BaseDoc, newDoc);
+
         Assert.True(summary.ChartsChanged);
         Assert.False(summary.PagesChanged);
+    }
+
+    [Fact]
+    public void UnknownTileKindAdded_FailsClosedToChartsClass()
+    {
+        var newDoc = BaseDoc.Replace(
+            """{ "id": "p2", "name": "Detail", "tiles": [] }""",
+            """{ "id": "p2", "name": "Detail", "tiles": [{ "id": "t9", "kind": "hologram" }] }""");
+
+        Assert.True(Diff(BaseDoc, newDoc).ChartsChanged);
     }
 
     [Fact]

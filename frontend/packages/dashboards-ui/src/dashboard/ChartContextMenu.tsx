@@ -1,5 +1,15 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { BellPlus, Copy, FileDown, Paintbrush, Pencil, Trash2, type LucideIcon } from 'lucide-react';
+import {
+  BellPlus,
+  ClipboardCopy,
+  Copy,
+  CopyPlus,
+  FileDown,
+  Paintbrush,
+  Pencil,
+  Trash2,
+  type LucideIcon,
+} from 'lucide-react';
 import { ConfirmDialog } from '../primitives';
 
 export interface ChartContextMenuProps {
@@ -12,6 +22,10 @@ export interface ChartContextMenuProps {
   /** Opens the builder dialog on the Fields tab. */
   onEditFields: () => void;
   onDuplicate: () => void;
+  /** Copies the AUTHORED chart to the session clipboard (paste via Add ▾). */
+  onCopy?: () => void;
+  /** Opens the cross-dashboard "Copy chart to…" dialog. */
+  onCopyTo?: () => void;
   /** CSV export of the tile's CURRENT effective query; items hidden when absent. */
   onExport?: (mode: 'summarized' | 'underlying') => void;
   /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
@@ -34,6 +48,8 @@ export function ChartContextMenu({
   onFormat,
   onEditFields,
   onDuplicate,
+  onCopy,
+  onCopyTo,
   onExport,
   onSetAlert = null,
   onDelete,
@@ -107,6 +123,26 @@ export function ChartContextMenu({
             onClose();
           }}
         />
+        {onCopy && (
+          <MenuItem
+            icon={ClipboardCopy}
+            label="Copy"
+            onClick={() => {
+              onCopy();
+              onClose();
+            }}
+          />
+        )}
+        {onCopyTo && (
+          <MenuItem
+            icon={CopyPlus}
+            label="Copy chart to…"
+            onClick={() => {
+              onCopyTo();
+              onClose();
+            }}
+          />
+        )}
         {onExport && (
           <>
             <div className="my-1 border-t border-rcd-border" />

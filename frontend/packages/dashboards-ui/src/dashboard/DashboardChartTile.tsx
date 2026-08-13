@@ -716,6 +716,38 @@ export function DashboardChartTile({
   );
 
   /**
+   * Authored Top-N on the (drilled) spec. Pagination must never widen it: the
+   * pageable universe is the FIRST authoredLimit rows (finding 6 — a pageSize
+   * larger than the Top-N used to overwrite it and show rows the author cut).
+   */
+  const authoredLimit = drilledChart.query.limit ?? null;
+
+  /**
+   * The offset walk is bounded by the authored Top-N: the last reachable page
+   * is the one containing the Top-N's final row, so a stale pager click (count
+   * companion failed) can never fetch rows past the authored cut.
+   */
+  const maxPage =
+    pageSize !== null && authoredLimit !== null
+      ? Math.max(0, Math.ceil(authoredLimit / pageSize) - 1)
+      : null;
+  const tablePage = maxPage !== null ? Math.min(tableState.page, maxPage) : tableState.page;
+
+  /** Row offset for server-side table pagination (merged into the wire spec). */
+  const tableOffset = pageSize !== null ? tablePage * pageSize : null;
+
+  /**
+   * Per-page row limit: the page size, shrunk on the LAST page inside an
+   * authored Top-N so the page never reads past it.
+   */
+  const pageLimit =
+    pageSize === null
+      ? null
+      : authoredLimit === null
+        ? pageSize
+        : Math.max(1, Math.min(pageSize, authoredLimit - (tableOffset ?? 0)));
+
+  /**
    * The spec ChartTile actually fetches/renders: the drilled chart plus the
    * transient table sort (replacing spec.sort), page-size limit, and any
    * view-mode column layout override. Non-table charts pass through.
@@ -725,14 +757,14 @@ export function DashboardChartTile({
     const sortSpecs = tableState.sortSpecs;
     const needsSort = sortSpecs.length > 0;
     const needsLayout = tableLayoutOverride !== null;
-    if (!needsSort && !needsLayout && pageSize === null) return drilledChart;
+    if (!needsSort && !needsLayout && pageLimit === null) return drilledChart;
     return {
       ...drilledChart,
       query: {
         ...drilledChart.query,
         // Every level, in priority order -> one composed ORDER BY.
         ...(needsSort ? { sort: sortSpecs } : {}),
-        ...(pageSize !== null ? { limit: pageSize } : {}),
+        ...(pageLimit !== null ? { limit: pageLimit } : {}),
       },
       ...(needsLayout
         ? {
@@ -745,10 +777,7 @@ export function DashboardChartTile({
           }
         : {}),
     };
-  }, [isTable, drilledChart, tableState.sortSpecs, tableLayoutOverride, pageSize]);
-
-  /** Row offset for server-side table pagination (merged into the wire spec). */
-  const tableOffset = pageSize !== null ? tableState.page * pageSize : null;
+  }, [isTable, drilledChart, tableState.sortSpecs, tableLayoutOverride, pageLimit]);
 
   /* ------------------------------------------------------------ totals row */
 
@@ -820,13 +849,16 @@ export function DashboardChartTile({
   const countSpec = useMemo(() => {
     if (!isTable || pageSize === null || modelId === null) return null;
     if (drilledChart.query.measures.length === 0) return null;
+    // The authored Top-N caps the companion too (finding 6): the pageable
+    // universe is the first authoredLimit groups, so the pager must count
+    // exactly those — not the unlimited group count.
     const base = toWireSpec(
-      { ...drilledChart, query: { ...drilledChart.query, sort: [], limit: null } },
+      { ...drilledChart, query: { ...drilledChart.query, sort: [], limit: authoredLimit } },
       modelId,
       mergedFilters,
     );
     return tableHaving.length > 0 ? { ...base, having: tableHaving } : base;
-  }, [isTable, pageSize, modelId, drilledChart, mergedFilters, tableHaving]);
+  }, [isTable, pageSize, modelId, drilledChart, mergedFilters, tableHaving, authoredLimit]);
 
   const countKey = countSpec ? runtime.queries.keyFor(countSpec) : null;
   const countEntry = useQueryCacheState((state) =>
@@ -845,11 +877,15 @@ export function DashboardChartTile({
   }, [runtime, countKey, refreshKey]);
 
   // A server-truncated companion can't count everything — report "unknown"
-  // (graceful "Page X", no Last jump) instead of a wrong smaller total.
+  // (graceful "Page X", no Last jump) instead of a wrong smaller total. With
+  // an authored Top-N the truncation point IS the known total: the pageable
+  // universe ends exactly at the authored cut.
   const tableTotalRows = useMemo<number | null>(() => {
     if (!countSpec || countEntry?.status !== 'ok' || !countEntry.data) return null;
-    return countEntry.data.meta.truncated ? null : countEntry.data.rows.length;
-  }, [countSpec, countEntry]);
+    const rowCount = countEntry.data.rows.length;
+    if (countEntry.data.meta.truncated) return authoredLimit;
+    return authoredLimit !== null ? Math.min(rowCount, authoredLimit) : rowCount;
+  }, [countSpec, countEntry, authoredLimit]);
   const tablePageCount =
     tableTotalRows !== null && pageSize !== null
       ? Math.max(1, Math.ceil(tableTotalRows / pageSize))
@@ -1198,7 +1234,7 @@ export function DashboardChartTile({
             onTableSortChange={
               isTable && tableOptions?.sortable !== false ? handleTableSortChange : undefined
             }
-            tablePage={tableState.page}
+            tablePage={tablePage}
             tablePageCount={tablePageCount}
             onTablePageChange={pageSize !== null ? handleTablePageChange : undefined}
             tableTotalRows={tableTotalRows}

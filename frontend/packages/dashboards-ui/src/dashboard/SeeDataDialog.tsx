@@ -22,6 +22,7 @@ import {
 } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdDialog, RcdSpinner } from '../primitives';
+import { downloadBlob } from '../util/downloadBlob';
 // Type-only imports (same doctrine as ChartTile): the lazy chunk split survives.
 import type { ChartRendererProps, TableColumnFilter, TableSortState } from '../chart/ChartRenderer';
 import type { ChartHavingClause } from '../chart/ChartTile';
@@ -382,12 +383,7 @@ export function SeeDataDialog({
         spec: request.spec,
         mode: 'underlying',
       });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `${csvFileName(baseTitle)}.csv`;
-      anchor.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(`${csvFileName(baseTitle)}.csv`, blob);
       if (capped) onNotice('Export truncated: the server capped the row count.');
     } catch (error) {
       onNotice(`Export failed: ${messageOf(error)}`);

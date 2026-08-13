@@ -16,6 +16,60 @@ const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' });
 const monthFormat = new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' });
 const yearFormat = new Intl.DateTimeFormat(undefined, { year: 'numeric' });
 
+// UTC twins for values parsed as calendar parts (see parseDateValue): the
+// parts live at UTC midnight, so rendering them with local-zone formatters
+// would shift the date a whole day west of UTC.
+const dateFormatUtc = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeZone: 'UTC' });
+const monthFormatUtc = new Intl.DateTimeFormat(undefined, {
+  month: 'short',
+  year: 'numeric',
+  timeZone: 'UTC',
+});
+const yearFormatUtc = new Intl.DateTimeFormat(undefined, { year: 'numeric', timeZone: 'UTC' });
+
+/**
+ * ISO date-only ("2026-08-04") and NAIVE timestamps ("2026-08-04T13:00:00",
+ * no zone suffix) denote CALENDAR PARTS, not instants — `new Date(iso)` parses
+ * the first as UTC midnight and the second in the local zone, so mixing either
+ * with the other zone's getters shifts the value (bug findings 2/3).
+ */
+const NAIVE_ISO =
+  /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/;
+
+/** A parsed date cell plus which getter family renders it faithfully. */
+interface ParsedDateValue {
+  date: Date;
+  /** True = calendar-parts value stored at UTC midnight; render with getUTC*. */
+  utc: boolean;
+}
+
+/**
+ * Parses a date-ish string. Date-only / naive-timestamp shapes become their
+ * literal calendar parts (held at UTC, rendered via UTC getters); anything
+ * else (zoned timestamps, epoch-ish strings) keeps `new Date` instant
+ * semantics with local rendering. Null when unparseable.
+ */
+const parseDateValue = (value: string): ParsedDateValue | null => {
+  const match = NAIVE_ISO.exec(value.trim());
+  if (match) {
+    const date = new Date(
+      Date.UTC(
+        Number(match[1]),
+        Number(match[2]) - 1,
+        Number(match[3]),
+        Number(match[4] ?? '0'),
+        Number(match[5] ?? '0'),
+        Number(match[6] ?? '0'),
+      ),
+    );
+    // Date.UTC maps years 0-99 to 1900+y — force the literal year.
+    date.setUTCFullYear(Number(match[1]));
+    return Number.isNaN(date.getTime()) ? null : { date, utc: true };
+  }
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : { date: parsed, utc: false };
+};
+
 // ---------------------------------------------------------------------------
 // Excel-style format patterns (AxisValueFormat kind 'custom', pattern-shaped
 // ChartFormat.valueFormat strings, ChartFormat.dateFormatPattern). Pure and
@@ -186,30 +240,62 @@ export const formatNumberPattern = (value: number, pattern: string): string => {
 
 const pad2 = (n: number): string => String(n).padStart(2, '0');
 
-const monthLongFormat = new Intl.DateTimeFormat(undefined, { month: 'long' });
-const monthShortFormat = new Intl.DateTimeFormat(undefined, { month: 'short' });
-const weekdayLongFormat = new Intl.DateTimeFormat(undefined, { weekday: 'long' });
-const weekdayShortFormat = new Intl.DateTimeFormat(undefined, { weekday: 'short' });
+/** Getter/formatter family the mask renderers read through (local vs UTC). */
+interface DateReaders {
+  year(d: Date): number;
+  month(d: Date): number; // 0-based, Date getter semantics
+  day(d: Date): number;
+  hours(d: Date): number;
+  minutes(d: Date): number;
+  monthLong: Intl.DateTimeFormat;
+  monthShort: Intl.DateTimeFormat;
+  weekdayLong: Intl.DateTimeFormat;
+  weekdayShort: Intl.DateTimeFormat;
+}
+
+const LOCAL_READERS: DateReaders = {
+  year: (d) => d.getFullYear(),
+  month: (d) => d.getMonth(),
+  day: (d) => d.getDate(),
+  hours: (d) => d.getHours(),
+  minutes: (d) => d.getMinutes(),
+  monthLong: new Intl.DateTimeFormat(undefined, { month: 'long' }),
+  monthShort: new Intl.DateTimeFormat(undefined, { month: 'short' }),
+  weekdayLong: new Intl.DateTimeFormat(undefined, { weekday: 'long' }),
+  weekdayShort: new Intl.DateTimeFormat(undefined, { weekday: 'short' }),
+};
+
+const UTC_READERS: DateReaders = {
+  year: (d) => d.getUTCFullYear(),
+  month: (d) => d.getUTCMonth(),
+  day: (d) => d.getUTCDate(),
+  hours: (d) => d.getUTCHours(),
+  minutes: (d) => d.getUTCMinutes(),
+  monthLong: new Intl.DateTimeFormat(undefined, { month: 'long', timeZone: 'UTC' }),
+  monthShort: new Intl.DateTimeFormat(undefined, { month: 'short', timeZone: 'UTC' }),
+  weekdayLong: new Intl.DateTimeFormat(undefined, { weekday: 'long', timeZone: 'UTC' }),
+  weekdayShort: new Intl.DateTimeFormat(undefined, { weekday: 'short', timeZone: 'UTC' }),
+};
 
 /**
  * Date-mask tokens, LONGEST FIRST so the tokenizer never mis-splits (yyyy
  * before yy, MMMM before MMM before MM before M, EEEE before EEE, dd before d).
  * Case matters: MM = month, mm = minutes. Qq yields the quarter number (1-4).
  */
-const DATE_MASK_TOKENS: readonly [token: string, render: (d: Date) => string][] = [
-  ['yyyy', (d) => String(d.getFullYear())],
-  ['MMMM', (d) => monthLongFormat.format(d)],
-  ['EEEE', (d) => weekdayLongFormat.format(d)],
-  ['MMM', (d) => monthShortFormat.format(d)],
-  ['EEE', (d) => weekdayShortFormat.format(d)],
-  ['yy', (d) => pad2(d.getFullYear() % 100)],
-  ['MM', (d) => pad2(d.getMonth() + 1)],
-  ['dd', (d) => pad2(d.getDate())],
-  ['HH', (d) => pad2(d.getHours())],
-  ['mm', (d) => pad2(d.getMinutes())],
-  ['Qq', (d) => String(Math.floor(d.getMonth() / 3) + 1)],
-  ['M', (d) => String(d.getMonth() + 1)],
-  ['d', (d) => String(d.getDate())],
+const DATE_MASK_TOKENS: readonly [token: string, render: (d: Date, r: DateReaders) => string][] = [
+  ['yyyy', (d, r) => String(r.year(d))],
+  ['MMMM', (d, r) => r.monthLong.format(d)],
+  ['EEEE', (d, r) => r.weekdayLong.format(d)],
+  ['MMM', (d, r) => r.monthShort.format(d)],
+  ['EEE', (d, r) => r.weekdayShort.format(d)],
+  ['yy', (d, r) => pad2(r.year(d) % 100)],
+  ['MM', (d, r) => pad2(r.month(d) + 1)],
+  ['dd', (d, r) => pad2(r.day(d))],
+  ['HH', (d, r) => pad2(r.hours(d))],
+  ['mm', (d, r) => pad2(r.minutes(d))],
+  ['Qq', (d, r) => String(Math.floor(r.month(d) / 3) + 1)],
+  ['M', (d, r) => String(r.month(d) + 1)],
+  ['d', (d, r) => String(r.day(d))],
 ];
 
 /**
@@ -217,8 +303,17 @@ const DATE_MASK_TOKENS: readonly [token: string, render: (d: Date) => string][] 
  * number) HH mm; "double" or 'single' quoted runs are literals; any other
  * character passes through unchanged (so `dd/MM/yyyy` or `"Q"Qq yyyy` just
  * work). Invalid dates render '' and nothing ever throws.
+ *
+ * `utc: true` renders through the getUTC* getter family — for dates that hold
+ * calendar parts at UTC midnight (naive engine values, UTC-gridded axes like
+ * the Gantt time axis) rather than local instants.
  */
-export const formatDatePattern = (date: Date, mask: string): string => {
+export const formatDatePattern = (
+  date: Date,
+  mask: string,
+  opts?: { utc?: boolean },
+): string => {
+  const readers = opts?.utc ? UTC_READERS : LOCAL_READERS;
   try {
     if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
     let out = '';
@@ -238,7 +333,7 @@ export const formatDatePattern = (date: Date, mask: string): string => {
       }
       for (const [token, render] of DATE_MASK_TOKENS) {
         if (mask.startsWith(token, i)) {
-          out += render(date);
+          out += render(date, readers);
           i += token.length;
           continue outer;
         }
@@ -248,7 +343,7 @@ export const formatDatePattern = (date: Date, mask: string): string => {
     }
     return out;
   } catch {
-    return dateFormat.format(date);
+    return (opts?.utc ? dateFormatUtc : dateFormat).format(date);
   }
 };
 
@@ -282,17 +377,21 @@ export const formatCellValue = (value: CellValue, column: QueryColumn): string =
   if (typeof value === 'boolean') return value ? 'Yes' : 'No';
 
   if ((column.type === 'date' || column.type === 'timestamp') && typeof value === 'string') {
-    const parsed = new Date(value);
-    if (!Number.isNaN(parsed.getTime())) {
+    // Calendar-parts values (date-only / naive) format from their parts via
+    // the UTC twins; only genuinely zoned instants render in the local zone.
+    const parsed = parseDateValue(value);
+    if (parsed !== null) {
+      const { date, utc } = parsed;
+      const readers = utc ? UTC_READERS : LOCAL_READERS;
       switch (column.dateBucket) {
         case 'year':
-          return yearFormat.format(parsed);
+          return (utc ? yearFormatUtc : yearFormat).format(date);
         case 'quarter':
-          return `Q${Math.floor(parsed.getMonth() / 3) + 1} ${parsed.getFullYear()}`;
+          return `Q${Math.floor(readers.month(date) / 3) + 1} ${readers.year(date)}`;
         case 'month':
-          return monthFormat.format(parsed);
+          return (utc ? monthFormatUtc : monthFormat).format(date);
         default:
-          return dateFormat.format(parsed);
+          return (utc ? dateFormatUtc : dateFormat).format(date);
       }
     }
   }
@@ -346,35 +445,40 @@ export const formatDateLabel = (
   mask?: string | null,
 ): string => {
   if (value === null) return '(Blank)';
-  const parsed = typeof value === 'string' ? new Date(value) : null;
-  if (parsed && !Number.isNaN(parsed.getTime()) && mask) {
-    const custom = formatDatePattern(parsed, mask);
+  const parsed = typeof value === 'string' ? parseDateValue(value) : null;
+  if (parsed && mask) {
+    const custom = formatDatePattern(parsed.date, mask, { utc: parsed.utc });
     if (custom !== '') return custom;
   }
-  if (!parsed || Number.isNaN(parsed.getTime()) || !preset || preset === 'auto') {
+  if (!parsed || !preset || preset === 'auto') {
     return formatCellValue(value, column);
   }
+  // Calendar-parts values (date-only / naive) render from their parts — the
+  // UTC reader family; zoned instants keep local rendering.
+  const { date, utc } = parsed;
+  const readers = utc ? UTC_READERS : LOCAL_READERS;
   switch (preset) {
     case 'monthShort':
-      return new Intl.DateTimeFormat(undefined, { month: 'short' }).format(parsed);
+      return readers.monthShort.format(date);
     case 'monthLong':
-      return new Intl.DateTimeFormat(undefined, { month: 'long' }).format(parsed);
+      return readers.monthLong.format(date);
     case 'monthNum':
-      return String(parsed.getMonth() + 1);
+      return String(readers.month(date) + 1);
     case 'monthYear':
-      return new Intl.DateTimeFormat(undefined, { month: 'short', year: 'numeric' }).format(parsed);
+      return (utc ? monthFormatUtc : monthFormat).format(date);
     case 'dayShort':
-      return new Intl.DateTimeFormat(undefined, { weekday: 'short' }).format(parsed);
+      return readers.weekdayShort.format(date);
     case 'dayLong':
-      return new Intl.DateTimeFormat(undefined, { weekday: 'long' }).format(parsed);
+      return readers.weekdayLong.format(date);
     case 'dayOfMonth':
-      return String(parsed.getDate());
+      return String(readers.day(date));
     case 'quarter':
-      return `Q${Math.floor(parsed.getMonth() / 3) + 1} ${parsed.getFullYear()}`;
+      return `Q${Math.floor(readers.month(date) / 3) + 1} ${readers.year(date)}`;
     case 'year':
-      return String(parsed.getFullYear());
+      return String(readers.year(date));
     case 'isoDate':
-      return parsed.toISOString().slice(0, 10);
+      // From parts — never a local-zone round-trip through toISOString.
+      return `${String(readers.year(date)).padStart(4, '0')}-${pad2(readers.month(date) + 1)}-${pad2(readers.day(date))}`;
     default:
       return formatCellValue(value, column);
   }

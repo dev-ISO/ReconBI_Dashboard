@@ -303,9 +303,15 @@ export interface GanttChartProps {
   selection?: ChartSelection | null;
 }
 
-/** Full date-time text for tooltip start/end rows (time only when it exists). */
+/**
+ * Full date-time text for tooltip start/end rows (time only when it exists).
+ * Date-typed cells parse to UTC midnights, so their day must be read back in
+ * UTC (finding 4's off-by-one); real timestamps keep local-time display.
+ */
 const boundText = (ms: number, column: QueryColumn | null): string =>
-  formatDatePattern(new Date(ms), column?.type === 'timestamp' ? 'd MMM yyyy HH:mm' : 'd MMM yyyy');
+  column?.type === 'timestamp'
+    ? formatDatePattern(new Date(ms), 'd MMM yyyy HH:mm')
+    : formatDatePattern(new Date(ms), 'd MMM yyyy', { utc: true });
 
 /**
  * Tooltip content adapter: recharts injects active/payload/label/coordinate;
@@ -536,16 +542,26 @@ export function GanttChart({
       ? weekendBands(domainMin, domainMax)
       : [];
 
+  // Tick labels format in UTC: the tick grid is UTC-aligned (epochTicks/
+  // monthTicks), so local-zone getters would caption a UTC midnight tick with
+  // the previous local day ("Mar 1" grid line labeled "Feb 28"). The preset
+  // path feeds formatDateLabel a NAIVE timestamp (no zone suffix) carrying the
+  // UTC calendar parts — the zone-suffixed toISOString round-trip re-read in
+  // local time was the bug (finding 4).
   const tickLabel = (ms: number): string => {
     const date = new Date(ms);
     if (format.dateFormatPattern) {
-      const custom = formatDatePattern(date, format.dateFormatPattern);
+      const custom = formatDatePattern(date, format.dateFormatPattern, { utc: true });
       if (custom !== '') return custom;
     }
     if (format.dateFormat && format.dateFormat !== 'auto') {
-      return formatDateLabel(date.toISOString(), shaped.startColumn!, format.dateFormat);
+      return formatDateLabel(
+        date.toISOString().slice(0, 19),
+        shaped.startColumn!,
+        format.dateFormat,
+      );
     }
-    return formatDatePattern(date, mask);
+    return formatDatePattern(date, mask, { utc: true });
   };
 
   // ---- selection / highlight -----------------------------------------------

@@ -4,7 +4,7 @@ import type {
   DashboardShareInput,
   ListActivityOptions,
 } from '../api/DashboardsApi';
-import { rcdErrorMessage } from '../api/fetcher';
+import { RcdApiError, rcdErrorMessage } from '../api/fetcher';
 import type { ChartSpec } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
@@ -147,6 +147,12 @@ export interface DashboardStoreState {
   canRedo: boolean;
   saveStatus: AsyncStatus;
   error: string | null;
+  /**
+   * Transient chart clipboard (copyChart / pasteChartTile). NEVER persisted;
+   * survives closing/opening dashboards within the session so a chart copied
+   * on one dashboard can be pasted on another.
+   */
+  chartClipboard: { chart: ChartSpec; sourceModelId: number | null } | null;
 }
 
 /** The subset of FilterCard a viewer may tweak transiently in view mode. */
@@ -417,6 +423,7 @@ const initialState: DashboardStoreState = {
   canRedo: false,
   saveStatus: 'idle',
   error: null,
+  chartClipboard: null,
 };
 
 /** One undo/redo step: the whole document + which page was active. */
@@ -643,7 +650,14 @@ export class DashboardStore {
 
   close(): void {
     this.clearHistory();
-    this.set({ ...initialState, list: this.state.list, listStatus: this.state.listStatus });
+    this.set({
+      ...initialState,
+      list: this.state.list,
+      listStatus: this.state.listStatus,
+      // The clipboard outlives the open dashboard on purpose — copy on one
+      // dashboard, paste on the next (still never persisted).
+      chartClipboard: this.state.chartClipboard,
+    });
   }
 
   enterEdit(): void {
@@ -658,6 +672,7 @@ export class DashboardStore {
   discardEdits(): void {
     this.clearHistory();
     const backup = this.state.draftBackup;
+    const live = this.state.current;
     this.set({
       mode: 'view',
       dirty: false,
@@ -671,7 +686,16 @@ export class DashboardStore {
       // page that exists in the backup when the active one is among them.
       ...(backup
         ? {
-            current: backup,
+            // The concurrency stamp and publish flag are LIVE server state,
+            // not draft content: setPublish mid-edit advances both, and
+            // restoring the backup's stale expectedUpdatedAtUtc would make
+            // every future save 409 (rcd.dashboard.stale) forever.
+            current: {
+              ...backup,
+              ...(live
+                ? { expectedUpdatedAtUtc: live.expectedUpdatedAtUtc, isShared: live.isShared }
+                : {}),
+            },
             activePageId: resolveActivePageId(backup.layout, this.state.activePageId),
           }
         : {}),
@@ -1519,19 +1543,50 @@ export class DashboardStore {
   }
 
   /**
+   * Finding 7: bookmark edits made in VIEW mode auto-persist — view mode has
+   * no Save affordance, so a merely-dirty doc would silently lose the change
+   * on close. Runs the doc mutation, then immediately save(); a failed save
+   * surfaces the store error (save() sets it) and REVERTS the doc mutation.
+   * Edit mode runs the mutation alone — it saves with the draft as before.
+   */
+  private commitBookmarkMutation(mutate: () => void): void {
+    const current = this.state.current;
+    if (!current) return;
+    if (this.state.mode !== 'view') {
+      mutate();
+      return;
+    }
+    const layoutBefore = current.layout;
+    const dirtyBefore = this.state.dirty;
+    mutate();
+    void this.save().then((saved) => {
+      if (saved) return;
+      const live = this.state.current;
+      if (!live || live.id !== current.id) return;
+      this.set({
+        current: { ...live, layout: layoutBefore },
+        dirty: dirtyBefore,
+        lastAppliedBookmarkId: null,
+      });
+    });
+  }
+
+  /**
    * Adds a bookmark capturing the CURRENT view (active page, slicer
-   * selections, view-mode filter-card overrides). Dirties the doc like any
-   * other layout edit — Save persists it. Returns the new id (null when no
-   * dashboard is open).
+   * selections, view-mode filter-card overrides). In edit mode it dirties the
+   * draft like any other layout edit; in view mode it persists immediately
+   * (finding 7). Returns the new id (null when no dashboard is open).
    */
   addBookmark(name: string): string | null {
     const trimmed = name.trim();
     const state = this.captureBookmarkState();
-    if (trimmed === '' || state === null) return null;
+    if (trimmed === '' || state === null || !this.state.current) return null;
     const id = newId();
-    this.mutateBookmarks((bookmarks) => [...bookmarks, { id, name: trimmed, state }]);
-    // A freshly captured bookmark IS the current view.
-    this.set({ lastAppliedBookmarkId: id });
+    this.commitBookmarkMutation(() => {
+      this.mutateBookmarks((bookmarks) => [...bookmarks, { id, name: trimmed, state }]);
+      // A freshly captured bookmark IS the current view.
+      this.set({ lastAppliedBookmarkId: id });
+    });
     return id;
   }
 
@@ -1545,7 +1600,14 @@ export class DashboardStore {
     this.set({
       ...(pageExists ? { activePageId: bookmark.state.pageId } : {}),
       slicerValues: structuredClone(bookmark.state.slicers),
-      filterCardOverrides: structuredClone(bookmark.state.filterOverrides),
+      // Finding 10: edit mode always shows the AUTHORED doc (enterEdit's
+      // rule) — installing the captured overrides there would silently win
+      // over every FiltersPane write and make its controls look inert. The
+      // captured card tweaks are view-mode personal state; edit mode applies
+      // page + slicers only.
+      ...(this.state.mode === 'view'
+        ? { filterCardOverrides: structuredClone(bookmark.state.filterOverrides) }
+        : {}),
       // A bookmark restores its FULL captured filter context — transient
       // cross-filter/drillthrough state would pollute it. (Bookmarks capture
       // slicers + filter-card overrides, never cross-filters — unchanged.)
@@ -1556,29 +1618,40 @@ export class DashboardStore {
     });
   }
 
-  /** Overwrites a bookmark's captured state with the current view. */
+  /** Overwrites a bookmark's captured state with the current view.
+   *  View mode persists immediately (finding 7). */
   updateBookmark(id: string): void {
     const state = this.captureBookmarkState();
     if (state === null) return;
-    this.mutateBookmarks((bookmarks) =>
-      bookmarks.map((b) => (b.id === id ? { ...b, state } : b)),
-    );
-    this.set({ lastAppliedBookmarkId: id });
+    if (!(this.state.current?.layout.bookmarks ?? []).some((b) => b.id === id)) return;
+    this.commitBookmarkMutation(() => {
+      this.mutateBookmarks((bookmarks) =>
+        bookmarks.map((b) => (b.id === id ? { ...b, state } : b)),
+      );
+      this.set({ lastAppliedBookmarkId: id });
+    });
   }
 
+  /** View mode persists immediately (finding 7). */
   renameBookmark(id: string, name: string): void {
     const trimmed = name.trim();
     if (trimmed === '') return;
     const bookmark = (this.state.current?.layout.bookmarks ?? []).find((b) => b.id === id);
     if (!bookmark || bookmark.name === trimmed) return;
-    this.mutateBookmarks((bookmarks) =>
-      bookmarks.map((b) => (b.id === id ? { ...b, name: trimmed } : b)),
-    );
+    this.commitBookmarkMutation(() => {
+      this.mutateBookmarks((bookmarks) =>
+        bookmarks.map((b) => (b.id === id ? { ...b, name: trimmed } : b)),
+      );
+    });
   }
 
+  /** View mode persists immediately (finding 7). */
   deleteBookmark(id: string): void {
-    this.mutateBookmarks((bookmarks) => bookmarks.filter((b) => b.id !== id));
-    if (this.state.lastAppliedBookmarkId === id) this.set({ lastAppliedBookmarkId: null });
+    if (!(this.state.current?.layout.bookmarks ?? []).some((b) => b.id === id)) return;
+    this.commitBookmarkMutation(() => {
+      this.mutateBookmarks((bookmarks) => bookmarks.filter((b) => b.id !== id));
+      if (this.state.lastAppliedBookmarkId === id) this.set({ lastAppliedBookmarkId: null });
+    });
   }
 
   /** View-mode auto-refresh interval (persisted with the layout on save). */
@@ -1677,6 +1750,103 @@ export class DashboardStore {
     const clamped = clampIndex(index, parameter.options.length);
     if (this.state.parameterSelections[id] === clamped) return;
     this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
+  }
+
+  /* -------------------------------------- chart clipboard / copy (0.9.0) */
+
+  /** Puts a chart on the transient clipboard (never persisted). */
+  copyChart(chart: ChartSpec, sourceModelId: number | null): void {
+    this.set({ chartClipboard: { chart: structuredClone(chart), sourceModelId } });
+  }
+
+  /**
+   * Pastes the clipboard chart as a new tile on the active page (edit mode
+   * only), following duplicateTile's conventions: fresh tile/chart ids,
+   * "(copy)" title, placed below all content at maxY.
+   */
+  pasteChartTile(): void {
+    const clip = this.state.chartClipboard;
+    if (!clip || this.state.mode !== 'edit' || !this.state.current) return;
+    this.addTile(
+      structuredClone({ ...clip.chart, id: newId(), title: `${clip.chart.title} (copy)` }),
+    );
+  }
+
+  /**
+   * Copies a chart onto another dashboard (or this one). Same dashboard:
+   * in-store append to the active page — dirties and honors the edit session
+   * like any other draft change. Other dashboard: server round-trip
+   * (getDashboard → append a tile to the FIRST page, or to the top-level
+   * tiles on a legacy no-pages doc → updateDashboard with the fresh
+   * expectedUpdatedAtUtc); a concurrent-save 409 (rcd.dashboard.stale)
+   * refetches and retries ONCE. Failures surface via the store error (and the
+   * rejected promise). Model mismatch is the UI's concern — the dialog warns;
+   * this method just copies.
+   */
+  async copyChartToDashboard(
+    targetId: number,
+    chart: ChartSpec,
+    _sourceModelId: number | null,
+  ): Promise<void> {
+    const current = this.state.current;
+    if (current && current.id === targetId) {
+      this.addTile(structuredClone({ ...chart, id: newId() }));
+      return;
+    }
+    try {
+      await this.appendChartRemote(targetId, chart);
+    } catch (error) {
+      const stale =
+        error instanceof RcdApiError && error.errorCode === 'rcd.dashboard.stale';
+      if (!stale) {
+        this.set({ error: messageOf(error) });
+        throw error;
+      }
+      try {
+        await this.appendChartRemote(targetId, chart);
+      } catch (retryError) {
+        this.set({ error: messageOf(retryError) });
+        throw retryError;
+      }
+    }
+  }
+
+  /** One fetch → append → save round-trip (copyChartToDashboard's engine). */
+  private async appendChartRemote(targetId: number, chart: ChartSpec): Promise<void> {
+    const detail = await this.api.getDashboard(targetId);
+    const layout = detail.layout?.tiles ? detail.layout : emptyLayout();
+    const tileFor = (tiles: DashboardTile[]): DashboardTile => ({
+      id: newId(),
+      layout: {
+        x: 0,
+        y: tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0),
+        w: 12,
+        h: 8,
+        minW: 4,
+        minH: 4,
+      },
+      chart: structuredClone({ ...chart, id: newId() }),
+    });
+    const pages = layout.pages ?? [];
+    const nextLayout: DashboardLayoutDoc =
+      pages.length > 0
+        ? {
+            ...layout,
+            pages: pages.map((page, index) =>
+              index === 0 ? { ...page, tiles: [...page.tiles, tileFor(page.tiles)] } : page,
+            ),
+          }
+        : // Legacy doc with no pages: append to the top-level tiles.
+          { ...layout, tiles: [...layout.tiles, tileFor(layout.tiles)] };
+    await this.api.updateDashboard(targetId, {
+      name: detail.name,
+      description: detail.description,
+      modelId: detail.modelId,
+      layout: nextLayout,
+      isShared: detail.isShared,
+      expectedUpdatedAtUtc: detail.updatedAtUtc,
+    });
+    void this.loadList();
   }
 
   /* --------------------------------------------- sharing/activity (0.8.0) */

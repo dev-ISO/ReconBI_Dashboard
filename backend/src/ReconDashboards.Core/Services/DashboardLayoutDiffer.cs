@@ -12,13 +12,13 @@ public sealed record PageRename(string From, string To);
 /// </summary>
 public sealed class LayoutChangeSummary
 {
-    /// <summary>Tile move/resize, doc-level settings, slicer/text/image tile edits.</summary>
+    /// <summary>Tile move/resize, doc-level settings, slicer/text/image tile add/remove/edits.</summary>
     public bool LayoutChanged { get; set; }
 
     /// <summary>Page add/remove/rename/reorder/color/mobile layout/drillthrough.</summary>
     public bool PagesChanged { get; set; }
 
-    /// <summary>Tile add/remove, chart spec/format changes.</summary>
+    /// <summary>Chart tile add/remove, chart spec/format changes.</summary>
     public bool ChartsChanged { get; set; }
 
     public List<string> PagesAdded { get; } = [];
@@ -206,14 +206,14 @@ public static class DashboardLayoutDiffer
 
         foreach (var tile in newTiles.Where(t => !oldByKey.ContainsKey(t.Key)))
         {
-            summary.ChartsChanged = true;
+            ClassifyTileAddOrRemove(tile, summary);
             summary.TilesAdded++;
             changed = true;
         }
 
         foreach (var tile in oldTiles.Where(t => !newByKey.ContainsKey(t.Key)))
         {
-            summary.ChartsChanged = true;
+            ClassifyTileAddOrRemove(tile, summary);
             summary.TilesRemoved++;
             changed = true;
         }
@@ -246,11 +246,21 @@ public static class DashboardLayoutDiffer
             explained = true;
         }
 
-        // A kind switch replaces the tile's content wholesale: charts class.
+        // A kind switch replaces the tile's content wholesale: charts class
+        // when a chart is on either side; a swap between the static kinds
+        // (slicer/text/image) stays a layout-class edit.
         if (!StringEquals(GetString(oldTile.Element, "kind"), GetString(newTile.Element, "kind")))
         {
-            summary.ChartsChanged = true;
-            AddChartModified(summary, newTile, oldTile);
+            if (IsChartClass(oldTile) || IsChartClass(newTile))
+            {
+                summary.ChartsChanged = true;
+                AddChartModified(summary, newTile, oldTile);
+            }
+            else
+            {
+                summary.LayoutChanged = true;
+            }
+
             explained = true;
         }
         else if (!ElementsEqual(GetOrNull(oldTile.Element, "chart"), GetOrNull(newTile.Element, "chart")))
@@ -278,6 +288,28 @@ public static class DashboardLayoutDiffer
         return true;
     }
 
+    /// <summary>
+    /// Add/remove of a slicer/text/image tile is a LAYOUT-class change (same
+    /// class as editing one); anything else — chart tiles, kind-less legacy
+    /// tiles, unknown future kinds (fail closed to the stricter flag) — is a
+    /// charts-class change.
+    /// </summary>
+    private static void ClassifyTileAddOrRemove(Tile tile, LayoutChangeSummary summary)
+    {
+        if (IsChartClass(tile))
+        {
+            summary.ChartsChanged = true;
+        }
+        else
+        {
+            summary.LayoutChanged = true;
+        }
+    }
+
+    /// <summary>False only for the known static kinds (slicer/text/image).</summary>
+    private static bool IsChartClass(Tile tile) =>
+        GetString(tile.Element, "kind") is not ("slicer" or "text" or "image");
+
     private static void AddChartModified(LayoutChangeSummary summary, Tile newTile, Tile oldTile)
     {
         var title = ChartTitle(newTile) ?? ChartTitle(oldTile) ?? "Chart";
@@ -299,8 +331,13 @@ public static class DashboardLayoutDiffer
             return;
         }
 
-        // A page arriving/leaving with tiles adds/removes those charts too.
-        summary.ChartsChanged = true;
+        // A page arriving/leaving with tiles adds/removes those tiles too —
+        // classified per tile kind exactly like an in-page add/remove.
+        foreach (var tile in page.Tiles)
+        {
+            ClassifyTileAddOrRemove(tile, summary);
+        }
+
         if (added)
         {
             summary.TilesAdded += page.Tiles.Count;

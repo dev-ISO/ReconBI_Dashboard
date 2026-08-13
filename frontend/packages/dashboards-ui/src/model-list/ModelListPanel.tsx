@@ -4,6 +4,7 @@ import { RcdApiError } from '@recon/dashboards-core';
 import type { ModelExportDocument, ModelSummary } from '@recon/dashboards-core';
 import { useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdDialog, RcdIconButton, RcdSpinner } from '../primitives';
+import { downloadBlob } from '../util/downloadBlob';
 
 export interface ModelListPanelProps {
   /** Open an existing model — typically navigates into the model editor. */
@@ -138,12 +139,7 @@ export function ModelListPanel({ onOpen, onNew, readOnly = false }: ModelListPan
       const blob = new Blob([`${JSON.stringify(exported, null, 2)}\n`], {
         type: 'application/json',
       });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = downloadName(model.name);
-      anchor.click();
-      URL.revokeObjectURL(url);
+      downloadBlob(downloadName(model.name), blob);
     } catch (error) {
       setActionError(messageOf(error));
     } finally {

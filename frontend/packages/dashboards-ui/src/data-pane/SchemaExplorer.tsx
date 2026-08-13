@@ -49,7 +49,8 @@ function TableKindIcon({ kind }: { kind: TableKind }) {
   }
 }
 
-function ColumnTypeIcon({ type }: { type: ColumnType }) {
+/** Per-type column glyph, shared with the chart builder's field list. */
+export function ColumnTypeIcon({ type }: { type: ColumnType }) {
   switch (type) {
     case 'text':
       return <Type size={12} className="shrink-0 text-rcd-muted" />;

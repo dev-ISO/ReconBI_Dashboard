@@ -66,10 +66,20 @@ const addDays = (d: Date, days: number): Date => {
   return next;
 };
 
+/** Days in a month (month is 0-based; day 0 of the NEXT month is its last day). */
+const daysInMonth = (year: number, month: number): number =>
+  new Date(year, month + 1, 0).getDate();
+
+/**
+ * Month arithmetic with the day-of-month CLAMPED to the target month's length.
+ * A bare setMonth overflows month-end dates (Mar 31 − 1 month → "Feb 31" →
+ * Mar 3), silently shifting rolling windows computed at month ends.
+ */
 const addMonths = (d: Date, months: number): Date => {
-  const next = new Date(d);
-  next.setMonth(next.getMonth() + months);
-  return next;
+  const total = d.getMonth() + months;
+  const year = d.getFullYear() + Math.floor(total / 12);
+  const month = ((total % 12) + 12) % 12;
+  return new Date(year, month, Math.min(d.getDate(), daysInMonth(year, month)));
 };
 
 /**
@@ -91,7 +101,9 @@ export const relativePresetRange = (
           ? addDays(today, -(custom.n * 7 - 1))
           : custom.unit === 'month'
             ? addDays(addMonths(today, -custom.n), 1)
-            : addDays(new Date(today.getFullYear() - custom.n, today.getMonth(), today.getDate()), 1);
+            : // Years route through the same clamped month arithmetic (a bare
+              // Date(y-n, m, d) overflows Feb 29 into Mar 1 off leap years).
+              addDays(addMonths(today, -custom.n * 12), 1);
     return { start: isoDate(start), end };
   }
   switch (presetId) {

@@ -5,6 +5,7 @@ import {
   Bookmark,
   Check,
   ChevronDown,
+  ClipboardPaste,
   Copy,
   Filter,
   Highlighter,
@@ -57,6 +58,10 @@ export interface DashboardToolbarProps {
   onAddSlicer: () => void;
   /** Disables the Add > Slicer item (no model attached). */
   addSlicerDisabled?: boolean;
+  /** Add ▾ > Paste chart (hidden when absent; disabled while the clipboard is empty). */
+  onPasteChart?: () => void;
+  /** True while the session chart clipboard holds a copied chart. */
+  pasteChartEnabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
   /** View-mode auto-refresh interval (persisted with the layout); null = off. */
@@ -167,6 +172,8 @@ export function DashboardToolbar({
   onAddImage,
   onAddSlicer,
   addSlicerDisabled,
+  onPasteChart,
+  pasteChartEnabled = false,
   onSave,
   onDiscard,
   refreshSeconds = null,
@@ -468,6 +475,8 @@ export function DashboardToolbar({
                   onAddImage={onAddImage}
                   onAddSlicer={onAddSlicer}
                   addSlicerDisabled={addSlicerDisabled ?? false}
+                  onPasteChart={onPasteChart}
+                  pasteChartEnabled={pasteChartEnabled}
                   onManageParameters={onManageParameters}
                 />
               )}
@@ -1076,6 +1085,8 @@ function AddTileMenu({
   onAddImage,
   onAddSlicer,
   addSlicerDisabled,
+  onPasteChart,
+  pasteChartEnabled,
   onManageParameters,
 }: {
   onAddChart: () => void;
@@ -1083,6 +1094,8 @@ function AddTileMenu({
   onAddImage: () => void;
   onAddSlicer: () => void;
   addSlicerDisabled: boolean;
+  onPasteChart?: () => void;
+  pasteChartEnabled?: boolean;
   onManageParameters?: () => void;
 }) {
   const [open, setOpen] = useState(false);
@@ -1150,6 +1163,23 @@ function AddTileMenu({
             <SlidersHorizontal size={14} />
             Slicer
           </AddMenuItem>
+          {onPasteChart && (
+            <>
+              <div className="my-1 border-t border-rcd-border" />
+              <AddMenuItem
+                onClick={() => pick(onPasteChart)}
+                disabled={!pasteChartEnabled}
+                title={
+                  pasteChartEnabled
+                    ? undefined
+                    : 'Copy a chart first (right-click a chart > Copy)'
+                }
+              >
+                <ClipboardPaste size={14} />
+                Paste chart
+              </AddMenuItem>
+            </>
+          )}
           {onManageParameters && (
             <>
               <div className="my-1 border-t border-rcd-border" />

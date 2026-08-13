@@ -113,7 +113,8 @@ Three distinct verbs (see SHARING-DESIGN.md for the full contract):
 
 - **Share**: named-user grants in `rcd_dashboard_shares`, each with three
   flags — `canEditLayout` (move/resize tiles, doc settings, slicer/text/image
-  tiles), `canManagePages`, `canEditCharts`; all false = view-only. A grantee
+  tile add/remove/edit), `canManagePages`, `canEditCharts` (chart tile
+  add/remove, chart spec/format edits); all false = view-only. A grantee
   save is diffed server-side and rejected (403
   `rcd.dashboard.permission_denied`) when a change class exceeds their flags;
   grantees can never change name/description/modelId/isShared

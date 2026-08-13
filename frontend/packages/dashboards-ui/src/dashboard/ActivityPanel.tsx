@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   rcdErrorMessage,
   type ActivityEntry,
@@ -88,11 +88,21 @@ export function ActivityPanel({ open, dashboardId, onClose }: ActivityPanelProps
 
   const [entries, setEntries] = useState<ActivityEntry[]>([]);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  /** Failed page fetch: the message plus the cursor to re-request THAT page. */
+  const [error, setError] = useState<{ message: string; beforeId?: number } | null>(null);
   const [hasMore, setHasMore] = useState(false);
+
+  /**
+   * Request ticket: every fetch takes a fresh one and only the freshest may
+   * land. A dashboardId change (new loadPage identity → new fetch) or re-open
+   * therefore invalidates any in-flight response — a slow page from the
+   * previous dashboard can no longer populate this one's list.
+   */
+  const requestSeqRef = useRef(0);
 
   const loadPage = useCallback(
     async (beforeId?: number) => {
+      const seq = ++requestSeqRef.current;
       setLoading(true);
       setError(null);
       try {
@@ -100,12 +110,15 @@ export function ActivityPanel({ open, dashboardId, onClose }: ActivityPanelProps
           limit: PAGE_SIZE,
           ...(beforeId !== undefined ? { beforeId } : {}),
         });
+        if (seq !== requestSeqRef.current) return;
         setEntries((prev) => (beforeId === undefined ? page : [...prev, ...page]));
         setHasMore(page.length === PAGE_SIZE);
       } catch (err) {
-        setError(rcdErrorMessage(err));
+        // A load-more failure keeps the fetched entries (finding 14); only
+        // the failed PAGE is re-requested by Retry, via its beforeId cursor.
+        if (seq === requestSeqRef.current) setError({ message: rcdErrorMessage(err), beforeId });
       } finally {
-        setLoading(false);
+        if (seq === requestSeqRef.current) setLoading(false);
       }
     },
     [runtime, dashboardId],
@@ -116,6 +129,7 @@ export function ActivityPanel({ open, dashboardId, onClose }: ActivityPanelProps
     if (!open) return;
     setEntries([]);
     setHasMore(false);
+    setError(null);
     void loadPage();
   }, [open, loadPage]);
 
@@ -123,12 +137,12 @@ export function ActivityPanel({ open, dashboardId, onClose }: ActivityPanelProps
 
   return (
     <RcdDialog title="Activity" open={open} onClose={onClose}>
-      {error ? (
+      {entries.length === 0 && error ? (
         <div className="flex flex-col items-start gap-3">
           <p className="text-sm text-[var(--rcd-status-critical)]" role="alert">
-            {error}
+            {error.message}
           </p>
-          <RcdButton onClick={() => void loadPage()}>Retry</RcdButton>
+          <RcdButton onClick={() => void loadPage(error.beforeId)}>Retry</RcdButton>
         </div>
       ) : entries.length === 0 && loading ? (
         <div className="flex h-32 items-center justify-center">
@@ -159,7 +173,19 @@ export function ActivityPanel({ open, dashboardId, onClose }: ActivityPanelProps
               ))}
             </div>
           ))}
-          {hasMore && oldest !== undefined && (
+          {/* Load-more failure: the fetched list stays; the error renders
+              inline below it and Retry re-requests exactly the failed page. */}
+          {error && (
+            <div className="flex flex-col items-start gap-2 pt-3">
+              <p className="text-xs text-[var(--rcd-status-critical)]" role="alert">
+                {error.message}
+              </p>
+              <RcdButton size="sm" disabled={loading} onClick={() => void loadPage(error.beforeId)}>
+                Retry
+              </RcdButton>
+            </div>
+          )}
+          {!error && hasMore && oldest !== undefined && (
             <div className="flex justify-center pt-3">
               <RcdButton size="sm" disabled={loading} onClick={() => void loadPage(oldest.id)}>
                 {loading ? 'Loading…' : 'Load more'}

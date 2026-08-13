@@ -134,6 +134,10 @@ LIMIT @p1
         Assert.Equal(ResultColumnRole.Dimension, isTop.Role);
         Assert.Equal(NormalizedType.Boolean, isTop.Type);
         Assert.Null(isTop.Source);
+
+        // Finding 17: the LIMIT's +1 probe row (reachable when n equals the
+        // effective cap) must be trimmed like the non-Others path.
+        Assert.Equal(5000, compiled.RowLimit);
     }
 
     [Fact]

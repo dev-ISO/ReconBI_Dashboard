@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Globe, Search, UserRound, X } from 'lucide-react';
 import { rcdErrorMessage, type RcdUser } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
@@ -127,10 +127,23 @@ export function ShareDialog({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
+  /**
+   * Directory-search sequencing (finding 16): each issued search takes a
+   * ticket; only the freshest ticket's response may land, so an older slow
+   * response can never overwrite a newer query's results. `searched` marks
+   * that a non-initial search actually ran — the debounced effect's mount run
+   * (query still '') is skipped entirely, because the open effect below
+   * already fetched the unfiltered directory once.
+   */
+  const searchSeqRef = useRef(0);
+  const searchedRef = useRef(false);
+
   // (Re)load shares + directory on each open.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    searchSeqRef.current++;
+    searchedRef.current = false;
     setLoading(true);
     setLoadError(null);
     setSaveError(null);
@@ -165,13 +178,22 @@ export function ShareDialog({
     };
   }, [open, dashboardId, runtime, isShared]);
 
-  // Debounced directory search (skipped entirely when unconfigured).
+  // Debounced directory search (skipped entirely when unconfigured). The
+  // initial empty-query run duplicates the open effect's unfiltered fetch, so
+  // it is skipped until a real search happened; clearing the box after that
+  // re-fetches the unfiltered list as before.
   useEffect(() => {
     if (!open || directoryEmpty) return;
+    const q = query.trim();
+    if (q === '' && !searchedRef.current) return;
+    searchedRef.current = true;
+    const seq = ++searchSeqRef.current;
     const timer = window.setTimeout(() => {
       runtime.dashboards
-        .listUsers(query.trim() === '' ? undefined : query.trim())
-        .then(setUsers)
+        .listUsers(q === '' ? undefined : q)
+        .then((result) => {
+          if (seq === searchSeqRef.current) setUsers(result);
+        })
         .catch(() => {
           // keep the previous results on a failed search keystroke
         });
@@ -201,6 +223,25 @@ export function ShareDialog({
     setRows((prev) => prev.map((row) => (row.userId === userId ? { ...row, ...patch } : row)));
   };
 
+  /** Re-reads the server's grant rows (partial-failure recovery display). */
+  const refreshRows = async () => {
+    try {
+      const shares = await runtime.dashboards.listShares(dashboardId);
+      setRows(
+        shares.map((share) => ({
+          userId: share.userId,
+          displayName: share.displayName,
+          canEditLayout: share.canEditLayout,
+          canManagePages: share.canManagePages,
+          canEditCharts: share.canEditCharts,
+        })),
+      );
+      setPicked([]);
+    } catch {
+      // keep the edited rows; the error message already tells the user what happened
+    }
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setSaveError(null);
@@ -213,7 +254,22 @@ export function ShareDialog({
         .filter((user) => !rows.some((row) => row.userId === user.id))
         .map((user) => ({ userId: user.id, displayName: user.displayName, ...perms })),
     ];
+    // Publish flips FIRST (finding 13): it is the admin-gated call likeliest
+    // to be refused, so failing it saves NOTHING — no half-committed state to
+    // explain. If it succeeds and saveShares then fails, the message states
+    // exactly what saved and the rows refresh to the server's truth.
+    const wantPublishFlip = canPublish && isShared !== undefined && publish !== isShared;
+    let publishFlipped = false;
     try {
+      if (wantPublishFlip) {
+        const ok = await runtime.dashboards.setPublish(publish);
+        if (!ok) {
+          throw new Error(
+            runtime.dashboards.store.getState().error ?? 'The publish change was rejected.',
+          );
+        }
+        publishFlipped = true;
+      }
       await runtime.dashboards.saveShares(
         dashboardId,
         finalRows.map((row) => ({
@@ -223,18 +279,19 @@ export function ShareDialog({
           canEditCharts: row.canEditCharts,
         })),
       );
-      if (canPublish && isShared !== undefined && publish !== isShared) {
-        const ok = await runtime.dashboards.setPublish(publish);
-        if (!ok) {
-          throw new Error(
-            runtime.dashboards.store.getState().error ?? 'The publish change was rejected.',
-          );
-        }
-      }
       onSaved?.();
       onClose();
     } catch (error) {
-      setSaveError(rcdErrorMessage(error));
+      if (publishFlipped) {
+        setSaveError(
+          `Publish is now ${publish ? 'ON' : 'OFF'} (that change saved), but the people list did not save: ${rcdErrorMessage(error)}`,
+        );
+        void refreshRows();
+      } else if (wantPublishFlip) {
+        setSaveError(`Nothing was saved — the publish change failed: ${rcdErrorMessage(error)}`);
+      } else {
+        setSaveError(rcdErrorMessage(error));
+      }
     } finally {
       setSaving(false);
     }

@@ -270,15 +270,19 @@ LIMIT @p1
     // ---------- composition with Top-N ----------
 
     [Fact]
-    public void TopNWithoutOthersWrapsTheRankedLimitedQueryAsTheCalcBase()
+    public void TopNWithoutOthersWrapsExactlyNRankedRowsAsTheCalcBase()
     {
+        // Finding 5: the window base must hold EXACTLY n rows (the +1 probe
+        // row would leak into running totals / percent-of-total), so the
+        // probed statement becomes __rcd_topn, the base re-selects the top n,
+        // and truncation reports through the trailing EXISTS probe column.
         var compiled = Compile(Spec(
             dimensions: [CustomerRegion()],
             measures: [SumOrderTotal(new MeasureCalcSpec(MeasureCalcKind.RunningTotal))],
             topN: new TopNSpec(5, 0, IncludeOthers: false)));
 
         AssertSql("""
-WITH "__rcd_base" AS (
+WITH "__rcd_topn" AS (
 SELECT "t1"."region" AS "dim0",
        SUM("t0"."order_total") AS "meas0"
 FROM "public"."orders" AS "t0"
@@ -286,17 +290,31 @@ LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 GROUP BY "t1"."region"
 ORDER BY "meas0" DESC NULLS LAST, "t1"."region" ASC NULLS LAST
 LIMIT @p0
+),
+"__rcd_base" AS (
+SELECT *
+FROM "__rcd_topn"
+ORDER BY "meas0" DESC NULLS LAST, "dim0" ASC NULLS LAST
+LIMIT @p1
 )
 SELECT "dim0",
-       SUM("meas0") OVER (ORDER BY "dim0" ASC NULLS LAST ROWS UNBOUNDED PRECEDING) AS "meas0"
+       SUM("meas0") OVER (ORDER BY "dim0" ASC NULLS LAST ROWS UNBOUNDED PRECEDING) AS "meas0",
+       EXISTS (SELECT 1 FROM "__rcd_topn" OFFSET @p2) AS "__rcd_truncated"
 FROM "__rcd_base"
 ORDER BY "dim0" ASC NULLS LAST
-LIMIT @p1
+LIMIT @p3
 """, compiled);
 
-        Assert.Equal(2, compiled.Parameters.Count);
+        Assert.Equal(4, compiled.Parameters.Count);
         Assert.Equal(6L, compiled.Parameters[0].Value); // N + 1 overflow probe
-        Assert.Equal(5001L, compiled.Parameters[1].Value);
+        Assert.Equal(5L, compiled.Parameters[1].Value); // exact window base
+        Assert.Equal(5L, compiled.Parameters[2].Value); // EXISTS probe offset
+        Assert.Equal(5001L, compiled.Parameters[3].Value);
+
+        // The probe column is service-stripped: not part of the column plans.
+        Assert.True(compiled.HasTruncationProbe);
+        Assert.Equal(["dim0", "meas0"], compiled.Columns.Select(c => c.Name).ToArray());
+        Assert.Equal(5000, compiled.RowLimit);
     }
 
     [Fact]
@@ -341,6 +359,10 @@ LIMIT @p1
         Assert.Equal(["dim0", "is_topn", "meas0"], compiled.Columns.Select(c => c.Name).ToArray());
         Assert.Equal("Sum of order_total (running total)", compiled.Columns[2].Label);
         Assert.Empty(compiled.Warnings);
+
+        // Finding 17: the outer +1 probe row must be trimmed like everywhere else.
+        Assert.Equal(5000, compiled.RowLimit);
+        Assert.False(compiled.HasTruncationProbe);
     }
 
     // ---------- composition with calculated (expression) measures ----------

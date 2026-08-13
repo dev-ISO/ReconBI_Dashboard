@@ -8,6 +8,7 @@
   "scripts": {
     "build": "npm run build -w @recon/dashboards-core && npm run build -w @recon/dashboards-ui && npm run build -w recon-dashboards-portal",
     "dev": "npm run dev -w recon-dashboards-portal",
+    "test": "npm run test --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present"
   }
 }

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, BellPlus, CornerUpLeft, FileDown, Rows3, Table2, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, BellPlus, CopyPlus, CornerUpLeft, FileDown, Rows3, Table2, Zap } from 'lucide-react';
 import type { FilterClause } from '@recon/dashboards-core';
 
 /** One candidate drillthrough page for the clicked point. */
@@ -45,6 +45,12 @@ export interface PointContextMenuProps {
   seeRecords?: { label: string; onClick: () => void } | null;
   /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
   onSetAlert?: (() => void) | null;
+  /**
+   * "Copy chart to…" — clone the AUTHORED chart onto another dashboard.
+   * Offered to every viewer (built-ins are cloneable per chart); hidden when
+   * absent (the point-level menu instance doesn't pass it).
+   */
+  onCopyChart?: (() => void) | null;
   onExport: (mode: 'summarized' | 'underlying') => void;
   onClose: () => void;
 }
@@ -65,6 +71,7 @@ export function PointContextMenu({
   onSeeData = null,
   seeRecords = null,
   onSetAlert = null,
+  onCopyChart = null,
   onExport,
   onClose,
 }: PointContextMenuProps) {
@@ -226,6 +233,21 @@ export function PointContextMenu({
           onClose();
         }}
       />
+
+      {onCopyChart && (
+        <>
+          <div className="my-1 border-t border-rcd-border" />
+          <ActionItem
+            icon={<CopyPlus size={14} />}
+            onClick={() => {
+              onCopyChart();
+              onClose();
+            }}
+          >
+            Copy chart to…
+          </ActionItem>
+        </>
+      )}
 
       {onSetAlert && (
         <>

@@ -5,6 +5,7 @@ import {
   type DashboardsRuntime,
   type DashboardStoreState,
   type ModelStoreState,
+  type QueryCacheOptions,
   type QueryCacheState,
   type RcdFetcher,
 } from '@recon/dashboards-core';
@@ -16,6 +17,12 @@ export interface DashboardsProviderProps {
   baseUrl: string;
   /** Host-adapted authenticated fetch. */
   fetcher: RcdFetcher;
+  /**
+   * Query-cache tuning (TTLs, entry cap, request-concurrency cap) threaded to
+   * createDashboardsRuntime. Pass a stable (module-level or memoized) object —
+   * a fresh literal per render would rebuild the whole runtime.
+   */
+  queryOptions?: QueryCacheOptions;
   children: ReactNode;
 }
 
@@ -23,8 +30,16 @@ export interface DashboardsProviderProps {
  * Scopes one runtime (api + stores + query cache) to a subtree and provides
  * the .rcd-root theming boundary. Multiple providers on one page are fine.
  */
-export function DashboardsProvider({ baseUrl, fetcher, children }: DashboardsProviderProps) {
-  const runtime = useMemo(() => createDashboardsRuntime(baseUrl, fetcher), [baseUrl, fetcher]);
+export function DashboardsProvider({
+  baseUrl,
+  fetcher,
+  queryOptions,
+  children,
+}: DashboardsProviderProps) {
+  const runtime = useMemo(
+    () => createDashboardsRuntime(baseUrl, fetcher, queryOptions ? { queryOptions } : undefined),
+    [baseUrl, fetcher, queryOptions],
+  );
   return (
     <RuntimeContext.Provider value={runtime}>
       <div className="rcd-root flex h-full min-h-0 flex-col">{children}</div>

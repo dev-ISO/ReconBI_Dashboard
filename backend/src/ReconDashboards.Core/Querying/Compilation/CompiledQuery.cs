@@ -34,10 +34,18 @@ public sealed record CompiledQuery(
     /// <summary>
     /// Requested row cap of the statement. The SQL asks for RowLimit + 1 (the
     /// truncation probe); the query service trims the probe row back off and
-    /// reports Truncated. Null when the statement is structurally capped
-    /// (TopN+Others) or has its own probe accounting (distinct, underlying).
+    /// reports Truncated. Null when the statement has its own probe accounting
+    /// (distinct, underlying).
     /// </summary>
-    int? RowLimit = null);
+    int? RowLimit = null,
+    /// <summary>
+    /// True when the final select carries a trailing constant boolean column
+    /// ("__rcd_truncated") that is NOT part of <see cref="Columns"/>: an
+    /// in-statement truncation probe used where the row-count probe cannot
+    /// work (Top-N + window calcs, whose base must hold EXACTLY n rows). The
+    /// query service folds it into Truncated and strips the cell off every row.
+    /// </summary>
+    bool HasTruncationProbe = false);
 
 /// <summary>
 /// Compilation failure with a stable code (QRY_DISCONNECTED,

@@ -1,4 +1,4 @@
-export const RCD_CORE_VERSION = '0.8.0';
+export const RCD_CORE_VERSION = '0.9.0';
 
 export * from './types/schema';
 export * from './types/model';
@@ -24,7 +24,7 @@ export type {
 } from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';
-export type { QueryCacheEntry, QueryCacheState } from './state/queryCache';
+export type { QueryCacheEntry, QueryCacheOptions, QueryCacheState } from './state/queryCache';
 export { ModelStore } from './state/modelStore';
 export type { AsyncStatus, EditableModel, ModelStoreState, NewRelationshipInput } from './state/modelStore';
 export {
@@ -44,7 +44,10 @@ export type {
   OpenDashboard,
 } from './state/dashboardStore';
 export { createDashboardsRuntime } from './state/createRuntime';
-export type { DashboardsRuntime } from './state/createRuntime';
+export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
+
+export { validateChartSpec } from './validation/chartValidation';
+export type { ChartIssue } from './validation/chartValidation';
 
 export { dateOnlyPartOf, displayDateBound, inclusiveDateUpperBound } from './util/dateBounds';
 export { stableStringify } from './util/hash';

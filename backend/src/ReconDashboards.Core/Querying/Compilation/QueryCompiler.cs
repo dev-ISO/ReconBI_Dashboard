@@ -473,13 +473,31 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
             if (hasCalc)
             {
-                // Calcs apply over the Top-N output: the flat ranked+limited
-                // query becomes the base and windows run over those rows.
-                // Offset (like the outer limit) applies to the final select.
+                // Calcs apply over the Top-N output, and the window base must
+                // hold EXACTLY n rows: the +1 truncation probe row would leak
+                // into PERCENTOFTOTAL grand totals, running sums and LAG
+                // positions. So the probed (n+1) statement becomes __rcd_topn,
+                // the calc base re-selects exactly the top n rows from it, and
+                // an EXISTS over the leftover probe row keeps the truncation
+                // signal alive on the outer select. Offset (like the outer
+                // limit) applies to the final select.
+                var topnAlias = dialect.QuoteIdentifier("__rcd_topn");
+                var topnCte = $"{topnAlias} AS (\n{flat}\n)";
+                var exactPlaceholder = dialect.ParameterPlaceholder(bag.Add((long)n, NormalizedType.Integer));
+                var baseCore = new StringBuilder();
+                baseCore.Append("SELECT *").Append('\n').Append("FROM ").Append(topnAlias);
+                baseCore.Append('\n').Append("ORDER BY ")
+                    .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix)
+                    .Append(", ").Append(dialect.QuoteIdentifier("dim0")).Append(" ASC").Append(dialect.NullsLastSuffix);
+                baseCore.Append('\n').Append(dialect.LimitClause(exactPlaceholder));
+
+                var probeOffset = dialect.ParameterPlaceholder(bag.Add((long)n, NormalizedType.Integer));
+                var truncationProbe = $"EXISTS (SELECT 1 FROM {topnAlias} {dialect.OffsetClause(probeOffset)})";
+
                 return EmitWithCalcs(
-                    prepared, spec, [.. calendarCtes], flat.ToString(),
+                    prepared, spec, [.. calendarCtes, topnCte], baseCore.ToString(),
                     includeIsTopN: false, orderByAxisOnly: true, effectiveLimit, bag, warnings,
-                    rowLimit: n);
+                    rowLimit: effectiveLimit, truncationProbe: truncationProbe);
             }
 
             AppendOffset(flat, spec, bag);
@@ -570,7 +588,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             // through so consumers can still tell the Others bucket apart.
             return EmitWithCalcs(
                 prepared, spec, [.. calendarCtes, baseCte, rankedCte], groupedCore.ToString(),
-                includeIsTopN: true, orderByAxisOnly: true, effectiveLimit, bag, warnings);
+                includeIsTopN: true, orderByAxisOnly: true, effectiveLimit, bag, warnings,
+                rowLimit: effectiveLimit);
         }
 
         var sql = new StringBuilder();
@@ -586,7 +605,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             .Append(rankAlias).Append(" DESC").Append(dialect.NullsLastSuffix);
         AppendLimitAndOffset(sql, effectiveLimit, spec, bag);
 
-        return new CompiledQuery(sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings);
+        return new CompiledQuery(
+            sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN: true), warnings,
+            RowLimit: effectiveLimit);
     }
 
     /// <summary>True when any measure needs the post-aggregation window stage (time-intelligence calc or percent-of-total).</summary>
@@ -601,9 +622,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// PERCENTOFTOTAL measures also live here: value / SUM(value) OVER () — an
     /// unpartitioned grand total over the rows of the base stage, i.e. the
     /// current result set AFTER WHERE/HAVING/Top-N folding but BEFORE the final
-    /// LIMIT/OFFSET. With Top-N the total therefore covers exactly the
-    /// displayed rows (including the Others bucket when present); NULL group
-    /// values are ignored by SUM. A zero/NULL grand total yields NULL.
+    /// LIMIT/OFFSET. With Top-N the base holds EXACTLY the displayed rows —
+    /// the flat path re-selects the top n rows out of its probed (n+1) CTE and
+    /// signals truncation via <paramref name="truncationProbe"/> instead of a
+    /// probe row; the Others path is structurally folded — so the total covers
+    /// exactly the displayed rows (including the Others bucket when present).
+    /// NULL group values are ignored by SUM. A zero/NULL grand total yields
+    /// NULL.
     /// When a bucket-relative kind (YTD or the prior-period family) rides a
     /// date-bucketed axis the base is densified first: the full bucket series
     /// between the observed min and max axis value is generated, CROSS JOINed
@@ -624,7 +649,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         int effectiveLimit,
         ParameterBag bag,
         List<EngineWarning> warnings,
-        int? rowLimit = null)
+        int? rowLimit = null,
+        string? truncationProbe = null)
     {
         var baseAlias = dialect.QuoteIdentifier("__rcd_base");
         var axisBucket = prepared.Dimensions.Count > 0 ? prepared.Dimensions[0].Spec.DateBucket : null;
@@ -711,6 +737,12 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             outerItems.Add(item);
         }
 
+        if (truncationProbe is not null)
+        {
+            // Constant per statement; the query service strips it off the rows.
+            outerItems.Add($"{truncationProbe} AS {dialect.QuoteIdentifier("__rcd_truncated")}");
+        }
+
         var sql = new StringBuilder();
         sql.Append("WITH ").Append(string.Join(",\n", ctes)).Append('\n');
         sql.Append("SELECT ").Append(string.Join(",\n       ", outerItems));
@@ -740,7 +772,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         return new CompiledQuery(
             sql.ToString(), bag.Parameters, BuildColumnPlans(prepared, includeIsTopN), warnings,
-            RowLimit: rowLimit);
+            RowLimit: rowLimit, HasTruncationProbe: truncationProbe is not null);
     }
 
     /// <summary>

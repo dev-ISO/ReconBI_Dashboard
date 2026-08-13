@@ -466,11 +466,11 @@ export interface DashboardAccess {
   isOwner: boolean;
   /** owner || CanManageShared admin || any granted edit flag. */
   canEdit: boolean;
-  /** Move/resize tiles, doc settings, slicer/text/image tile edits. */
+  /** Move/resize tiles, doc settings, slicer/text/image tile add/remove/edits. */
   canEditLayout: boolean;
   /** Add/remove/rename/reorder/recolor pages (+ mobile layout, drillthrough). */
   canManagePages: boolean;
-  /** Add/remove tiles, edit chart specs/format. */
+  /** Add/remove chart tiles, edit chart specs/format. */
   canEditCharts: boolean;
   /** Access comes from a per-user share row. */
   viaShare: boolean;

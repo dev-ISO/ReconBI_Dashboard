@@ -13,6 +13,7 @@ import {
 import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
 import { ChartLoadingSkeleton, TileUpdatingBar } from '../dashboard/ChartLoadingSkeleton';
+import { queryErrorTextFor } from './queryErrorText';
 // Type-only import: erased at compile time, so the lazy chunk split survives.
 import type { ChartDatumClickInfo, ChartRendererProps } from './ChartRenderer';
 
@@ -360,9 +361,15 @@ export function ChartTile({
   }
 
   if (entry.status === 'error') {
+    // Actionable text keyed on the server's rcd.query.* error code (falls back
+    // to the raw message — server messages are contract-specified and precise).
+    const friendly = queryErrorTextFor(entry.errorCode, entry.error ?? 'The chart query failed.');
     return (
       <State icon={<AlertTriangle size={20} className="text-rcd-muted" />}>
-        <span className="max-w-full break-words text-xs text-rcd-text-2">{entry.error}</span>
+        <span className="max-w-full break-words text-xs text-rcd-text-2">{friendly.message}</span>
+        {friendly.hint && (
+          <span className="max-w-full break-words text-[11px] text-rcd-muted">{friendly.hint}</span>
+        )}
         <RcdButton onClick={() => setRetryToken((t) => t + 1)}>
           <RefreshCw size={14} /> Retry
         </RcdButton>

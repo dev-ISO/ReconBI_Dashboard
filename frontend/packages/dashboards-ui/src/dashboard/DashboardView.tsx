@@ -47,6 +47,7 @@ import { AddSlicerDialog } from './AddSlicerDialog';
 import { ShareDialog } from './ShareDialog';
 import { AlertDialog, type AlertSource } from './AlertDialog';
 import { ChartContextMenu } from './ChartContextMenu';
+import { CopyChartDialog } from './CopyChartDialog';
 import { DashboardChartTile, type TileEffectiveState } from './DashboardChartTile';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
 import { DashboardPrintView } from './DashboardPrintView';
@@ -74,6 +75,7 @@ import {
   type DrillthroughTarget,
   type PointDrillActions,
 } from './PointContextMenu';
+import { downloadBlob } from '../util/downloadBlob';
 import { resolveColumnType, useModelCatalog } from './columnType';
 import { describeClause } from './printLayout';
 import { PrintConfigDialog, type PrintOptions } from './PrintConfigDialog';
@@ -317,6 +319,11 @@ export function DashboardView({
   } | null>(null);
   /** "See data" dialog: aggregated result or a point's underlying records. */
   const [seeData, setSeeData] = useState<SeeDataRequest | null>(null);
+  /**
+   * "Copy chart to…" dialog: the AUTHORED spec being copied (never the
+   * drilled/filtered effective spec); null = closed.
+   */
+  const [copyChartSpec, setCopyChartSpec] = useState<ChartSpec | null>(null);
   /** Transient toolbar-area notice (export failures / truncation). */
   const [notice, setNotice] = useState<string | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
@@ -367,6 +374,8 @@ export function DashboardView({
    * renders 1:1 regardless).
    */
   const viewFitOverride = useDashboardState((state) => state.viewFitOverride);
+  /** Session chart clipboard (edit-mode Copy / Paste chart). */
+  const chartClipboard = useDashboardState((state) => state.chartClipboard);
 
   // Ctrl/Cmd-click detection for additive cross-filtering (see module header).
   useClickModifierTracker();
@@ -846,12 +855,7 @@ export function DashboardView({
           spec: having !== null && having.length > 0 ? { ...wire, having } : wire,
           mode,
         });
-        const url = URL.createObjectURL(blob);
-        const anchor = document.createElement('a');
-        anchor.href = url;
-        anchor.download = `${csvFileName(chart.title)}.csv`;
-        anchor.click();
-        URL.revokeObjectURL(url);
+        downloadBlob(`${csvFileName(chart.title)}.csv`, blob);
         if (truncated) setNotice('Export truncated: the server capped the row count.');
       } catch (error) {
         setNotice(`Export failed: ${messageOf(error)}`);
@@ -1613,10 +1617,14 @@ export function DashboardView({
         onAxisRangeCrossFilter={(effectiveChart, range, columns) =>
           handleAxisRangeCrossFilter(tile.id, effectiveChart, range, columns)
         }
-        onPointMenu={editable ? undefined : setPointMenu}
+        // Edit mode WITHOUT chart rights falls back to the view-mode menus
+        // (finding 15): the edit-mode config card is gated on canEditCharts,
+        // so a layout-only grantee would otherwise lose See data / export /
+        // drill entirely while editing.
+        onPointMenu={editable && canEditCharts ? undefined : setPointMenu}
         // Whole-tile right-click (view mode): chart-level menu whenever the
         // click hit no chart point — every chart type incl. KPI gets a menu.
-        onChartMenu={editable ? undefined : setTileMenu}
+        onChartMenu={editable && canEditCharts ? undefined : setTileMenu}
         reportEffective={reportEffective}
       />
     );
@@ -1747,6 +1755,10 @@ export function DashboardView({
         onAddImage={() => setAddImageOpen(true)}
         onAddSlicer={() => setAddSlicerOpen(true)}
         addSlicerDisabled={modelId === null}
+        // Session clipboard paste (Add ▾ > Paste chart); the Add menu itself
+        // is already gated on canEditCharts via canAddTiles.
+        onPasteChart={() => runtime.dashboards.pasteChartTile()}
+        pasteChartEnabled={chartClipboard !== null}
         canAddTiles={canEditCharts}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
@@ -2073,6 +2085,10 @@ export function DashboardView({
                 })
               }
               onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
+              // Both copy flavors take the AUTHORED tile spec, never the
+              // drilled/filtered effective one.
+              onCopy={() => runtime.dashboards.copyChart(chartMenuTile.chart, modelId)}
+              onCopyTo={() => setCopyChartSpec(chartMenuTile.chart)}
               onExport={(exportMode) => void exportChartCsv(chartMenuTile.id, exportMode)}
               onSetAlert={
                 modelId !== null && chartMenuTile.chart.query.measures.length > 0
@@ -2185,6 +2201,13 @@ export function DashboardView({
                   ? () => openAlertFor(tileMenu.tileId, tileMenu.chart)
                   : null
               }
+              // Everyone who can view can clone a chart to a dashboard THEY
+              // can edit — built-ins included (that is the point). The copied
+              // spec is the AUTHORED tile spec, not the drilled effective one.
+              onCopyChart={() => {
+                const authored = tiles.find((t) => t.id === tileMenu.tileId);
+                if (authored && isChartTile(authored)) setCopyChartSpec(authored.chart);
+              }}
               onExport={(exportMode) => void exportChartCsv(tileMenu.tileId, exportMode)}
               onClose={() => setTileMenu(null)}
             />
@@ -2198,6 +2221,14 @@ export function DashboardView({
         onClose={() => setSeeData(null)}
         onExportSummarized={(tileId) => void exportChartCsv(tileId, 'summarized')}
         onNotice={setNotice}
+      />
+
+      <CopyChartDialog
+        open={copyChartSpec !== null}
+        chart={copyChartSpec}
+        sourceModelId={modelId}
+        currentDashboardId={dashboardId}
+        onClose={() => setCopyChartSpec(null)}
       />
 
       <RcdDialog
