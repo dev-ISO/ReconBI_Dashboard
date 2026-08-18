@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronDown, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
@@ -1284,7 +1284,7 @@ function ConditionalFormatCard({
  * reaches the spec. Applying an empty editor emits undefined (clears the
  * target field).
  */
-function RichTextDialog({
+export function RichTextDialog({
   title,
   initialHtml,
   onApply,
@@ -1298,6 +1298,21 @@ function RichTextDialog({
 }) {
   const editorRef = useRef<HTMLDivElement>(null);
   const [html, setHtml] = useState(initialHtml);
+
+  // Seed the editor's DOM exactly ONCE, imperatively. It used to be seeded via
+  // dangerouslySetInnerHTML on the element itself, but React 19 re-applies
+  // that HTML on EVERY re-render (proven in test/contentEditable.test.tsx) —
+  // and this component re-renders on each keystroke (onInput -> setHtml), so
+  // typing was overwritten by the original seed mid-word, leaving stray
+  // "remnant" fragments. After this one-time seed the browser owns the
+  // contentEditable's DOM entirely; React renders the element childless and
+  // never touches its contents again. (The dialog is conditionally mounted
+  // per open, so each open re-seeds from the then-current value.)
+  useLayoutEffect(() => {
+    if (editorRef.current) editorRef.current.innerHTML = initialHtml;
+    // Mount-only by design — see above; a changing seed must NOT re-stomp.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const sanitized = sanitizeRichHtml(html);
   const isEmpty = sanitized.replace(/<[^>]*>/g, '').trim() === '';
@@ -1397,7 +1412,6 @@ function RichTextDialog({
           aria-label={`${title} rich text`}
           className="min-h-[5rem] rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent"
           onInput={(event) => setHtml(event.currentTarget.innerHTML)}
-          dangerouslySetInnerHTML={{ __html: initialHtml }}
         />
         <div className="flex flex-col gap-1">
           <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
