@@ -10,8 +10,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@recon/dashboards-core": "^0.10.0",
-    "@recon/dashboards-ui": "^0.10.0",
+    "@recon/dashboards-core": "^0.10.1",
+    "@recon/dashboards-ui": "^0.10.1",
     "lucide-react": "^0.474.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",

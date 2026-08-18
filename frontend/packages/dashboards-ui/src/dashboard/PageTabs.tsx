@@ -56,6 +56,11 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
 
   const menuIndex = menu ? pages.findIndex((page) => page.id === menu.pageId) : -1;
   const menuPage = menuIndex === -1 ? null : (pages[menuIndex] ?? null);
+  // Stable position identity: an inline {x, y} literal re-ran the card's
+  // clamp useLayoutEffect on EVERY parent render (store updates, hover
+  // state), making the open card jump back to its raw anchor. `menu` is
+  // state, so this identity holds until the menu actually moves.
+  const menuPosition = useMemo(() => (menu ? { x: menu.x, y: menu.y } : null), [menu]);
 
   return (
     <>
@@ -150,12 +155,12 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
         )}
       </div>
 
-      {menu && menuPage && (
+      {menu && menuPage && menuPosition && (
         <PageTabMenu
           page={menuPage}
           index={menuIndex}
           pageCount={pages.length}
-          position={{ x: menu.x, y: menu.y }}
+          position={menuPosition}
           onRename={() => startRename(menuPage)}
           onDelete={() => setConfirmDelete(menuPage)}
           onClose={() => setMenu(null)}
@@ -407,6 +412,35 @@ function DrillthroughSection({ page }: { page: DashboardPage }) {
       .map((c) => ({ name: c.name, label: overrides.get(c.name)?.friendlyName ?? c.name }));
   }, [usableCatalog, pendingTable, tables]);
 
+  // When the model arrives AFTER the user started typing (the inputs swap to
+  // selects), carry typed values over by case-insensitive match so they don't
+  // silently render as a blank select while Add still writes them. Values
+  // that match nothing keep the free-text inputs below (with a hint) instead.
+  useEffect(() => {
+    if (!modelDriven || pendingTable === '') return;
+    const trimmed = pendingTable.trim().toLowerCase();
+    const match = tables.find((t) => tableKey(t.schema, t.name).toLowerCase() === trimmed);
+    if (match) {
+      const key = tableKey(match.schema, match.name);
+      if (key !== pendingTable) setPendingTable(key);
+    }
+  }, [modelDriven, tables, pendingTable]);
+  useEffect(() => {
+    if (pendingColumn === '' || columns.length === 0) return;
+    const trimmed = pendingColumn.trim().toLowerCase();
+    const match = columns.find((c) => c.name.toLowerCase() === trimmed);
+    if (match && match.name !== pendingColumn) setPendingColumn(match.name);
+  }, [columns, pendingColumn]);
+
+  // Selects can only DISPLAY values that exist among their options — pending
+  // text the reconciliation above could not resolve stays in the free-text
+  // style (never invisibly inside a blank select).
+  const pendingTableDisplayable =
+    pendingTable === '' || tables.some((t) => tableKey(t.schema, t.name) === pendingTable);
+  const pendingColumnDisplayable =
+    pendingColumn === '' || columns.some((c) => c.name === pendingColumn);
+  const showSelects = modelDriven && pendingTableDisplayable && pendingColumnDisplayable;
+
   const commit = (next: PageDrillthrough | null) =>
     runtime.dashboards.setPageDrillthrough(page.id, next);
 
@@ -472,7 +506,7 @@ function DrillthroughSection({ page }: { page: DashboardPage }) {
               <p className="text-xs text-rcd-muted">Add the field(s) this page filters by.</p>
             )}
 
-            {modelDriven ? (
+            {showSelects ? (
               <>
                 <RcdSelect
                   aria-label="Drillthrough field table"
@@ -516,29 +550,38 @@ function DrillthroughSection({ page }: { page: DashboardPage }) {
                 </div>
               </>
             ) : (
-              // No model/catalog reachable: free-text "schema.table" + column.
-              <div className="flex items-center gap-1.5">
-                <RcdInput
-                  aria-label="Drillthrough field table"
-                  value={pendingTable}
-                  onChange={(event) => setPendingTable(event.target.value)}
-                  placeholder="schema.table"
-                  className="min-w-0 flex-1"
-                />
-                <RcdInput
-                  aria-label="Drillthrough field column"
-                  value={pendingColumn}
-                  onChange={(event) => setPendingColumn(event.target.value)}
-                  placeholder="column"
-                  className="min-w-0 flex-1"
-                />
-                <RcdButton
-                  disabled={pendingTable.trim() === '' || pendingColumn.trim() === ''}
-                  onClick={addField}
-                >
-                  Add
-                </RcdButton>
-              </div>
+              // No model/catalog reachable — or typed values the loaded
+              // model could not resolve: free-text "schema.table" + column.
+              <>
+                <div className="flex items-center gap-1.5">
+                  <RcdInput
+                    aria-label="Drillthrough field table"
+                    value={pendingTable}
+                    onChange={(event) => setPendingTable(event.target.value)}
+                    placeholder="schema.table"
+                    className="min-w-0 flex-1"
+                  />
+                  <RcdInput
+                    aria-label="Drillthrough field column"
+                    value={pendingColumn}
+                    onChange={(event) => setPendingColumn(event.target.value)}
+                    placeholder="column"
+                    className="min-w-0 flex-1"
+                  />
+                  <RcdButton
+                    disabled={pendingTable.trim() === '' || pendingColumn.trim() === ''}
+                    onClick={addField}
+                  >
+                    Add
+                  </RcdButton>
+                </div>
+                {modelDriven && (
+                  <p className="text-[11px] leading-snug text-rcd-muted">
+                    These names don’t match the model — fix the spelling, or clear them to
+                    pick from the lists.
+                  </p>
+                )}
+              </>
             )}
           </>
         )}

@@ -344,6 +344,66 @@ describe('cloneChartForCopy (the shared copy-path clone)', () => {
     expect(copy.format.container?.innerTitleHtml).toBe('<p>plain description</p>');
   });
 
+  /* H1: the rewrite is CONDITIONAL — it fires only while the bold lead-in
+   * still reads as the SOURCE chart's title. A customized inner title is the
+   * user's newer statement and must survive every copy path untouched. */
+
+  it('preserves a CUSTOMIZED bold lead-in (rewrite only when it matches the source title)', () => {
+    const customized: ChartSpec = {
+      ...chartFor('Valve Status'),
+      format: {
+        container: {
+          hideHeader: true,
+          innerTitleHtml: '<p><b>Executive Overview</b> <span>&mdash; by area</span></p>',
+        },
+      },
+    };
+    const copy = cloneChartForCopy(customized, { suffix: true });
+    // Title still gains the suffix; the custom inner title rides through.
+    expect(copy.title).toBe('Valve Status (copy)');
+    expect(copy.format.container?.innerTitleHtml).toBe(
+      '<p><b>Executive Overview</b> <span>&mdash; by area</span></p>',
+    );
+  });
+
+  it('matches the source title through HTML entities in the bold run', () => {
+    const source: ChartSpec = {
+      ...chartFor('P&L Overview'),
+      format: {
+        container: { innerTitleHtml: '<p><b>P&amp;L Overview</b> <span>tail</span></p>' },
+      },
+    };
+    const copy = cloneChartForCopy(source, { suffix: true });
+    expect(copy.format.container?.innerTitleHtml).toBe(
+      '<p><b>P&amp;L Overview (copy)</b> <span>tail</span></p>',
+    );
+  });
+
+  it('duplicateTile keeps a customized inner title too (store copy path)', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+    const customized: ChartSpec = {
+      ...chartFor('Valve Status'),
+      format: {
+        container: {
+          hideHeader: true,
+          innerTitleHtml: '<p><b>Executive Overview</b></p>',
+        },
+      },
+    };
+    store.addTile(customized);
+    const tileId = store.store.getState().current!.layout.pages![0]!.tiles[0]!.id;
+
+    store.duplicateTile(tileId);
+
+    const tiles = store.store.getState().current!.layout.pages![0]!.tiles;
+    expect(tiles).toHaveLength(2);
+    expect(tiles[1]!.chart!.title).toBe('Valve Status (copy)');
+    expect(tiles[1]!.chart!.format.container?.innerTitleHtml).toBe(
+      '<p><b>Executive Overview</b></p>',
+    );
+  });
+
   it('same-dashboard "copy to" gains the suffix and the retitled inner title', async () => {
     const { store } = await openStore();
     store.enterEdit();

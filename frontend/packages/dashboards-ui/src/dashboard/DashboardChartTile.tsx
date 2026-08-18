@@ -1187,6 +1187,7 @@ export function DashboardChartTile({
         title={chart.title}
         editable={editable}
         container={chart.format.container ?? null}
+        titleStyle={chart.format.titleStyle ?? null}
         headerExtra={drillControls}
         onEdit={onEdit}
         onDuplicate={onDuplicate}

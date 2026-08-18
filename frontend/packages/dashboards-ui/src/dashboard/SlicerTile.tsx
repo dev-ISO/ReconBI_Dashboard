@@ -979,14 +979,48 @@ function RelativeDateSlicer({
   onPick: (presetId: string) => void;
 }) {
   const custom = activePresetId ? parseCustomPreset(activePresetId) : null;
-  const [customN, setCustomN] = useState(custom?.n ?? 30);
+  // "Last N" is a RAW STRING draft, committed on blur/Enter/unit-pick only
+  // (FilterEditor pattern). Binding a coerced number per keystroke made the
+  // box uneditable — clearing wrote "1" back with the caret after it, so
+  // typing 45 yielded 145 — and pushed one undo entry + a full layout clone
+  // per character through updateSlicer.
+  const [customNDraft, setCustomNDraft] = useState(() => String(custom?.n ?? 30));
   const [customUnit, setCustomUnit] = useState<RelativeUnit>(custom?.unit ?? 'day');
+
+  // Re-sync the drafts whenever the ACTIVE preset's parsed parts change:
+  // activePresetId moves under this component (bookmark apply, the persisted
+  // default-preset effect), and seed-once state then applied a stale N on the
+  // next unit-only change ("Last 90 days" silently became "Last 30"). Keyed
+  // on the parsed n/unit so a user mid-typing (draft diverged, preset
+  // unchanged) is never clobbered.
+  useEffect(() => {
+    if (custom === null) return;
+    setCustomNDraft(String(custom.n));
+    setCustomUnit(custom.unit);
+  }, [custom?.n, custom?.unit]);
 
   // The select shows 'custom' while a lastN preset is active.
   const selectValue = custom !== null ? 'custom' : (activePresetId ?? (hasClause ? 'custom' : 'all'));
 
   const applyCustom = (n: number, unit: RelativeUnit) => {
     if (n > 0) onPick(customPresetId(n, unit));
+  };
+
+  /** Draft -> positive integer; null when it holds nothing usable. */
+  const parseDraftN = (draft: string): number | null => {
+    const n = Math.trunc(Number(draft));
+    return Number.isFinite(n) && n > 0 ? n : null;
+  };
+
+  /** Blur/Enter commit: apply a usable draft, else restore the active value. */
+  const commitCustomN = () => {
+    const n = parseDraftN(customNDraft);
+    if (n !== null) {
+      setCustomNDraft(String(n));
+      applyCustom(n, customUnit);
+    } else {
+      setCustomNDraft(String(custom?.n ?? 30));
+    }
   };
 
   const selectClasses = compact ? 'h-7 w-full text-xs' : 'w-full';
@@ -998,7 +1032,7 @@ function RelativeDateSlicer({
         value={selectValue}
         onChange={(event) => {
           const next = event.target.value;
-          if (next === 'custom') applyCustom(customN, customUnit);
+          if (next === 'custom') applyCustom(parseDraftN(customNDraft) ?? 30, customUnit);
           else onPick(next);
         }}
         className={selectClasses}
@@ -1020,11 +1054,11 @@ function RelativeDateSlicer({
           <RcdInput
             type="number"
             min={1}
-            value={customN}
-            onChange={(event) => {
-              const n = Math.max(1, Math.trunc(Number(event.target.value) || 1));
-              setCustomN(n);
-              applyCustom(n, customUnit);
+            value={customNDraft}
+            onChange={(event) => setCustomNDraft(event.target.value)}
+            onBlur={commitCustomN}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') commitCustomN();
             }}
             aria-label={`${spec.label} custom window size`}
             className={compact ? 'h-7 w-16 text-xs' : 'w-16'}
@@ -1034,7 +1068,10 @@ function RelativeDateSlicer({
             onChange={(event) => {
               const unit = event.target.value as RelativeUnit;
               setCustomUnit(unit);
-              applyCustom(customN, unit);
+              // Unit picks commit immediately (a select carries no
+              // mid-typing state) with the draft N coerced, falling back to
+              // the ACTIVE parsed N so a blank draft never applies "Last 1".
+              applyCustom(parseDraftN(customNDraft) ?? custom?.n ?? 30, unit);
             }}
             aria-label={`${spec.label} custom window unit`}
             className={compact ? 'h-7 min-w-0 flex-1 text-xs' : 'min-w-0 flex-1'}

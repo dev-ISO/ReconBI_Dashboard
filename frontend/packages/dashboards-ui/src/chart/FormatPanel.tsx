@@ -1,4 +1,4 @@
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronDown, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
@@ -244,7 +244,14 @@ function SegmentedRow<T extends string>({
   );
 }
 
-/** Label + clamped integer input; empty clears back to the (theme) default. */
+/**
+ * Label + integer input; empty clears back to the (theme) default. Typing
+ * writes the raw truncated value and the range clamp waits for blur/Enter
+ * (TextStyleRow's contract): clamping per keystroke made every value below
+ * min*10 untypeable — "12" with min 10 clamped the intermediate "1" to 10,
+ * yielding 102 — so mid-range table font sizes / gantt thicknesses could
+ * never be entered.
+ */
 function NumberRow({
   label,
   value,
@@ -262,6 +269,7 @@ function NumberRow({
   disabled?: boolean;
   onChange: (next: number | undefined) => void;
 }) {
+  const clamp = (n: number) => Math.min(max, Math.max(min, n));
   return (
     <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
       {label}
@@ -284,10 +292,96 @@ function NumberRow({
             onChange(undefined);
             return;
           }
-          onChange(Math.min(max, Math.max(min, Math.trunc(parsed))));
+          onChange(Math.trunc(parsed));
+        }}
+        onBlur={() => {
+          if (value !== undefined && value !== clamp(value)) onChange(clamp(value));
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' && value !== undefined && value !== clamp(value)) {
+            onChange(clamp(value));
+          }
         }}
       />
     </label>
+  );
+}
+
+/**
+ * Zoom "Initial view" select + its "Periods shown" box. Both are COMPONENT
+ * state committed on blur/Enter (FilterEditor pattern): the row used to mount
+ * off the SPEC's lastN, so clearing the box pruned initialWindow and the row
+ * unmounted under the caret (select snapping to "All data") before a new
+ * number could be typed. The select alone turns the window off; an unusable
+ * draft restores the persisted value on commit. External spec moves
+ * (undo/redo) re-seed both.
+ */
+function InitialWindowRows({
+  lastN,
+  onChange,
+}: {
+  /** Persisted zoom.initialWindow.lastN (undefined = open on all data). */
+  lastN: number | undefined;
+  /** null clears the window; a number persists { lastN }. */
+  onChange: (next: number | null) => void;
+}) {
+  const active = typeof lastN === 'number' && lastN >= 1;
+  const [mode, setMode] = useState<'all' | 'lastN'>(active ? 'lastN' : 'all');
+  const [draft, setDraft] = useState(active ? String(lastN) : '12');
+  useEffect(() => {
+    setMode(active ? 'lastN' : 'all');
+    if (active) setDraft(String(lastN));
+  }, [active, lastN]);
+
+  const commit = () => {
+    const n = Math.trunc(Number(draft));
+    if (Number.isFinite(n) && n >= 1) {
+      const clamped = Math.min(999, n);
+      setDraft(String(clamped));
+      if (clamped !== lastN) onChange(clamped);
+    } else {
+      setDraft(active ? String(lastN) : '12');
+    }
+  };
+
+  return (
+    <>
+      <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+        Initial view
+        <RcdSelect
+          aria-label="Initial view window"
+          className="w-36 shrink-0"
+          value={mode}
+          onChange={(event) => {
+            const next = event.target.value === 'lastN' ? 'lastN' : 'all';
+            setMode(next);
+            onChange(next === 'lastN' ? 12 : null);
+          }}
+        >
+          <option value="all">All data</option>
+          <option value="lastN">Last N periods</option>
+        </RcdSelect>
+      </label>
+      {mode === 'lastN' && (
+        <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+          Periods shown
+          <input
+            type="number"
+            min={1}
+            max={999}
+            placeholder="12"
+            aria-label="Periods shown"
+            className={NUMBER_INPUT_CLASS}
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={commit}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') commit();
+            }}
+          />
+        </label>
+      )}
+    </>
   );
 }
 
@@ -502,16 +596,27 @@ function AxisFormatEditor({
 }) {
   const kind = value?.kind ?? 'auto';
 
+  // Session stash of the INACTIVE kind's fields: the spec prunes decimals
+  // under Custom and the pattern under everything else (specs stay minimal),
+  // so a kind round-trip used to eat a painstakingly built pattern. The stash
+  // lives only in component state — what persists is unchanged.
+  const stash = useRef<{ decimals?: number; pattern?: string }>({});
+
   const setKind = (nextKind: NonNullable<AxisValueFormat['kind']>) => {
+    // Capture the outgoing kind's fields before the spec write prunes them.
+    if (value?.decimals !== undefined) stash.current.decimals = value.decimals;
+    if (value?.pattern) stash.current.pattern = value.pattern;
     if (nextKind === 'auto') {
       onChange(undefined);
       return;
     }
     const next: AxisValueFormat = { kind: nextKind };
     if (nextKind === 'custom') {
-      if (value?.pattern) next.pattern = value.pattern;
-    } else if (value?.decimals !== undefined) {
-      next.decimals = value.decimals;
+      const pattern = value?.pattern ?? stash.current.pattern;
+      if (pattern) next.pattern = pattern;
+    } else {
+      const decimals = value?.decimals ?? stash.current.decimals;
+      if (decimals !== undefined) next.decimals = decimals;
     }
     onChange(next);
   };
@@ -608,8 +713,20 @@ function AxisScaleEditor({
   onChange: (next: AxisScaleOptions | undefined) => void;
 }) {
   const range = value?.range ?? 'zero';
-  const set = (partial: Partial<AxisScaleOptions>) =>
-    onChange(pruneAxisScale({ ...value, ...partial }));
+  // Session stash of custom min/max: pruneAxisScale drops them the moment the
+  // range leaves 'custom', so a range round-trip used to eat typed bounds.
+  // Component state only — the persisted spec still prunes as before.
+  const stash = useRef<{ min?: number | null; max?: number | null }>({});
+  const set = (partial: Partial<AxisScaleOptions>) => {
+    if (value?.min != null) stash.current.min = value.min;
+    if (value?.max != null) stash.current.max = value.max;
+    const merged = { ...value, ...partial };
+    if (partial.range === 'custom') {
+      if (merged.min == null && stash.current.min != null) merged.min = stash.current.min;
+      if (merged.max == null && stash.current.max != null) merged.max = stash.current.max;
+    }
+    onChange(pruneAxisScale(merged));
+  };
 
   return (
     <div className="flex flex-col gap-1">
@@ -1849,12 +1966,14 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           <RcdSelect
             className="w-32 shrink-0"
             value={container?.shadow ?? 'none'}
+            // 'none' persists EXPLICITLY (deliberate exception to the
+            // emit-undefined-for-defaults convention): an undefined shadow
+            // means "theme default", and the tile default HAS a shadow — so
+            // mapping None to undefined made it unreachable, the picked value
+            // visibly snapping back to the default shadow.
             onChange={(event) =>
               setContainer({
-                shadow:
-                  event.target.value === 'none'
-                    ? undefined
-                    : (event.target.value as 'sm' | 'md' | 'lg'),
+                shadow: event.target.value as NonNullable<ContainerStyle['shadow']>,
               })
             }
           >
@@ -1869,6 +1988,15 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           value={format.titleStyle}
           onChange={(next) => patch({ titleStyle: next })}
         />
+        {spec.type === 'kpi' && (
+          // KPI-only: the big value normally auto-fits its tile (container
+          // query clamp in the renderer); an explicit fontSize here pins it.
+          <TextStyleRow
+            label="Value text"
+            value={format.kpiValueStyle}
+            onChange={(next) => patch({ kpiValueStyle: next })}
+          />
+        )}
         <div className="flex items-center justify-between gap-2">
           <span className="text-sm text-rcd-text-2">Inner title</span>
           <div className="flex items-center gap-1">
@@ -2262,34 +2390,12 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             Compact buttons in the plot corner: zoom in/out, pan and reset. Hold a button to
             keep moving.
           </p>
-          <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
-            Initial view
-            <RcdSelect
-              aria-label="Initial view window"
-              className="w-36 shrink-0"
-              value={(format.zoom?.initialWindow?.lastN ?? 0) >= 1 ? 'lastN' : 'all'}
-              onChange={(event) =>
-                setZoom({
-                  initialWindow: event.target.value === 'lastN' ? { lastN: 12 } : null,
-                })
-              }
-            >
-              <option value="all">All data</option>
-              <option value="lastN">Last N periods</option>
-            </RcdSelect>
-          </label>
-          {(format.zoom?.initialWindow?.lastN ?? 0) >= 1 && (
-            <NumberRow
-              label="Periods shown"
-              value={format.zoom?.initialWindow?.lastN}
-              min={1}
-              max={999}
-              placeholder="12"
-              onChange={(next) =>
-                setZoom({ initialWindow: next !== undefined && next >= 1 ? { lastN: next } : null })
-              }
-            />
-          )}
+          <InitialWindowRows
+            lastN={format.zoom?.initialWindow?.lastN}
+            onChange={(next) =>
+              setZoom({ initialWindow: next !== null ? { lastN: next } : null })
+            }
+          />
           <p className="text-xs text-rcd-muted">
             Opens the chart on its most recent buckets; viewers can still pan and zoom, and
             reset returns here.

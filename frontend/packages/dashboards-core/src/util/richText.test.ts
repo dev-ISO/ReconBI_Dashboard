@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { retitleInnerTitleHtml } from './richText';
+import { boldRunText, retitleInnerTitleHtml } from './richText';
 
 /* Inputs mirror the seeded-dashboard inner-title pattern (rich HTML that
  * already passed sanitizeRichHtml): a bold lead-in carrying the visible name,
@@ -54,5 +54,46 @@ describe('retitleInnerTitleHtml', () => {
   it('does not mistake other tags starting with b for bold', () => {
     // <br> must not match the <b> pattern.
     expect(retitleInnerTitleHtml('<p>line<br>break</p>', 'New')).toBeNull();
+  });
+});
+
+/* boldRunText is the READ half of retitleInnerTitleHtml: the auto-retitle
+ * paths compare it against the source chart title and rewrite ONLY when the
+ * bold lead-in still IS that title — a customized lead-in rides through. It
+ * must run without a DOM, like the writer. */
+
+describe('boldRunText', () => {
+  it('extracts the first bold run, trimmed', () => {
+    expect(boldRunText(SEED_HTML)).toBe('Valve Status');
+    expect(boldRunText('<p><b>  Padded  </b> tail</p>')).toBe('Padded');
+  });
+
+  it('reads <strong> and only the FIRST bold element', () => {
+    expect(boldRunText('<p><strong>First</strong> and <b>Second</b></p>')).toBe('First');
+  });
+
+  it('strips nested markup inside the run', () => {
+    expect(boldRunText('<p><b>Old <i>fancy</i></b> tail</p>')).toBe('Old fancy');
+  });
+
+  it('decodes entities so escaped titles compare equal to their source', () => {
+    expect(boldRunText('<p><b>A &lt;5 &amp; B &gt; C</b></p>')).toBe('A <5 & B > C');
+    // Numeric references (decimal + hex) and the common named ones.
+    expect(boldRunText('<p><b>Caf&#233; &#x2014; Q&ndash;2</b></p>')).toBe('Café — Q–2');
+    // Single-pass decode: &amp;lt; is the TEXT "&lt;", never "<".
+    expect(boldRunText('<p><b>&amp;lt;tag&amp;gt;</b></p>')).toBe('&lt;tag&gt;');
+  });
+
+  it('round-trips what retitleInnerTitleHtml wrote', () => {
+    const title = 'New <Title> & Co';
+    const rewritten = retitleInnerTitleHtml(SEED_HTML, title);
+    expect(rewritten).not.toBeNull();
+    expect(boldRunText(rewritten!)).toBe(title);
+  });
+
+  it('returns null when there is no bold element', () => {
+    expect(boldRunText('<p>Just prose</p>')).toBeNull();
+    expect(boldRunText('<p>line<br>break</p>')).toBeNull();
+    expect(boldRunText('')).toBeNull();
   });
 });

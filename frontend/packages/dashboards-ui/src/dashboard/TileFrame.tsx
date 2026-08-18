@@ -17,7 +17,8 @@ import {
   Trash2,
   type LucideIcon,
 } from 'lucide-react';
-import { sanitizeRichHtml, type ContainerStyle } from '@recon/dashboards-core';
+import { sanitizeRichHtml, type ContainerStyle, type TextStyle } from '@recon/dashboards-core';
+import { textStyleToCss } from '../chart/textStyle';
 import { ConfirmDialog, RcdIconButton } from '../primitives';
 
 export interface TileFrameProps {
@@ -33,6 +34,12 @@ export interface TileFrameProps {
    * INSIDE the body above the content (both modes, header hidden or not).
    */
   container?: ContainerStyle | null;
+  /**
+   * format.titleStyle: styles the header-bar title text. Until now the Format
+   * panel's "Title" control was a silent no-op on every non-KPI chart — the
+   * header hard-coded its classes and never read it.
+   */
+  titleStyle?: TextStyle | null;
   onEdit?: () => void;
   onDuplicate?: () => void;
   onDelete?: () => void;
@@ -93,6 +100,7 @@ export function TileFrame({
   title,
   editable,
   container = null,
+  titleStyle = null,
   onEdit,
   onDuplicate,
   onDelete,
@@ -214,6 +222,7 @@ export function TileFrame({
             {editable && <GripVertical size={14} className="shrink-0 text-rcd-muted" />}
             <span
               className="truncate text-sm font-medium leading-5 text-rcd-text"
+              style={textStyleToCss(titleStyle ?? undefined)}
               title={title}
             >
               {title}
@@ -246,8 +255,19 @@ export function TileFrame({
           )}
           {/* Floating header extras + kebab, above the drag strip so they stay
               clickable. Frameless tiles keep their header-area controls (e.g.
-              drill buttons) in this same hover strip in BOTH modes. */}
-          <div className="absolute right-1 top-1 z-20 flex items-center gap-0.5 rounded-md bg-rcd-surface opacity-0 shadow-sm transition-opacity group-hover:opacity-100">
+              drill buttons) in this same hover strip in BOTH modes.
+              z-40: renderer-internal chrome may legitimately float (table
+              sticky headers, zoom clusters) but the TILE's own controls must
+              always win paint AND hit-testing over it — a kebab that loses to
+              a sticky <th> is an edit affordance users can never click.
+              Edit mode keeps the cluster faintly visible at rest instead of
+              opacity-0: a frameless tile otherwise shows ZERO evidence it can
+              be edited until the user happens to hover the right corner. */}
+          <div
+            className={`absolute right-1 top-1 z-40 flex items-center gap-0.5 rounded-md bg-rcd-surface shadow-sm transition-opacity group-hover:opacity-100 ${
+              editable ? 'opacity-60' : 'opacity-0'
+            }`}
+          >
             {headerExtra}
             {kebab}
           </div>

@@ -34,15 +34,31 @@ const isValidSrc = (src: string): boolean =>
  */
 export function ImageTileDialog({ open, title, initial, onClose, onSave }: ImageTileDialogProps) {
   const [src, setSrc] = useState('');
+  /**
+   * The URL text box's OWN draft, independent of the effective `src`: an
+   * upload replaces src with the data URL, but the typed URL survives here so
+   * removing the upload (or just changing sources) never erases it.
+   */
+  const [urlDraft, setUrlDraft] = useState('');
   const [fit, setFit] = useState<ImageTileSpec['fit']>('contain');
   const [alt, setAlt] = useState('');
   const [error, setError] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
-  // (Re)initialize from the incoming spec each time the dialog opens.
+  // (Re)initialize from the incoming spec ONLY on the closed→open EDGE. The
+  // effect used to key on `initial`'s object identity too — but `initial` is
+  // the tile spec read from the store, and undo/redo (applySnapshot's
+  // structuredClone) mints a new identity for unchanged content, so Ctrl+Z
+  // elsewhere on the dashboard wiped this dialog's in-progress drafts back to
+  // the tile spec while it was open.
+  const wasOpen = useRef(false);
   useEffect(() => {
-    if (!open) return;
-    setSrc(initial?.src ?? '');
+    const opening = open && !wasOpen.current;
+    wasOpen.current = open;
+    if (!opening) return;
+    const initialSrc = initial?.src ?? '';
+    setSrc(initialSrc);
+    setUrlDraft(/^data:/i.test(initialSrc) ? '' : initialSrc);
     setFit(initial?.fit ?? 'contain');
     setAlt(initial?.alt ?? '');
     setError(null);
@@ -125,7 +141,9 @@ export function ImageTileDialog({ open, title, initial, onClose, onSave }: Image
                 <button
                   type="button"
                   aria-label="Remove uploaded image"
-                  onClick={() => setSrc('')}
+                  // Removing the upload falls back to the preserved URL draft
+                  // instead of blanking the source outright.
+                  onClick={() => setSrc(urlDraft)}
                   className="rounded-md p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
                 >
                   <X size={11} />
@@ -141,9 +159,15 @@ export function ImageTileDialog({ open, title, initial, onClose, onSave }: Image
           <RcdInput
             type="url"
             placeholder="https://example.com/logo.png"
-            value={isUpload ? '' : src}
+            // Bound to the URL DRAFT, not the effective src: while an upload
+            // is active the typed URL stays visible-in-waiting here rather
+            // than being discarded (the upload badge marks what will save).
+            value={urlDraft}
             disabled={isUpload}
-            onChange={(event) => setSrc(event.target.value)}
+            onChange={(event) => {
+              setUrlDraft(event.target.value);
+              setSrc(event.target.value);
+            }}
             className="w-full disabled:opacity-50"
           />
         </label>

@@ -12,25 +12,30 @@ import {
   type FilterClause,
   type SlicerValues,
 } from '@recon/dashboards-core';
-import type { PrintOptions, PrintOrientation, PrintPaper } from './PrintConfigDialog';
+import type { PrintMargin, PrintOptions, PrintOrientation, PrintPaper } from './PrintConfigDialog';
 
 /** A printable tile: chart, text, or image (slicers never print). */
 export type ChartTileEntry = DashboardTile;
 
 /* ---------------------------------------------------------------- paper math
- * All geometry is exact CSS px at 96dpi. The printed page box is declared via
- * an injected `@page { size: <W>mm <H>mm; margin: 12mm }`, so the printable
- * (content) area is the paper minus 12mm on every side. Content px are FLOORED
- * so the on-screen layout is always a hair inside the browser's printable
- * area — content can never spill onto a stray extra page.
+ * All geometry is exact CSS px at 96dpi. The printed page is claimed WHOLE via
+ * an injected `@page { size: <W>mm <H>mm; margin: 0 }` (see printPageCss); the
+ * sheet element is the paper and its padding is the chosen margin preset, so
+ * the printable (content) area is the paper minus the margin on every side.
+ * Content px are FLOORED so the on-screen layout is always a hair inside the
+ * real printable area — content can never spill onto a stray extra page.
  *
- * Content-area px per paper/orientation (width × height):
+ * Content-area px per paper/orientation at the default 12mm margins
+ * (width × height):
  *   letter   portrait  725 × 965    landscape  965 × 725
  *   a4       portrait  702 × 1031   landscape 1031 × 702
  *   legal    portrait  725 × 1253   landscape 1253 × 725
  *   tabloid  portrait  965 × 1541   landscape 1541 × 965
  */
-export const PAGE_MARGIN_MM = 12;
+
+/** Margin preset → mm per side. 'normal' is the historic hard-coded 12mm. */
+export const MARGIN_MM: Record<PrintMargin, number> = { normal: 12, narrow: 6, none: 0 };
+
 const DPI = 96;
 const MM_PER_IN = 25.4;
 
@@ -48,26 +53,34 @@ export interface PageGeometry {
   /** Oriented full-paper size in mm — feed straight into `@page { size }`. */
   paperWidthMm: number;
   paperHeightMm: number;
+  /** Chosen per-side margin in mm — the sheet's print padding. */
+  marginMm: number;
   /** Full paper in px (content + margins) — the on-screen sheet size. */
   paperWidthPx: number;
   paperHeightPx: number;
-  /** Printable content box in px (paper minus the 12mm margins, floored). */
+  /** Printable content box in px (paper minus the margins, floored). */
   contentWidthPx: number;
   contentHeightPx: number;
-  /** 12mm in px — the sheet's visual padding, 1:1 with the real margins. */
+  /** The margin in px — the sheet's visual padding, 1:1 with print. */
   marginPx: number;
 }
 
-export function pageGeometry(paper: PrintPaper, orientation: PrintOrientation): PageGeometry {
+export function pageGeometry(
+  paper: PrintPaper,
+  orientation: PrintOrientation,
+  margin: PrintMargin = 'normal',
+): PageGeometry {
   const size = PAPER_SIZES_MM[paper];
+  const marginMm = MARGIN_MM[margin];
   const paperWidthMm = orientation === 'landscape' ? size.long : size.short;
   const paperHeightMm = orientation === 'landscape' ? size.short : size.long;
-  const contentWidthPx = Math.floor(mmToPx(paperWidthMm - 2 * PAGE_MARGIN_MM));
-  const contentHeightPx = Math.floor(mmToPx(paperHeightMm - 2 * PAGE_MARGIN_MM));
-  const marginPx = mmToPx(PAGE_MARGIN_MM);
+  const contentWidthPx = Math.floor(mmToPx(paperWidthMm - 2 * marginMm));
+  const contentHeightPx = Math.floor(mmToPx(paperHeightMm - 2 * marginMm));
+  const marginPx = mmToPx(marginMm);
   return {
     paperWidthMm,
     paperHeightMm,
+    marginMm,
     paperWidthPx: contentWidthPx + 2 * marginPx,
     paperHeightPx: contentHeightPx + 2 * marginPx,
     contentWidthPx,
@@ -192,7 +205,8 @@ export interface PrintPage {
 
 export interface PrintLayout {
   geometry: PageGeometry;
-  /** User zoom (1 for 'fit'; N/100 otherwise). */
+  /** User zoom (1 for 'fit' — the job-wide fit growth is baked into the
+   *  BLOCKS by computePrintJob, never into this number; N/100 otherwise). */
   userScale: number;
   /** Width the tile geometry is computed at (contentWidth / userScale). */
   layoutWidth: number;
@@ -253,7 +267,7 @@ export function computePrintLayout(
   options: PrintOptions,
   hasFilterSummary: boolean,
 ): PrintLayout {
-  const geometry = pageGeometry(options.paper, options.orientation);
+  const geometry = pageGeometry(options.paper, options.orientation, options.margin ?? 'normal');
   const userScale = options.scale === 'fit' ? 1 : options.scale / 100;
   const layoutWidth = geometry.contentWidthPx / userScale;
   const headerHeight = headerHeightPx(options, hasFilterSummary);
@@ -386,7 +400,8 @@ export interface PrintSectionInput {
 }
 
 export interface PrintJobSection extends PrintSectionInput {
-  /** This section's own pagination — computePrintLayout, verbatim. */
+  /** This section's own pagination — computePrintLayout, with the job-wide
+   *  'fit' growth factor (if any) already baked into every block. */
   layout: PrintLayout;
   /** Zero-based physical page index of the section's first sheet. */
   startPage: number;
@@ -398,19 +413,173 @@ export interface PrintJob {
   sections: PrintJobSection[];
   /** Physical sheet count across every included dashboard page. */
   totalPages: number;
+  /** Job-wide 'fit' growth factor already applied to every block (1 for the
+   *  percent scales, and whenever no page has room to grow). */
+  fitScale: number;
 }
+
+/* ----------------------------------------------------------- job-wide 'fit'
+ * 'Fit to page' used to be a quiet no-op: it laid tiles out at the printable
+ * width and the only fitting that ever ran was the per-block SHRINK for
+ * oversize bands — a half-empty dashboard printed small in a sea of white.
+ * Real fit: ONE uniform factor for the whole job, the minimum over every
+ * physical page of (available / used) in BOTH axes, so after scaling every
+ * page still fits by construction. Growth is allowed (that is the point) but
+ * capped at 2× so a one-tile dashboard cannot print as a poster; shrink is
+ * never needed because the factor-1 pagination already fits, so the factor is
+ * clamped to [1, cap] (also swallowing float noise from exact-fit pages).
+ *
+ * The factor is applied AFTER pagination through the existing per-block scale
+ * mechanism (the outer box reserves the scaled footprint): page assignments
+ * and page counts never change, the composed pages just zoom uniformly — and
+ * print output is vector, so growth costs no sharpness. One factor for the
+ * WHOLE job (not per page/section) keeps a workbook visually coherent: the
+ * same chart never prints at two sizes on consecutive sheets.
+ *
+ * Per-page constraints:
+ *  - width: the RENDERED extent of each block's tiles (max right edge ×
+ *    block scale), not the block's box width — at the default left alignment
+ *    the block box spans the full layout width even when the dashboard only
+ *    uses half the columns, and counting that empty slack would forbid all
+ *    growth. The grown box may overhang the printable area, but only empty
+ *    space overhangs (the tile extent is what is constrained) and the sheet
+ *    clips it.
+ *  - height: the page-1 header is real text OUTSIDE the block scale
+ *    mechanism and keeps its fixed height, so each section's first page only
+ *    grows into (content height − header). Inter-block gaps scale WITH the
+ *    factor so the composition zooms proportionally.
+ */
+const FIT_GROWTH_CAP = 2;
+
+/** Uniform job growth factor (see block comment). 1 = no room to grow. */
+function jobFitScale(sections: PrintJobSection[], geometry: PageGeometry): number {
+  let factor = FIT_GROWTH_CAP;
+  let constrained = false;
+  for (const section of sections) {
+    section.layout.pages.forEach((page, localIndex) => {
+      if (page.blocks.length === 0) return; // header-only/empty sheet: no bound
+      const headerH = localIndex === 0 ? section.layout.headerHeight : 0;
+      let usedH = 0;
+      let usedW = 0;
+      for (const block of page.blocks) {
+        usedH += block.marginTop + block.height;
+        const extent = block.tiles.reduce((max, tile) => Math.max(max, tile.left + tile.width), 0);
+        usedW = Math.max(usedW, extent * block.scale);
+      }
+      if (usedH > 0) {
+        factor = Math.min(factor, (geometry.contentHeightPx - headerH) / usedH);
+        constrained = true;
+      }
+      if (usedW > 0) {
+        factor = Math.min(factor, geometry.contentWidthPx / usedW);
+        constrained = true;
+      }
+    });
+  }
+  if (!constrained) return 1;
+  // Floored to 3 decimals like every other print scale (rounding UP could
+  // overflow a page); clamped growth-only — see block comment.
+  return Math.max(1, Math.min(FIT_GROWTH_CAP, Math.floor(factor * 1000) / 1000));
+}
+
+/** One block, uniformly grown: footprint, gap and render scale together. */
+const growBlock = (block: PrintBlock, factor: number): PrintBlock => ({
+  ...block,
+  scale: block.scale * factor,
+  width: block.width * factor,
+  height: block.height * factor,
+  marginTop: block.marginTop * factor,
+});
 
 export function computePrintJob(sections: PrintSectionInput[], options: PrintOptions): PrintJob {
   const list: PrintSectionInput[] =
     sections.length > 0
       ? sections
       : [{ pageId: '', title: '', tiles: [], filterSummary: [] }];
-  const out: PrintJobSection[] = [];
+  let out: PrintJobSection[] = [];
   let startPage = 0;
   for (const section of list) {
     const layout = computePrintLayout(section.tiles, options, section.filterSummary.length > 0);
     out.push({ ...section, layout, startPage });
     startPage += layout.pages.length; // computePrintLayout never returns 0 pages
   }
-  return { geometry: out[0]!.layout.geometry, sections: out, totalPages: startPage };
+  const geometry = out[0]!.layout.geometry;
+  // Job-wide fit growth (percent scales are exact user intent — never grown).
+  const fitScale = options.scale === 'fit' ? jobFitScale(out, geometry) : 1;
+  if (fitScale !== 1) {
+    out = out.map((section) => ({
+      ...section,
+      layout: {
+        ...section.layout,
+        pages: section.layout.pages.map((page) => ({
+          blocks: page.blocks.map((block) => growBlock(block, fitScale)),
+        })),
+      },
+    }));
+  }
+  return { geometry, sections: out, totalPages: startPage, fitScale };
 }
+
+/* ------------------------------------------------------------ print page CSS
+ * @page cannot be parameterized from a static stylesheet, so
+ * DashboardPrintView injects this string as a runtime <style> for the
+ * lifetime of the overlay. Built here — pure — so unit tests can assert the
+ * exact CSS a given option set prints with.
+ *
+ * Page-box model: `@page { margin: 0 }` hands the WHOLE sheet of paper to the
+ * layout and each .rcd-print-sheet IS one sheet — pinned to the exact paper
+ * mm size (mm beats the on-screen inline px, which are only a 96dpi
+ * round-trip of the same numbers), with the chosen margin as PADDING
+ * (border-box, so the padding carves out exactly the printable area the
+ * pagination math used). The browser is left with no margin arithmetic of its
+ * own to disagree with: preview and paper agree by construction, and the
+ * browser dialog's "Margins: Default" resolves to our @page margins (0).
+ * Height sits 1px shy of the paper so the mm→px round-trip can never spill a
+ * sheet onto a stray blank page. Everything geometry-independent (page
+ * breaks, chrome hiding, box-sizing/overflow, the 100%-height content box)
+ * lives statically in rcd.css.
+ */
+export function printPageCss(options: PrintOptions): string {
+  const geometry = pageGeometry(options.paper, options.orientation, options.margin ?? 'normal');
+  return [
+    `@page { size: ${geometry.paperWidthMm}mm ${geometry.paperHeightMm}mm; margin: 0; }`,
+    '@media print {',
+    '  body.rcd-printing .rcd-print-sheet {',
+    `    width: ${geometry.paperWidthMm}mm !important;`,
+    `    height: calc(${geometry.paperHeightMm}mm - 1px) !important;`,
+    `    padding: ${geometry.marginMm}mm !important;`,
+    '  }',
+    '}',
+  ].join('\n');
+}
+
+/* --------------------------------------------------- browser-dialog checklist
+ * The browser's own print dialog re-asks for destination, paper, layout,
+ * margins, scale and its header/footer strip — and any mismatch there
+ * silently defeats the geometry above (printer drivers rescale mismatched
+ * stock; the header strip overlays the page edge). The config dialog and the
+ * preview toolbar both render this option-driven checklist so the words can
+ * never drift from the chosen job.
+ */
+const PAPER_SHORT_LABEL: Record<PrintPaper, string> = {
+  letter: 'Letter',
+  a4: 'A4',
+  legal: 'Legal',
+  tabloid: 'Tabloid',
+};
+
+export function printBrowserChecklist(options: PrintOptions): string[] {
+  return [
+    'Destination: "Save as PDF" (for exact output)',
+    `Paper: ${PAPER_SHORT_LABEL[options.paper]}`,
+    `Layout: ${options.orientation === 'landscape' ? 'Landscape' : 'Portrait'}`,
+    // 'Default' because @page { margin: 0 } IS the default the browser reads.
+    'Margins: Default',
+    'Scale: 100%',
+    'Headers and footers: off',
+  ];
+}
+
+/** Stock physical printers rarely hold — drivers then silently rescale. */
+export const isUncommonPaper = (paper: PrintPaper): boolean =>
+  paper !== 'letter' && paper !== 'a4';

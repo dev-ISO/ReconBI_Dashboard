@@ -539,6 +539,12 @@ export interface ChartFormat {
    * respects it.
    */
   titleStyle?: TextStyle;
+  /**
+   * KPI value styling. fontSize (px) OVERRIDES the KPI's container-query
+   * auto-fit — set it only to pin an exact size; leave unset to let the value
+   * shrink-to-fit its tile (screen and print alike).
+   */
+  kpiValueStyle?: TextStyle;
   /** Styling for the x/y axis title labels (xAxisLabel / yAxisLabel). */
   axisTitleStyle?: TextStyle;
   /** Styling for legend text; the table chart's header row uses it too. */

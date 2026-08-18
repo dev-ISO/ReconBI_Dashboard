@@ -19,8 +19,8 @@ import type { PrintOptions } from './PrintConfigDialog';
 import { usePrintSections } from './usePrintSections';
 import {
   computePrintJob,
-  pageGeometry,
-  PAGE_MARGIN_MM,
+  printBrowserChecklist,
+  printPageCss,
   type ChartTileEntry,
   type PrintBlock,
   type PrintJobSection,
@@ -94,9 +94,9 @@ export interface PrintSheetsProps {
 /**
  * The paginated stack of paper sheets, shared by the full-screen preview and
  * the config dialog's live thumbnail (same computePrintJob — same pages).
- * Every sheet is rendered at the paper's EXACT px size (96dpi) with the 12mm
- * margin as padding, so the on-screen preview is 1:1 with the printed page,
- * orientation included. Sheets are `pointer-events: none` — charts never
+ * Every sheet is rendered at the paper's EXACT px size (96dpi) with the
+ * chosen margin as padding, so the on-screen preview is 1:1 with the printed
+ * page, orientation included. Sheets are `pointer-events: none` — charts never
  * react to hover/click in a preview.
  *
  * Workbook jobs: each section (dashboard page) starts on a fresh sheet, its
@@ -186,9 +186,11 @@ export function PrintSheets({
         key={`${section.pageId || 'section'}-${localIndex}`}
         className="rcd-print-page mx-auto mb-6 w-fit last:mb-0"
       >
-        {/* The white sheet: full paper px; the padding IS the 12mm margin
-            (visual 1:1). For print the padding/height are stripped — @page
-            applies the real margins and the content defines the height. */}
+        {/* The white sheet: full paper px; the padding IS the chosen margin
+            (visual 1:1). In print the sheet KEEPS this box — the injected
+            printPageCss re-pins it to the exact paper mm size while @page
+            { margin: 0 } hands it the whole physical sheet, so the padding
+            here becomes the real print margin. */}
         <section
           aria-label={`Page ${pageIndex + 1} of ${totalPages}`}
           className="rcd-print-sheet pointer-events-none select-none bg-white shadow-xl"
@@ -206,8 +208,8 @@ export function PrintSheets({
               // Composed-content placement inside the printable area. The
               // pagination math is unchanged (it measures from the top);
               // this only distributes the leftover slack. In PRINT the sheet
-              // height goes auto, so DashboardPrintView injects a matching
-              // min-height whenever the vertical setting is not 'top'.
+              // keeps its page box and rcd.css stretches this inner box to
+              // 100% of it, so alignment behaves identically on paper.
               justifyContent: VERTICAL_ALIGN[options.alignV ?? 'top'],
               alignItems: HORIZONTAL_ALIGN[options.alignH ?? 'left'],
             }}
@@ -384,38 +386,22 @@ export function DashboardPrintView({ options, onClose }: DashboardPrintViewProps
   }, []);
 
   // @page cannot be parameterized from a static stylesheet — inject the chosen
-  // paper/orientation as a runtime <style> for the lifetime of the overlay.
-  // EXPLICIT mm dimension pairs (width first — landscape = wider first): Chrome
-  // honors dimension pairs far more reliably than the orientation keywords.
-  // Pinning html/body to the printable width keeps the print layout engine at
-  // the exact width the sheets were computed for.
+  // paper/orientation/margins as a runtime <style> for the lifetime of the
+  // overlay. printLayout.printPageCss builds the text (pure, unit-tested):
+  // EXPLICIT mm dimension pairs (width first — landscape = wider first, which
+  // Chrome honors far more reliably than the orientation keywords), @page
+  // margin 0, and the sheet pinned to the exact paper mm box with the margin
+  // as padding — the browser has no margin arithmetic of its own, so what the
+  // preview shows is what prints. No html/body width pin and no alignment
+  // min-height hack any more: the sheet keeps its page box in print and
+  // rcd.css stretches the inner content box to 100% of it.
   useEffect(() => {
-    const geometry = pageGeometry(options.paper, options.orientation);
     const styleEl = document.createElement('style');
     styleEl.setAttribute('data-rcd-print', '');
-    // Vertical content alignment needs a page-tall box to distribute slack in,
-    // but the print rules deliberately let each sheet go height:auto (so a
-    // rounding hair can never spill onto a blank page). Re-establish the box
-    // as a MIN-height, one pixel shy of the @page content area, and only when
-    // the setting actually asks for it — 'top' stays byte-identical to before.
-    const contentHeightMm = geometry.paperHeightMm - 2 * PAGE_MARGIN_MM;
-    const alignV = options.alignV ?? 'top';
-    styleEl.textContent = [
-      `@page { size: ${geometry.paperWidthMm}mm ${geometry.paperHeightMm}mm; margin: ${PAGE_MARGIN_MM}mm; }`,
-      '@media print {',
-      `  html, body { width: ${geometry.contentWidthPx}px !important; height: auto !important; }`,
-      ...(alignV === 'top'
-        ? []
-        : [
-            '  body.rcd-printing .rcd-print-sheet-inner {',
-            `    min-height: calc(${contentHeightMm}mm - 1px) !important;`,
-            '  }',
-          ]),
-      '}',
-    ].join('\n');
+    styleEl.textContent = printPageCss(options);
     document.head.appendChild(styleEl);
     return () => styleEl.remove();
-  }, [options.paper, options.orientation, options.alignV]);
+  }, [options.paper, options.orientation, options.margin]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -437,8 +423,11 @@ export function DashboardPrintView({ options, onClose }: DashboardPrintViewProps
       {/* On-screen toolbar; hidden by the @media print rules. */}
       <div className="rcd-print-toolbar sticky top-0 z-10 flex items-center gap-3 bg-[#1c1c1f] px-4 py-2.5 shadow-md">
         <span className="shrink-0 text-sm font-semibold text-white">Print preview</span>
+        {/* Same option-driven checklist the config dialog shows — the browser
+            dialog re-asks for all of this and a mismatch silently defeats the
+            page geometry. */}
         <span className="hidden min-w-0 truncate text-xs text-white/60 sm:inline">
-          Use &ldquo;Save as PDF&rdquo; as the destination in the print dialog.
+          In the browser dialog set: {printBrowserChecklist(options).join(' · ')}
         </span>
         <div className="min-w-0 flex-1" />
         <RcdButton variant="primary" onClick={() => window.print()}>

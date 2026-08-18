@@ -44,6 +44,7 @@ import {
   formatCellValue,
   sanitizeRichHtml,
   seriesColor,
+  seriesStyleLookup,
   type AxisValueFormat,
   type CellValue,
   type ChartFormat,
@@ -58,6 +59,7 @@ import {
 } from '@recon/dashboards-core';
 import {
   COLOR_INDEX_KEY,
+  legacyMeasureColumnLabels,
   measureNameForKey,
   RAW_AXIS_KEY,
   shapeChartData,
@@ -911,7 +913,11 @@ function secondarySeriesKeys(
   const matches = (s: ChartSeries) =>
     names.has(s.styleKey) ||
     names.has(s.label) ||
-    (s.measureLabel !== undefined && names.has(s.measureLabel));
+    (s.measureLabel !== undefined && names.has(s.measureLabel)) ||
+    // Pre-Wave-21 raw-form keys (ChartSeries.legacyStyleKey contract): an
+    // assignment saved before friendly labels still moves its series.
+    (s.legacyStyleKey !== undefined && names.has(s.legacyStyleKey)) ||
+    (s.legacyMeasureLabel !== undefined && names.has(s.legacyMeasureLabel));
   const hits = series.filter(matches);
   if (hits.length === 0) return new Set();
   if (stacked) return new Set(series.map((s) => s.key));
@@ -1320,15 +1326,27 @@ function useNeighbourMarks(
       return;
     }
     const origin = wrapper.getBoundingClientRect();
+    // Unit normalization: getBoundingClientRect deltas are VISUAL px, but the
+    // whole placement pipeline (tooltip `coordinate`, usePlotArea, the card's
+    // offsetWidth/Height size) works in the container's LAYOUT px. Under a
+    // scaled ancestor (the dashboard's fit-to-page viewport) the two diverge
+    // and the card dodged phantom boxes — divide by the effective scale, read
+    // once per measurement from the wrapper's own rect/offset ratio (free on
+    // the hover path; both rects are already in hand).
+    const wrapperEl = wrapper as HTMLElement;
+    const scaleX = wrapperEl.offsetWidth > 0 ? origin.width / wrapperEl.offsetWidth : 1;
+    const scaleY = wrapperEl.offsetHeight > 0 ? origin.height / wrapperEl.offsetHeight : 1;
+    const safeX = scaleX > 0.01 ? scaleX : 1;
+    const safeY = scaleY > 0.01 ? scaleY : 1;
     const next: TipBox[] = [];
     nodes.forEach((node) => {
       const r = node.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) return;
       next.push({
-        left: r.left - origin.left,
-        top: r.top - origin.top,
-        right: r.right - origin.left,
-        bottom: r.bottom - origin.top,
+        left: (r.left - origin.left) / safeX,
+        top: (r.top - origin.top) / safeY,
+        right: (r.right - origin.left) / safeX,
+        bottom: (r.bottom - origin.top) / safeY,
       });
     });
     setMarks(next);
@@ -2492,8 +2510,13 @@ function CartesianChart({
     const onSecondary = Boolean(ref.secondary);
     if (onSecondary && !hasSecondary) return [];
     const target =
-      (ref.measureKey ? shaped.series.find((s) => s.styleKey === ref.measureKey) : undefined) ??
-      shaped.series[0];
+      (ref.measureKey
+        ? shaped.series.find(
+            // legacyStyleKey: reference lines saved against a pre-Wave-21
+            // measure label keep anchoring to their series.
+            (s) => s.styleKey === ref.measureKey || s.legacyStyleKey === ref.measureKey,
+          )
+        : undefined) ?? shaped.series[0];
     const value = referenceLineValue(ref, target ? seriesValues(shaped.data, target.key) : []);
     if (value === null) return [];
     return [
@@ -2738,7 +2761,11 @@ function CartesianChart({
               </Bar>
             );
           }
-          const lineStyle = format.lineStyles?.[series.styleKey];
+          const lineStyle = seriesStyleLookup(
+            format.lineStyles,
+            series.styleKey,
+            series.legacyStyleKey,
+          );
           // Selection on line/area: series failing the legend facet dim to
           // 0.35 (selection wins over the hover dim); series that match get
           // an enlarged accent-ringed dot on the selected category.
@@ -3744,8 +3771,12 @@ export default function ChartRenderer({
       const primaryValue = row[result.columns.indexOf(primary)] ?? null;
       const secondary = measureColumns[1];
       const secondaryValue = secondary ? (row[result.columns.indexOf(secondary)] ?? null) : null;
-      const kpiLabel = (column: QueryColumn): string =>
-        format.seriesLabels?.[column.label] ?? column.label;
+      // Pre-Wave-21 label forms per measure column (undefined = identical) —
+      // the legacy fallback keys for renames/rules saved before friendly
+      // labels (ChartSeries.legacyStyleKey contract).
+      const kpiLegacyLabels = legacyMeasureColumnLabels(measureColumns, spec);
+      const kpiLabel = (column: QueryColumn, legacyLabel?: string): string =>
+        seriesStyleLookup(format.seriesLabels, column.label, legacyLabel) ?? column.label;
       // 'kpi' conditional rules color the primary value text (keyed by the
       // measure's DEFAULT label, like every other measureKey).
       const kpiColor = conditionalColor(
@@ -3753,15 +3784,35 @@ export default function ChartRenderer({
         'kpi',
         primary.label,
         primaryValue,
+        kpiLegacyLabels[0],
       );
 
       return (
-        <div className="flex h-full flex-col items-center justify-center gap-2 p-4 text-center">
+        // [container-type:size]: the box is definitively sized (h-full in the
+        // tile body), so it can be a size query container for the value's
+        // auto-fit clamp below. `safe center` on BOTH axes: when the value
+        // still overflows (pinned fontSize, tiny tile), overflow aligns to
+        // the START so the first line stays readable instead of the old
+        // plain-center behavior shaving glyphs off BOTH ends — the "AUG 18,
+        // 2026 gets cut off top and bottom" print bug.
+        <div className="flex h-full flex-col [container-type:size] [justify-content:safe_center] [align-items:safe_center] gap-2 p-4 text-center">
           {/* leading-none: the number's font box otherwise sits optically low
-              in the tile (4xl line-height adds ~25% dead space above/below). */}
+              in the tile (4xl line-height adds ~25% dead space above/below).
+              Font size auto-fits the tile via container-query clamp (print
+              lays tiles out 30-50% narrower than screen at identical font
+              sizes — the whole reason dates clipped on paper); an explicit
+              format.kpiValueStyle.fontSize wins over the clamp (inline style
+              beats class). tabular-nums only for numbers — it widens date
+              letterforms for no benefit. overflow-wrap so an unbreakable
+              token (ISO date, long id) wraps instead of spilling. */}
           <div
-            className="text-4xl font-semibold leading-none tracking-tight tabular-nums text-rcd-text"
-            style={kpiColor ? { color: kpiColor } : undefined}
+            className={`min-w-0 max-w-full [font-size:clamp(1.125rem,min(13cqw,26cqh),2.25rem)] font-semibold leading-none tracking-tight [overflow-wrap:anywhere] text-rcd-text ${
+              typeof primaryValue === 'number' ? 'tabular-nums' : ''
+            }`}
+            style={{
+              ...textStyleToCss(format.kpiValueStyle),
+              ...(kpiColor ? { color: kpiColor } : {}),
+            }}
           >
             {kpiText(primaryValue, primary)}
           </div>
@@ -3769,7 +3820,7 @@ export default function ChartRenderer({
             className="text-xs font-medium uppercase tracking-[0.08em] text-rcd-text-2"
             style={textStyleToCss(format.titleStyle)}
           >
-            {kpiLabel(primary)}
+            {kpiLabel(primary, kpiLegacyLabels[0])}
           </div>
           {secondary && (
             // Delta-ready secondary row: value leads in weight, its label
@@ -3778,7 +3829,7 @@ export default function ChartRenderer({
               <span className="font-medium tabular-nums text-rcd-text-2">
                 {kpiText(secondaryValue, secondary)}
               </span>
-              <span className="text-xs text-rcd-muted">{kpiLabel(secondary)}</span>
+              <span className="text-xs text-rcd-muted">{kpiLabel(secondary, kpiLegacyLabels[1])}</span>
             </div>
           )}
         </div>

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, BellPlus, CopyPlus, CornerUpLeft, FileDown, Rows3, Table2, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, BellPlus, CopyPlus, CornerUpLeft, FileDown, Pencil, Rows3, Table2, Zap } from 'lucide-react';
 import type { FilterClause } from '@recon/dashboards-core';
 
 /** One candidate drillthrough page for the clicked point. */
@@ -51,6 +51,14 @@ export interface PointContextMenuProps {
    * absent (the point-level menu instance doesn't pass it).
    */
   onCopyChart?: (() => void) | null;
+  /**
+   * "Edit chart…" — jump straight from view mode into edit mode with this
+   * chart's builder open. Passed only when the viewer can enter edit mode;
+   * hidden otherwise. Exists because a frameless (hideHeader) tile shows no
+   * edit chrome at all in view mode, so tables especially read as "not
+   * editable" — this is the discoverable path.
+   */
+  onEdit?: (() => void) | null;
   onExport: (mode: 'summarized' | 'underlying') => void;
   onClose: () => void;
 }
@@ -72,6 +80,7 @@ export function PointContextMenu({
   seeRecords = null,
   onSetAlert = null,
   onCopyChart = null,
+  onEdit = null,
   onExport,
   onClose,
 }: PointContextMenuProps) {
@@ -116,6 +125,17 @@ export function PointContextMenu({
       onContextMenu={(event) => event.preventDefault()}
       className="fixed z-50 flex w-52 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
     >
+      {onEdit && (
+        <ActionItem
+          icon={<Pencil size={14} />}
+          onClick={() => {
+            onEdit();
+            onClose();
+          }}
+        >
+          Edit chart…
+        </ActionItem>
+      )}
       {(onSeeData || seeRecords) && (
         <>
           {onSeeData && (

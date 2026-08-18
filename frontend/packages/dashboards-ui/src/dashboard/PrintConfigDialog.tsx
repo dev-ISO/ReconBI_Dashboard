@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Printer } from 'lucide-react';
 import { RcdButton, RcdDialog, RcdSelect } from '../primitives';
 import { PrintSheets } from './DashboardPrintView';
-import { computePrintJob } from './printLayout';
+import { computePrintJob, isUncommonPaper, printBrowserChecklist } from './printLayout';
 import { usePrintSections } from './usePrintSections';
 
 /** Paper stock the print pipeline can size (valid CSS `@page size` keywords). */
@@ -12,6 +12,14 @@ export type PrintOrientation = 'landscape' | 'portrait';
 
 /** 'grid' preserves the dashboard geometry; 'sequential' = one tile per row. */
 export type PrintTileFlow = 'grid' | 'sequential';
+
+/**
+ * Page-margin preset, applied to all four sides. 'normal' is the historic
+ * hard-coded 12mm; 'narrow' halves it; 'none' hands the whole sheet to
+ * content (@page prints edge-to-edge — physical printers still clip their
+ * unprintable border, so 'none' is really a save-as-PDF affordance).
+ */
+export type PrintMargin = 'normal' | 'narrow' | 'none';
 
 /** Where the composed content sits inside the printable area. */
 export type PrintAlignH = 'left' | 'center' | 'right';
@@ -27,10 +35,15 @@ export type PrintPagesMode = 'current' | 'all' | 'custom';
 export interface PrintOptions {
   paper: PrintPaper;
   orientation: PrintOrientation;
+  /** Margin preset — decides the printable area every layout number uses. */
+  margin: PrintMargin;
   /**
-   * 'fit' lays tiles out at exactly the printable page width. A number is a
-   * zoom percentage: 50 halves tile/text size (more content per page), 150
-   * enlarges — the layout width compensates so the page width is always full.
+   * 'fit' lays tiles out at the printable page width, then grows the WHOLE
+   * job by one uniform factor (capped at 2×) until the tightest page runs out
+   * of width or height — small dashboards actually fill the paper. A number
+   * is a zoom percentage: 50 halves tile/text size (more content per page),
+   * 150 enlarges — the layout width compensates so the page width is always
+   * full.
    */
   scale: 'fit' | number;
   flow: PrintTileFlow;
@@ -60,6 +73,7 @@ export interface PrintOptions {
 const DEFAULT_OPTIONS: PrintOptions = {
   paper: 'letter',
   orientation: 'landscape',
+  margin: 'normal',
   scale: 'fit',
   flow: 'grid',
   alignH: 'left',
@@ -86,8 +100,14 @@ const ORIENTATION_OPTIONS: { value: PrintOrientation; label: string }[] = [
   { value: 'portrait', label: 'Portrait' },
 ];
 
+const MARGIN_OPTIONS: { value: PrintMargin; label: string }[] = [
+  { value: 'normal', label: 'Normal (12 mm)' },
+  { value: 'narrow', label: 'Narrow (6 mm)' },
+  { value: 'none', label: 'None' },
+];
+
 const SCALE_OPTIONS: { value: string; label: string }[] = [
-  { value: 'fit', label: 'Fit to page width' },
+  { value: 'fit', label: 'Fit to page' },
   { value: '50', label: '50%' },
   { value: '75', label: '75%' },
   { value: '100', label: '100%' },
@@ -291,6 +311,20 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
                 }
               >
                 {ORIENTATION_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </RcdSelect>
+            </Field>
+
+            <Field label="Margins">
+              <RcdSelect
+                aria-label="Margins"
+                value={draft.margin}
+                onChange={(event) => patch({ margin: event.target.value as PrintMargin })}
+              >
+                {MARGIN_OPTIONS.map((option) => (
                   <option key={option.value} value={option.value}>
                     {option.label}
                   </option>
@@ -531,12 +565,21 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
             The preview uses the exact printed page geometry — every page here matches the PDF,
             page for page.
           </p>
-          {/* Browsers give web pages no way to preselect a destination: an app
-              "Printer" dropdown here could not do anything. Say so instead. */}
+          {/* Browsers give web pages no way to preset the print dialog (destination,
+              stock, header strip…), and any mismatch there silently defeats the
+              geometry above. Spell out the exact settings, driven by the current
+              options so the words can never drift from the chosen job. */}
           <p className="text-[11px] leading-4 text-rcd-muted">
-            Pick the printer (or <span className="font-medium">Save as PDF</span>) and its DPI in
-            the browser print dialog that opens next — browsers do not let a web page choose it.
+            In the browser dialog that opens next set:{' '}
+            <span className="font-medium">{printBrowserChecklist(draft).join(' · ')}</span>.
           </p>
+          {isUncommonPaper(draft.paper) && (
+            <p className="text-[11px] leading-4 text-[var(--rcd-status-warn)]" role="alert">
+              {draft.paper === 'legal' ? 'Legal' : 'Tabloid'} stock: physical printers silently
+              rescale the page when the loaded paper does not match. Use{' '}
+              <span className="font-medium">Save as PDF</span> for exact output.
+            </p>
+          )}
         </div>
       </div>
     </RcdDialog>

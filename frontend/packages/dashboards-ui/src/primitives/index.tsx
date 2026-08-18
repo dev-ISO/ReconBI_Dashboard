@@ -146,6 +146,30 @@ const clampDialogPos = (x: number, y: number, w: number, h: number): DialogPoint
  */
 const lastDialogGeometries = new Map<string, { pos: DialogPoint | null; size: DialogSize | null }>();
 
+/**
+ * Module-level stack of OPEN RcdDialogs, pushed on open in mount order (a
+ * nested dialog mounts after — thus above — its opener). Two jobs:
+ *
+ *  - Escape routing: every open dialog listens on `document`, and
+ *    stopPropagation cannot stop SIBLING listeners on the same target — so one
+ *    Escape used to close a confirm dialog AND the builder under it,
+ *    discarding the draft. Only the TOPMOST dialog answers Escape now (plus
+ *    stopImmediatePropagation as a belt against later-registered document
+ *    listeners).
+ *  - a modal-open signal (anyDialogOpen) for global hotkey handlers: the
+ *    dashboard's Ctrl+Z/Y must not mutate the document invisibly behind an
+ *    open modal.
+ */
+const dialogStack: object[] = [];
+
+const releaseDialog = (token: object): void => {
+  const index = dialogStack.indexOf(token);
+  if (index !== -1) dialogStack.splice(index, 1);
+};
+
+/** True while any RcdDialog (or a dialog built on it) is open. */
+export const anyDialogOpen = (): boolean => dialogStack.length > 0;
+
 /** Focus-trapped modal; Esc closes. No browser dialogs anywhere in the library. */
 export function RcdDialog({
   title,
@@ -265,8 +289,14 @@ export function RcdDialog({
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
+  // Stable identity of THIS dialog instance on the module dialog stack.
+  const stackToken = useRef<object | null>(null);
+  if (stackToken.current === null) stackToken.current = {};
+
   useEffect(() => {
     if (!open) return;
+    const token = stackToken.current!;
+    dialogStack.push(token);
     const previouslyFocused = document.activeElement as HTMLElement | null;
     // Focus the first focusable element (not the panel), and never steal focus
     // when it is already inside the panel (e.g. an autoFocus input) — stealing
@@ -281,6 +311,15 @@ export function RcdDialog({
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
+        // Only the TOPMOST open dialog answers Escape — every open dialog has
+        // a listener on `document`, and stopPropagation never stopped SIBLING
+        // document listeners, so nested-dialog Escape closed the whole stack
+        // (confirm + builder, discarding the draft). The stack check makes
+        // exactly one dialog act regardless of listener order;
+        // stopImmediatePropagation additionally halts any later-registered
+        // document handlers for this keypress.
+        if (dialogStack[dialogStack.length - 1] !== token) return;
+        event.stopImmediatePropagation();
         event.stopPropagation();
         onCloseRef.current();
       }
@@ -303,6 +342,7 @@ export function RcdDialog({
 
     document.addEventListener('keydown', onKeyDown);
     return () => {
+      releaseDialog(token);
       document.removeEventListener('keydown', onKeyDown);
       // Runs only on true close/unmount now (see the dep note above), so the
       // opener gets focus back exactly once, when the dialog actually leaves.

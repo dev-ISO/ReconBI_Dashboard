@@ -105,6 +105,9 @@ export function SlicerConfigMenu({
     if (confirmRemove) return;
     const onPointerDown = (event: MouseEvent) => {
       if (cardRef.current && event.target instanceof Node && !cardRef.current.contains(event.target)) {
+        // Outside click means "done here", not "discard" — commit the
+        // pending rename/month drafts first (PageTabs' rename contract).
+        commitDraftsRef.current();
         onClose();
       }
     };
@@ -198,6 +201,25 @@ export function SlicerConfigMenu({
       : pinnedMonth !== null
         ? 'pinned'
         : 'current';
+
+  // Commit for the OUTSIDE-CLICK close path: document-level mousedown closes
+  // and unmounts the card before React delivers the focused input's blur, so
+  // a rename (or pinned month) typed without tabbing away was silently
+  // dropped. Latest-ref pattern because the close effect must not re-bind per
+  // keystroke. Escape still cancels — closing without committing is its
+  // contract; the drafts die with the card.
+  const commitDraftsOnClose = () => {
+    commitLabel();
+    if (
+      initialMonthMode === 'pinned' &&
+      MONTH_PIN.test(monthDraft) &&
+      monthDraft !== pinnedMonth
+    ) {
+      patchDateRange({ initialMonth: monthDraft });
+    }
+  };
+  const commitDraftsRef = useRef(commitDraftsOnClose);
+  commitDraftsRef.current = commitDraftsOnClose;
 
   const appliesToSummary = allCharts
     ? 'All charts'
@@ -477,8 +499,13 @@ export function SlicerConfigMenu({
                           aria-label="Calendar initial month (YYYY-MM)"
                           onChange={(event) => setMonthDraft(event.target.value)}
                           onBlur={() => {
+                            // Commit when valid; a PARTIAL draft is left in
+                            // place — blur fires on ANY focus move inside the
+                            // card (picking "Opens on", ticking a checkbox),
+                            // and resetting here wiped a half-typed YYYY-MM
+                            // mid-edit. Unfinished drafts simply die with the
+                            // card on close.
                             if (MONTH_PIN.test(monthDraft)) patchDateRange({ initialMonth: monthDraft });
-                            else setMonthDraft(pinnedMonth ?? monthOf(todayDateOnly()));
                           }}
                           onKeyDown={(event) => {
                             if (event.key === 'Enter' && MONTH_PIN.test(monthDraft)) {

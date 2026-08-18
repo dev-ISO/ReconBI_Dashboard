@@ -42,7 +42,14 @@ import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuil
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
-import { ConfirmDialog, RcdButton, RcdDialog, RcdSelect, RcdSpinner } from '../primitives';
+import {
+  anyDialogOpen,
+  ConfirmDialog,
+  RcdButton,
+  RcdDialog,
+  RcdSelect,
+  RcdSpinner,
+} from '../primitives';
 import { ActivityPanel } from './ActivityPanel';
 import { AddSlicerDialog } from './AddSlicerDialog';
 import { ShareDialog } from './ShareDialog';
@@ -297,6 +304,14 @@ export function DashboardView({
     spec: ChartSpec;
     initialTab?: 'fields' | 'format';
   } | null>(null);
+  /**
+   * The mounted ChartBuilder's GUARDED close (its Cancel flow: dirty →
+   * confirm, clean → close), filled via requestCloseRef. The builder dialog's
+   * own onClose (Escape / backdrop / ✕) routes through it so no close path
+   * can silently discard an edited draft; null (no builder mounted — model
+   * missing/loading placeholder bodies) closes directly.
+   */
+  const builderCloseRef = useRef<(() => void) | null>(null);
   /** Right-click context card on a CHART tile (edit mode only). */
   const [chartMenu, setChartMenu] = useState<{
     tileId: string;
@@ -468,6 +483,12 @@ export function DashboardView({
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       const key = event.key.toLowerCase();
       if (key !== 'z' && key !== 'y') return;
+      // Any open modal (chart builder, image dialog, confirms, …) suspends
+      // the dashboard hotkeys entirely: focus often sits on a BUTTON inside
+      // the dialog, which slips past the input guard below, and Ctrl+Z then
+      // mutated the document invisibly behind the modal — with Save wiping
+      // the redo stack, those edits were unrecoverable.
+      if (anyDialogOpen()) return;
       const target = event.target instanceof HTMLElement ? event.target : null;
       if (target && (target.isContentEditable || target.closest('input, textarea, select'))) return;
       event.preventDefault();
@@ -695,6 +716,12 @@ export function DashboardView({
   // send neither keep the historic "the chart's one category dimension" path.
   const handleDatumClick = useCallback(
     (tileId: string, chart: ChartSpec, info: ChartDatumClickInfo, columns: QueryColumn[] | null) => {
+      // EDIT mode: a datum click only ever SELECTS the tile (the grid's
+      // onSelect has already run) — cross-filtering while authoring
+      // reshuffled every other tile's data on a mere layout click, a
+      // transient state no viewer would ever see. Read off the store so the
+      // callback stays dependency-free (existing doctrine below).
+      if (runtime.dashboards.store.getState().mode === 'edit') return;
       // The chart's own category dimension: what an unqualified click means.
       const fallback =
         chart.type === 'pie' || chart.type === 'donut'
@@ -1545,6 +1572,22 @@ export function DashboardView({
     setBuilder(null);
   };
 
+  /**
+   * View-mode "Edit chart…" (the context menus' discoverability path — a
+   * frameless tile shows no edit chrome at all, so tables especially read as
+   * "not editable"): one click enters edit mode AND opens this tile's builder.
+   * Always the AUTHORED tile spec, never a drilled/filtered effective one
+   * (same doctrine as onCopyChart). Guarded so an already-running edit
+   * session is never re-entered (enterEdit would re-snapshot the backup and
+   * clear undo history mid-session).
+   */
+  const editChartFromView = (tileId: string) => {
+    const tile = tiles.find((t) => t.id === tileId);
+    if (!tile || !isChartTile(tile)) return;
+    if (mode !== 'edit') runtime.dashboards.enterEdit();
+    setBuilder({ tileId, spec: tile.chart });
+  };
+
   if (!current || current.id !== dashboardId) {
     if (openError) {
       return (
@@ -1697,6 +1740,7 @@ export function DashboardView({
         }))}
         onSave={handleBuilderSave}
         onCancel={() => setBuilder(null)}
+        requestCloseRef={builderCloseRef}
       />
     );
   })();
@@ -2192,6 +2236,8 @@ export function DashboardView({
                   ? () => openAlertFor(pointMenu.tileId, pointMenu.chart)
                   : null
               }
+              // Offered only to users who may edit at all (canEnterEdit).
+              onEdit={canEnterEdit ? () => editChartFromView(pointMenu.tileId) : null}
               onExport={(exportMode) => void exportChartCsv(pointMenu.tileId, exportMode)}
               onClose={() => setPointMenu(null)}
             />
@@ -2227,6 +2273,8 @@ export function DashboardView({
                 const authored = tiles.find((t) => t.id === tileMenu.tileId);
                 if (authored && isChartTile(authored)) setCopyChartSpec(authored.chart);
               }}
+              // Offered only to users who may edit at all (canEnterEdit).
+              onEdit={canEnterEdit ? () => editChartFromView(tileMenu.tileId) : null}
               onExport={(exportMode) => void exportChartCsv(tileMenu.tileId, exportMode)}
               onClose={() => setTileMenu(null)}
             />
@@ -2253,7 +2301,13 @@ export function DashboardView({
       <RcdDialog
         title={builder?.tileId ? 'Edit chart' : 'Add chart'}
         open={builder !== null}
-        onClose={() => setBuilder(null)}
+        // Escape/backdrop/✕ go through the builder's dirty-confirm (see
+        // builderCloseRef) — the builder itself calls onCancel/onSave, which
+        // setBuilder(null) via their own handlers.
+        onClose={() => {
+          if (builderCloseRef.current) builderCloseRef.current();
+          else setBuilder(null);
+        }}
         wide
         draggable
         resizable

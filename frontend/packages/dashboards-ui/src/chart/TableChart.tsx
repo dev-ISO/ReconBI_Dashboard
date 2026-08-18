@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import {
   formatCellValue,
+  seriesStyleLookup,
   type CellValue,
   type ChartPointEvent,
   type ChartSpec,
@@ -31,6 +32,7 @@ import {
   type QueryResult,
 } from '@recon/dashboards-core';
 import { conditionalColor, matchRuleColor } from './analytics';
+import { legacyMeasureColumnLabels } from './chartData';
 import { textStyleToCss } from './textStyle';
 import type { ChartDatumClickInfo, ChartDatumFacet, ChartSelection } from './ChartRenderer';
 
@@ -841,7 +843,7 @@ function HeaderMenu({
         className={`shrink-0 rounded p-0.5 hover:bg-black/10 dark:hover:bg-white/10 ${
           active || open
             ? 'text-rcd-accent opacity-100'
-            : 'text-rcd-muted opacity-0 focus-visible:opacity-100 group-hover:opacity-100'
+            : 'text-rcd-muted opacity-0 focus-visible:opacity-100 group-hover/th:opacity-100'
         }`}
       >
         <ChevronDown size={12} />
@@ -906,6 +908,16 @@ export function TableChart({
   // only guards the single-page path.
   const rows = paged ? result.rows : result.rows.slice(0, TABLE_ROW_CAP);
   const measureColumns = result.columns.filter((c) => c.role === 'measure');
+  // Pre-Wave-21 label form per measure column (undefined = identical) — the
+  // legacy fallback key for seriesLabels / conditionalFormats saved before
+  // friendly labels re-labeled inline measures (ChartSeries.legacyStyleKey
+  // contract). Keyed by column NAME so per-cell lookups stay O(1).
+  const legacyLabelByName = new Map<string, string | undefined>(
+    legacyMeasureColumnLabels(measureColumns, spec).map((legacy, i) => [
+      measureColumns[i]!.name,
+      legacy,
+    ]),
+  );
 
   // ---- structural styling from TableOptions --------------------------------
   const headerAlign = table.headerAlign ?? 'center';
@@ -975,9 +987,14 @@ export function TableChart({
     const next: Record<string, number> = {};
     for (const column of orderedColumns.slice(0, pinnedCount)) {
       next[column.name] = left;
+      // offsetWidth, not getBoundingClientRect: these offsets feed sticky
+      // `left` styles, which are LAYOUT px. Under a scaled ancestor (the
+      // dashboard's fit-to-page viewport) rect widths are VISUAL px and the
+      // pinned columns drifted apart; offsetWidth stays in layout units in
+      // both modes. (Integer rounding is well under a px of drift per column.)
       left +=
         widths[column.name] ??
-        headerRefs.current.get(column.name)?.getBoundingClientRect().width ??
+        headerRefs.current.get(column.name)?.offsetWidth ??
         FALLBACK_COLUMN_WIDTH;
     }
     setMeasuredLefts((prev) => {
@@ -1021,9 +1038,13 @@ export function TableChart({
   const startResize = (name: string) => (e: ReactPointerEvent<HTMLSpanElement>) => {
     e.preventDefault();
     e.stopPropagation();
+    // offsetWidth, not getBoundingClientRect: the measured width seeds a
+    // LAYOUT-px column width. Measuring the VISUAL rect under a scaled
+    // ancestor (fit-to-page viewport) made the column visibly jump to the
+    // scaled size the moment a resize began.
     const startWidth =
       widths[name] ??
-      headerRefs.current.get(name)?.getBoundingClientRect().width ??
+      headerRefs.current.get(name)?.offsetWidth ??
       FALLBACK_COLUMN_WIDTH;
     resizeRef.current = { name, startX: e.clientX, startWidth, width: null };
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -1300,8 +1321,12 @@ export function TableChart({
     { cf: ConditionalFormatSpec; maxAbs: number; hasNegative: boolean }
   >();
   for (const column of measureColumns) {
+    const legacyLabel = legacyLabelByName.get(column.name);
     const cf = format.conditionalFormats?.find(
-      (f) => f.style === 'dataBar' && f.measureKey === column.label,
+      (f) =>
+        f.style === 'dataBar' &&
+        // legacyLabel: data bars saved against a pre-Wave-21 measure label.
+        (f.measureKey === column.label || (legacyLabel !== undefined && f.measureKey === legacyLabel)),
     );
     if (!cf) continue;
     const columnIndex = result.columns.indexOf(column);
@@ -1364,7 +1389,8 @@ export function TableChart({
 
   const headerLabel = (column: QueryColumn): string =>
     column.role === 'measure'
-      ? (format.seriesLabels?.[column.label] ?? column.label)
+      ? (seriesStyleLookup(format.seriesLabels, column.label, legacyLabelByName.get(column.name)) ??
+        column.label)
       : column.label;
 
   return (
@@ -1453,9 +1479,17 @@ export function TableChart({
                         : null),
                     }}
                     // Layering: pinned headers float above plain headers, which
-                    // float above pinned body cells, which float above the rest.
-                    className={`group sticky top-0 select-none px-3 py-2 text-xs ${
-                      pinned ? 'z-30' : 'z-20'
+                    // float above pinned body cells, which float above the rest —
+                    // all kept BELOW z-20, the floor where floating TILE chrome
+                    // (TileFrame kebab/hover controls) lives. At z-20/z-30 these
+                    // sticky headers painted over AND stole clicks from the tile's
+                    // edit kebab, so a table tile looked uneditable.
+                    // group/th (named, not bare `group`): the column-menu chevron
+                    // reveals on hovering THIS header cell only — a bare group
+                    // matched the tile wrapper's group class, so hovering anywhere
+                    // in the tile lit up every chevron at once.
+                    className={`group/th sticky top-0 select-none px-3 py-2 text-xs ${
+                      pinned ? 'z-10' : 'z-[5]'
                     } ${sortable ? 'cursor-pointer' : ''}`}
                     title={
                       sortable ? 'Click to sort · Shift+click to add a sort level' : undefined
@@ -1485,7 +1519,7 @@ export function TableChart({
                                 background:
                                   'color-mix(in srgb, var(--rcd-accent) 18%, transparent)',
                               }}
-                              className="rounded-[3px] px-1 text-[9px] font-semibold leading-[14px] text-rcd-accent tabular-nums"
+                              className="rounded-[3px] px-1 text-[10px] font-semibold leading-[14px] text-rcd-accent tabular-nums"
                             >
                               {sortIndex + 1}
                             </span>
@@ -1600,10 +1634,22 @@ export function TableChart({
                     // They survive reorder/pinning/paging because they only
                     // depend on the column + cell value.
                     const cellBackground = isMeasure
-                      ? conditionalColor(format.conditionalFormats, 'cellBackground', column.label, raw)
+                      ? conditionalColor(
+                          format.conditionalFormats,
+                          'cellBackground',
+                          column.label,
+                          raw,
+                          legacyLabelByName.get(column.name),
+                        )
                       : undefined;
                     const cellText = isMeasure
-                      ? conditionalColor(format.conditionalFormats, 'cellText', column.label, raw)
+                      ? conditionalColor(
+                          format.conditionalFormats,
+                          'cellText',
+                          column.label,
+                          raw,
+                          legacyLabelByName.get(column.name),
+                        )
                       : undefined;
                     const dataBar = isMeasure ? dataBars.get(column.name) : undefined;
                     const text = formatCellValue(raw, column);
@@ -1679,8 +1725,12 @@ export function TableChart({
                           ...(pinned ? { left: l.pinnedLeft ?? 0 } : null),
                           ...(barHere ? { boxShadow: SELECTION_BAR } : null),
                         }}
+                        // z-[1], demoted with the header cells: pinned BODY
+                        // cells must stay under BOTH header tiers (plain
+                        // headers now sit at z-[5]) and, like all renderer
+                        // chrome, under the tile's floating controls.
                         className={`px-3 py-1 text-rcd-text ${
-                          pinned ? 'sticky z-10' : ''
+                          pinned ? 'sticky z-[1]' : ''
                         } ${isMeasure ? 'tabular-nums' : ''} ${
                           // Cell-level click target: tint the hovered cell (an
                           // inset wash that layers over its own background).
@@ -1723,8 +1773,10 @@ export function TableChart({
                           : null),
                         ...(pinned ? { left: l.pinnedLeft ?? 0 } : null),
                       }}
+                      // Same sub-z-20 layering contract as the header cells:
+                      // renderer chrome must never outrank floating tile chrome.
                       className={`sticky bottom-0 px-3 py-1.5 font-semibold text-rcd-text ${
-                        pinned ? 'z-30' : 'z-20'
+                        pinned ? 'z-10' : 'z-[5]'
                       } ${isMeasure ? 'tabular-nums' : ''}`}
                     >
                       {isMeasure

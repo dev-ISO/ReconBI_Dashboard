@@ -44,6 +44,7 @@ export function CopyChartDialog({
   const runtime = useRuntime();
   const list = useDashboardState((state) => state.list);
   const listStatus = useDashboardState((state) => state.listStatus);
+  const mode = useDashboardState((state) => state.mode);
 
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [phase, setPhase] = useState<Phase>('pick');
@@ -60,7 +61,17 @@ export function CopyChartDialog({
     void runtime.dashboards.loadList();
   }, [open, runtime]);
 
-  const targets = useMemo(() => list.filter(isWritableTarget), [list]);
+  // The CURRENT dashboard is a valid target only during an edit session: the
+  // same-dashboard path appends to the IN-MEMORY draft, and view mode has no
+  // Save affordance — the copy looked successful, then silently evaporated on
+  // close. Other targets round-trip the server and are safe from any mode.
+  const targets = useMemo(
+    () =>
+      list.filter(
+        (row) => isWritableTarget(row) && (mode === 'edit' || row.id !== currentDashboardId),
+      ),
+    [list, mode, currentDashboardId],
+  );
   const selected = targets.find((t) => t.id === selectedId) ?? null;
   const modelMismatch = selected !== null && selected.modelId !== sourceModelId;
 

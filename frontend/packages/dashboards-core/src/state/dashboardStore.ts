@@ -50,7 +50,7 @@ import type {
 import type { ColumnType } from '../types/schema';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
-import { retitleInnerTitleHtml, sanitizeRichHtml } from '../util/richText';
+import { boldRunText, retitleInnerTitleHtml, sanitizeRichHtml } from '../util/richText';
 import type { AsyncStatus } from './modelStore';
 
 export interface OpenDashboard {
@@ -409,8 +409,15 @@ export const dateRangeClauseFor = (
  * (format.container.innerTitleHtml, the frameless seeded-tile pattern where
  * THAT is the visible name, not chart.title) — the inner title's bold
  * lead-in rewritten to the copy's title, so the copy shows its own name
- * immediately instead of masquerading as its source. A helper miss (no bold
- * element in the HTML) leaves the inner title untouched.
+ * immediately instead of masquerading as its source.
+ *
+ * The rewrite fires ONLY when the bold lead-in still READS as the SOURCE
+ * chart's title (boldRunText === chart.title): an inner title the user
+ * customized away from the chart title is their newer statement of what the
+ * tile says, and an unconditional rewrite silently destroyed it on every
+ * duplicate/paste/copy. Customized inner titles ride through untouched — the
+ * copy is distinguished by its " (copy)" TITLE suffix alone. A helper miss
+ * (no bold element in the HTML) likewise leaves the inner title untouched.
  */
 export const cloneChartForCopy = (
   chart: ChartSpec,
@@ -420,7 +427,7 @@ export const cloneChartForCopy = (
   copy.id = newId();
   if (options?.suffix) copy.title = `${chart.title} (copy)`;
   const innerTitleHtml = copy.format.container?.innerTitleHtml;
-  if (innerTitleHtml) {
+  if (innerTitleHtml && boldRunText(innerTitleHtml) === chart.title.trim()) {
     const retitled = retitleInnerTitleHtml(innerTitleHtml, copy.title);
     if (retitled !== null) copy.format.container!.innerTitleHtml = retitled;
   }
@@ -884,10 +891,14 @@ export class DashboardStore {
     });
   }
 
-  /** Patches a slicer tile's spec (variant, label, targets, showClear). */
+  /** Patches a slicer tile's spec (variant, label, targets, showClear).
+   *  Same-tile bursts (config-menu typing, the "Last N" custom box) coalesce
+   *  into one undo step, mirroring updateChart's slider-storm rule. */
   updateSlicer(tileId: string, patch: Partial<SlicerTileSpec>): void {
-    this.mutateActiveTiles((tiles) =>
-      tiles.map((t) => (t.id === tileId && t.slicer ? { ...t, slicer: { ...t.slicer, ...patch } } : t)),
+    this.mutateActiveTiles(
+      (tiles) =>
+        tiles.map((t) => (t.id === tileId && t.slicer ? { ...t, slicer: { ...t.slicer, ...patch } } : t)),
+      { tag: `updateSlicer:${tileId}`, windowMs: 800 },
     );
   }
 
@@ -1150,8 +1161,14 @@ export class DashboardStore {
 
   /* ----------------------------------------------------------- filter cards */
 
-  private mutateFilterCards(mutate: (cards: FilterCard[]) => FilterCard[]): void {
-    this.mutateLayout((layout) => ({ ...layout, filterCards: mutate(layout.filterCards ?? []) }));
+  private mutateFilterCards(
+    mutate: (cards: FilterCard[]) => FilterCard[],
+    coalesce?: HistoryCoalesce,
+  ): void {
+    this.mutateLayout(
+      (layout) => ({ ...layout, filterCards: mutate(layout.filterCards ?? []) }),
+      coalesce,
+    );
   }
 
   /** Card with any view-mode personal overrides applied. */
@@ -1192,7 +1209,12 @@ export class DashboardStore {
       });
       return;
     }
-    this.mutateFilterCards((cards) => cards.map((c) => (c.id === id ? { ...c, ...patch, id } : c)));
+    // Same-card bursts (typing in an advanced-condition value box) coalesce
+    // into one undo step — Ctrl+Z after typing "1000" must not leave "100".
+    this.mutateFilterCards(
+      (cards) => cards.map((c) => (c.id === id ? { ...c, ...patch, id } : c)),
+      { tag: `filterCard:${id}`, windowMs: 800 },
+    );
     this.set({ lastAppliedBookmarkId: null });
   }
 

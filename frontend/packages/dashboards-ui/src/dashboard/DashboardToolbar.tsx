@@ -853,12 +853,27 @@ function BookmarksMenu({
   const [addName, setAddName] = useState('');
   const [confirmDelete, setConfirmDelete] = useState<ToolbarBookmark | null>(null);
 
+  const commitRename = () => {
+    if (!renaming) return;
+    const next = renaming.draft.trim();
+    if (next !== '') onRename?.(renaming.id, next);
+    setRenaming(null);
+  };
+  // Latest-ref for the outside-click path below: closing unmounts the rename
+  // input before React can deliver its blur, so the typed name was silently
+  // dropped; the close handler commits explicitly instead (Escape keeps
+  // cancelling). Ref-routed so the listener effect never re-binds per
+  // keystroke.
+  const commitRenameRef = useRef(commitRename);
+  commitRenameRef.current = commitRename;
+
   // Close on outside click / Escape (suspended while the delete confirm owns
   // the keyboard — it renders inside rootRef, so its clicks stay "inside").
   useEffect(() => {
     if (!open || confirmDelete !== null) return;
     const onPointerDown = (event: MouseEvent) => {
       if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
+        commitRenameRef.current();
         setOpen(false);
       }
     };
@@ -873,21 +888,17 @@ function BookmarksMenu({
     };
   }, [open, confirmDelete]);
 
-  // Transient row state resets whenever the card closes.
+  // Transient row state resets whenever the card closes — EXCEPT the add-name
+  // draft, which survives close/reopen on purpose: an accidental outside
+  // click no longer eats a half-typed name, and NOT auto-committing it means
+  // no bookmark is ever created by mere dismissal (creation stays an explicit
+  // Add). Reopening "+ New bookmark" shows the preserved draft.
   useEffect(() => {
     if (open) return;
     setKebabFor(null);
     setRenaming(null);
     setAdding(false);
-    setAddName('');
   }, [open]);
-
-  const commitRename = () => {
-    if (!renaming) return;
-    const next = renaming.draft.trim();
-    if (next !== '') onRename?.(renaming.id, next);
-    setRenaming(null);
-  };
 
   const commitAdd = () => {
     const name = addName.trim();

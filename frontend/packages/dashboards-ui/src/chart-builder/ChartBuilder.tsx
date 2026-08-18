@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject } from 'react';
 import {
   DndContext,
   DragOverlay,
@@ -10,6 +10,7 @@ import {
 } from '@dnd-kit/core';
 import { AlertTriangle, Sigma, Variable, XCircle } from 'lucide-react';
 import {
+  boldRunText,
   isRunnable,
   retitleInnerTitleHtml,
   stableStringify,
@@ -40,6 +41,9 @@ import {
   defaultWellFor,
   measureLabel,
   normalizeQueryForType,
+  supportsDrill,
+  supportsSmallMultiples,
+  valuesMaxFor,
   type BuilderParameter,
   type FieldDragData,
   type WellId,
@@ -61,6 +65,14 @@ export interface ChartBuilderProps {
   parameters?: BuilderParameter[];
   /** Tab shown when the builder opens (a dashboard-side "Format chart" flow passes 'format'). */
   initialTab?: 'fields' | 'format';
+  /**
+   * Receives the builder's GUARDED close entry point (the Cancel button's
+   * flow: dirty → "Discard chart changes?" confirm, clean → onCancel). The
+   * hosting dialog routes its own onClose (Escape, backdrop click, ✕) through
+   * it so no close path can silently discard an edited draft. Cleared to null
+   * on unmount so a stale closure can never fire against a gone builder.
+   */
+  requestCloseRef?: MutableRefObject<(() => void) | null>;
 }
 
 /** Target of the FilterEditor dialog: an existing clause (index) or a new one. */
@@ -90,10 +102,23 @@ const ORDERABLE_TYPES: ReadonlyArray<ChartType> = [
  * the inner title's bold lead-in is rewritten to the new name — the same
  * helper every chart-copy path routes through, so rename and copy stay one
  * behavior. A helper miss (no bold element) leaves the HTML untouched.
+ *
+ * The rewrite fires ONLY when the inner title is genuinely still the mirror
+ * of the old chart title, judged two ways (both must hold):
+ *  - untouched this session: an explicit Format → Container inner-title edit
+ *    is the newer statement of what the tile should say, and auto-retitling
+ *    over it made the editor appear broken (Apply visibly took, then Save
+ *    snapped the bold text back to the Title field's value);
+ *  - its bold lead-in still READS as the pre-rename title (boldRunText ===
+ *    initial.title): an inner title customized in an EARLIER session never
+ *    tracked the chart title, so a rename must not clobber it either — the
+ *    session guard alone cannot see cross-session customization.
  */
-const withRetitledInnerTitle = (draft: ChartSpec, initialTitle: string): ChartSpec => {
+const withRetitledInnerTitle = (draft: ChartSpec, initial: ChartSpec): ChartSpec => {
   const innerTitleHtml = draft.format.container?.innerTitleHtml;
-  if (draft.title === initialTitle || !innerTitleHtml) return draft;
+  if (draft.title === initial.title || !innerTitleHtml) return draft;
+  if (innerTitleHtml !== initial.format.container?.innerTitleHtml) return draft;
+  if (boldRunText(innerTitleHtml) !== initial.title.trim()) return draft;
   const retitled = retitleInnerTitleHtml(innerTitleHtml, draft.title);
   if (retitled === null) return draft;
   return {
@@ -115,6 +140,7 @@ export function ChartBuilder({
   catalog,
   parameters,
   initialTab = 'fields',
+  requestCloseRef,
 }: ChartBuilderProps) {
   const runtime = useRuntime();
   const [draft, setDraft] = useState<ChartSpec>(() => structuredClone(initial));
@@ -189,10 +215,76 @@ export function ChartBuilder({
     addToWell(target.well, data, target.slot);
   };
 
+  /**
+   * Session stash of query parts a chart-type switch PRUNES
+   * (normalizeQueryForType): measures past the new type's capacity, drill
+   * levels, the small-multiples dimension. Switching back to a type that can
+   * hold them restores whatever the query has not refilled since — a column →
+   * kpi → column round-trip keeps all its measures instead of silently ending
+   * at one. Builder-local by design (dies with the dialog, never persisted);
+   * restored parts leave the stash so a later deliberate removal stays
+   * removed. Each drop overwrites its slot — the newest loss is the one a
+   * switch-back should revive.
+   */
+  const prunedQueryStash = useRef<{
+    measures: ChartSpec['query']['measures'];
+    drillLevels: ChartSpec['query']['drillLevels'] | null;
+    smallMultiples: ChartSpec['query']['smallMultiples'] | null;
+  }>({ measures: [], drillLevels: null, smallMultiples: null });
+
+  const handleTypeChange = (type: ChartType) => {
+    const stash = prunedQueryStash.current;
+    const previous = draft.query;
+    let query = normalizeQueryForType(type, previous);
+    // Capture what THIS switch dropped, then restore whatever the NEW type
+    // can hold again (the two never overlap: a part just captured was
+    // captured precisely because the new type has no room for it).
+    if (query.measures.length < previous.measures.length) {
+      stash.measures = previous.measures.slice(query.measures.length);
+    }
+    if ((previous.drillLevels?.length ?? 0) > 0 && !query.drillLevels?.length) {
+      stash.drillLevels = previous.drillLevels;
+    }
+    if (previous.smallMultiples && !query.smallMultiples) {
+      stash.smallMultiples = previous.smallMultiples;
+    }
+    const max = valuesMaxFor(type);
+    if (stash.measures.length > 0 && query.measures.length < max) {
+      const room = Number.isFinite(max)
+        ? max - query.measures.length
+        : stash.measures.length;
+      const revived = stash.measures.slice(0, room);
+      query = { ...query, measures: [...query.measures, ...revived] };
+      stash.measures = stash.measures.slice(revived.length);
+    }
+    if (stash.drillLevels?.length && supportsDrill(type) && !query.drillLevels?.length) {
+      query = { ...query, drillLevels: stash.drillLevels };
+      stash.drillLevels = null;
+    }
+    if (stash.smallMultiples && supportsSmallMultiples(type) && !query.smallMultiples) {
+      query = { ...query, smallMultiples: stash.smallMultiples };
+      stash.smallMultiples = null;
+    }
+    setDraft((current) => ({ ...current, type, query }));
+  };
+
   const handleCancel = () => {
     if (dirty) setConfirmCancel(true);
     else onCancel();
   };
+
+  // Host-facing guarded close (requestCloseRef contract): the ref always
+  // points at the LATEST closure — dirty/onCancel change across renders — via
+  // the same latest-ref pattern RcdDialog uses for onClose.
+  const handleCancelRef = useRef(handleCancel);
+  handleCancelRef.current = handleCancel;
+  useEffect(() => {
+    if (!requestCloseRef) return;
+    requestCloseRef.current = () => handleCancelRef.current();
+    return () => {
+      requestCloseRef.current = null;
+    };
+  }, [requestCloseRef]);
 
   const applyFilter = (clause: FilterClause) => {
     const target = filterTarget;
@@ -253,12 +345,19 @@ export function ChartBuilder({
     () => (previewResult ? shapeChartData(previewResult, draft) : null),
     [previewResult, draft],
   );
-  // Series keys for the Format panel: legend charts read the shaped preview
-  // (unknown → []); otherwise measure labels (no fetch needed).
+  // Series keys for the Format panel: the SHAPED PREVIEW's styleKeys — the
+  // exact strings every style map keys on (colorOverrides / seriesLabels /
+  // lineStyles / secondaryAxisKeys), the same source the Custom-order list
+  // reads. The old composition wrote keys the renderer never read back:
+  // measure mode composed the client-side "sum of order_total" (lowercase
+  // wire enum) against the server's "Sum of order_total" label, and combo
+  // mode passed series.key (name\x1Fvalue) instead of the "<Measure> —
+  // <value>" styleKey — raw 0x1F rendered in the Series rows. Client
+  // measureLabel remains ONLY as the pre-preview fallback for measure-mode
+  // charts (legend/combo keys are unknowable without the result: []).
   const seriesKeys = useMemo<string[]>(() => {
-    if (draft.query.legend) {
-      return previewShaped?.series.map((series) => series.key) ?? [];
-    }
+    if (previewShaped) return previewShaped.series.map((series) => series.styleKey);
+    if (draft.query.legend) return [];
     return draft.query.measures.map((measure) => measureLabel(model, measure));
   }, [draft, previewShaped, model]);
 
@@ -382,16 +481,7 @@ export function ChartBuilder({
                   <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
                     Chart type
                   </span>
-                  <ChartTypePicker
-                    value={draft.type}
-                    onChange={(type) =>
-                      setDraft((current) => ({
-                        ...current,
-                        type,
-                        query: normalizeQueryForType(type, current.query),
-                      }))
-                    }
-                  />
+                  <ChartTypePicker value={draft.type} onChange={handleTypeChange} />
                 </div>
 
                 <Wells
@@ -494,7 +584,7 @@ export function ChartBuilder({
                 ? undefined
                 : 'Add at least one field to a values well'
           }
-          onClick={() => onSave(withRetitledInnerTitle(draft, initial.title))}
+          onClick={() => onSave(withRetitledInnerTitle(draft, initial))}
         >
           Save chart
         </RcdButton>

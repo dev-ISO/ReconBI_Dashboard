@@ -205,17 +205,21 @@ export function matchRuleColor(rules: ConditionalRule[], value: number): string 
 /**
  * Color from the first spec of `style` for `measureKey` whose rules match.
  * Specs evaluate in array order, like their rules — first match wins.
- * Non-numeric cells never match.
+ * Non-numeric cells never match. `legacyMeasureKey` is the measure's
+ * pre-Wave-21 raw-form label (ChartSeries.legacyStyleKey contract): rules
+ * saved before friendly labels re-labeled inline measures still apply.
  */
 export function conditionalColor(
   specs: ConditionalFormatSpec[] | undefined,
   style: ConditionalFormatSpec['style'],
   measureKey: string,
   value: CellValue,
+  legacyMeasureKey?: string,
 ): string | undefined {
   if (!specs || typeof value !== 'number') return undefined;
   for (const spec of specs) {
-    if (spec.style !== style || spec.measureKey !== measureKey) continue;
+    if (spec.style !== style) continue;
+    if (spec.measureKey !== measureKey && spec.measureKey !== legacyMeasureKey) continue;
     const color = matchRuleColor(spec.rules, value);
     if (color) return color;
   }

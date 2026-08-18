@@ -231,7 +231,7 @@ export const supportsDrill = (type: ChartType): boolean =>
   wellsFor(type).some((well) => well.id === 'axis' && well.capacity === 'many');
 
 /** Total measures the type can hold (slot count, or the values well's max). */
-const valuesMaxFor = (type: ChartType): number => {
+export const valuesMaxFor = (type: ChartType): number => {
   const wells = wellsFor(type).filter((well) => well.id === 'values');
   const slots = wells.filter((well) => well.slot !== undefined);
   if (slots.length > 0) return slots.length;

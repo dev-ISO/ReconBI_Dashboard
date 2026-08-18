@@ -313,15 +313,23 @@ function AddFilterButton({ tables, catalog, catalogStatus, modelReady, onPick }:
   const [table, setTable] = useState('');
   const rootRef = useRef<HTMLDivElement>(null);
 
+  // EVERY dismissal resets the table select: a picker abandoned mid-flow
+  // (outside click, Escape, the button itself) used to reopen on the stale
+  // table, which read as a half-made choice the user never made.
+  const dismiss = () => {
+    setOpen(false);
+    setTable('');
+  };
+
   useEffect(() => {
     if (!open) return;
     const onPointerDown = (event: MouseEvent) => {
       if (rootRef.current && event.target instanceof Node && !rootRef.current.contains(event.target)) {
-        setOpen(false);
+        dismiss();
       }
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false);
+      if (event.key === 'Escape') dismiss();
     };
     document.addEventListener('mousedown', onPointerDown);
     document.addEventListener('keydown', onKeyDown);
@@ -356,7 +364,7 @@ function AddFilterButton({ tables, catalog, catalogStatus, modelReady, onPick }:
         type="button"
         aria-haspopup="dialog"
         aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => (open ? dismiss() : setOpen(true))}
         className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs font-medium text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
       >
         <Plus size={12} />
@@ -615,6 +623,54 @@ const coerceValue = (raw: string, type: ColumnType | null): FilterValue | null =
 const conditionInputText = (value: FilterValue | null | undefined): string =>
   value === null || value === undefined || typeof value === 'boolean' ? '' : String(value);
 
+/**
+ * Advanced-condition value box with a LOCAL string draft, committed on
+ * blur/Enter (the FilterEditor pattern). Binding the box to the coerced STORE
+ * value per keystroke made whitespace unenterable — coerceValue nulls
+ * whitespace-only text, so a leading space was wiped as typed — and pushed a
+ * doc write (undo entry, full layout clone) per character. The draft re-seeds
+ * whenever the store's text changes underneath (undo/redo, operator resets),
+ * which is a no-op while the user types (the store only moves on commit).
+ */
+function ConditionValueInput({
+  value,
+  columnType,
+  inputType,
+  ariaLabel,
+  onCommit,
+}: {
+  value: FilterValue | null | undefined;
+  columnType: ColumnType | null;
+  inputType: string;
+  ariaLabel: string;
+  onCommit: (next: FilterValue | null) => void;
+}) {
+  const storeText = conditionInputText(value);
+  const [draft, setDraft] = useState(storeText);
+  useEffect(() => {
+    setDraft(storeText);
+  }, [storeText]);
+  const commit = () => {
+    const next = coerceValue(draft, columnType);
+    // Skip no-op commits so blurring an untouched box never dirties the doc.
+    if (next !== (value ?? null)) onCommit(next);
+  };
+  return (
+    <RcdInput
+      aria-label={ariaLabel}
+      type={inputType}
+      value={draft}
+      onChange={(event) => setDraft(event.target.value)}
+      onBlur={commit}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') commit();
+      }}
+      placeholder="Value"
+      className="min-w-0 flex-1"
+    />
+  );
+}
+
 /** 1-3 condition rows + And/Or join, mirrored straight into the store. */
 function AdvancedEditor({ card, columnType }: { card: FilterCard; columnType: ColumnType | null }) {
   const runtime = useRuntime();
@@ -697,15 +753,12 @@ function AdvancedEditor({ card, columnType }: { card: FilterCard; columnType: Co
                     <option value="false">False</option>
                   </RcdSelect>
                 ) : (
-                  <RcdInput
-                    aria-label={`Condition ${index + 1} value`}
-                    type={inputType}
-                    value={conditionInputText(condition.value)}
-                    onChange={(event) =>
-                      patchCondition(index, { value: coerceValue(event.target.value, columnType) })
-                    }
-                    placeholder="Value"
-                    className="min-w-0 flex-1"
+                  <ConditionValueInput
+                    ariaLabel={`Condition ${index + 1} value`}
+                    inputType={inputType}
+                    value={condition.value}
+                    columnType={columnType}
+                    onCommit={(next) => patchCondition(index, { value: next })}
                   />
                 ))}
 

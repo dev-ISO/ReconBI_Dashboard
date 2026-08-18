@@ -52,7 +52,7 @@ export type { ChartIssue } from './validation/chartValidation';
 export { dateOnlyPartOf, displayDateBound, inclusiveDateUpperBound } from './util/dateBounds';
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
-export { retitleInnerTitleHtml, sanitizeRichHtml } from './util/richText';
+export { boldRunText, retitleInnerTitleHtml, sanitizeRichHtml } from './util/richText';
 export { reconcileOrder, reconcileOrderBy } from './util/ordering';
 export { composeDataLabel } from './util/dataLabels';
 export {
@@ -63,5 +63,6 @@ export {
   formatDatePattern,
 } from './util/format';
 export { seriesColor, CATEGORICAL_SLOTS, CHART_THEMES } from './util/palette';
+export { seriesStyleLookup, legacyInlineMeasureLabel } from './util/seriesStyle';
 export { buildXlsx, downloadXlsx } from './util/xlsx';
 export type { XlsxSheetInput } from './util/xlsx';

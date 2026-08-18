@@ -202,6 +202,57 @@ const escapeHtmlText = (text: string): string =>
 const FIRST_BOLD_RE = /<(b|strong)(\s[^>]*)?>([\s\S]*?)<\/\1\s*>/i;
 
 /**
+ * Named entities the sanitizer/escaper can leave inside a bold run. Numeric
+ * references decode generically below; unknown named entities pass through
+ * untouched (conservative — a miss just means "no rewrite").
+ */
+const NAMED_ENTITIES: Record<string, string> = {
+  amp: '&',
+  lt: '<',
+  gt: '>',
+  quot: '"',
+  apos: "'",
+  nbsp: ' ',
+  mdash: '—',
+  ndash: '–',
+  hellip: '…',
+};
+
+/**
+ * Single-pass entity decode (each reference resolved exactly once, so
+ * "&amp;lt;" correctly becomes "&lt;" and never double-decodes to "<").
+ */
+const decodeHtmlEntities = (text: string): string =>
+  text.replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (whole, body: string) => {
+    if (body.startsWith('#')) {
+      const code = body[1]?.toLowerCase() === 'x'
+        ? Number.parseInt(body.slice(2), 16)
+        : Number.parseInt(body.slice(1), 10);
+      return Number.isFinite(code) && code > 0 ? String.fromCodePoint(code) : whole;
+    }
+    return NAMED_ENTITIES[body.toLowerCase()] ?? whole;
+  });
+
+/**
+ * Plain text of the FIRST <b>/<strong> run of an inner-title HTML block:
+ * nested tags stripped, entities decoded, surrounding whitespace trimmed.
+ * Null when the HTML carries no bold element.
+ *
+ * Why: the auto-retitle paths (builder save, every chart-copy clone) must
+ * only rewrite an inner title whose bold lead-in still IS the chart's title —
+ * a customized bold run is the user's newer statement and rides through
+ * untouched. This is the read half of retitleInnerTitleHtml's write, and like
+ * it must run without a DOM (store code, vitest), hence regex + manual
+ * entity decoding rather than DOMParser.
+ */
+export const boldRunText = (html: string): string | null => {
+  if (typeof html !== 'string' || html === '') return null;
+  const match = FIRST_BOLD_RE.exec(html);
+  if (match === null) return null;
+  return decodeHtmlEntities((match[3] ?? '').replace(/<[^>]*>/g, '')).trim();
+};
+
+/**
  * Rewrites the content of the FIRST <b>/<strong> element of an inner-title
  * HTML block to `newTitle` (HTML-escaped), preserving the tag, its attributes
  * and everything around it. Returns null when the HTML carries no bold

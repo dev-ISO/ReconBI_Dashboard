@@ -182,16 +182,20 @@ html[data-theme='dark'] .rcd-card:hover {
 /* PDF export (DashboardPrintView). While the print preview overlay is open it
    adds `rcd-printing` to <body>; the overlay itself is portaled directly under
    <body>, so hiding every OTHER body child leaves only the print sheets in the
-   output. The @page size/margin rule (explicit mm dimension pair) is injected
-   at runtime from the chosen paper + orientation (CSS alone cannot
-   parameterize it).
+   output. The geometry-dependent rules — @page size + the sheet's exact paper
+   mm box and margin padding — are injected at runtime from the chosen options
+   (printLayout.printPageCss; CSS alone cannot parameterize them). Only the
+   static rules live here.
 
-   Pagination model: PrintSheets pre-slices the tiles into page-sized sheets
-   (.rcd-print-page > .rcd-print-sheet), each laid out at the EXACT printable
-   px size. In print every sheet becomes one page: fixed heights/padding are
-   stripped (the content fits by construction; @page applies the real margins)
-   while the inner content box keeps its exact inline pixel width, and each
-   sheet but the last forces a page break. */
+   Page-box model: `@page { margin: 0 }` hands the WHOLE sheet of paper to the
+   layout and each .rcd-print-page > .rcd-print-sheet IS one sheet: an
+   explicit paper-size mm box (injected) whose PADDING is the chosen print
+   margin — border-box, so the padding carves out exactly the printable area
+   the pagination math used. The browser is left with no margin arithmetic of
+   its own, so preview and paper agree by construction, and the sheets need no
+   width/height stripping: each sheet but the last forces a page break. (The
+   browser's own "Headers and footers" strip would overlay the sheet edges —
+   the in-app checklist tells users to turn it off.) */
 @media print {
   body.rcd-printing > :not(.rcd-print-view) {
     display: none !important;
@@ -229,20 +233,25 @@ html[data-theme='dark'] .rcd-card:hover {
     page-break-after: always;
   }
 
-  /* The sheet sheds its paper chrome: the visual 12mm padding is replaced by
-     the real @page margins, and the fixed paper height goes auto so nothing
-     ever spills onto a stray page. The inner content box KEEPS its exact
-     inline pixel width (the layout was computed at that width). */
+  /* The sheet sheds only its on-screen chrome (the drop shadow); the box
+     itself STAYS — the injected rules re-pin width/height/padding in exact mm
+     (mm beats the inline styles' 96dpi px round-trip of the same numbers,
+     and the height sits 1px shy of the paper so rounding can never spill a
+     blank page). border-box keeps the padding carving the printable area;
+     overflow guards that reserved 1px. */
   body.rcd-printing .rcd-print-sheet {
-    width: auto !important;
-    height: auto !important;
-    margin: 0 !important;
-    padding: 0 !important;
+    box-sizing: border-box !important;
+    overflow: hidden !important;
     box-shadow: none !important;
   }
 
+  /* The inner content box fills the sheet's printable area, so the vertical
+     alignment setting (justify-content) distributes slack on paper exactly as
+     in the preview — this replaces the old injected min-height hack. Its
+     inline pixel WIDTH is kept: the layout was computed at that width,
+     floored a hair inside the mm box, so content can never spill. */
   body.rcd-printing .rcd-print-sheet-inner {
-    height: auto !important;
+    height: 100% !important;
   }
 }
 

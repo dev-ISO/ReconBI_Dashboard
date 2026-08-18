@@ -1,4 +1,5 @@
 import type { ChartThemeName } from '../types/chart';
+import { seriesStyleLookup } from './seriesStyle';
 
 /**
  * Series color resolution: explicit override -> theme palette -> fixed
@@ -29,8 +30,17 @@ export const seriesColor = (
   seriesKey?: string,
   overrides?: Record<string, string>,
   theme?: ChartThemeName,
+  /**
+   * Pre-Wave-21 raw-form key (seriesStyle.legacyInlineMeasureLabel): overrides
+   * saved before friendly labels re-labeled inline measures still resolve.
+   * Writes never use it — the swatch UI keys new overrides on `seriesKey`.
+   */
+  legacySeriesKey?: string,
 ): string => {
-  if (seriesKey && overrides?.[seriesKey]) return overrides[seriesKey];
+  if (seriesKey) {
+    const override = seriesStyleLookup(overrides, seriesKey, legacySeriesKey);
+    if (override) return override;
+  }
   if (theme && theme !== 'default') {
     const palette = CHART_THEMES[theme];
     const themed = palette[index % palette.length];
