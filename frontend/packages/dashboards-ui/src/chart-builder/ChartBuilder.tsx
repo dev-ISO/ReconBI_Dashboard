@@ -11,6 +11,7 @@ import {
 import { AlertTriangle, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   isRunnable,
+  retitleInnerTitleHtml,
   stableStringify,
   toWireSpec,
   validateChartSpec,
@@ -18,10 +19,11 @@ import {
   type ChartFormat,
   type ChartIssue,
   type ChartSpec,
+  type ChartType,
   type FilterClause,
   type ModelDefinition,
 } from '@recon/dashboards-core';
-import { shapeChartData } from '../chart/chartData';
+import { shapeChartData, shapePieData } from '../chart/chartData';
 import { ChartTile, type ChartTableLayoutPatch } from '../chart/ChartTile';
 import { FormatPanel } from '../chart/FormatPanel';
 import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
@@ -30,7 +32,7 @@ import { PaneDivider, useBuilderPanes } from './builderLayout';
 import { ChartTypePicker } from './ChartTypePicker';
 import { FieldList } from './FieldList';
 import { FilterEditor } from './FilterEditor';
-import { Wells } from './Wells';
+import { Wells, type ManualOrderInputs } from './Wells';
 import {
   applyDrop,
   columnLabelOf,
@@ -69,6 +71,39 @@ interface FilterEditorTarget {
 }
 
 type BuilderTab = 'fields' | 'format';
+
+/** Chart families whose display order format.categoryOrder/seriesOrder drive. */
+const ORDERABLE_TYPES: ReadonlyArray<ChartType> = [
+  'column',
+  'bar',
+  'stackedColumn',
+  'stackedBar',
+  'line',
+  'area',
+  'pie',
+  'donut',
+];
+
+/**
+ * Builder-save retitling: when the user renamed the chart AND the tile
+ * carries a rich inner title (frameless tiles display THAT, not chart.title),
+ * the inner title's bold lead-in is rewritten to the new name — the same
+ * helper every chart-copy path routes through, so rename and copy stay one
+ * behavior. A helper miss (no bold element) leaves the HTML untouched.
+ */
+const withRetitledInnerTitle = (draft: ChartSpec, initialTitle: string): ChartSpec => {
+  const innerTitleHtml = draft.format.container?.innerTitleHtml;
+  if (draft.title === initialTitle || !innerTitleHtml) return draft;
+  const retitled = retitleInnerTitleHtml(innerTitleHtml, draft.title);
+  if (retitled === null) return draft;
+  return {
+    ...draft,
+    format: {
+      ...draft.format,
+      container: { ...draft.format.container, innerTitleHtml: retitled },
+    },
+  };
+};
 
 /** Field list | tabs (title + type + wells / format panel) | live preview. */
 export function ChartBuilder({
@@ -201,26 +236,60 @@ export function ChartBuilder({
       ? (draft.query.filters[filterTarget.index] ?? null)
       : null;
 
-  // Series keys for the Format panel, derived without fetching: legend charts
-  // read the preview's cached result (unknown → []); otherwise measure labels.
+  // Preview-derived shaping, without fetching: the cache key mirrors the
+  // preview ChartTile's own fetch, so reading it never issues a query — an
+  // unknown/loading entry just yields empty lists. Feeds the Format panel's
+  // series keys (legend charts) and the Sort section's manual-order lists.
   const previewCacheKey = useMemo(
-    () =>
-      draft.query.legend && isRunnable(draft)
-        ? runtime.queries.keyFor(toWireSpec(draft, modelId))
-        : null,
+    () => (isRunnable(draft) ? runtime.queries.keyFor(toWireSpec(draft, modelId)) : null),
     [runtime, draft, modelId],
   );
   const previewEntry = useQueryCacheState((state) =>
     previewCacheKey ? state.entries[previewCacheKey] : undefined,
   );
+  const previewResult =
+    previewEntry?.status === 'ok' && previewEntry.data ? previewEntry.data : null;
+  const previewShaped = useMemo(
+    () => (previewResult ? shapeChartData(previewResult, draft) : null),
+    [previewResult, draft],
+  );
+  // Series keys for the Format panel: legend charts read the shaped preview
+  // (unknown → []); otherwise measure labels (no fetch needed).
   const seriesKeys = useMemo<string[]>(() => {
     if (draft.query.legend) {
-      return previewEntry?.status === 'ok' && previewEntry.data
-        ? shapeChartData(previewEntry.data, draft).series.map((series) => series.key)
-        : [];
+      return previewShaped?.series.map((series) => series.key) ?? [];
     }
     return draft.query.measures.map((measure) => measureLabel(model, measure));
-  }, [draft, previewEntry, model]);
+  }, [draft, previewShaped, model]);
+
+  // Manual-order inputs for the Wells sort section (orderable families only).
+  // Categories/series come from the CURRENT shaped preview — exactly the
+  // labels/styleKeys the persisted arrays key on; pie mirrors slice labels.
+  const ordering = useMemo<ManualOrderInputs | undefined>(() => {
+    if (!ORDERABLE_TYPES.includes(draft.type)) return undefined;
+    const isPie = draft.type === 'pie' || draft.type === 'donut';
+    const categories = isPie
+      ? previewResult
+        ? shapePieData(previewResult, draft).slices.map((slice) => slice.label)
+        : []
+      : (previewShaped?.data.map((row) => String(row[previewShaped.axisKey] ?? '')) ?? []);
+    return {
+      categories,
+      series: isPie ? [] : (previewShaped?.series.map((series) => series.styleKey) ?? []),
+      axisIsDate: !isPie && (previewShaped?.axisIsDate ?? false),
+      categoryOrder: draft.format.categoryOrder,
+      seriesOrder: draft.format.seriesOrder,
+      onOrderChange: (categoryOrder, seriesOrder) =>
+        setDraft((current) => {
+          const format = { ...current.format };
+          if (categoryOrder && categoryOrder.length > 0) format.categoryOrder = categoryOrder;
+          else delete format.categoryOrder;
+          if (seriesOrder && seriesOrder.length > 0) format.seriesOrder = seriesOrder;
+          else delete format.seriesOrder;
+          return { ...current, format };
+        }),
+    };
+  }, [draft, previewResult, previewShaped]);
 
   return (
     // h-full: the hosting dialog (fillHeight + resizable) provides a definite
@@ -298,6 +367,15 @@ export function ChartBuilder({
                     }
                     placeholder="Chart title"
                   />
+                  {Boolean(draft.format.container?.hideHeader) &&
+                    Boolean(draft.format.container?.innerTitleHtml) && (
+                      // Frameless tiles show the INNER title, not this field —
+                      // without the hint a rename looks like it did nothing.
+                      <p className="text-[11px] leading-snug text-rcd-muted">
+                        This tile displays its inner title (Format → Container). Renaming
+                        updates the bold lead-in.
+                      </p>
+                    )}
                 </label>
 
                 <div className="flex flex-col gap-1">
@@ -322,6 +400,7 @@ export function ChartBuilder({
                   model={model}
                   catalog={catalog ?? null}
                   parameters={parameters}
+                  ordering={ordering}
                   onChange={(query) => setDraft((current) => ({ ...current, query }))}
                   onEditFilter={(index) => {
                     const clause = draft.query.filters[index];
@@ -395,7 +474,9 @@ export function ChartBuilder({
               {activeDrag.kind === 'parameter' && (
                 <Variable size={12} className="text-rcd-accent" />
               )}
-              {activeDrag.kind === 'column' ? activeDrag.column : activeDrag.name}
+              {activeDrag.kind === 'column'
+                ? columnLabelOf(model, activeDrag.table, activeDrag.column)
+                : activeDrag.name}
             </div>
           )}
         </DragOverlay>
@@ -413,7 +494,7 @@ export function ChartBuilder({
                 ? undefined
                 : 'Add at least one field to a values well'
           }
-          onClick={() => onSave(draft)}
+          onClick={() => onSave(withRetitledInnerTitle(draft, initial.title))}
         >
           Save chart
         </RcdButton>

@@ -190,3 +190,40 @@ export const sanitizeRichHtml = (html: string): string => {
   sanitizeChildren(doc, doc.body, container);
   return container.innerHTML;
 };
+
+/** Text → HTML escaping for retitleInnerTitleHtml's replacement content. */
+const escapeHtmlText = (text: string): string =>
+  text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * First <b>…</b> / <strong>…</strong> element, attributes allowed on the
+ * opening tag; non-greedy so only the FIRST bold run matches.
+ */
+const FIRST_BOLD_RE = /<(b|strong)(\s[^>]*)?>([\s\S]*?)<\/\1\s*>/i;
+
+/**
+ * Rewrites the content of the FIRST <b>/<strong> element of an inner-title
+ * HTML block to `newTitle` (HTML-escaped), preserving the tag, its attributes
+ * and everything around it. Returns null when the HTML carries no bold
+ * element — callers then leave the HTML untouched rather than guessing where
+ * the name lives.
+ *
+ * Why: frameless tiles (container.hideHeader) display container.innerTitleHtml
+ * INSTEAD of chart.title, with the visible name as a bold lead-in — the
+ * seeded-dashboard pattern "<p><b>NAME</b> <span>&mdash; description</span></p>".
+ * Renaming a chart (builder save) and every chart-copy path route the new
+ * title through here so the on-screen name follows the rename instead of the
+ * two titles silently diverging. A conservative regex is deliberate over DOM
+ * parsing: the input is already sanitizeRichHtml output (well-formed,
+ * allowlisted), and this must run without a DOM (store code, vitest).
+ */
+export const retitleInnerTitleHtml = (html: string, newTitle: string): string | null => {
+  if (typeof html !== 'string' || html === '') return null;
+  const match = FIRST_BOLD_RE.exec(html);
+  if (match === null) return null;
+  return (
+    html.slice(0, match.index) +
+    `<${match[1]}${match[2] ?? ''}>${escapeHtmlText(newTitle)}</${match[1]}>` +
+    html.slice(match.index + match[0].length)
+  );
+};

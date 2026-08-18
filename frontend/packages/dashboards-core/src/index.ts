@@ -52,7 +52,9 @@ export type { ChartIssue } from './validation/chartValidation';
 export { dateOnlyPartOf, displayDateBound, inclusiveDateUpperBound } from './util/dateBounds';
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
-export { sanitizeRichHtml } from './util/richText';
+export { retitleInnerTitleHtml, sanitizeRichHtml } from './util/richText';
+export { reconcileOrder, reconcileOrderBy } from './util/ordering';
+export { composeDataLabel } from './util/dataLabels';
 export {
   formatCellValue,
   formatAxisValue,

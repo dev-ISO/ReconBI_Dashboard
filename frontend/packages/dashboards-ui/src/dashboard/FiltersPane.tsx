@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { AlertTriangle, ChevronDown, ChevronRight, Filter, Plus, Trash2, X } from 'lucide-react';
 import {
+  columnLabelOf,
   filterCardHasUnsupportedOr,
   isChartTile,
   isCompleteFilterCondition,
@@ -138,10 +139,9 @@ export function FiltersPane({ pageId, tiles, modelId, editable, onClose }: Filte
     return modelTable?.friendlyName ?? modelTable?.name ?? table;
   };
 
-  const columnLabelOf = (table: string, column: string): string => {
-    const modelTable = modelTables.find((t) => tableKey(t.schema, t.name) === table);
-    return modelTable?.columns?.find((c) => c.name === column)?.friendlyName ?? column;
-  };
+  /** Friendly column label via the shared core helper; raw name until the model loads. */
+  const columnLabel = (table: string, column: string): string =>
+    modelReady && openModel ? columnLabelOf(openModel.definition, table, column) : column;
 
   const addCard = (scope: FilterScope, field: PickedField) => {
     const id = runtime.dashboards.addFilterCard({
@@ -166,7 +166,7 @@ export function FiltersPane({ pageId, tiles, modelId, editable, onClose }: Filte
         card={card}
         modelId={modelId}
         editable={editable}
-        columnLabel={columnLabelOf(card.table, card.column)}
+        columnLabel={columnLabel(card.table, card.column)}
         tableLabel={tableLabelOf(card.table)}
         expanded={expanded[card.id] ?? false}
         onToggleExpanded={() =>

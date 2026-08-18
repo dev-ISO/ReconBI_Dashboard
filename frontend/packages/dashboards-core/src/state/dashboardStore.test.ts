@@ -3,7 +3,7 @@ import type { DashboardsApi, SaveDashboardBody } from '../api/DashboardsApi';
 import { RcdApiError } from '../api/fetcher';
 import type { ChartSpec } from '../types/chart';
 import type { DashboardDetail, DashboardLayoutDoc } from '../types/dashboard';
-import { DashboardStore } from './dashboardStore';
+import { cloneChartForCopy, DashboardStore } from './dashboardStore';
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -297,6 +297,64 @@ describe('copyChartToDashboard', () => {
     expect(updateDashboard).toHaveBeenCalledTimes(1);
     expect(store.store.getState().error).toBe(
       'Your access to this dashboard does not allow that change.',
+    );
+  });
+});
+
+describe('cloneChartForCopy (the shared copy-path clone)', () => {
+  /** Frameless seeded-tile pattern: the INNER title carries the visible name. */
+  const framelessChart = (): ChartSpec => ({
+    ...chartFor('Valve Status'),
+    format: {
+      container: {
+        hideHeader: true,
+        innerTitleHtml:
+          '<p><b>Valve Status</b> <span style="color:#64748b">&mdash; by area</span></p>',
+      },
+    },
+  });
+
+  it('assigns a fresh chart id and suffixes the title (source untouched)', () => {
+    const source = chartFor('Orders');
+    const copy = cloneChartForCopy(source, { suffix: true });
+    expect(copy.id).not.toBe(source.id);
+    expect(copy.title).toBe('Orders (copy)');
+    expect(source.title).toBe('Orders');
+  });
+
+  it("rewrites the inner title's bold lead-in to the copy's title", () => {
+    const copy = cloneChartForCopy(framelessChart(), { suffix: true });
+    expect(copy.format.container?.innerTitleHtml).toBe(
+      '<p><b>Valve Status (copy)</b> <span style="color:#64748b">&mdash; by area</span></p>',
+    );
+  });
+
+  it('without a suffix the inner title still normalizes to the (unchanged) title', () => {
+    const copy = cloneChartForCopy(framelessChart());
+    expect(copy.title).toBe('Valve Status');
+    expect(copy.format.container?.innerTitleHtml).toContain('<b>Valve Status</b>');
+  });
+
+  it('leaves an inner title without a bold element untouched', () => {
+    const source: ChartSpec = {
+      ...chartFor('Orders'),
+      format: { container: { innerTitleHtml: '<p>plain description</p>' } },
+    };
+    const copy = cloneChartForCopy(source, { suffix: true });
+    expect(copy.format.container?.innerTitleHtml).toBe('<p>plain description</p>');
+  });
+
+  it('same-dashboard "copy to" gains the suffix and the retitled inner title', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+
+    await store.copyChartToDashboard(1, framelessChart(), 1);
+
+    const tiles = store.store.getState().current!.layout.pages![0]!.tiles;
+    expect(tiles).toHaveLength(1);
+    expect(tiles[0]!.chart!.title).toBe('Valve Status (copy)');
+    expect(tiles[0]!.chart!.format.container?.innerTitleHtml).toContain(
+      '<b>Valve Status (copy)</b>',
     );
   });
 });

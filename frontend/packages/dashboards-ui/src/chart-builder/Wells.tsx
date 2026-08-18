@@ -29,6 +29,7 @@ import {
 } from 'lucide-react';
 import {
   isTemporalType,
+  reconcileOrder,
   type Aggregation,
   type Catalog,
   type ChartQuery,
@@ -68,6 +69,30 @@ export interface WellsProps {
   onChange: (query: ChartQuery) => void;
   /** Opens the FilterEditor for an existing clause in query.filters. */
   onEditFilter: (index: number) => void;
+  /**
+   * Inputs for the Sort section's "Custom order…" drag lists (cartesian +
+   * pie families). Absent = the choice is not offered. ChartBuilder derives
+   * the lists from the cached preview result — no extra fetch.
+   */
+  ordering?: ManualOrderInputs;
+}
+
+/** What the manual-order UI needs to know about the CURRENTLY rendered chart. */
+export interface ManualOrderInputs {
+  /** Category display labels in the order the chart shows them (categoryOrder keys). */
+  categories: string[];
+  /** Series styleKeys in render order (the colorOverrides/seriesLabels keys seriesOrder uses). */
+  series: string[];
+  /** Date axes keep server chronology — the category list is suppressed. */
+  axisIsDate: boolean;
+  /** Persisted format.categoryOrder / format.seriesOrder. */
+  categoryOrder?: string[];
+  seriesOrder?: string[];
+  /** Writes both arrays back to format (undefined/empty clears a side). */
+  onOrderChange: (
+    categoryOrder: string[] | undefined,
+    seriesOrder: string[] | undefined,
+  ) => void;
 }
 
 const DATE_BUCKETS: { value: DateBucket; label: string }[] = [
@@ -202,6 +227,7 @@ export function Wells({
   parameters,
   onChange,
   onEditFilter,
+  ordering,
 }: WellsProps) {
   const removeMeasure = (index: number) =>
     onChange({ ...query, measures: query.measures.filter((_, i) => i !== index) });
@@ -406,7 +432,7 @@ export function Wells({
         ))}
       </Well>
 
-      <SortLimitSection query={query} model={model} onChange={onChange} />
+      <SortLimitSection query={query} model={model} ordering={ordering} onChange={onChange} />
     </div>
   );
 }
@@ -710,7 +736,14 @@ function SortableLevelRow({
 // Sort / Top N
 // ---------------------------------------------------------------------------
 
-type SortChoice = 'auto' | 'custom' | `dim-asc` | `dim-desc` | `m${number}-asc` | `m${number}-desc`;
+type SortChoice =
+  | 'auto'
+  | 'custom'
+  | 'customOrder'
+  | `dim-asc`
+  | `dim-desc`
+  | `m${number}-asc`
+  | `m${number}-desc`;
 
 const currentSortChoice = (query: ChartQuery): SortChoice => {
   const sort = query.sort ?? [];
@@ -727,7 +760,7 @@ const currentSortChoice = (query: ChartQuery): SortChoice => {
 };
 
 const sortSpecFor = (choice: SortChoice): SortSpec[] | undefined => {
-  if (choice === 'auto' || choice === 'custom') return undefined;
+  if (choice === 'auto' || choice === 'custom' || choice === 'customOrder') return undefined;
   const [target, direction] = choice.split('-') as [string, 'asc' | 'desc'];
   if (target === 'dim') return [{ target: { kind: 'dimension', index: 0 }, direction }];
   return [{ target: { kind: 'measure', index: Number(target.slice(1)) }, direction }];
@@ -737,14 +770,21 @@ const sortSpecFor = (choice: SortChoice): SortSpec[] | undefined => {
  * Plain-labeled Sort and Top N controls over the EXISTING query.sort /
  * query.limit fields (nothing new on the wire) — previously these were
  * invisible in the builder. "Highest X first" + a row limit = a Top N chart.
+ *
+ * "Custom order…" (when `ordering` is provided) is DISPLAY ordering, not a
+ * sort rule: it writes format.categoryOrder / format.seriesOrder and leaves
+ * query.sort untouched — the server order stays the base the manual order
+ * reconciles against (listed-first, unlisted-append, stale-drop).
  */
 function SortLimitSection({
   query,
   model,
+  ordering,
   onChange,
 }: {
   query: ChartQuery;
   model: ModelDefinition;
+  ordering?: ManualOrderInputs;
   onChange: (query: ChartQuery) => void;
 }) {
   // The first wire dimension is what sorting "by category" orders: the axis,
@@ -753,9 +793,25 @@ function SortLimitSection({
   const dimLabel = firstDimension
     ? columnLabelOf(model, firstDimension.table, firstDimension.column)
     : null;
-  const choice = currentSortChoice(query);
+  const hasManual =
+    (ordering?.categoryOrder?.length ?? 0) > 0 || (ordering?.seriesOrder?.length ?? 0) > 0;
+  // Keeps "Custom order…" selected (lists open) before the first drag has
+  // persisted anything; persisted arrays keep it selected across reopens.
+  const [customOrderOpen, setCustomOrderOpen] = useState(hasManual);
+  const choice: SortChoice =
+    ordering && (customOrderOpen || hasManual) ? 'customOrder' : currentSortChoice(query);
 
   const apply = (next: SortChoice) => {
+    if (next === 'customOrder') {
+      setCustomOrderOpen(true);
+      return;
+    }
+    // Leaving custom order clears the persisted arrays — a select reading
+    // "A to Z" over a still-manually-ordered chart would lie.
+    if (customOrderOpen || hasManual) {
+      setCustomOrderOpen(false);
+      ordering?.onOrderChange(undefined, undefined);
+    }
     if (next === 'custom') return; // display-only marker for multi-rule specs
     onChange({ ...query, sort: sortSpecFor(next) });
   };
@@ -793,9 +849,14 @@ function SortLimitSection({
               </optgroup>
             );
           })}
+          {ordering && <option value="customOrder">Custom order…</option>}
           {choice === 'custom' && <option value="custom">Custom (multiple rules)</option>}
         </RcdSelect>
       </label>
+
+      {ordering && choice === 'customOrder' && (
+        <ManualOrderEditor ordering={ordering} />
+      )}
 
       <label className="flex flex-col gap-1">
         <span className="text-xs font-medium text-rcd-text">Top N</span>
@@ -814,6 +875,138 @@ function SortLimitSection({
           </span>
         </div>
       </label>
+    </div>
+  );
+}
+
+/**
+ * The "Custom order…" body: up to two drag lists (categories / series) whose
+ * DISPLAYED order is the persisted array reconciled against the live items —
+ * so it always shows exactly what the chart shows — and whose first drag
+ * persists the complete list. Categories are suppressed on date axes
+ * (chronology beats manual order); the series list only appears when there
+ * is more than one series (single-series colorByCategory bars reorder via
+ * the category list).
+ */
+function ManualOrderEditor({ ordering }: { ordering: ManualOrderInputs }) {
+  const categoryItems = reconcileOrder(ordering.categoryOrder, ordering.categories);
+  const seriesItems = reconcileOrder(ordering.seriesOrder, ordering.series);
+  const showCategories = !ordering.axisIsDate && categoryItems.length > 0;
+  const showSeries = seriesItems.length > 1;
+  const hasManual =
+    (ordering.categoryOrder?.length ?? 0) > 0 || (ordering.seriesOrder?.length ?? 0) > 0;
+
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-rcd-border bg-black/[0.02] p-2 dark:bg-white/[0.03]">
+      <p className="text-[11px] leading-snug text-rcd-muted">
+        Drag to set the display order. Values not listed keep the sorted order
+        and append at the end.
+      </p>
+      {showCategories && (
+        <OrderList
+          label="Categories"
+          items={categoryItems}
+          onReorder={(next) => ordering.onOrderChange(next, ordering.seriesOrder)}
+        />
+      )}
+      {ordering.axisIsDate && (
+        <p className="text-[11px] leading-snug text-rcd-muted">
+          Date axes keep chronological order — only series can be reordered.
+        </p>
+      )}
+      {showSeries && (
+        <OrderList
+          label="Series / legend"
+          items={seriesItems}
+          onReorder={(next) => ordering.onOrderChange(ordering.categoryOrder, next)}
+        />
+      )}
+      {!showCategories && !showSeries && !ordering.axisIsDate && (
+        <p className="text-[11px] leading-snug text-rcd-muted">
+          Waiting for preview data — the current categories appear here.
+        </p>
+      )}
+      {hasManual && (
+        <button
+          type="button"
+          onClick={() => ordering.onOrderChange(undefined, undefined)}
+          className="self-start text-[11px] font-medium text-rcd-accent hover:underline"
+        >
+          Reset order
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * One reorderable name list. A nested DndContext — REQUIRED, not stylistic:
+ * the builder's outer field-drag DndContext (ChartBuilder) would otherwise
+ * capture these drags (same isolation doctrine as OrderedDimensionList).
+ * Sortable ids are positional (labels can collide under coarse date
+ * formats); the drag emits the full reordered label list.
+ */
+function OrderList({
+  label,
+  items,
+  onReorder,
+}: {
+  label: string;
+  items: string[];
+  onReorder: (items: string[]) => void;
+}) {
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const ids = items.map((_, index) => `${label}-${index}`);
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const from = ids.indexOf(String(event.active.id));
+    const to = event.over ? ids.indexOf(String(event.over.id)) : -1;
+    if (from < 0 || to < 0 || from === to) return;
+    onReorder(arrayMove(items, from, to));
+  };
+
+  return (
+    <div>
+      <span className="text-[11px] font-medium text-rcd-text-2">{label}</span>
+      <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+        <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+          <div className="mt-1 flex flex-col gap-1">
+            {items.map((item, index) => (
+              <SortableOrderRow key={ids[index]} id={ids[index]!} label={item} />
+            ))}
+          </div>
+        </SortableContext>
+      </DndContext>
+    </div>
+  );
+}
+
+function SortableOrderRow({ id, label }: { id: string; label: string }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id,
+  });
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
+      className={`flex min-w-0 max-w-full items-center gap-1 rounded-md border border-rcd-border bg-rcd-bg px-1.5 py-1 text-xs font-medium text-rcd-text ${
+        isDragging ? 'relative z-10 opacity-80' : ''
+      }`}
+    >
+      <button
+        type="button"
+        aria-label={`Reorder ${label}`}
+        title="Drag to reorder"
+        {...attributes}
+        {...listeners}
+        className="shrink-0 cursor-grab touch-none rounded p-0.5 text-rcd-muted hover:text-rcd-text"
+      >
+        <GripVertical size={11} />
+      </button>
+      <span className="min-w-0 flex-1 truncate" title={label}>
+        {label}
+      </span>
     </div>
   );
 }

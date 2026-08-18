@@ -253,6 +253,18 @@ export function RcdDialog({
     rememberGeometry();
   };
 
+  // The focus-trap effect must depend on `open` ALONE. Consumers routinely
+  // pass inline onClose closures, and with onClose in the deps every parent
+  // re-render (query resolutions, refresh ticks) re-ran setup/cleanup: the
+  // cleanup refocused the OPENER outside the dialog, the re-run focused the
+  // dialog's first focusable — yanking the caret out of inputs mid-word
+  // (ShareDialog's people search was the visible casualty). The latest
+  // onClose is read through a ref instead, so Escape always calls the
+  // current closure while genuine open/close transitions (and unmount) keep
+  // the focus-restore contract exactly as before.
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
   useEffect(() => {
     if (!open) return;
     const previouslyFocused = document.activeElement as HTMLElement | null;
@@ -270,7 +282,7 @@ export function RcdDialog({
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === 'Escape') {
         event.stopPropagation();
-        onClose();
+        onCloseRef.current();
       }
       if (event.key === 'Tab' && panelRef.current) {
         const focusables = panelRef.current.querySelectorAll<HTMLElement>(
@@ -292,9 +304,11 @@ export function RcdDialog({
     document.addEventListener('keydown', onKeyDown);
     return () => {
       document.removeEventListener('keydown', onKeyDown);
+      // Runs only on true close/unmount now (see the dep note above), so the
+      // opener gets focus back exactly once, when the dialog actually leaves.
       previouslyFocused?.focus();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   if (!open) return null;
 

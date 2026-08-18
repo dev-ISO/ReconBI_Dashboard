@@ -50,7 +50,7 @@ import type {
 import type { ColumnType } from '../types/schema';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
-import { sanitizeRichHtml } from '../util/richText';
+import { retitleInnerTitleHtml, sanitizeRichHtml } from '../util/richText';
 import type { AsyncStatus } from './modelStore';
 
 export interface OpenDashboard {
@@ -400,6 +400,31 @@ export const dateRangeClauseFor = (
       ? { start: first.start, end: last.end }
       : { start: last.start, end: first.end };
   return betweenClause(dimension, ordered.start, ordered.end, options.columnType);
+};
+
+/**
+ * Chart clone shared by EVERY copy path — duplicate tile, clipboard paste,
+ * copy-to-dashboard (same- and cross-dashboard): fresh chart id, optional
+ * " (copy)" title suffix, and — when the tile carries a rich inner title
+ * (format.container.innerTitleHtml, the frameless seeded-tile pattern where
+ * THAT is the visible name, not chart.title) — the inner title's bold
+ * lead-in rewritten to the copy's title, so the copy shows its own name
+ * immediately instead of masquerading as its source. A helper miss (no bold
+ * element in the HTML) leaves the inner title untouched.
+ */
+export const cloneChartForCopy = (
+  chart: ChartSpec,
+  options?: { suffix?: boolean },
+): ChartSpec => {
+  const copy = structuredClone(chart);
+  copy.id = newId();
+  if (options?.suffix) copy.title = `${chart.title} (copy)`;
+  const innerTitleHtml = copy.format.container?.innerTitleHtml;
+  if (innerTitleHtml) {
+    const retitled = retitleInnerTitleHtml(innerTitleHtml, copy.title);
+    if (retitled !== null) copy.format.container!.innerTitleHtml = retitled;
+  }
+  return copy;
 };
 
 const initialState: DashboardStoreState = {
@@ -795,15 +820,7 @@ export class DashboardStore {
         id: newId(),
         layout: { ...source.layout, x: source.layout.x, y: maxY },
         ...(source.kind ? { kind: source.kind } : {}),
-        ...(source.chart
-          ? {
-              chart: structuredClone({
-                ...source.chart,
-                id: newId(),
-                title: `${source.chart.title} (copy)`,
-              }),
-            }
-          : {}),
+        ...(source.chart ? { chart: cloneChartForCopy(source.chart, { suffix: true }) } : {}),
         ...(source.slicer
           ? { slicer: structuredClone({ ...source.slicer, label: `${source.slicer.label} (copy)` }) }
           : {}),
@@ -1767,15 +1784,16 @@ export class DashboardStore {
   pasteChartTile(): void {
     const clip = this.state.chartClipboard;
     if (!clip || this.state.mode !== 'edit' || !this.state.current) return;
-    this.addTile(
-      structuredClone({ ...clip.chart, id: newId(), title: `${clip.chart.title} (copy)` }),
-    );
+    this.addTile(cloneChartForCopy(clip.chart, { suffix: true }));
   }
 
   /**
    * Copies a chart onto another dashboard (or this one). Same dashboard:
    * in-store append to the active page — dirties and honors the edit session
-   * like any other draft change. Other dashboard: server round-trip
+   * like any other draft change — with the " (copy)" suffix the other
+   * same-dashboard copy paths use (a suffixless twin on the same page was
+   * indistinguishable from its source); cross-dashboard copies keep the name
+   * unchanged. Other dashboard: server round-trip
    * (getDashboard → append a tile to the FIRST page, or to the top-level
    * tiles on a legacy no-pages doc → updateDashboard with the fresh
    * expectedUpdatedAtUtc); a concurrent-save 409 (rcd.dashboard.stale)
@@ -1790,7 +1808,7 @@ export class DashboardStore {
   ): Promise<void> {
     const current = this.state.current;
     if (current && current.id === targetId) {
-      this.addTile(structuredClone({ ...chart, id: newId() }));
+      this.addTile(cloneChartForCopy(chart, { suffix: true }));
       return;
     }
     try {
@@ -1825,7 +1843,10 @@ export class DashboardStore {
         minW: 4,
         minH: 4,
       },
-      chart: structuredClone({ ...chart, id: newId() }),
+      // No suffix (the name stays), but the clone still routes the inner
+      // title through the retitle helper so title and inner title stay in
+      // sync on the target dashboard.
+      chart: cloneChartForCopy(chart),
     });
     const pages = layout.pages ?? [];
     const nextLayout: DashboardLayoutDoc =

@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Printer, X } from 'lucide-react';
-import { isChartTile, isImageTile, isTextTile, type FilterClause } from '@recon/dashboards-core';
+import {
+  isChartTile,
+  isImageTile,
+  isTextTile,
+  sanitizeRichHtml,
+  type ContainerStyle,
+  type FilterClause,
+} from '@recon/dashboards-core';
 import { ChartTile } from '../chart/ChartTile';
+import { INNER_TITLE_CLASSES } from './TileFrame';
 import { TextTileContent } from './TextTile';
 import { ImageTileContent } from './ImageTile';
 import { useDashboardState } from '../provider/DashboardsProvider';
@@ -146,7 +154,7 @@ export function PrintSheets({
     // Print renders the BASE chart spec: transient per-tile drill state lives
     // in the on-screen DashboardChartTile and is deliberately ignored here.
     return (
-      <PrintTileBox title={tile.chart.title}>
+      <PrintTileBox title={tile.chart.title} container={tile.chart.format.container ?? null}>
         {modelId === null ? (
           <div className="flex h-full items-center justify-center p-4 text-center text-sm text-rcd-muted">
             No model attached to this dashboard.
@@ -313,16 +321,45 @@ function BlockBox({
   );
 }
 
-/** Minimal print tile chrome (no drag handle / kebab / hover affordances). */
-function PrintTileBox({ title, children }: { title: string; children: ReactNode }) {
+/**
+ * Minimal print tile chrome (no drag handle / kebab / hover affordances),
+ * honoring the tile's container customization the way TileFrame does on
+ * screen: hideHeader drops the header bar (frameless tiles would otherwise
+ * print a title bar they never show), and a rich inner title renders
+ * sanitized above the body — so printed built-ins keep their bold lead-in +
+ * description instead of showing the bare chart.title.
+ */
+function PrintTileBox({
+  title,
+  container,
+  children,
+}: {
+  title: string;
+  container: ContainerStyle | null;
+  children: ReactNode;
+}) {
+  const hideHeader = container?.hideHeader === true;
+  // Sanitize-before-inject, same second-belt doctrine as TileFrame (print
+  // renders rarely — no memo needed).
+  const innerTitleSafe = sanitizeRichHtml(container?.innerTitleHtml ?? '');
   return (
     <div className="flex h-full w-full flex-col overflow-hidden rounded-lg border border-rcd-border bg-rcd-surface">
-      <div className="border-b border-rcd-border px-2.5 py-1">
-        <span className="block truncate text-sm font-medium text-rcd-text" title={title}>
-          {title}
-        </span>
+      {!hideHeader && (
+        <div className="border-b border-rcd-border px-2.5 py-1">
+          <span className="block truncate text-sm font-medium text-rcd-text" title={title}>
+            {title}
+          </span>
+        </div>
+      )}
+      <div className="flex min-h-0 flex-1 flex-col p-2">
+        {innerTitleSafe !== '' && (
+          <div
+            className={INNER_TITLE_CLASSES}
+            dangerouslySetInnerHTML={{ __html: innerTitleSafe }}
+          />
+        )}
+        <div className="min-h-0 flex-1">{children}</div>
       </div>
-      <div className="min-h-0 flex-1 p-2">{children}</div>
     </div>
   );
 }

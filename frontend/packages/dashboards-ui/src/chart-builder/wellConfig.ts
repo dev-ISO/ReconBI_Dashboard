@@ -3,9 +3,9 @@
 // shapes below encode each type's capacity rules (pie slices by legend, kpi
 // is values-only, scatter wants exactly two measures, ...).
 import {
+  columnLabelOf,
   isNumericType,
   isTemporalType,
-  tableKey,
   type Aggregation,
   type Catalog,
   type ChartQuery,
@@ -527,10 +527,10 @@ export const columnTypeOf = (
 ): ColumnType | null =>
   catalog?.tables.find((t) => t.key === table)?.columns.find((c) => c.name === column)?.type ?? null;
 
-export const columnLabelOf = (model: ModelDefinition, table: string, column: string): string => {
-  const modelTable = model.tables.find((t) => tableKey(t.schema, t.name) === table);
-  return modelTable?.columns?.find((c) => c.name === column)?.friendlyName ?? column;
-};
+// columnLabelOf was PROMOTED to dashboards-core (the dashboard layer needs it
+// for cross-filter chip labels); re-exported here so existing
+// '../chart-builder/wellConfig' imports keep working unchanged.
+export { columnLabelOf };
 
 /** Display label for a measure chip / series (alias > model measure name > "agg of column"). */
 export const measureLabel = (model: ModelDefinition, measure: MeasureRef): string => {

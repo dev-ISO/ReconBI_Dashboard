@@ -39,6 +39,7 @@ import {
   type MouseHandlerDataParam,
 } from 'recharts';
 import {
+  composeDataLabel,
   formatAxisValue,
   formatCellValue,
   sanitizeRichHtml,
@@ -56,6 +57,7 @@ import {
   type TooltipStyle,
 } from '@recon/dashboards-core';
 import {
+  COLOR_INDEX_KEY,
   measureNameForKey,
   RAW_AXIS_KEY,
   shapeChartData,
@@ -1989,6 +1991,50 @@ function CartesianChart({
     [rows, winStart, winEnd, lastRow],
   );
 
+  // ---- data-label content (format.dataLabelContent) ------------------------
+  // Percent denominators are SIGNED sums, exactly like the axis domain
+  // (composeDataLabel falls back to value-only on a non-positive total).
+  // Non-stacked labels divide by the series' own total across the VISIBLE
+  // rows (the zoom slice — the picture the viewer reads the share against),
+  // memoized alongside displayRows and null in the value-only common case so
+  // it pays nothing. Stacked labels divide by their OWN row's stack total
+  // over the visible series, summed at label time from the row itself — no
+  // index-addressed parallel array to fall out of step with.
+  const labelContent = format.dataLabelContent ?? 'value';
+  const numericCell = (cell: CellValue | undefined): number =>
+    typeof cell === 'number' ? cell : 0;
+  const labelSeriesTotals = useMemo(() => {
+    if (!showDataLabels || labelContent === 'value' || stacked) return null;
+    return new Map<string, number>(
+      visibleSeries.map((sr) => [
+        sr.key,
+        displayRows.reduce((sum, row) => sum + numericCell(row[sr.key]), 0),
+      ]),
+    );
+  }, [showDataLabels, labelContent, stacked, displayRows, visibleSeries]);
+
+  /**
+   * LabelList valueAccessor computing the FINAL label string. valueAccessor
+   * — not dataKey + formatter — because recharts ignores the accessor while a
+   * dataKey is set, and only the accessor sees the full row (entry.payload)
+   * the percent denominators need. Position/font/fill stay as before, so
+   * value-only labels render exactly where they always did.
+   */
+  const dataLabelAccessor =
+    (series: ChartSeries) =>
+    (entry: unknown, index: number): string => {
+      const payload = (entry as { payload?: Record<string, CellValue> } | null)?.payload;
+      const row = payload ?? displayRows[index];
+      const value = row?.[series.key];
+      if (typeof value !== 'number') return '';
+      const formatted = formatSeriesValue(value, series.key);
+      if (labelContent === 'value') return formatted;
+      const total = stacked
+        ? visibleSeries.reduce((sum, sr) => sum + numericCell(row?.[sr.key]), 0)
+        : (labelSeriesTotals?.get(series.key) ?? 0);
+      return composeDataLabel(formatted, value, total, labelContent);
+    };
+
   // ---- axis scales (AxisScaleOptions) --------------------------------------
   // Extents cover the VISIBLE series on each axis (so legend toggles re-fit
   // like recharts' own auto domain) plus the trendline overlays fitted to
@@ -2234,8 +2280,15 @@ function CartesianChart({
     // (colorByCategory mode) > first matching barFill rule > palette slot /
     // series color. An explicit per-category override is the strongest user
     // intent; rules still beat the default palette.
+    // The palette slot comes from the row's SHAPE-TIME ordinal
+    // (COLOR_INDEX_KEY): the display index shifts under zoom windows and
+    // format.categoryOrder, and a category must keep its hue through both.
+    // Every shapeChartData row carries the stamp (trendline copies spread it
+    // along); the display-index fallback is defensive only.
+    const colorIndex =
+      typeof row[COLOR_INDEX_KEY] === 'number' ? (row[COLOR_INDEX_KEY] as number) : dataIndex;
     const paletteFill = colorByCategory
-      ? seriesColor(dataIndex, categoryLabel, format.colorOverrides, format.theme)
+      ? seriesColor(colorIndex, categoryLabel, format.colorOverrides, format.theme)
       : series.color;
     const overridden = colorByCategory && Boolean(format.colorOverrides?.[categoryLabel]);
     const ruleFill =
@@ -2676,13 +2729,10 @@ function CartesianChart({
                   })}
                 {showDataLabels && (
                   <LabelList
-                    dataKey={series.key}
+                    valueAccessor={dataLabelAccessor(series)}
                     position={labelPosition}
                     fontSize={10}
                     fill="var(--rcd-text-2)"
-                    formatter={(label) =>
-                      typeof label === 'number' ? formatSeriesValue(label, series.key) : label
-                    }
                   />
                 )}
               </Bar>

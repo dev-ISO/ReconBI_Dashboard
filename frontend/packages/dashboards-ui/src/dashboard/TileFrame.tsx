@@ -58,9 +58,11 @@ const SHADOWS: Record<NonNullable<ContainerStyle['shadow']>, string> = {
 
 /**
  * Element styling for the sanitized inner-title subset (Tailwind preflight
- * strips default margins/list styles). Literal classes so host builds keep them.
+ * strips default margins/list styles). Literal classes so host builds keep
+ * them. Exported for DashboardPrintView's PrintTileBox, which renders the
+ * same inner title on paper.
  */
-const INNER_TITLE_CLASSES =
+export const INNER_TITLE_CLASSES =
   'shrink-0 pb-1 text-sm leading-snug text-rcd-text [overflow-wrap:anywhere] ' +
   '[&_a]:text-rcd-accent [&_a]:underline ' +
   '[&_h1]:my-0.5 [&_h1]:text-xl [&_h1]:font-semibold ' +

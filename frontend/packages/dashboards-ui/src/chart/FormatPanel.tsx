@@ -1417,6 +1417,8 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const hasAxes = !AXISLESS_TYPES.includes(spec.type);
   const horizontal = HORIZONTAL_TYPES.includes(spec.type);
   const isLineType = LINE_TYPES.includes(spec.type);
+  /** Bar/column family — the renderer's one LabelList site (line/area draw no labels). */
+  const isBarFamily = CARTESIAN_TYPES.includes(spec.type) && !isLineType;
   const supportsPercent = PERCENT_TYPES.includes(spec.type);
   const supportsTooltip = spec.type !== 'kpi' && spec.type !== 'table';
   const tooltipEnabled = format.tooltip?.enabled ?? true;
@@ -2508,6 +2510,25 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
             checked={format.showDataLabels ?? false}
             onChange={(checked) => patch({ showDataLabels: checked })}
           />
+        )}
+        {isBarFamily && (format.showDataLabels ?? false) && (
+          // What the on-mark labels SAY (value / share of total / both) —
+          // indented under the checkbox it refines; 'value' is the default
+          // and stays out of the persisted spec.
+          <div className="pl-5">
+            <SegmentedRow
+              label="Labels show"
+              options={[
+                { value: 'value', label: 'Value' },
+                { value: 'percent', label: '% of total' },
+                { value: 'both', label: 'Both' },
+              ]}
+              value={format.dataLabelContent ?? 'value'}
+              onChange={(next) =>
+                patch({ dataLabelContent: next === 'value' ? undefined : next })
+              }
+            />
+          </div>
         )}
         <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
           Value format

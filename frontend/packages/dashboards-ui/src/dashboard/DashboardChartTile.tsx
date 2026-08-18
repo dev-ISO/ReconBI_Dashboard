@@ -441,6 +441,13 @@ export function DashboardChartTile({
     });
     return {
       ...chart,
+      // Manual category order keys the LEVEL-0 axis labels; a drilled axis
+      // shows different categories, so the order is dropped while drilled
+      // instead of silently mismatching. seriesOrder keys the legend, which
+      // drilling never swaps — it stays.
+      ...(chart.format.categoryOrder
+        ? { format: { ...chart.format, categoryOrder: undefined } }
+        : null),
       query: {
         ...chart.query,
         axis: drillLevels[level - 1],

@@ -501,6 +501,34 @@ export interface ChartFormat {
   showLegend?: boolean;
   legendPosition?: 'top' | 'right' | 'bottom';
   showDataLabels?: boolean;
+  /**
+   * What the on-mark value labels SAY (bar/column family incl. stacked — the
+   * renderer's one LabelList site; line/area draw no labels): unset/'value'
+   * renders the formatted number, 'percent' its share of total, 'both' both
+   * ("1,234 (12.5%)"). Denominators are SIGNED sums exactly as the axis reads
+   * them: the stack total within the category on stacked charts, else the
+   * series' own total across the visible rows (util/dataLabels
+   * composeDataLabel documents the non-positive-total fallback).
+   */
+  dataLabelContent?: 'value' | 'percent' | 'both';
+  /**
+   * Manual display order of category labels (the formatted axis/slice labels
+   * the shapers emit). Applied client-side at the END of shaping — after
+   * colors are assigned and empty edges trimmed, so reordering never re-hues
+   * — with TableOptions.columnOrder reconciliation semantics (util/ordering
+   * reconcileOrder): listed labels first in this order, unlisted categories
+   * append in engine order, stale labels drop silently. query.sort stays the
+   * base order underneath. Ignored while a tile is drilled below level 0
+   * (the drilled axis shows different categories).
+   */
+  categoryOrder?: string[];
+  /**
+   * Manual order of series (legend entries, stacking order), keyed by
+   * styleKey — the series' DEFAULT display name, the same key colorOverrides
+   * and seriesLabels use — with categoryOrder's reconciliation semantics.
+   * Colors stay bound to each series, never to its list position.
+   */
+  seriesOrder?: string[];
   /** e.g. "#,0" | "0.0%" | "$#,0" — applied to measure values. */
   valueFormat?: string;
   xAxisLabel?: string;

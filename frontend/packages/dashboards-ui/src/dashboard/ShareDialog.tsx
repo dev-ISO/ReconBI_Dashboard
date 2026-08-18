@@ -43,6 +43,14 @@ interface PermissionTemplate {
 
 const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', layout: true, pages: true, charts: true };
 
+/**
+ * Candidate rows rendered at once. The list scrolls (max-h-40), so the cap is
+ * about render cost, not UX; when more users match, a "Showing N of M" line
+ * says so instead of silently truncating (the old cap of 8 made mid-sized
+ * directories look incomplete).
+ */
+const CANDIDATE_CAP = 50;
+
 const templatePermissions = (
   template: PermissionTemplate,
 ): Pick<ShareRow, 'canEditLayout' | 'canManagePages' | 'canEditCharts'> =>
@@ -120,6 +128,8 @@ export function ShareDialog({
   /** True when the UNFILTERED directory came back empty (not configured). */
   const [directoryEmpty, setDirectoryEmpty] = useState(false);
   const [query, setQuery] = useState('');
+  /** Non-null after the freshest search request failed (cleared on success). */
+  const [searchError, setSearchError] = useState<string | null>(null);
   /** Picked-but-not-yet-added users (the chips). */
   const [picked, setPicked] = useState<RcdUser[]>([]);
   const [template, setTemplate] = useState<PermissionTemplate>(DEFAULT_TEMPLATE);
@@ -147,6 +157,7 @@ export function ShareDialog({
     setLoading(true);
     setLoadError(null);
     setSaveError(null);
+    setSearchError(null);
     setRows([]);
     setPicked([]);
     setQuery('');
@@ -192,20 +203,28 @@ export function ShareDialog({
       runtime.dashboards
         .listUsers(q === '' ? undefined : q)
         .then((result) => {
-          if (seq === searchSeqRef.current) setUsers(result);
+          if (seq === searchSeqRef.current) {
+            setUsers(result);
+            setSearchError(null);
+          }
         })
         .catch(() => {
-          // keep the previous results on a failed search keystroke
+          // The previous results stay on screen (a failed keystroke should
+          // degrade, not blank the list) — but say so: silence here made a
+          // failed search indistinguishable from "no results". The ticket
+          // guard applies to failures too: only the freshest may complain.
+          if (seq === searchSeqRef.current) setSearchError('Search failed — try again.');
         });
     }, 250);
     return () => window.clearTimeout(timer);
   }, [open, directoryEmpty, query, runtime]);
 
-  /** Directory hits not already granted or picked. */
-  const candidates = useMemo(() => {
+  /** Directory hits not already granted or picked (uncapped; render cap below). */
+  const matching = useMemo(() => {
     const taken = new Set([...rows.map((r) => r.userId), ...picked.map((u) => u.id)]);
-    return (users ?? []).filter((user) => !taken.has(user.id)).slice(0, 8);
+    return (users ?? []).filter((user) => !taken.has(user.id));
   }, [users, rows, picked]);
+  const candidates = matching.slice(0, CANDIDATE_CAP);
 
   const addPicked = () => {
     if (picked.length === 0) return;
@@ -342,7 +361,10 @@ export function ShareDialog({
                   <RcdInput
                     value={query}
                     onChange={(event) => setQuery(event.target.value)}
-                    placeholder="Search people…"
+                    // Names what the directory can actually match — typing a
+                    // person's real name finds nothing when the directory
+                    // only indexes usernames and emails.
+                    placeholder="Search by username or email"
                     aria-label="Search people to share with"
                     className="w-full pl-8"
                   />
@@ -390,8 +412,20 @@ export function ShareDialog({
                   ))}
                 </div>
               )}
-              {candidates.length === 0 && query.trim() !== '' && (
-                <p className="text-xs text-rcd-muted">No matching people.</p>
+              {matching.length > CANDIDATE_CAP && (
+                <p className="text-xs text-rcd-muted">
+                  Showing {CANDIDATE_CAP} of {matching.length} — keep typing to narrow.
+                </p>
+              )}
+              {searchError && (
+                <p className="text-xs text-[var(--rcd-status-critical)]" role="alert">
+                  {searchError}
+                </p>
+              )}
+              {candidates.length === 0 && query.trim() !== '' && !searchError && (
+                <p className="text-xs text-rcd-muted">
+                  No people match — search by username or email address.
+                </p>
               )}
 
               {/* Bulk template applied to every picked chip on Add. */}

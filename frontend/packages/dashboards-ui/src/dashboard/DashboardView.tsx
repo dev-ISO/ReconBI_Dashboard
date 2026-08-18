@@ -10,6 +10,7 @@ import {
 import { createPortal } from 'react-dom';
 import { AlertTriangle, ArrowLeft, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
 import {
+  columnLabelOf,
   crossFilterClauseFor,
   dateRangeClauseFor,
   emptyChart,
@@ -339,6 +340,7 @@ export function DashboardView({
   const [subscribeOpen, setSubscribeOpen] = useState(false);
   /** Share dialog (toolbar Share button; owner/admin). */
   const [shareOpen, setShareOpen] = useState(false);
+  const closeShareDialog = useCallback(() => setShareOpen(false), []);
   /** Activity log dialog (⋯ > Activity; edit-rights holders). */
   const [activityOpen, setActivityOpen] = useState(false);
   /** Linked-model picker (⋯ > Linked model…; owner/admin, edit mode). */
@@ -414,6 +416,23 @@ export function DashboardView({
   useEffect(() => {
     loadModel();
   }, [loadModel]);
+
+  /**
+   * Friendly column label for transient-filter chips and cross-filter labels,
+   * resolved through the open model's column overrides (columnLabelOf) — the
+   * same names the field list and well chips show, so a click on "open_vent"
+   * raises a chip reading its friendly name. Read straight off the model
+   * store so the cross-filter callbacks below stay dependency-stable (their
+   * doctrine); the raw name is the graceful fallback while the definition is
+   * still loading.
+   */
+  const chipColumnLabel = useCallback(
+    (table: string, column: string): string => {
+      const definition = runtime.models.store.getState().current?.definition;
+      return definition ? columnLabelOf(definition, table, column) : column;
+    },
+    [runtime],
+  );
 
   // Pages are guaranteed non-empty after the store's open migration; the grid
   // shows the ACTIVE page's tiles only.
@@ -617,13 +636,13 @@ export function DashboardView({
       entries.push({
         id: `xf:${table}.${column}`,
         kind: 'crossFilter',
-        field: column,
+        field: chipColumnLabel(table, column),
         value: cross.categoryLabel,
         onClear: () => runtime.dashboards.removeCrossFilter(table, column),
       });
     }
     return entries;
-  }, [runtime, crossFilters, tiles, slicerValues]);
+  }, [runtime, crossFilters, tiles, slicerValues, chipColumnLabel]);
 
   const clearAllFilters = useCallback(() => {
     // Every cross-filter (any page — dashboard scope may hold off-page ones)
@@ -737,7 +756,7 @@ export function DashboardView({
         runtime.dashboards.applyCrossFilter({
           sourceTileId: tileId,
           clause,
-          label: `${dimension.column}: ${label}`,
+          label: `${chipColumnLabel(dimension.table, dimension.column)}: ${label}`,
           categoryLabel: label,
           // Single clause keeps the historic replace/toggle semantics; a
           // multi-clause set has already been cleared, so every clause adds.
@@ -745,7 +764,7 @@ export function DashboardView({
         });
       });
     },
-    [runtime],
+    [runtime, chipColumnLabel],
   );
 
   /**
@@ -775,12 +794,12 @@ export function DashboardView({
       runtime.dashboards.applyCrossFilter({
         sourceTileId: tileId,
         clause,
-        label: `${dimension.column}: ${label}`,
+        label: `${chipColumnLabel(dimension.table, dimension.column)}: ${label}`,
         categoryLabel: label,
         mode: readAdditiveModifier() ? 'add' : 'replace',
       });
     },
-    [runtime],
+    [runtime, chipColumnLabel],
   );
 
   // Legend cross-filter (legendMode 'crossFilter'): the renderer reports the
@@ -813,13 +832,13 @@ export function DashboardView({
       runtime.dashboards.applyCrossFilter({
         sourceTileId: tileId,
         clause,
-        label: `${dimension.column}: ${e.label}`,
+        label: `${chipColumnLabel(dimension.table, dimension.column)}: ${e.label}`,
         categoryLabel: e.label,
         kind: 'legend',
         mode: readAdditiveModifier() ? 'add' : 'replace',
       });
     },
-    [runtime],
+    [runtime, chipColumnLabel],
   );
 
   // Transient notice auto-dismisses (manual x too).
@@ -902,7 +921,7 @@ export function DashboardView({
         }
         const value = hit.value;
         if (value === undefined || value === null) {
-          disabledReason ??= `The clicked point has no ${field.column} value`;
+          disabledReason ??= `The clicked point has no ${chipColumnLabel(field.table, field.column)} value`;
           continue;
         }
         clauses.push({
@@ -923,7 +942,7 @@ export function DashboardView({
       });
     }
     return targets;
-  }, [pointMenu, pages, activePage]);
+  }, [pointMenu, pages, activePage, chipColumnLabel]);
 
   /**
    * Drill actions for the open point menu, driven through the effective-state
@@ -2287,7 +2306,10 @@ export function DashboardView({
       <ShareDialog
         open={shareOpen}
         dashboardId={dashboardId}
-        onClose={() => setShareOpen(false)}
+        // Memoized (belt-and-braces to RcdDialog's onClose ref): an inline
+        // closure changed identity on every re-render of this large view,
+        // which used to re-run the dialog's focus trap mid-keystroke.
+        onClose={closeShareDialog}
         // The frontend has no dedicated admin signal, so owner-or-admin sees
         // the publish toggle; a non-admin owner's flip is refused server-side.
         canPublish={canManageShares}

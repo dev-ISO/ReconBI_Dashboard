@@ -58,10 +58,18 @@ public sealed record PreparedUnderlyingQuery(
     IReadOnlyList<ResolvedFilter> Filters,
     JoinPlan Plan,
     DatabaseSchema Schema,
-    IReadOnlyList<DateTableDef>? DateTables = null)
+    IReadOnlyList<DateTableDef>? DateTables = null,
+    IReadOnlyList<ModelColumn>? ColumnOverrides = null)
 {
     /// <summary>Date tables the join plan touches, in emission order.</summary>
     public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+
+    /// <summary>
+    /// The anchor table's model column overrides (FriendlyName), carried here
+    /// because emission has no model in scope — EmitUnderlying labels its
+    /// result columns through them like ResolveDimension labels dimensions.
+    /// </summary>
+    public IReadOnlyList<ModelColumn> AnchorColumnOverrides => ColumnOverrides ?? [];
 }
 
 public sealed record PreparedDistinctQuery(
@@ -253,7 +261,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var active = model.Relationships.Where(r => r.IsActive).ToArray();
         var plan = JoinPathResolver.Resolve(table.Key, involved, active, limits.MaxJoins);
 
-        return new PreparedUnderlyingQuery(table, filters, plan, schema, CollectDateTables(model, plan));
+        return new PreparedUnderlyingQuery(
+            table, filters, plan, schema, CollectDateTables(model, plan),
+            model.FindTable(anchorKey)?.ColumnOverrides);
     }
 
     /// <summary>
@@ -911,9 +921,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             .Append(" ASC").Append(dialect.NullsLastSuffix);
         sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
+        // Labels resolve through the anchor table's column overrides exactly
+        // like dimension labels (ResolveDimension): the raw name stays the SQL
+        // identifier AND the wire column name, only the label changes — so the
+        // "See records" drill-through table and its CSV export read friendly
+        // without any consumer changes.
+        var overrides = prepared.AnchorColumnOverrides;
         var columns = prepared.Table.Columns
             .Select(c => new ResultColumnPlan(
-                c.Name, c.Name, ResultColumnRole.Dimension, c.Type,
+                c.Name,
+                overrides.FirstOrDefault(o => string.Equals(o.Name, c.Name, StringComparison.Ordinal))
+                    ?.FriendlyName ?? c.Name,
+                ResultColumnRole.Dimension, c.Type,
                 $"{prepared.Table.Key}.{c.Name}", DateBucket: null, FormatHint: null))
             .ToArray();
 
@@ -1033,8 +1052,21 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 "QRY_BAD_MEASURE", "An inline measure needs a table and an aggregation (or reference a model measure by id).");
         }
 
+        // Inline measures label through the model's column overrides exactly
+        // like dimensions do (ResolveDimension): "Sum of open_vent" reads as
+        // "Sum of Phase I Revalidation Project" once the model names the
+        // column. Only the LABEL changes — the SQL identifier and wire column
+        // name stay raw. NOTE: on models that carry a FriendlyName this
+        // changes the DEFAULT series-label string, which is also the key
+        // format.seriesLabels / colorOverrides / conditionalFormats[].measureKey
+        // use; existing dashboards without overrides are byte-identical.
+        var columnLabel = spec.Column is null
+            ? null
+            : model.FindTable(spec.Table)?.ColumnOverrides
+                .FirstOrDefault(c => string.Equals(c.Name, spec.Column, StringComparison.Ordinal))
+                ?.FriendlyName ?? spec.Column;
         var label = spec.Alias
-            ?? (spec.Column is null ? $"{spec.Aggregation}" : $"{spec.Aggregation} of {spec.Column}");
+            ?? (columnLabel is null ? $"{spec.Aggregation}" : $"{spec.Aggregation} of {columnLabel}");
         return ResolveMeasureCore(label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, null, model, schema);
     }
 

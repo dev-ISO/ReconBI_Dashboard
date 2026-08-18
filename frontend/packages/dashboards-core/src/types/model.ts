@@ -142,6 +142,18 @@ export const tableKey = (schema: string, name: string): string => `${schema}.${n
 export const dateTableKey = (name: string): string => `#date.${name}`;
 
 /**
+ * Display label for a column: the model's friendlyName override when one
+ * exists, else the raw column name. The client-side twin of the server's
+ * dimension-label rule (QueryCompiler.ResolveDimension), shared by field
+ * lists, well chips, filter editors and cross-filter indicators so every
+ * surface renames together when a model adds an override.
+ */
+export const columnLabelOf = (model: ModelDefinition, table: string, column: string): string => {
+  const modelTable = model.tables.find((t) => tableKey(t.schema, t.name) === table);
+  return modelTable?.columns?.find((c) => c.name === column)?.friendlyName ?? column;
+};
+
+/**
  * The fixed columns every engine date table exposes, in display order
  * (mirrors backend DateTableSchema.Build). fiscal_* honor
  * fiscalYearStartMonth (calendar-equal when it is 1); day_of_week/week_start
