@@ -221,9 +221,13 @@ html[data-theme='dark'] .rcd-card:hover {
     padding: 0 !important;
   }
 
-  /* One preview sheet = one printed page. */
+  /* One preview sheet = one printed page. Horizontal margins auto: when the
+     DESTINATION page matches our @page size the auto margins resolve to zero
+     and change nothing — but a PDF-printer driver rendering onto a wider
+     stock used to pin the sheet to the top-left corner; auto keeps it
+     centered like the in-app preview. */
   body.rcd-printing .rcd-print-page {
-    margin: 0 !important;
+    margin: 0 auto !important;
     break-inside: avoid;
     page-break-inside: avoid;
   }

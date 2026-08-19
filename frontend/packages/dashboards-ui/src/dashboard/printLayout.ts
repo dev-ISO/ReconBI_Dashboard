@@ -539,15 +539,39 @@ export function computePrintJob(sections: PrintSectionInput[], options: PrintOpt
  * breaks, chrome hiding, box-sizing/overflow, the 100%-height content box)
  * lives statically in rcd.css.
  */
+/**
+ * CSS paged-media KEYWORD for each paper. Raw `<W>mm <H>mm` sizes express
+ * orientation only by dimension order, and PDF-printer drivers (Foxit et al.)
+ * routinely normalize that to the stock's portrait and ROTATE the content —
+ * the "my tabloid PDF comes out sideways" bug. `size: <keyword> <orientation>`
+ * carries the orientation explicitly through the print pipeline. (CSS calls
+ * the 11in x 17in stock "ledger"; the trade name tabloid is the same paper.)
+ */
+const PAPER_CSS_KEYWORD: Record<PrintPaper, string> = {
+  letter: 'letter',
+  a4: 'A4',
+  legal: 'legal',
+  tabloid: 'ledger',
+};
+
 export function printPageCss(options: PrintOptions): string {
   const geometry = pageGeometry(options.paper, options.orientation, options.margin ?? 'normal');
+  // Two `size` declarations on purpose: the mm pair is the fallback for
+  // engines without the named size; where both parse (Chrome/Edge), the later
+  // keyword+orientation wins and pins the PDF page orientation itself, so a
+  // landscape job stays landscape through PDF-printer drivers instead of
+  // arriving rotated.
   return [
-    `@page { size: ${geometry.paperWidthMm}mm ${geometry.paperHeightMm}mm; margin: 0; }`,
+    `@page { size: ${geometry.paperWidthMm}mm ${geometry.paperHeightMm}mm; size: ${PAPER_CSS_KEYWORD[options.paper]} ${options.orientation}; margin: 0; }`,
     '@media print {',
     '  body.rcd-printing .rcd-print-sheet {',
     `    width: ${geometry.paperWidthMm}mm !important;`,
     `    height: calc(${geometry.paperHeightMm}mm - 1px) !important;`,
     `    padding: ${geometry.marginMm}mm !important;`,
+    // Auto side margins are zero when the destination page equals our @page
+    // size; on a driver's wider stock they keep the sheet centered instead of
+    // corner-pinned (mirrors .rcd-print-page in rcd.css).
+    '    margin: 0 auto !important;',
     '  }',
     '}',
   ].join('\n');

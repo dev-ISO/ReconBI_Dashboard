@@ -575,9 +575,11 @@ export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialo
           </p>
           {isUncommonPaper(draft.paper) && (
             <p className="text-[11px] leading-4 text-[var(--rcd-status-warn)]" role="alert">
-              {draft.paper === 'legal' ? 'Legal' : 'Tabloid'} stock: physical printers silently
-              rescale the page when the loaded paper does not match. Use{' '}
-              <span className="font-medium">Save as PDF</span> for exact output.
+              {draft.paper === 'legal' ? 'Legal' : 'Tabloid'} stock: physical printers and
+              PDF-printer drivers (Foxit, Adobe PDF, Microsoft Print to PDF) silently rescale,
+              re-anchor, or rotate the page when their configured stock does not match. Chrome&apos;s
+              built-in <span className="font-medium">Save as PDF</span> destination reproduces this
+              preview exactly.
             </p>
           )}
         </div>

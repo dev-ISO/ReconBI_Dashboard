@@ -1172,6 +1172,9 @@ export function DashboardChartTile({
 
   return (
     <div
+      // DOM anchor for tile-scoped lookups that live outside this component —
+      // the image-export menu items resolve the chart's <svg> through it.
+      data-rcd-tile={tileId}
       className={`relative h-full rounded-xl ${editable && selected ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''}`}
       onClick={editable ? onSelect : undefined}
     >

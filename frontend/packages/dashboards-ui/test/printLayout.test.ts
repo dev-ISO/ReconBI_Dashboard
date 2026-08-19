@@ -291,17 +291,21 @@ describe('computePrintJob job-wide fit', () => {
 describe('printPageCss', () => {
   it('claims the whole sheet and pins it in mm (letter landscape, normal)', () => {
     const css = printPageCss(opts());
-    expect(css).toContain('@page { size: 279.4mm 215.9mm; margin: 0; }');
+    // mm fallback FIRST, named size + explicit orientation SECOND (wins where
+    // supported — carries orientation through PDF-printer drivers).
+    expect(css).toContain('@page { size: 279.4mm 215.9mm; size: letter landscape; margin: 0; }');
     expect(css).toContain('@media print {');
     expect(css).toContain('body.rcd-printing .rcd-print-sheet {');
     expect(css).toContain('width: 279.4mm !important;');
     expect(css).toContain('height: calc(215.9mm - 1px) !important;');
     expect(css).toContain('padding: 12mm !important;');
+    // Auto side margins keep the sheet centered on a driver's wider stock.
+    expect(css).toContain('margin: 0 auto !important;');
   });
 
   it('follows paper/orientation/margin (a4 portrait, narrow)', () => {
     const css = printPageCss(opts({ paper: 'a4', orientation: 'portrait', margin: 'narrow' }));
-    expect(css).toContain('@page { size: 210mm 297mm; margin: 0; }');
+    expect(css).toContain('@page { size: 210mm 297mm; size: A4 portrait; margin: 0; }');
     expect(css).toContain('width: 210mm !important;');
     expect(css).toContain('height: calc(297mm - 1px) !important;');
     expect(css).toContain('padding: 6mm !important;');
@@ -309,6 +313,17 @@ describe('printPageCss', () => {
 
   it("margin 'none' prints edge to edge", () => {
     expect(printPageCss(opts({ margin: 'none' }))).toContain('padding: 0mm !important;');
+  });
+
+  it('tabloid maps to the CSS "ledger" keyword with explicit orientation', () => {
+    // Raw W/H mm alone let PDF drivers normalize to portrait and rotate the
+    // content (the "tabloid PDF comes out sideways" bug); the keyword pins it.
+    expect(printPageCss(opts({ paper: 'tabloid', orientation: 'landscape' }))).toContain(
+      'size: ledger landscape;',
+    );
+    expect(printPageCss(opts({ paper: 'tabloid', orientation: 'portrait' }))).toContain(
+      'size: ledger portrait;',
+    );
   });
 });
 

@@ -41,6 +41,7 @@ import {
 import { ChartBuilder, type ChartBuilderProps } from '../chart-builder/ChartBuilder';
 import type { ChartLegendSelectEvent } from '../chart/ChartTile';
 import type { ChartDatumClickInfo } from '../chart/ChartRenderer';
+import { exportChartImage } from '../chart/chartImage';
 import { useDashboardState, useModelState, useRuntime } from '../provider/DashboardsProvider';
 import {
   anyDialogOpen,
@@ -1588,6 +1589,20 @@ export function DashboardView({
     setBuilder({ tileId, spec: tile.chart });
   };
 
+  /**
+   * "Copy as image" / "Download image (2×)": SVG-rendered chart types only —
+   * table and KPI tiles are HTML and can't ride the SVG rasterizer. The tile's
+   * DOM is found through DashboardChartTile's data-rcd-tile anchor.
+   */
+  const imageExportable = (chart: ChartSpec): boolean =>
+    chart.type !== 'table' && chart.type !== 'kpi';
+  const exportTileImage = (tileId: string, title: string, exportMode: 'copy' | 'download') => {
+    const tileRoot = document.querySelector<HTMLElement>(
+      `[data-rcd-tile="${CSS.escape(tileId)}"]`,
+    );
+    void exportChartImage(tileRoot, title, exportMode);
+  };
+
   if (!current || current.id !== dashboardId) {
     if (openError) {
       return (
@@ -2238,6 +2253,16 @@ export function DashboardView({
               }
               // Offered only to users who may edit at all (canEnterEdit).
               onEdit={canEnterEdit ? () => editChartFromView(pointMenu.tileId) : null}
+              onCopyImage={
+                imageExportable(pointMenu.chart)
+                  ? () => exportTileImage(pointMenu.tileId, pointMenu.chart.title, 'copy')
+                  : null
+              }
+              onDownloadImage={
+                imageExportable(pointMenu.chart)
+                  ? () => exportTileImage(pointMenu.tileId, pointMenu.chart.title, 'download')
+                  : null
+              }
               onExport={(exportMode) => void exportChartCsv(pointMenu.tileId, exportMode)}
               onClose={() => setPointMenu(null)}
             />
@@ -2275,6 +2300,16 @@ export function DashboardView({
               }}
               // Offered only to users who may edit at all (canEnterEdit).
               onEdit={canEnterEdit ? () => editChartFromView(tileMenu.tileId) : null}
+              onCopyImage={
+                imageExportable(tileMenu.chart)
+                  ? () => exportTileImage(tileMenu.tileId, tileMenu.chart.title, 'copy')
+                  : null
+              }
+              onDownloadImage={
+                imageExportable(tileMenu.chart)
+                  ? () => exportTileImage(tileMenu.tileId, tileMenu.chart.title, 'download')
+                  : null
+              }
               onExport={(exportMode) => void exportChartCsv(tileMenu.tileId, exportMode)}
               onClose={() => setTileMenu(null)}
             />

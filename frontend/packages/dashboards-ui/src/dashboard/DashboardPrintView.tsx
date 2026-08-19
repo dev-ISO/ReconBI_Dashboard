@@ -278,9 +278,17 @@ export function PrintSheets({
 /**
  * One pagination block. The OUTER box is in normal flow with the exact scaled
  * footprint (so in-flow stacking reproduces the pure pagination math on screen
- * AND in print); the inner box carries the layout size and the transform
- * (top-left origin). Tiles sit at fixed pixel rects — nothing is percentage-
- * sized, so charts can never overflow their boxes.
+ * AND in print); the inner box carries the layout size and the scale. Tiles
+ * sit at fixed pixel rects — nothing is percentage-sized, so charts can never
+ * overflow their boxes.
+ *
+ * The scale is CSS `zoom`, not `transform: scale()`: a transform rasterizes
+ * the block's glyphs at layout size and stretches them, so the ON-SCREEN
+ * preview went soft whenever fit-scale ≠ 1 (and screen snips of a chart
+ * inherited that softness). `zoom` re-lays-out at the effective size — the
+ * preview is as sharp as the monitor, and a snip captures real pixels. Print
+ * output was always vector-sharp and stays correct: the outer box reserves
+ * the identical scaled footprint either way, so pagination never moves.
  */
 function BlockBox({
   block,
@@ -299,9 +307,7 @@ function BlockBox({
         style={{
           width: block.layoutWidth,
           height: block.layoutHeight,
-          ...(block.scale !== 1
-            ? { transform: `scale(${block.scale})`, transformOrigin: 'top left' }
-            : null),
+          ...(block.scale !== 1 ? { zoom: block.scale } : null),
         }}
       >
         {block.tiles.map((placed) => (
