@@ -192,15 +192,20 @@ export function TileFrame({
               onDuplicate?.();
             }}
           />
-          <MenuItem
-            icon={Trash2}
-            label="Delete"
-            danger
-            onClick={() => {
-              setMenuOpen(false);
-              setConfirmDelete(true);
-            }}
-          />
+          {/* Hidden (not disabled) without a handler: tile deletion is gated
+              on the CanDeleteContent right (0.11.1) and callers withhold the
+              callback when the caller lacks it. */}
+          {onDelete && (
+            <MenuItem
+              icon={Trash2}
+              label="Delete"
+              danger
+              onClick={() => {
+                setMenuOpen(false);
+                setConfirmDelete(true);
+              }}
+            />
+          )}
         </div>
       )}
     </div>

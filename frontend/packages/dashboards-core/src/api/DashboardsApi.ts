@@ -78,6 +78,10 @@ export interface DashboardShareInput {
   canEditLayout: boolean;
   canManagePages: boolean;
   canEditCharts: boolean;
+  /** 0.11.1 "arrange tiles" right; the server defaults an absent value to false. */
+  canMoveTiles?: boolean;
+  /** 0.11.1 delete right (tiles + pages); the server defaults an absent value to false. */
+  canDeleteContent?: boolean;
 }
 
 /** Body of PUT dashboards/{id}/shares — REPLACES the dashboard's full grant set. */

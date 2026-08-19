@@ -20,28 +20,46 @@ export interface ShareDialogProps {
   onSaved?: () => void;
 }
 
+/**
+ * DATA-DRIVEN flag descriptors: THE single place a grant flag exists in this
+ * dialog. Adding a right = adding one entry — the checkboxes (template + per
+ * row), the view/edit split, the wire payload and the row mapping all iterate
+ * this array. Keys are the wire names (DashboardShareInput fields).
+ */
+const PERMISSION_FLAGS = [
+  { key: 'canEditLayout', label: 'Layout', title: 'Doc settings; add/edit text, image, button and slicer tiles' },
+  { key: 'canManagePages', label: 'Pages', title: 'Add, rename, reorder and recolor pages' },
+  { key: 'canEditCharts', label: 'Charts', title: 'Add chart tiles; edit chart fields and formatting (renaming stays owner-only)' },
+  { key: 'canMoveTiles', label: 'Move/resize', title: 'Arrange tiles: move and resize them on the grid' },
+  { key: 'canDeleteContent', label: 'Delete', title: 'Remove tiles and pages (on top of the matching edit right)' },
+] as const;
+
+type PermissionKey = (typeof PERMISSION_FLAGS)[number]['key'];
+
+type PermissionFlags = Record<PermissionKey, boolean>;
+
+const allFlags = (value: boolean): PermissionFlags =>
+  Object.fromEntries(PERMISSION_FLAGS.map((flag) => [flag.key, value])) as PermissionFlags;
+
 /** One editable grant row (existing share or freshly picked user). */
-interface ShareRow {
+interface ShareRow extends PermissionFlags {
   userId: string;
   displayName: string | null;
-  canEditLayout: boolean;
-  canManagePages: boolean;
-  canEditCharts: boolean;
+  /** "granted by X on date" (existing rows only; fresh picks have neither). */
+  grantedByDisplayName?: string | null;
+  createdAtUtc?: string;
 }
 
-/** All three flags false = view-only. */
-const rowCanEdit = (row: ShareRow): boolean =>
-  row.canEditLayout || row.canManagePages || row.canEditCharts;
+/** All flags false = view-only. */
+const rowCanEdit = (row: ShareRow): boolean => PERMISSION_FLAGS.some((flag) => row[flag.key]);
 
 /** The bulk "apply to selected" permission template. */
 interface PermissionTemplate {
   mode: 'view' | 'edit';
-  layout: boolean;
-  pages: boolean;
-  charts: boolean;
+  flags: PermissionFlags;
 }
 
-const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', layout: true, pages: true, charts: true };
+const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', flags: allFlags(true) };
 
 /**
  * Candidate rows rendered at once. The list scrolls (max-h-40), so the cap is
@@ -51,57 +69,73 @@ const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', layout: true, pages
  */
 const CANDIDATE_CAP = 50;
 
-const templatePermissions = (
-  template: PermissionTemplate,
-): Pick<ShareRow, 'canEditLayout' | 'canManagePages' | 'canEditCharts'> =>
-  template.mode === 'view'
-    ? { canEditLayout: false, canManagePages: false, canEditCharts: false }
-    : {
-        canEditLayout: template.layout,
-        canManagePages: template.pages,
-        canEditCharts: template.charts,
-      };
+const templatePermissions = (template: PermissionTemplate): PermissionFlags =>
+  template.mode === 'view' ? allFlags(false) : { ...template.flags };
 
-/** Shared look of the three granular permission checkboxes. */
+/** Shared look of the granular permission checkboxes (one per PERMISSION_FLAGS entry). */
 function PermissionChecks({
-  layout,
-  pages,
-  charts,
+  value,
   onChange,
   idPrefix,
 }: {
-  layout: boolean;
-  pages: boolean;
-  charts: boolean;
-  onChange: (patch: { layout?: boolean; pages?: boolean; charts?: boolean }) => void;
+  value: PermissionFlags;
+  onChange: (patch: Partial<PermissionFlags>) => void;
   idPrefix: string;
 }) {
-  const options: { key: 'layout' | 'pages' | 'charts'; label: string; checked: boolean }[] = [
-    { key: 'layout', label: 'Layout', checked: layout },
-    { key: 'pages', label: 'Pages', checked: pages },
-    { key: 'charts', label: 'Charts', checked: charts },
-  ];
   return (
-    <div className="flex items-center gap-3">
-      {options.map((option) => (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+      {PERMISSION_FLAGS.map((flag) => (
         <label
-          key={option.key}
-          htmlFor={`${idPrefix}-${option.key}`}
+          key={flag.key}
+          htmlFor={`${idPrefix}-${flag.key}`}
+          title={flag.title}
           className="flex items-center gap-1.5 text-xs text-rcd-text-2"
         >
           <input
-            id={`${idPrefix}-${option.key}`}
+            id={`${idPrefix}-${flag.key}`}
             type="checkbox"
-            checked={option.checked}
-            onChange={(event) => onChange({ [option.key]: event.target.checked })}
+            checked={value[flag.key]}
+            onChange={(event) => onChange({ [flag.key]: event.target.checked })}
             className="accent-[var(--rcd-accent)]"
           />
-          {option.label}
+          {flag.label}
         </label>
       ))}
     </div>
   );
 }
+
+/** Tolerant UTC parse (server timestamps come zoneless), for the granted-on date. */
+const grantedOnText = (iso: string | undefined): string | null => {
+  if (!iso) return null;
+  const at = new Date(/[zZ]$|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso}Z`);
+  if (Number.isNaN(at.getTime())) return null;
+  return at.toLocaleDateString([], { month: 'short', day: 'numeric', year: 'numeric' });
+};
+
+/** Server grant row → editable dialog row. Absent 0.11.1 flags (older server) read false. */
+const toShareRow = (share: {
+  userId: string;
+  displayName: string | null;
+  canEditLayout: boolean;
+  canManagePages: boolean;
+  canEditCharts: boolean;
+  canMoveTiles?: boolean;
+  canDeleteContent?: boolean;
+  grantedByDisplayName?: string | null;
+  grantedByUserId?: string;
+  createdAtUtc?: string;
+}): ShareRow => ({
+  userId: share.userId,
+  displayName: share.displayName,
+  canEditLayout: share.canEditLayout,
+  canManagePages: share.canManagePages,
+  canEditCharts: share.canEditCharts,
+  canMoveTiles: share.canMoveTiles ?? false,
+  canDeleteContent: share.canDeleteContent ?? false,
+  grantedByDisplayName: share.grantedByDisplayName ?? share.grantedByUserId ?? null,
+  ...(share.createdAtUtc !== undefined ? { createdAtUtc: share.createdAtUtc } : {}),
+});
 
 /**
  * Share management for one dashboard (owner/admin): searchable multi-select
@@ -166,15 +200,7 @@ export function ShareDialog({
     Promise.all([runtime.dashboards.listShares(dashboardId), runtime.dashboards.listUsers()])
       .then(([shares, directory]) => {
         if (cancelled) return;
-        setRows(
-          shares.map((share) => ({
-            userId: share.userId,
-            displayName: share.displayName,
-            canEditLayout: share.canEditLayout,
-            canManagePages: share.canManagePages,
-            canEditCharts: share.canEditCharts,
-          })),
-        );
+        setRows(shares.map(toShareRow));
         setUsers(directory);
         setDirectoryEmpty(directory.length === 0);
       })
@@ -246,15 +272,7 @@ export function ShareDialog({
   const refreshRows = async () => {
     try {
       const shares = await runtime.dashboards.listShares(dashboardId);
-      setRows(
-        shares.map((share) => ({
-          userId: share.userId,
-          displayName: share.displayName,
-          canEditLayout: share.canEditLayout,
-          canManagePages: share.canManagePages,
-          canEditCharts: share.canEditCharts,
-        })),
-      );
+      setRows(shares.map(toShareRow));
       setPicked([]);
     } catch {
       // keep the edited rows; the error message already tells the user what happened
@@ -293,9 +311,10 @@ export function ShareDialog({
         dashboardId,
         finalRows.map((row) => ({
           userId: row.userId,
-          canEditLayout: row.canEditLayout,
-          canManagePages: row.canManagePages,
-          canEditCharts: row.canEditCharts,
+          // Wire payload straight from the flag descriptors — one source of truth.
+          ...(Object.fromEntries(
+            PERMISSION_FLAGS.map((flag) => [flag.key, row[flag.key]]),
+          ) as PermissionFlags),
         })),
       );
       onSaved?.();
@@ -444,10 +463,10 @@ export function ShareDialog({
                   {template.mode === 'edit' && (
                     <PermissionChecks
                       idPrefix="rcd-share-template"
-                      layout={template.layout}
-                      pages={template.pages}
-                      charts={template.charts}
-                      onChange={(patch) => setTemplate((prev) => ({ ...prev, ...patch }))}
+                      value={template.flags}
+                      onChange={(patch) =>
+                        setTemplate((prev) => ({ ...prev, flags: { ...prev.flags, ...patch } }))
+                      }
                     />
                   )}
                   <RcdButton size="sm" variant="primary" className="ml-auto" onClick={addPicked}>
@@ -465,59 +484,56 @@ export function ShareDialog({
               <p className="text-xs text-rcd-muted">Not shared with anyone yet.</p>
             ) : (
               <div className="flex flex-col rounded-lg border border-rcd-border">
-                {rows.map((row) => (
-                  <div
-                    key={row.userId}
-                    className="flex flex-wrap items-center gap-2 border-b border-rcd-border px-2.5 py-2 last:border-b-0"
-                  >
-                    <UserRound size={14} aria-hidden className="shrink-0 text-rcd-muted" />
-                    <span
-                      className="min-w-0 flex-1 truncate text-sm text-rcd-text"
-                      title={row.userId}
+                {rows.map((row) => {
+                  const grantedOn = grantedOnText(row.createdAtUtc);
+                  return (
+                    <div
+                      key={row.userId}
+                      className="flex flex-wrap items-center gap-2 border-b border-rcd-border px-2.5 py-2 last:border-b-0"
                     >
-                      {row.displayName ?? row.userId}
-                    </span>
-                    <RcdSelect
-                      aria-label={`Access for ${row.displayName ?? row.userId}`}
-                      value={rowCanEdit(row) ? 'edit' : 'view'}
-                      onChange={(event) =>
-                        patchRow(
-                          row.userId,
-                          event.target.value === 'edit'
-                            ? { canEditLayout: true, canManagePages: true, canEditCharts: true }
-                            : { canEditLayout: false, canManagePages: false, canEditCharts: false },
-                        )
-                      }
-                    >
-                      <option value="view">Can view</option>
-                      <option value="edit">Can edit</option>
-                    </RcdSelect>
-                    {rowCanEdit(row) && (
-                      <PermissionChecks
-                        idPrefix={`rcd-share-${row.userId}`}
-                        layout={row.canEditLayout}
-                        pages={row.canManagePages}
-                        charts={row.canEditCharts}
-                        onChange={(patch) =>
-                          patchRow(row.userId, {
-                            ...(patch.layout !== undefined ? { canEditLayout: patch.layout } : {}),
-                            ...(patch.pages !== undefined ? { canManagePages: patch.pages } : {}),
-                            ...(patch.charts !== undefined ? { canEditCharts: patch.charts } : {}),
-                          })
+                      <UserRound size={14} aria-hidden className="shrink-0 text-rcd-muted" />
+                      <span className="flex min-w-0 flex-1 flex-col">
+                        <span className="truncate text-sm text-rcd-text" title={row.userId}>
+                          {row.displayName ?? row.userId}
+                        </span>
+                        {/* Grant provenance (existing rows only — fresh picks
+                            gain theirs once saved). */}
+                        {row.grantedByDisplayName != null && (
+                          <span className="truncate text-[11px] text-rcd-muted">
+                            granted by {row.grantedByDisplayName}
+                            {grantedOn !== null ? ` on ${grantedOn}` : ''}
+                          </span>
+                        )}
+                      </span>
+                      <RcdSelect
+                        aria-label={`Access for ${row.displayName ?? row.userId}`}
+                        value={rowCanEdit(row) ? 'edit' : 'view'}
+                        onChange={(event) =>
+                          patchRow(row.userId, allFlags(event.target.value === 'edit'))
                         }
-                      />
-                    )}
-                    <RcdIconButton
-                      aria-label={`Remove access for ${row.displayName ?? row.userId}`}
-                      title="Remove access"
-                      onClick={() =>
-                        setRows((prev) => prev.filter((r) => r.userId !== row.userId))
-                      }
-                    >
-                      <X size={13} />
-                    </RcdIconButton>
-                  </div>
-                ))}
+                      >
+                        <option value="view">Can view</option>
+                        <option value="edit">Can edit</option>
+                      </RcdSelect>
+                      {rowCanEdit(row) && (
+                        <PermissionChecks
+                          idPrefix={`rcd-share-${row.userId}`}
+                          value={row}
+                          onChange={(patch) => patchRow(row.userId, patch)}
+                        />
+                      )}
+                      <RcdIconButton
+                        aria-label={`Remove access for ${row.displayName ?? row.userId}`}
+                        title="Remove access"
+                        onClick={() =>
+                          setRows((prev) => prev.filter((r) => r.userId !== row.userId))
+                        }
+                      >
+                        <X size={13} />
+                      </RcdIconButton>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>

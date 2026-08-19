@@ -84,7 +84,9 @@ public sealed class DashboardsController(DashboardService dashboards) : RcdContr
         int id, [FromBody] SaveDashboardSharesRequest request, CancellationToken ct)
     {
         var grants = (request.Shares ?? [])
-            .Select(s => new DashboardShareGrant(s.UserId, s.CanEditLayout, s.CanManagePages, s.CanEditCharts))
+            .Select(s => new DashboardShareGrant(
+                s.UserId, s.CanEditLayout, s.CanManagePages, s.CanEditCharts,
+                s.CanMoveTiles, s.CanDeleteContent))
             .ToArray();
         var result = await dashboards.ReplaceSharesAsync(id, grants, ct);
         return result.Succeeded
@@ -124,11 +126,13 @@ public sealed class DashboardsController(DashboardService dashboards) : RcdContr
 
     private static DashboardAccessResponse ToAccessResponse(DashboardAccess access) =>
         new(access.IsOwner, access.CanEdit, access.CanEditLayout, access.CanManagePages,
-            access.CanEditCharts, access.ViaShare, access.ViaPublish);
+            access.CanEditCharts, access.CanMoveTiles, access.CanDeleteContent,
+            access.ViaShare, access.ViaPublish);
 
     private static DashboardShareResponse ToShareResponse(DashboardShareInfo share) =>
         new(share.UserId, share.DisplayName, share.CanEditLayout, share.CanManagePages,
-            share.CanEditCharts, share.UpdatedAtUtc);
+            share.CanEditCharts, share.CanMoveTiles, share.CanDeleteContent,
+            share.GrantedByUserId, share.GrantedByDisplayName, share.CreatedAtUtc, share.UpdatedAtUtc);
 
     /// <summary>
     /// The stored DetailJson was serialized camelCase by the service, so it is

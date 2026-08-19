@@ -18,6 +18,8 @@ public sealed record DashboardAccess(
     bool CanEditLayout,
     bool CanManagePages,
     bool CanEditCharts,
+    bool CanMoveTiles,
+    bool CanDeleteContent,
     bool ViaShare,
     bool ViaPublish);
 
@@ -57,21 +59,36 @@ public sealed record DashboardSaveRequest(
     bool IsShared = false,
     DateTime? ExpectedUpdatedAtUtc = null);
 
-/// <summary>One named-user grant, decorated with the directory display name.</summary>
+/// <summary>
+/// One named-user grant, decorated with directory display names (the grantee's
+/// and the granter's) plus when it was granted — the Share dialog's
+/// "granted by X on date" line.
+/// </summary>
 public sealed record DashboardShareInfo(
     string UserId,
     string? DisplayName,
     bool CanEditLayout,
     bool CanManagePages,
     bool CanEditCharts,
+    bool CanMoveTiles,
+    bool CanDeleteContent,
+    string GrantedByUserId,
+    string? GrantedByDisplayName,
+    DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc);
 
-/// <summary>One requested grant in a full-set replace.</summary>
+/// <summary>
+/// One requested grant in a full-set replace. The 0.11.1 flags default false so
+/// pre-0.11.1 clients (which never send them) keep binding — their saves grant
+/// the new rights explicitly off rather than failing.
+/// </summary>
 public sealed record DashboardShareGrant(
     string UserId,
     bool CanEditLayout,
     bool CanManagePages,
-    bool CanEditCharts);
+    bool CanEditCharts,
+    bool CanMoveTiles = false,
+    bool CanDeleteContent = false);
 
 public sealed record DashboardActivityEntry(
     long Id,
@@ -269,7 +286,7 @@ public sealed class DashboardService(
 
             if (await NameTakenAsync(record.OwnerUserId, request.Name, excludeId: id, ct))
             {
-                return NameConflict(request.Name);
+                return NameConflict(request.Name, ownerIsCaller: isOwner);
             }
 
             var oldName = record.Name;
@@ -501,11 +518,15 @@ public sealed class DashboardService(
             {
                 if (row.CanEditLayout != grant.CanEditLayout
                     || row.CanManagePages != grant.CanManagePages
-                    || row.CanEditCharts != grant.CanEditCharts)
+                    || row.CanEditCharts != grant.CanEditCharts
+                    || row.CanMoveTiles != grant.CanMoveTiles
+                    || row.CanDeleteContent != grant.CanDeleteContent)
                 {
                     row.CanEditLayout = grant.CanEditLayout;
                     row.CanManagePages = grant.CanManagePages;
                     row.CanEditCharts = grant.CanEditCharts;
+                    row.CanMoveTiles = grant.CanMoveTiles;
+                    row.CanDeleteContent = grant.CanDeleteContent;
                     row.UpdatedAtUtc = now;
                     changed.Add(grant.UserId);
                 }
@@ -519,6 +540,8 @@ public sealed class DashboardService(
                     CanEditLayout = grant.CanEditLayout,
                     CanManagePages = grant.CanManagePages,
                     CanEditCharts = grant.CanEditCharts,
+                    CanMoveTiles = grant.CanMoveTiles,
+                    CanDeleteContent = grant.CanDeleteContent,
                     GrantedByUserId = userId,
                     CreatedAtUtc = now,
                     UpdatedAtUtc = now,
@@ -585,7 +608,8 @@ public sealed class DashboardService(
             return NotFound<IReadOnlyList<DashboardActivityEntry>>(id);
         }
 
-        var hasEditFlag = share is { } s && (s.CanEditLayout || s.CanManagePages || s.CanEditCharts);
+        var hasEditFlag = share is { } s
+            && (s.CanEditLayout || s.CanManagePages || s.CanEditCharts || s.CanMoveTiles || s.CanDeleteContent);
         if (record.OwnerUserId != userId && !currentUser.CanManageShared && !hasEditFlag)
         {
             return ServiceResult<IReadOnlyList<DashboardActivityEntry>>.Fail(
@@ -634,20 +658,30 @@ public sealed class DashboardService(
         if (IsSystem(record))
         {
             // Built-in content is read-only for everyone, admins included.
-            return new DashboardAccess(isOwner, false, false, false, false, viaShare, viaPublish);
+            return new DashboardAccess(isOwner, false, false, false, false, false, false, viaShare, viaPublish);
         }
 
         var full = isOwner || currentUser.CanManageShared;
         var canEditLayout = full || share?.CanEditLayout == true;
         var canManagePages = full || share?.CanManagePages == true;
         var canEditCharts = full || share?.CanEditCharts == true;
+        var canMoveTiles = full || share?.CanMoveTiles == true;
+        var canDeleteContent = full || share?.CanDeleteContent == true;
         return new DashboardAccess(
             isOwner,
-            full || canEditLayout || canManagePages || canEditCharts,
-            canEditLayout, canManagePages, canEditCharts, viaShare, viaPublish);
+            full || canEditLayout || canManagePages || canEditCharts || canMoveTiles || canDeleteContent,
+            canEditLayout, canManagePages, canEditCharts, canMoveTiles, canDeleteContent,
+            viaShare, viaPublish);
     }
 
-    /// <summary>Maps raised change classes to the share flags that must cover them.</summary>
+    /// <summary>
+    /// Maps raised change classes to the share flags that must cover them.
+    /// Beyond the three class flags: geometry rides CanMoveTiles; tile/page
+    /// REMOVALS additionally require CanDeleteContent (deletion = class flag
+    /// AND delete flag, so the delete right narrows rather than widens); chart
+    /// retitles have NO covering flag — they are owner/admin-only, so any
+    /// rename in a grantee save is always denied here.
+    /// </summary>
     private static List<string> MissingPermissions(LayoutChangeSummary summary, DashboardShareRecord share)
     {
         var missing = new List<string>();
@@ -664,6 +698,21 @@ public sealed class DashboardService(
         if (summary.ChartsChanged && !share.CanEditCharts)
         {
             missing.Add("chart changes");
+        }
+
+        if (summary.GeometryChanged && !share.CanMoveTiles)
+        {
+            missing.Add("moving or resizing tiles");
+        }
+
+        if (summary.HasRemovals && !share.CanDeleteContent)
+        {
+            missing.Add("removing tiles or pages");
+        }
+
+        if (summary.ChartsRenamed.Count > 0)
+        {
+            missing.Add("renaming charts (owner only)");
         }
 
         return missing;
@@ -708,14 +757,24 @@ public sealed class DashboardService(
             .OrderBy(s => s.CreatedAtUtc).ThenBy(s => s.Id)
             .ToListAsync(ct);
 
+        // One directory round-trip resolves grantees AND granters (the Share
+        // dialog shows "granted by X on date" per row).
         var users = await userDirectory.ResolveAsync(
-            rows.Select(s => s.UserId).Distinct(StringComparer.Ordinal), ct);
+            rows.Select(s => s.UserId)
+                .Concat(rows.Select(s => s.GrantedByUserId))
+                .Where(id => !string.IsNullOrEmpty(id))
+                .Distinct(StringComparer.Ordinal),
+            ct);
 
         return rows
             .Select(s => new DashboardShareInfo(
                 s.UserId,
                 users.TryGetValue(s.UserId, out var user) ? user.DisplayName : s.UserId,
-                s.CanEditLayout, s.CanManagePages, s.CanEditCharts, s.UpdatedAtUtc))
+                s.CanEditLayout, s.CanManagePages, s.CanEditCharts,
+                s.CanMoveTiles, s.CanDeleteContent,
+                s.GrantedByUserId,
+                users.TryGetValue(s.GrantedByUserId, out var granter) ? granter.DisplayName : s.GrantedByUserId,
+                s.CreatedAtUtc, s.UpdatedAtUtc))
             .ToList();
     }
 
@@ -756,11 +815,31 @@ public sealed class DashboardService(
         }
     }
 
+    /// <summary>Column caps of rcd_dashboards (Name/Description HasMaxLength) — validated here so an
+    /// over-long rename fails as a clean 400 instead of a provider truncation error.</summary>
+    internal const int MaxNameLength = 128;
+    internal const int MaxDescriptionLength = 512;
+
     private ServiceError? ValidateRequest(DashboardSaveRequest request)
     {
         if (string.IsNullOrWhiteSpace(request.Name))
         {
             return new ServiceError(ServiceErrorKind.BadRequest, "rcd.dashboard.name_required", "Dashboard name is required.");
+        }
+
+        // Trimmed length — the trimmed value is what gets stored.
+        if (request.Name.Trim().Length > MaxNameLength)
+        {
+            return new ServiceError(
+                ServiceErrorKind.BadRequest, "rcd.dashboard.name_too_long",
+                $"Dashboard names are limited to {MaxNameLength} characters.");
+        }
+
+        if (request.Description is { Length: > MaxDescriptionLength })
+        {
+            return new ServiceError(
+                ServiceErrorKind.BadRequest, "rcd.dashboard.description_too_long",
+                $"Dashboard descriptions are limited to {MaxDescriptionLength} characters.");
         }
 
         if (Encoding.UTF8.GetByteCount(request.LayoutJson) > options.Limits.MaxDashboardLayoutBytes)
@@ -817,10 +896,17 @@ public sealed class DashboardService(
             ServiceErrorKind.Forbidden, "rcd.dashboard.share_forbidden",
             "Sharing or unsharing dashboards requires administrator rights.");
 
-    private static ServiceResult<DashboardDetail> NameConflict(string name) =>
+    /// <summary>
+    /// Names are unique per OWNER, not globally — and an admin can rename a
+    /// dashboard they do not own, where "you already have…" would mislead.
+    /// The message names whose namespace collided.
+    /// </summary>
+    private static ServiceResult<DashboardDetail> NameConflict(string name, bool ownerIsCaller = true) =>
         ServiceResult<DashboardDetail>.Fail(
             ServiceErrorKind.Conflict, "rcd.dashboard.name_conflict",
-            $"You already have a dashboard named '{name.Trim()}'.");
+            ownerIsCaller
+                ? $"You already have a dashboard named '{name.Trim()}'. Names must be unique per owner."
+                : $"This dashboard's owner already has a dashboard named '{name.Trim()}'. Names must be unique per owner.");
 
     private async Task<DashboardDetail> MaterializeAsync(
         DashboardRecord record, string userId, DashboardShareRecord? share, CancellationToken ct)

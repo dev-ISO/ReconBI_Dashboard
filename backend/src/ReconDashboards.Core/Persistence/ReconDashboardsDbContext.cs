@@ -82,6 +82,8 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             entity.Property(e => e.CanEditLayout).HasDefaultValue(false);
             entity.Property(e => e.CanManagePages).HasDefaultValue(false);
             entity.Property(e => e.CanEditCharts).HasDefaultValue(false);
+            entity.Property(e => e.CanMoveTiles).HasDefaultValue(false);
+            entity.Property(e => e.CanDeleteContent).HasDefaultValue(false);
             entity.HasOne<DashboardRecord>()
                 .WithMany()
                 .HasForeignKey(e => e.DashboardId)

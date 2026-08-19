@@ -156,6 +156,48 @@ public class DashboardServiceTests : IDisposable
         Assert.Equal("rcd.dashboard.name_conflict", duplicate.Error.Code);
     }
 
+    // ----------------------- name/description caps (0.11.1) -----------------------
+    // Guarded in ValidateRequest so an over-long rename fails as a clean 400
+    // (rcd.dashboard.*_too_long) instead of a provider truncation error.
+
+    [Fact]
+    public async Task NameLongerThan128IsRejected_Exactly128Accepted()
+    {
+        var tooLong = await _service.CreateAsync(Request(new string('x', 129)), CancellationToken.None);
+        Assert.False(tooLong.Succeeded);
+        Assert.Equal("rcd.dashboard.name_too_long", tooLong.Error!.Code);
+
+        var atCap = await _service.CreateAsync(Request(new string('x', 128)), CancellationToken.None);
+        Assert.True(atCap.Succeeded, atCap.Error?.Message);
+    }
+
+    [Fact]
+    public async Task NameLengthIsMeasuredTrimmed()
+    {
+        // 128 real characters padded with whitespace: stored trimmed, so valid.
+        var padded = await _service.CreateAsync(
+            Request($"  {new string('x', 128)}  "), CancellationToken.None);
+        Assert.True(padded.Succeeded, padded.Error?.Message);
+    }
+
+    [Fact]
+    public async Task DescriptionLongerThan512IsRejected_OnCreateAndUpdate()
+    {
+        var request = new DashboardSaveRequest(
+            "Verbose Board", new string('d', 513), ModelId: null, """{"tiles":[]}""");
+        var created = await _service.CreateAsync(request, CancellationToken.None);
+        Assert.False(created.Succeeded);
+        Assert.Equal("rcd.dashboard.description_too_long", created.Error!.Code);
+
+        var ok = await _service.CreateAsync(Request("Board"), CancellationToken.None);
+        Assert.True(ok.Succeeded);
+        var updated = await _service.UpdateAsync(
+            ok.Value!.Id,
+            new DashboardSaveRequest("Board", new string('d', 513), ModelId: null, """{"tiles":[]}"""),
+            CancellationToken.None);
+        Assert.Equal("rcd.dashboard.description_too_long", updated.Error!.Code);
+    }
+
     [Fact]
     public async Task MaxDashboardsPerUserLimitIsEnforced()
     {

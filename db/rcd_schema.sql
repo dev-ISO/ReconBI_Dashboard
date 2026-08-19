@@ -376,3 +376,37 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819151209_ShareMoveAndDeleteRights') THEN
+    ALTER TABLE rcd_dashboard_shares ADD "CanDeleteContent" boolean NOT NULL DEFAULT FALSE;
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819151209_ShareMoveAndDeleteRights') THEN
+    ALTER TABLE rcd_dashboard_shares ADD "CanMoveTiles" boolean NOT NULL DEFAULT FALSE;
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819151209_ShareMoveAndDeleteRights') THEN
+    UPDATE rcd_dashboard_shares
+    SET "CanMoveTiles" = "CanEditLayout",
+        "CanDeleteContent" = ("CanEditCharts" OR "CanManagePages");
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819151209_ShareMoveAndDeleteRights') THEN
+    INSERT INTO "__RcdMigrationsHistory" ("MigrationId", "ProductVersion")
+    VALUES ('20260819151209_ShareMoveAndDeleteRights', '10.0.8');
+    END IF;
+END $EF$;
+COMMIT;
+

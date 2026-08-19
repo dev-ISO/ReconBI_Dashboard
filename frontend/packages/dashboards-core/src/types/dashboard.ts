@@ -151,6 +151,12 @@ export interface SlicerTileSpec {
  *  store write runs it through sanitizeRichHtml (util/richText). */
 export interface TextTileSpec {
   html: string;
+  /**
+   * Edit-mode frame title (and the phone-editor row label); trimmed-empty or
+   * absent falls back to "Text". Never rendered in view mode — text tiles stay
+   * frameless there (mirrors ImageTileSpec.alt naming the image tile).
+   */
+  title?: string;
   /** Whole-tile text alignment; absent = left. */
   align?: 'left' | 'center' | 'right';
   /** Fixed-palette hex persisted verbatim; null/absent = transparent. */
@@ -167,11 +173,35 @@ export interface ImageTileSpec {
   background?: string | null;
 }
 
+/**
+ * Navigation-button tile (0.11.1): view-mode click switches to `targetPageId`
+ * via setActivePage (which no-ops on dead ids, so a stale target is inert at
+ * runtime; edit mode badges it as broken instead). Layout-class content, like
+ * the other static kinds.
+ */
+export interface ButtonTileSpec {
+  /**
+   * RICH button label — sanitized subset like TextTileSpec.html (every store
+   * write runs sanitizeRichHtml). Text color/size/bold ride the rich spans;
+   * note the sanitizer's allowlist drops a literal <button> TAG — irrelevant
+   * here, the label is spans/paragraphs inside the tile's own button chrome.
+   */
+  html: string;
+  /** Page this button navigates to (by id — page renames never break it). */
+  targetPageId: string;
+  /** Fixed-palette hex persisted verbatim; null/absent = default button look. */
+  background?: string | null;
+  /** Corner radius in px; absent = 8. */
+  radius?: number;
+  /** True: the button fills the whole tile; false/absent: auto-sized, centered. */
+  fullSize?: boolean;
+}
+
 export interface DashboardTile {
   id: string;
   layout: TileLayout;
   /** Tile discriminator; absent = 'chart' (legacy docs). */
-  kind?: 'chart' | 'slicer' | 'text' | 'image';
+  kind?: 'chart' | 'slicer' | 'text' | 'image' | 'button';
   /** Present iff this is a chart tile (kind absent or 'chart'). */
   chart?: ChartSpec;
   /** Present iff this is a slicer tile (kind 'slicer'). */
@@ -180,6 +210,8 @@ export interface DashboardTile {
   text?: TextTileSpec;
   /** Present iff this is an image tile (kind 'image'). */
   image?: ImageTileSpec;
+  /** Present iff this is a navigation-button tile (kind 'button'). */
+  button?: ButtonTileSpec;
 }
 
 /** Legacy (pre-tile) slicer definition; migrated into slicer tiles on open. */
@@ -455,6 +487,11 @@ export const isImageTile = (
 ): tile is DashboardTile & { kind: 'image'; image: ImageTileSpec } =>
   tile.kind === 'image' && tile.image !== undefined;
 
+export const isButtonTile = (
+  tile: DashboardTile,
+): tile is DashboardTile & { kind: 'button'; button: ButtonTileSpec } =>
+  tile.kind === 'button' && tile.button !== undefined;
+
 /* ------------------------------------------------------- sharing (0.8.0)
  * Real per-user shares + activity log. Every field here is ADDITIVE on the
  * wire — pre-0.8 servers simply omit them, and readers derive sensible
@@ -466,12 +503,24 @@ export interface DashboardAccess {
   isOwner: boolean;
   /** owner || CanManageShared admin || any granted edit flag. */
   canEdit: boolean;
-  /** Move/resize tiles, doc settings, slicer/text/image tile add/remove/edits. */
+  /** Doc settings, slicer/text/image/button tile adds/edits. */
   canEditLayout: boolean;
   /** Add/remove/rename/reorder/recolor pages (+ mobile layout, drillthrough). */
   canManagePages: boolean;
-  /** Add/remove chart tiles, edit chart specs/format. */
+  /** Add chart tiles, edit chart specs/format (retitling stays owner/admin-only). */
   canEditCharts: boolean;
+  /**
+   * Move/resize tiles ("arrange tiles", 0.11.1). OPTIONAL on the wire —
+   * pre-0.11.1 servers omit it; always read access through dashboardAccessOf,
+   * which fills the gap from canEditLayout (the right it was split out of).
+   */
+  canMoveTiles?: boolean;
+  /**
+   * Remove tiles/pages on top of the matching class flag (0.11.1). OPTIONAL on
+   * the wire — pre-0.11.1 servers omit it; dashboardAccessOf fills the gap
+   * from canEditCharts || canManagePages (the classes removal used to ride).
+   */
+  canDeleteContent?: boolean;
   /** Access comes from a per-user share row. */
   viaShare: boolean;
   /** Access comes from the legacy publish ("Everyone") flag. */
@@ -485,6 +534,15 @@ export interface DashboardShare {
   canEditLayout: boolean;
   canManagePages: boolean;
   canEditCharts: boolean;
+  /** 0.11.1 — absent on older servers (treat as false). */
+  canMoveTiles?: boolean;
+  /** 0.11.1 — absent on older servers (treat as false). */
+  canDeleteContent?: boolean;
+  /** Who granted this row (0.11.1; opaque host id / resolved display name). */
+  grantedByUserId?: string;
+  grantedByDisplayName?: string | null;
+  /** When the grant was first created (0.11.1). */
+  createdAtUtc?: string;
   updatedAtUtc: string;
 }
 
@@ -493,6 +551,8 @@ export interface LayoutChangeSummaryJson {
   layoutChanged?: boolean;
   pagesChanged?: boolean;
   chartsChanged?: boolean;
+  /** Tile move/resize only (0.11.1 — split out of layoutChanged). */
+  geometryChanged?: boolean;
   pagesAdded?: string[];
   pagesRemoved?: string[];
   pagesRenamed?: { from: string; to: string }[];
@@ -500,12 +560,20 @@ export interface LayoutChangeSummaryJson {
   tilesRemoved?: number;
   /** Titles of charts whose spec/format changed. */
   chartsModified?: string[];
+  /** Chart retitles (0.11.1); from === to means only the inner title changed. */
+  chartsRenamed?: { from: string; to: string }[];
   settingsChanged?: boolean;
 }
 
 /** shared/unshared/shareChanged activity detail. */
 export interface ShareDetailJson {
   targetUserIds?: string[];
+}
+
+/** `renamed` activity detail: the dashboard's old and new name. */
+export interface RenameDetailJson {
+  from?: string;
+  to?: string;
 }
 
 /** One row of GET dashboards/{id}/activity. */
@@ -515,7 +583,7 @@ export interface ActivityEntry {
   displayName: string | null;
   /** created | saved | renamed | shared | unshared | shareChanged | left | deleted | duplicated */
   action: string;
-  detail: LayoutChangeSummaryJson | ShareDetailJson | null;
+  detail: LayoutChangeSummaryJson | ShareDetailJson | RenameDetailJson | null;
   atUtc: string;
 }
 
@@ -527,35 +595,48 @@ export interface RcdUser {
 }
 
 /**
- * The caller's access to a dashboard row, tolerating pre-0.8 servers that
- * send no `myAccess`: the owner gets full rights, anyone else view-only
- * (publish visibility is all a pre-shares server could have granted them).
+ * The caller's access to a dashboard row, tolerating older servers:
+ *  - pre-0.8 servers send no `myAccess` at all — the owner gets full rights,
+ *    anyone else view-only (publish visibility is all a pre-shares server
+ *    could have granted them);
+ *  - pre-0.11.1 servers send `myAccess` WITHOUT canMoveTiles/canDeleteContent —
+ *    those normalize to the rights they were split out of (move ⇐ layout,
+ *    delete ⇐ charts||pages), so existing grantees keep their pre-split
+ *    abilities against a lagging backend instead of silently losing UI.
+ * The result ALWAYS carries both 0.11.1 flags — consumers never re-derive.
  */
 export const dashboardAccessOf = (row: {
   ownerIsMe: boolean;
   isShared: boolean;
   myAccess?: DashboardAccess;
-}): DashboardAccess =>
-  row.myAccess ??
-  (row.ownerIsMe
-    ? {
-        isOwner: true,
-        canEdit: true,
-        canEditLayout: true,
-        canManagePages: true,
-        canEditCharts: true,
-        viaShare: false,
-        viaPublish: false,
-      }
-    : {
-        isOwner: false,
-        canEdit: false,
-        canEditLayout: false,
-        canManagePages: false,
-        canEditCharts: false,
-        viaShare: false,
-        viaPublish: row.isShared,
-      });
+}): Required<DashboardAccess> => {
+  const access =
+    row.myAccess ??
+    (row.ownerIsMe
+      ? {
+          isOwner: true,
+          canEdit: true,
+          canEditLayout: true,
+          canManagePages: true,
+          canEditCharts: true,
+          viaShare: false,
+          viaPublish: false,
+        }
+      : {
+          isOwner: false,
+          canEdit: false,
+          canEditLayout: false,
+          canManagePages: false,
+          canEditCharts: false,
+          viaShare: false,
+          viaPublish: row.isShared,
+        });
+  return {
+    ...access,
+    canMoveTiles: access.canMoveTiles ?? access.canEditLayout,
+    canDeleteContent: access.canDeleteContent ?? (access.canEditCharts || access.canManagePages),
+  };
+};
 
 export interface DashboardSummary {
   id: number;

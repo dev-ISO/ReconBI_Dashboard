@@ -5,6 +5,9 @@ namespace ReconDashboards.Core.Services;
 
 public sealed record PageRename(string From, string To);
 
+/// <summary>A chart title change (From == To means only the rich inner title changed).</summary>
+public sealed record ChartRename(string From, string To);
+
 /// <summary>
 /// What changed between two stored layout docs, as permission classes plus a
 /// human-renderable detail. Serialized camelCase into the "saved" activity
@@ -12,14 +15,21 @@ public sealed record PageRename(string From, string To);
 /// </summary>
 public sealed class LayoutChangeSummary
 {
-    /// <summary>Tile move/resize, doc-level settings, slicer/text/image tile add/remove/edits.</summary>
+    /// <summary>Doc-level settings, slicer/text/image/button tile add/remove/edits.</summary>
     public bool LayoutChanged { get; set; }
 
     /// <summary>Page add/remove/rename/reorder/color/mobile layout/drillthrough.</summary>
     public bool PagesChanged { get; set; }
 
-    /// <summary>Chart tile add/remove, chart spec/format changes.</summary>
+    /// <summary>Chart tile add/remove, chart spec/format changes (title excluded — see ChartsRenamed).</summary>
     public bool ChartsChanged { get; set; }
+
+    /// <summary>
+    /// Tile move/resize only (the tile's "layout" subtree). Split out of
+    /// LayoutChanged so the "arrange tiles" right (CanMoveTiles) can gate pure
+    /// geometry independently of layout-content edits.
+    /// </summary>
+    public bool GeometryChanged { get; set; }
 
     public List<string> PagesAdded { get; } = [];
     public List<string> PagesRemoved { get; } = [];
@@ -27,20 +37,56 @@ public sealed class LayoutChangeSummary
     public int TilesAdded { get; set; }
     public int TilesRemoved { get; set; }
     public List<string> ChartsModified { get; } = [];
+
+    /// <summary>
+    /// Chart retitles: chart.title and/or format.container.innerTitleHtml (the
+    /// frameless tiles' visible name) changed. Split out of the blanket chart
+    /// comparison because renaming a chart is owner/admin-only — grantees with
+    /// CanEditCharts may edit queries/format but never retitle.
+    /// </summary>
+    public List<ChartRename> ChartsRenamed { get; } = [];
+
     public bool SettingsChanged { get; set; }
 
     [JsonIgnore]
-    public bool HasAnyChange => LayoutChanged || PagesChanged || ChartsChanged;
+    public bool HasAnyChange =>
+        LayoutChanged || PagesChanged || ChartsChanged || GeometryChanged || ChartsRenamed.Count > 0;
+
+    /// <summary>
+    /// True when the diff includes tile or page REMOVALS — the axis the
+    /// CanDeleteContent right gates. Computed off the counts (not a stored
+    /// flag) so removal detection can never diverge from what the activity
+    /// detail reports; the fail-closed path raises it via FailClosed.
+    /// </summary>
+    [JsonIgnore]
+    public bool HasRemovals => TilesRemoved > 0 || PagesRemoved.Count > 0 || FailClosed;
+
+    /// <summary>
+    /// Set by the fail-closed paths (unparseable docs, changes no known field
+    /// explains). Grantee saves must then hold EVERY grantable right —
+    /// including move + delete, which are not implied by the three class
+    /// flags. Deliberately NOT the owner-only rename gate: an unexplained
+    /// diff (e.g. a future tile field the differ has not learned yet) must
+    /// stay saveable by fully-granted collaborators, not become owner-only.
+    /// </summary>
+    [JsonIgnore]
+    public bool FailClosed { get; private set; }
 
     /// <summary>Fail-closed result: every class raised, no detail (renders "updated the dashboard").</summary>
-    public static LayoutChangeSummary AllChanged() =>
-        new() { LayoutChanged = true, PagesChanged = true, ChartsChanged = true };
+    public static LayoutChangeSummary AllChanged()
+    {
+        var summary = new LayoutChangeSummary();
+        summary.MarkAllChanged();
+        return summary;
+    }
 
     internal void MarkAllChanged()
     {
         LayoutChanged = true;
         PagesChanged = true;
         ChartsChanged = true;
+        GeometryChanged = true;
+        FailClosed = true;
     }
 }
 
@@ -239,16 +285,18 @@ public static class DashboardLayoutDiffer
 
         var explained = false;
 
-        // Grid position/size: pure layout.
+        // Grid position/size: pure geometry — its own class since 0.11.1 so
+        // the "arrange tiles" right (CanMoveTiles) gates it independently of
+        // layout-content edits.
         if (!ElementsEqual(GetOrNull(oldTile.Element, "layout"), GetOrNull(newTile.Element, "layout")))
         {
-            summary.LayoutChanged = true;
+            summary.GeometryChanged = true;
             explained = true;
         }
 
         // A kind switch replaces the tile's content wholesale: charts class
         // when a chart is on either side; a swap between the static kinds
-        // (slicer/text/image) stays a layout-class edit.
+        // (slicer/text/image/button) stays a layout-class edit.
         if (!StringEquals(GetString(oldTile.Element, "kind"), GetString(newTile.Element, "kind")))
         {
             if (IsChartClass(oldTile) || IsChartClass(newTile))
@@ -265,13 +313,31 @@ public static class DashboardLayoutDiffer
         }
         else if (!ElementsEqual(GetOrNull(oldTile.Element, "chart"), GetOrNull(newTile.Element, "chart")))
         {
-            summary.ChartsChanged = true;
-            AddChartModified(summary, newTile, oldTile);
+            // The chart subtree differs. The RENAME axis — chart.title plus
+            // format.container.innerTitleHtml (the visible name of frameless
+            // tiles) — is split from the body comparison: retitles are
+            // owner/admin-only while body edits ride CanEditCharts.
+            var oldChart = GetOrNull(oldTile.Element, "chart");
+            var newChart = GetOrNull(newTile.Element, "chart");
+            if (ChartRenameOf(oldChart, newChart) is { } rename)
+            {
+                if (!summary.ChartsRenamed.Contains(rename))
+                {
+                    summary.ChartsRenamed.Add(rename);
+                }
+            }
+
+            if (!ChartBodiesEqual(oldChart, newChart))
+            {
+                summary.ChartsChanged = true;
+                AddChartModified(summary, newTile, oldTile);
+            }
+
             explained = true;
         }
 
-        // Slicer/text/image tile edits are layout-class changes.
-        foreach (var key in (string[])["slicer", "text", "image"])
+        // Slicer/text/image/button tile edits are layout-class changes.
+        foreach (var key in (string[])["slicer", "text", "image", "button"])
         {
             if (!ElementsEqual(GetOrNull(oldTile.Element, key), GetOrNull(newTile.Element, key)))
             {
@@ -289,10 +355,12 @@ public static class DashboardLayoutDiffer
     }
 
     /// <summary>
-    /// Add/remove of a slicer/text/image tile is a LAYOUT-class change (same
-    /// class as editing one); anything else — chart tiles, kind-less legacy
-    /// tiles, unknown future kinds (fail closed to the stricter flag) — is a
-    /// charts-class change.
+    /// Add/remove of a slicer/text/image/button tile is a LAYOUT-class change
+    /// (same class as editing one); anything else — chart tiles, kind-less
+    /// legacy tiles, unknown future kinds (fail closed to the stricter flag) —
+    /// is a charts-class change. Removals ADDITIONALLY feed TilesRemoved
+    /// regardless of kind (the callers count), which is what the delete gate
+    /// (CanDeleteContent) reads — deletion is class-flag AND delete-flag.
     /// </summary>
     private static void ClassifyTileAddOrRemove(Tile tile, LayoutChangeSummary summary)
     {
@@ -306,9 +374,133 @@ public static class DashboardLayoutDiffer
         }
     }
 
-    /// <summary>False only for the known static kinds (slicer/text/image).</summary>
+    /// <summary>False only for the known static kinds (slicer/text/image/button).</summary>
     private static bool IsChartClass(Tile tile) =>
-        GetString(tile.Element, "kind") is not ("slicer" or "text" or "image");
+        GetString(tile.Element, "kind") is not ("slicer" or "text" or "image" or "button");
+
+    /// <summary>
+    /// The rename (old title → new title) when the chart's title and/or its
+    /// format.container.innerTitleHtml differ; null when neither did, or when
+    /// either side is not an object (the body comparison then owns the diff).
+    /// From == To signals an inner-title-only retitle.
+    /// </summary>
+    private static ChartRename? ChartRenameOf(JsonElement? oldChart, JsonElement? newChart)
+    {
+        if (oldChart is not { ValueKind: JsonValueKind.Object } oldObj
+            || newChart is not { ValueKind: JsonValueKind.Object } newObj)
+        {
+            return null;
+        }
+
+        var oldTitle = GetString(oldObj, "title") ?? "";
+        var newTitle = GetString(newObj, "title") ?? "";
+        var titleChanged = !StringEquals(oldTitle, newTitle);
+        var innerTitleChanged = !ElementsEqual(InnerTitleOf(oldObj), InnerTitleOf(newObj));
+        return titleChanged || innerTitleChanged ? new ChartRename(oldTitle, newTitle) : null;
+    }
+
+    private static JsonElement? InnerTitleOf(JsonElement chart) =>
+        GetOrNull(chart, "format") is { ValueKind: JsonValueKind.Object } format
+        && GetOrNull(format, "container") is { ValueKind: JsonValueKind.Object } container
+            ? GetOrNull(container, "innerTitleHtml")
+            : null;
+
+    /// <summary>
+    /// Deep-equality of two chart subtrees IGNORING the rename axis (title +
+    /// format.container.innerTitleHtml). Non-object shapes (a chart appearing
+    /// or vanishing outright) compare with plain deep equality — such a change
+    /// is a body change, never a mere rename.
+    /// </summary>
+    private static bool ChartBodiesEqual(JsonElement? oldChart, JsonElement? newChart)
+    {
+        if (oldChart is not { ValueKind: JsonValueKind.Object } oldObj
+            || newChart is not { ValueKind: JsonValueKind.Object } newObj)
+        {
+            return ElementsEqual(oldChart, newChart);
+        }
+
+        return ObjectsEqualExcept(oldObj, newObj, key => key switch
+        {
+            "title" => Comparison.Skip,
+            "format" => Comparison.Formats,
+            _ => Comparison.Deep,
+        });
+    }
+
+    private enum Comparison
+    {
+        Deep,
+        Skip,
+        Formats,
+        Containers,
+    }
+
+    /// <summary>Key-wise object comparison with per-key handling (the rename-axis carve-out).</summary>
+    private static bool ObjectsEqualExcept(
+        JsonElement oldObj, JsonElement newObj, Func<string, Comparison> comparisonOf)
+    {
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var property in oldObj.EnumerateObject())
+        {
+            keys.Add(property.Name);
+        }
+
+        foreach (var property in newObj.EnumerateObject())
+        {
+            keys.Add(property.Name);
+        }
+
+        foreach (var key in keys)
+        {
+            var oldValue = GetOrNull(oldObj, key);
+            var newValue = GetOrNull(newObj, key);
+            switch (comparisonOf(key))
+            {
+                case Comparison.Skip:
+                    continue;
+                case Comparison.Formats:
+                    if (!NestedEqualExcept(oldValue, newValue, "container", Comparison.Containers))
+                    {
+                        return false;
+                    }
+
+                    continue;
+                case Comparison.Containers:
+                    if (!NestedEqualExcept(oldValue, newValue, "innerTitleHtml", Comparison.Skip))
+                    {
+                        return false;
+                    }
+
+                    continue;
+                default:
+                    if (!ElementsEqual(oldValue, newValue))
+                    {
+                        return false;
+                    }
+
+                    continue;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Compares two values that carve out ONE nested key: object shapes recurse
+    /// with the carve-out; anything else falls back to deep equality.
+    /// </summary>
+    private static bool NestedEqualExcept(
+        JsonElement? oldValue, JsonElement? newValue, string carvedKey, Comparison carvedComparison)
+    {
+        if (oldValue is not { ValueKind: JsonValueKind.Object } oldObj
+            || newValue is not { ValueKind: JsonValueKind.Object } newObj)
+        {
+            return ElementsEqual(oldValue, newValue);
+        }
+
+        return ObjectsEqualExcept(oldObj, newObj,
+            key => StringEquals(key, carvedKey) ? carvedComparison : Comparison.Deep);
+    }
 
     private static void AddChartModified(LayoutChangeSummary summary, Tile newTile, Tile oldTile)
     {

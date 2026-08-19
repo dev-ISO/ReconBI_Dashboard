@@ -16,6 +16,7 @@ import {
   emptyChart,
   filterCardIsActive,
   isChartTile,
+  isButtonTile,
   isImageTile,
   isRunnable,
   isSlicerTile,
@@ -75,6 +76,8 @@ import {
 import { FilterIndicatorMenu } from './FilterIndicatorMenu';
 import { FiltersPane } from './FiltersPane';
 import { FitPageViewport } from './FitPageViewport';
+import { ButtonTile } from './ButtonTile';
+import { ButtonTileDialog } from './ButtonTileDialog';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
 import { MOBILE_BREAKPOINT, MobileLayoutEditor, MobileStack } from './MobileLayout';
@@ -346,6 +349,7 @@ export function DashboardView({
   const [notice, setNotice] = useState<string | null>(null);
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
   const [addImageOpen, setAddImageOpen] = useState(false);
+  const [addButtonOpen, setAddButtonOpen] = useState(false);
   const [printConfigOpen, setPrintConfigOpen] = useState(false);
   /** Non-null while the print preview overlay is mounted. */
   const [printOptions, setPrintOptions] = useState<PrintOptions | null>(null);
@@ -475,6 +479,17 @@ export function DashboardView({
   const canEditLayout = editable && (access?.canEditLayout ?? false);
   const canManagePages = editable && (access?.canManagePages ?? false);
   const canEditCharts = editable && (access?.canEditCharts ?? false);
+  // 0.11.1 rights. The store normalizes myAccess through dashboardAccessOf,
+  // so against a pre-0.11.1 server these fall back to the rights they were
+  // split out of (move ⇐ layout, delete ⇐ charts||pages).
+  const canMoveTiles = editable && (access?.canMoveTiles ?? false);
+  const canDeleteContent = editable && (access?.canDeleteContent ?? false);
+  /**
+   * Chart renames are fullEditor-only (owner || admin — the same signal as
+   * canManageShares: a grantee's access is viaShare). Grantees with chart
+   * rights edit fields/format; the builder's Title input locks for them.
+   */
+  const canRenameCharts = canManageShares;
 
   // Ctrl+Z / Ctrl+Y / Ctrl+Shift+Z while editing. Document-level (key events
   // only reach the view root when focus happens to sit inside it) but gated on
@@ -1656,6 +1671,19 @@ export function DashboardView({
       return <ImageTile tileId={tile.id} spec={tile.image} editable={canEditLayout} />;
     }
 
+    // Navigation buttons: live page-switch in view mode; layout-class edits.
+    // `pages` resolves the target every render (broken-link badge).
+    if (isButtonTile(tile)) {
+      return (
+        <ButtonTile
+          tileId={tile.id}
+          spec={tile.button}
+          editable={canEditLayout}
+          pages={pages.map((page) => ({ id: page.id, name: page.name }))}
+        />
+      );
+    }
+
     if (!isChartTile(tile)) return null;
     const chart = tile.chart;
     // Edit-mode click selects the tile (drives the Filters pane's "On this
@@ -1679,7 +1707,9 @@ export function DashboardView({
         onSelect={() => runtime.dashboards.selectTile(tile.id)}
         onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
         onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
-        onDelete={() => runtime.dashboards.removeTile(tile.id)}
+        // Tile deletion additionally rides the CanDeleteContent right (0.11.1)
+        // — withholding the handler hides the affordance for grantees without it.
+        onDelete={canDeleteContent ? () => runtime.dashboards.removeTile(tile.id) : undefined}
         // Context card replaces the native menu in EDIT mode only; view mode
         // gets the POINT context menu (drillthrough/export) on chart points.
         onTileContextMenu={
@@ -1757,6 +1787,8 @@ export function DashboardView({
           name: p.name,
           kind: p.kind,
         }))}
+        // Owner-only chart rename (0.11.1): grantees get a locked Title input.
+        canRenameTitle={canRenameCharts}
         onSave={handleBuilderSave}
         onCancel={() => setBuilder(null)}
         requestCloseRef={builderCloseRef}
@@ -1835,13 +1867,18 @@ export function DashboardView({
         onAddChart={openAddChart}
         onAddText={() => runtime.dashboards.addTextTile()}
         onAddImage={() => setAddImageOpen(true)}
+        onAddButton={() => setAddButtonOpen(true)}
         onAddSlicer={() => setAddSlicerOpen(true)}
         addSlicerDisabled={modelId === null}
-        // Session clipboard paste (Add ▾ > Paste chart); the Add menu itself
-        // is already gated on canEditCharts via canAddTiles.
+        // Session clipboard paste (Add ▾ > Paste chart); gated with the
+        // chart-side Add items via canAddChartTiles.
         onPasteChart={() => runtime.dashboards.pasteChartTile()}
         pasteChartEnabled={chartClipboard !== null}
-        canAddTiles={canEditCharts}
+        // Split per server class (0.11.1): chart adds ride CanEditCharts;
+        // text/image/slicer/button adds are layout-class and ride
+        // CanEditLayout — the old single gate over-restricted layout grantees.
+        canAddChartTiles={canEditCharts}
+        canAddLayoutTiles={canEditLayout}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
         canUndo={canUndo}
@@ -2093,9 +2130,10 @@ export function DashboardView({
               <DashboardGrid
                 items={gridItems}
                 editable={editable}
-                // Grantees without layout rights get a static grid (honest
-                // UX; the differ + server reject their moves regardless).
-                locked={!canEditLayout}
+                // Grantees without the ARRANGE right get a static grid
+                // (0.11.1: move/resize rides CanMoveTiles, no longer
+                // CanEditLayout; the differ + server reject regardless).
+                locked={!canMoveTiles}
                 onLayoutChange={handleLayoutChange}
                 renderItem={renderTile}
                 draggableHandle=".rcd-tile-drag-handle"
@@ -2138,8 +2176,14 @@ export function DashboardView({
         </div>
       )}
 
-      {/* Excel-style page tabs, docked under the scroll area in BOTH modes. */}
-      <PageTabs pages={pages} activePageId={activePage?.id ?? null} editable={canManagePages} />
+      {/* Excel-style page tabs, docked under the scroll area in BOTH modes.
+          Page DELETION additionally needs the delete right (0.11.1). */}
+      <PageTabs
+        pages={pages}
+        activePageId={activePage?.id ?? null}
+        editable={canManagePages}
+        canDeletePages={canManagePages && canDeleteContent}
+      />
 
       {chartMenu &&
         canEditCharts &&
@@ -2177,7 +2221,12 @@ export function DashboardView({
                   ? () => openAlertFor(chartMenuTile.id)
                   : null
               }
-              onDelete={() => runtime.dashboards.removeTile(chartMenuTile.id)}
+              // Deletion rides CanDeleteContent (0.11.1) — item hides without it.
+              onDelete={
+                canDeleteContent
+                  ? () => runtime.dashboards.removeTile(chartMenuTile.id)
+                  : undefined
+              }
               onClose={() => setChartMenu(null)}
             />
           </div>,
@@ -2391,6 +2440,18 @@ export function DashboardView({
         onSave={(spec) => {
           runtime.dashboards.addImageTile(spec);
           setAddImageOpen(false);
+        }}
+      />
+
+      <ButtonTileDialog
+        open={addButtonOpen}
+        title="Add button"
+        initial={null}
+        pages={pages.map((page) => ({ id: page.id, name: page.name }))}
+        onClose={() => setAddButtonOpen(false)}
+        onSave={(spec) => {
+          runtime.dashboards.addButtonTile(spec);
+          setAddButtonOpen(false);
         }}
       />
 

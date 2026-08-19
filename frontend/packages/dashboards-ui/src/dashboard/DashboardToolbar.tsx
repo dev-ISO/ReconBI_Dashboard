@@ -16,6 +16,7 @@ import {
   Maximize,
   MoreHorizontal,
   MoreVertical,
+  MousePointerClick,
   Network,
   Pencil,
   Plus,
@@ -55,6 +56,7 @@ export interface DashboardToolbarProps {
   onAddChart: () => void;
   onAddText: () => void;
   onAddImage: () => void;
+  onAddButton: () => void;
   onAddSlicer: () => void;
   /** Disables the Add > Slicer item (no model attached). */
   addSlicerDisabled?: boolean;
@@ -141,10 +143,13 @@ export interface DashboardToolbarProps {
   onUndo?: () => void;
   onRedo?: () => void;
   /**
-   * Shows the edit-mode Add ▾ menu (default true). Grantees without chart
-   * rights get their add-tile affordance hidden here.
+   * Edit-mode Add ▾ gating, split per SERVER permission class (0.11.1 — the
+   * old single canAddTiles gate over-restricted): chart adds (+ paste) ride
+   * CanEditCharts; text/image/slicer/button adds are layout-class and ride
+   * CanEditLayout. The menu hides entirely when neither is true.
    */
-  canAddTiles?: boolean;
+  canAddChartTiles?: boolean;
+  canAddLayoutTiles?: boolean;
   /** Host-injected toolbar actions (e.g. "Send to chat"), right of the built-ins. */
   extraActions?: ReactNode;
 }
@@ -170,6 +175,7 @@ export function DashboardToolbar({
   onAddChart,
   onAddText,
   onAddImage,
+  onAddButton,
   onAddSlicer,
   addSlicerDisabled,
   onPasteChart,
@@ -214,7 +220,8 @@ export function DashboardToolbar({
   canRedo = false,
   onUndo,
   onRedo,
-  canAddTiles = true,
+  canAddChartTiles = true,
+  canAddLayoutTiles = true,
   extraActions,
 }: DashboardToolbarProps) {
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -468,11 +475,14 @@ export function DashboardToolbar({
                   ))}
                 </RcdSelect>
               )}
-              {canAddTiles && (
+              {(canAddChartTiles || canAddLayoutTiles) && (
                 <AddTileMenu
+                  showChartItems={canAddChartTiles}
+                  showLayoutItems={canAddLayoutTiles}
                   onAddChart={onAddChart}
                   onAddText={onAddText}
                   onAddImage={onAddImage}
+                  onAddButton={onAddButton}
                   onAddSlicer={onAddSlicer}
                   addSlicerDisabled={addSlicerDisabled ?? false}
                   onPasteChart={onPasteChart}
@@ -1086,23 +1096,32 @@ function BookmarksMenu({
 
 /**
  * The edit-mode add affordance: one "Add" button opening a small menu card
- * (chart / text / image / slicer). A styled card, NOT a native menu; closed by
- * outside click or Escape. The toolbar sits in normal (untransformed) flow, so
- * the absolutely-positioned card needs no portal.
+ * (chart / text / image / button / slicer). A styled card, NOT a native menu;
+ * closed by outside click or Escape. The toolbar sits in normal
+ * (untransformed) flow, so the absolutely-positioned card needs no portal.
+ * Items are gated per SERVER permission class: chart + paste ride
+ * showChartItems (CanEditCharts); the static kinds ride showLayoutItems
+ * (CanEditLayout) — matching how DashboardLayoutDiffer classifies the adds.
  */
 function AddTileMenu({
+  showChartItems,
+  showLayoutItems,
   onAddChart,
   onAddText,
   onAddImage,
+  onAddButton,
   onAddSlicer,
   addSlicerDisabled,
   onPasteChart,
   pasteChartEnabled,
   onManageParameters,
 }: {
+  showChartItems: boolean;
+  showLayoutItems: boolean;
   onAddChart: () => void;
   onAddText: () => void;
   onAddImage: () => void;
+  onAddButton: () => void;
   onAddSlicer: () => void;
   addSlicerDisabled: boolean;
   onPasteChart?: () => void;
@@ -1154,27 +1173,37 @@ function AddTileMenu({
           aria-label="Add tile"
           className="absolute right-0 top-full z-40 mt-1 w-40 rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
         >
-          <AddMenuItem onClick={() => pick(onAddChart)}>
-            <BarChart3 size={14} />
-            Chart
-          </AddMenuItem>
-          <AddMenuItem onClick={() => pick(onAddText)}>
-            <Type size={14} />
-            Text
-          </AddMenuItem>
-          <AddMenuItem onClick={() => pick(onAddImage)}>
-            <ImageIcon size={14} />
-            Image
-          </AddMenuItem>
-          <AddMenuItem
-            onClick={() => pick(onAddSlicer)}
-            disabled={addSlicerDisabled}
-            title={addSlicerDisabled ? 'Attach a model to add slicers' : undefined}
-          >
-            <SlidersHorizontal size={14} />
-            Slicer
-          </AddMenuItem>
-          {onPasteChart && (
+          {showChartItems && (
+            <AddMenuItem onClick={() => pick(onAddChart)}>
+              <BarChart3 size={14} />
+              Chart
+            </AddMenuItem>
+          )}
+          {showLayoutItems && (
+            <>
+              <AddMenuItem onClick={() => pick(onAddText)}>
+                <Type size={14} />
+                Text
+              </AddMenuItem>
+              <AddMenuItem onClick={() => pick(onAddImage)}>
+                <ImageIcon size={14} />
+                Image
+              </AddMenuItem>
+              <AddMenuItem onClick={() => pick(onAddButton)}>
+                <MousePointerClick size={14} />
+                Button
+              </AddMenuItem>
+              <AddMenuItem
+                onClick={() => pick(onAddSlicer)}
+                disabled={addSlicerDisabled}
+                title={addSlicerDisabled ? 'Attach a model to add slicers' : undefined}
+              >
+                <SlidersHorizontal size={14} />
+                Slicer
+              </AddMenuItem>
+            </>
+          )}
+          {showChartItems && onPasteChart && (
             <>
               <div className="my-1 border-t border-rcd-border" />
               <AddMenuItem

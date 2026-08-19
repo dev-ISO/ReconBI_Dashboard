@@ -34,7 +34,7 @@ public sealed class DashboardRecord
 }
 
 /// <summary>
-/// rcd_dashboard_shares — a named-user grant on one dashboard. All three flags
+/// rcd_dashboard_shares — a named-user grant on one dashboard. All flags
 /// false = view-only. UserId/GrantedByUserId are opaque host ids, same
 /// convention as OwnerUserId. One row per (DashboardId, UserId).
 /// </summary>
@@ -44,14 +44,21 @@ public sealed class DashboardShareRecord
     public int DashboardId { get; set; }
     public string UserId { get; set; } = "";
 
-    /// <summary>Move/resize tiles, doc-level settings, slicer/text/image tiles.</summary>
+    /// <summary>Doc-level settings, slicer/text/image/button tile adds/edits.</summary>
     public bool CanEditLayout { get; set; }
 
-    /// <summary>Add/remove/rename/reorder/recolor pages.</summary>
+    /// <summary>Add/remove/rename/reorder/recolor pages (removal ALSO needs CanDeleteContent).</summary>
     public bool CanManagePages { get; set; }
 
-    /// <summary>Add/remove tiles, edit chart specs/format.</summary>
+    /// <summary>Add chart tiles, edit chart specs/format (never retitle — renames are owner-only).</summary>
     public bool CanEditCharts { get; set; }
+
+    /// <summary>Move/resize tiles ("arrange tiles" — 0.11.1, backfilled from CanEditLayout).</summary>
+    public bool CanMoveTiles { get; set; }
+
+    /// <summary>Remove tiles (any kind) and pages, ON TOP of the matching class flag
+    /// (0.11.1, backfilled from CanEditCharts OR CanManagePages).</summary>
+    public bool CanDeleteContent { get; set; }
 
     public string GrantedByUserId { get; set; } = "";
     public DateTime CreatedAtUtc { get; set; }

@@ -28,11 +28,18 @@ public class DashboardLayoutDifferTests
         DashboardLayoutDiffer.Diff(oldDoc, newDoc);
 
     private static void AssertFlags(
-        LayoutChangeSummary summary, bool layout = false, bool pages = false, bool charts = false)
+        LayoutChangeSummary summary,
+        bool layout = false,
+        bool pages = false,
+        bool charts = false,
+        bool geometry = false,
+        bool renamed = false)
     {
         Assert.Equal(layout, summary.LayoutChanged);
         Assert.Equal(pages, summary.PagesChanged);
         Assert.Equal(charts, summary.ChartsChanged);
+        Assert.Equal(geometry, summary.GeometryChanged);
+        Assert.Equal(renamed, summary.ChartsRenamed.Count > 0);
     }
 
     [Fact]
@@ -155,14 +162,27 @@ public class DashboardLayoutDifferTests
     }
 
     [Fact]
-    public void TileMoved_IsLayoutOnly()
+    public void TileMoved_IsGeometryOnly()
     {
+        // 0.11.1: pure move/resize is its own class (CanMoveTiles), no longer
+        // a layout-class change.
         var newDoc = BaseDoc.Replace("""{ "x": 0, "y": 0, "w": 4, "h": 3 }""", """{ "x": 2, "y": 1, "w": 4, "h": 3 }""");
 
         var summary = Diff(BaseDoc, newDoc);
 
-        AssertFlags(summary, layout: true);
+        AssertFlags(summary, geometry: true);
+        Assert.True(summary.HasAnyChange);
         Assert.Empty(summary.ChartsModified);
+    }
+
+    [Fact]
+    public void TileMovedAndSlicerEdited_RaisesGeometryAndLayout()
+    {
+        var newDoc = BaseDoc
+            .Replace("""{ "x": 0, "y": 0, "w": 4, "h": 3 }""", """{ "x": 2, "y": 1, "w": 4, "h": 3 }""")
+            .Replace("\"column\": \"status\"", "\"column\": \"order_date\"");
+
+        AssertFlags(Diff(BaseDoc, newDoc), layout: true, geometry: true);
     }
 
     [Fact]
@@ -174,6 +194,79 @@ public class DashboardLayoutDifferTests
 
         AssertFlags(summary, charts: true);
         Assert.Equal(["Orders by Region"], summary.ChartsModified);
+    }
+
+    // ------------------------- chart renames (0.11.1) -------------------------
+    // chart.title + format.container.innerTitleHtml are split out of the chart
+    // body: retitles are owner/admin-only, body edits ride CanEditCharts.
+
+    [Fact]
+    public void ChartTitleChanged_IsRenameOnly_NotChartsClass()
+    {
+        var newDoc = BaseDoc.Replace("\"title\": \"Orders by Region\"", "\"title\": \"Orders by Area\"");
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, renamed: true);
+        var rename = Assert.Single(summary.ChartsRenamed);
+        Assert.Equal("Orders by Region", rename.From);
+        Assert.Equal("Orders by Area", rename.To);
+        Assert.True(summary.HasAnyChange);
+        Assert.Empty(summary.ChartsModified);
+    }
+
+    [Fact]
+    public void ChartTitleAndBodyChanged_RaisesRenameAndChartsClass()
+    {
+        var newDoc = BaseDoc
+            .Replace("\"title\": \"Orders by Region\"", "\"title\": \"Orders by Area\"")
+            .Replace("\"type\": \"column\"", "\"type\": \"line\"");
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, charts: true, renamed: true);
+        Assert.Equal(["Orders by Area"], summary.ChartsModified);
+    }
+
+    private const string InnerTitleDoc = """
+        {
+          "pages": [
+            {
+              "id": "p1", "name": "Overview",
+              "tiles": [
+                { "id": "t1", "kind": "chart", "layout": { "x": 0, "y": 0, "w": 4, "h": 3 },
+                  "chart": { "id": "c1", "type": "column", "title": "Orders",
+                             "query": { "measures": [{ "name": "Total" }] },
+                             "format": { "palette": "a",
+                                         "container": { "hideHeader": true, "innerTitleHtml": "<p><b>Orders</b></p>" } } } }
+              ]
+            }
+          ]
+        }
+        """;
+
+    [Fact]
+    public void InnerTitleOnlyChanged_IsRenameOnly()
+    {
+        // Frameless tiles display the INNER title as their visible name, so a
+        // change to it is a retitle even when chart.title is untouched.
+        var newDoc = InnerTitleDoc.Replace("<p><b>Orders</b></p>", "<p><b>Everything</b></p>");
+
+        var summary = Diff(InnerTitleDoc, newDoc);
+
+        AssertFlags(summary, renamed: true);
+        var rename = Assert.Single(summary.ChartsRenamed);
+        Assert.Equal(rename.From, rename.To); // title unchanged: inner-title-only retitle
+    }
+
+    [Fact]
+    public void InnerTitleAndOtherFormatChanged_RaisesRenameAndChartsClass()
+    {
+        var newDoc = InnerTitleDoc
+            .Replace("<p><b>Orders</b></p>", "<p><b>Everything</b></p>")
+            .Replace("\"palette\": \"a\"", "\"palette\": \"b\"");
+
+        AssertFlags(Diff(InnerTitleDoc, newDoc), charts: true, renamed: true);
     }
 
     [Fact]
@@ -223,13 +316,14 @@ public class DashboardLayoutDifferTests
         AssertFlags(Diff(BaseDoc, newDoc), layout: true);
     }
 
-    // Finding 9: add/remove of slicer/text/image tiles is a LAYOUT-class
+    // Finding 9: add/remove of slicer/text/image/button tiles is a LAYOUT-class
     // change, same as editing one; only chart-kind tiles gate on canEditCharts.
 
     [Theory]
     [InlineData("slicer", """{ "id": "t9", "kind": "slicer", "slicer": { "table": "public.orders", "column": "region" } }""")]
     [InlineData("text", """{ "id": "t9", "kind": "text", "text": { "html": "<p>hello</p>" } }""")]
     [InlineData("image", """{ "id": "t9", "kind": "image", "image": { "src": "https://x/y.png", "fit": "contain" } }""")]
+    [InlineData("button", """{ "id": "t9", "kind": "button", "button": { "html": "<p>Go</p>", "targetPageId": "p1" } }""")]
     public void StaticTileAdded_IsLayoutOnly(string kind, string tileJson)
     {
         _ = kind;
@@ -283,16 +377,47 @@ public class DashboardLayoutDifferTests
         Assert.Equal(1, summary.TilesAdded);
     }
 
-    [Fact]
-    public void TileKindChangedBetweenStaticKinds_IsLayoutClass()
+    [Theory]
+    [InlineData("text")]
+    [InlineData("button")]
+    public void TileKindChangedBetweenStaticKinds_IsLayoutClass(string newKind)
     {
-        var newDoc = BaseDoc.Replace("\"id\": \"t2\", \"kind\": \"slicer\"", "\"id\": \"t2\", \"kind\": \"text\"");
+        var newDoc = BaseDoc.Replace("\"id\": \"t2\", \"kind\": \"slicer\"", $"\"id\": \"t2\", \"kind\": \"{newKind}\"");
 
         var summary = Diff(BaseDoc, newDoc);
 
         Assert.True(summary.LayoutChanged);
         Assert.False(summary.ChartsChanged);
         Assert.False(summary.PagesChanged);
+    }
+
+    [Fact]
+    public void ButtonTileEdited_IsLayoutOnly()
+    {
+        const string oldDoc = """
+            { "pages": [{ "id": "p1", "tiles": [
+              { "id": "t1", "kind": "button", "layout": { "x": 0, "y": 0, "w": 4, "h": 2 },
+                "button": { "html": "<p>Go</p>", "targetPageId": "p1", "radius": 8 } }] }] }
+            """;
+        var newDoc = oldDoc.Replace("\"targetPageId\": \"p1\"", "\"targetPageId\": \"p2\"");
+
+        AssertFlags(Diff(oldDoc, newDoc), layout: true);
+    }
+
+    [Fact]
+    public void ButtonTileRemoved_IsLayoutOnly_AndCountsRemoval()
+    {
+        const string oldDoc = """
+            { "pages": [{ "id": "p1", "tiles": [
+              { "id": "t1", "kind": "button", "button": { "html": "<p>Go</p>", "targetPageId": "p1" } }] }] }
+            """;
+        const string newDoc = """{ "pages": [{ "id": "p1", "tiles": [] }] }""";
+
+        var summary = Diff(oldDoc, newDoc);
+
+        AssertFlags(summary, layout: true);
+        Assert.Equal(1, summary.TilesRemoved);
+        Assert.True(summary.HasRemovals);
     }
 
     [Fact]
@@ -357,10 +482,10 @@ public class DashboardLayoutDifferTests
     }
 
     [Fact]
-    public void LegacyTileMoved_IsLayoutOnly()
+    public void LegacyTileMoved_IsGeometryOnly()
     {
         var newDoc = LegacyDoc.Replace("\"x\": 0", "\"x\": 6");
-        AssertFlags(Diff(LegacyDoc, newDoc), layout: true);
+        AssertFlags(Diff(LegacyDoc, newDoc), geometry: true);
     }
 
     [Fact]
@@ -412,13 +537,17 @@ public class DashboardLayoutDifferTests
     {
         var summary = Diff(oldDoc, newDoc);
 
-        AssertFlags(summary, layout: true, pages: true, charts: true);
+        // Fail-closed raises every GRANTABLE class (geometry included, plus
+        // HasRemovals via FailClosed) — but never the owner-only rename gate.
+        AssertFlags(summary, layout: true, pages: true, charts: true, geometry: true);
+        Assert.True(summary.HasRemovals);
+        Assert.Empty(summary.ChartsRenamed);
     }
 
     [Fact]
     public void NullInputs_RaiseAllFlags()
     {
-        AssertFlags(Diff(null!, null!), layout: true, pages: true, charts: true);
+        AssertFlags(Diff(null!, null!), layout: true, pages: true, charts: true, geometry: true);
     }
 
     [Fact]
@@ -428,7 +557,7 @@ public class DashboardLayoutDifferTests
         var oldDoc = """{ "pages": [{ "id": "p1", "tiles": [{ "id": "t1", "future": 1 }] }] }""";
         var newDoc = """{ "pages": [{ "id": "p1", "tiles": [{ "id": "t1", "future": 2 }] }] }""";
 
-        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true);
+        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true, geometry: true);
     }
 
     [Fact]
@@ -437,7 +566,7 @@ public class DashboardLayoutDifferTests
         var oldDoc = """{ "pages": [{ "id": "p1", "tiles": [], "future": 1 }] }""";
         var newDoc = """{ "pages": [{ "id": "p1", "tiles": [], "future": 2 }] }""";
 
-        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true);
+        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true, geometry: true);
     }
 
     [Fact]
@@ -446,7 +575,7 @@ public class DashboardLayoutDifferTests
         var oldDoc = """{ "pages": [{ "id": "p1", "tiles": [{ "id": "t1" }, { "id": "t1" }] }] }""";
         var newDoc = """{ "pages": [{ "id": "p1", "tiles": [{ "id": "t1" }] }] }""";
 
-        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true);
+        AssertFlags(Diff(oldDoc, newDoc), layout: true, pages: true, charts: true, geometry: true);
     }
 
     [Fact]

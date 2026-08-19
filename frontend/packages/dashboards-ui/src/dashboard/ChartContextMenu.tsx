@@ -30,8 +30,9 @@ export interface ChartContextMenuProps {
   onExport?: (mode: 'summarized' | 'underlying') => void;
   /** "Set alert on this measure…" (charts with ≥1 measure); hidden when absent. */
   onSetAlert?: (() => void) | null;
-  /** Called after the user confirms the destructive delete. */
-  onDelete: () => void;
+  /** Called after the user confirms the destructive delete. Absent = the
+   *  caller lacks the delete right (0.11.1) — the item hides. */
+  onDelete?: () => void;
   onClose: () => void;
 }
 
@@ -180,8 +181,12 @@ export function ChartContextMenu({
             />
           </>
         )}
-        <div className="my-1 border-t border-rcd-border" />
-        <MenuItem icon={Trash2} label="Delete" danger onClick={() => setConfirmDelete(true)} />
+        {onDelete && (
+          <>
+            <div className="my-1 border-t border-rcd-border" />
+            <MenuItem icon={Trash2} label="Delete" danger onClick={() => setConfirmDelete(true)} />
+          </>
+        )}
       </div>
 
       <ConfirmDialog
@@ -192,7 +197,7 @@ export function ChartContextMenu({
         open={confirmDelete}
         onConfirm={() => {
           setConfirmDelete(false);
-          onDelete();
+          onDelete?.();
           onClose();
         }}
         onCancel={() => {

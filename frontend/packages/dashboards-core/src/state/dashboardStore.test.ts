@@ -301,6 +301,118 @@ describe('copyChartToDashboard', () => {
   });
 });
 
+describe('renameDashboard (0.11.1)', () => {
+  it('open dashboard: PUTs the in-memory layout with the new name and adopts the fresh stamp', async () => {
+    const { store, getDashboard, updateDashboard } = await openStore();
+    getDashboard.mockClear();
+
+    const ok = await store.renameDashboard(1, 'Renamed', 'new desc');
+
+    expect(ok).toBe(true);
+    expect(getDashboard).not.toHaveBeenCalled(); // no refetch — the open session's layout is the truth
+    const [id, body] = updateDashboard.mock.calls[0]! as [number, SaveDashboardBody];
+    expect(id).toBe(1);
+    expect(body.name).toBe('Renamed');
+    expect(body.description).toBe('new desc');
+    expect(body.expectedUpdatedAtUtc).toBe('stamp-1');
+    expect(body.layout.pages).toHaveLength(1);
+    const state = store.store.getState();
+    expect(state.current!.name).toBe('Renamed');
+    expect(state.current!.expectedUpdatedAtUtc).toBe('stamp-2');
+  });
+
+  it('open dashboard: omitting description keeps the existing one', async () => {
+    const { store, updateDashboard } = await openStore(detailFor(1, { description: 'keep me' }));
+
+    await store.renameDashboard(1, 'Renamed');
+
+    const body = updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    expect(body.description).toBe('keep me');
+  });
+
+  it('non-open row: fetch-then-PUT with the fetched layout, fields and stamp', async () => {
+    const { store, getDashboard, updateDashboard } = await openStore();
+    getDashboard.mockClear();
+
+    const ok = await store.renameDashboard(2, 'Other renamed');
+
+    expect(ok).toBe(true);
+    expect(getDashboard).toHaveBeenCalledWith(2);
+    const [id, body] = updateDashboard.mock.calls[0]! as [number, SaveDashboardBody];
+    expect(id).toBe(2);
+    expect(body.name).toBe('Other renamed');
+    expect(body.expectedUpdatedAtUtc).toBe('stamp-1'); // the FETCHED stamp
+    // The open dashboard is untouched.
+    expect(store.store.getState().current!.name).toBe('Dash 1');
+  });
+
+  it('surfaces failures via store error and returns false', async () => {
+    const { store, updateDashboard } = await openStore();
+    updateDashboard.mockRejectedValueOnce(new RcdApiError('409 conflict', 409, 'rcd.dashboard.name_conflict'));
+
+    const ok = await store.renameDashboard(1, 'Taken');
+
+    expect(ok).toBe(false);
+    expect(store.store.getState().error).toBeTruthy();
+    expect(store.store.getState().current!.name).toBe('Dash 1'); // nothing patched
+  });
+});
+
+describe('button tiles (0.11.1)', () => {
+  it('addButtonTile sanitizes the rich label and applies the default geometry', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+
+    store.addButtonTile({
+      html: '<p>Go</p><script>alert(1)</script>',
+      targetPageId: 'p1',
+      radius: 12,
+      fullSize: true,
+    });
+
+    const tile = store.store.getState().current!.layout.pages![0]!.tiles[0]!;
+    expect(tile.kind).toBe('button');
+    // Sanitized on write. (This suite runs in node, where sanitizeRichHtml
+    // degrades to escaped plain text — assert the invariant that holds in
+    // BOTH environments: no live markup survives, the label text does.)
+    expect(tile.button!.html).not.toContain('<script');
+    expect(tile.button!.html).toContain('Go');
+    expect(tile.button!.targetPageId).toBe('p1');
+    expect(tile.button!.radius).toBe(12);
+    expect(tile.button!.fullSize).toBe(true);
+    expect(tile.layout).toMatchObject({ w: 4, h: 2, minW: 2, minH: 1 });
+  });
+
+  it('updateButtonTile patches the spec and re-sanitizes html', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+    store.addButtonTile({ html: '<p>Go</p>', targetPageId: 'p1' });
+    const tileId = store.store.getState().current!.layout.pages![0]!.tiles[0]!.id;
+
+    store.updateButtonTile(tileId, { html: '<p>Next</p><iframe src="x"></iframe>', targetPageId: 'p2' });
+
+    const tile = store.store.getState().current!.layout.pages![0]!.tiles[0]!;
+    expect(tile.button!.html).not.toContain('<iframe');
+    expect(tile.button!.html).toContain('Next');
+    expect(tile.button!.targetPageId).toBe('p2');
+  });
+
+  it('duplicateTile clones the button spec', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+    store.addButtonTile({ html: '<p>Go</p>', targetPageId: 'p1', background: '#123456' });
+    const tileId = store.store.getState().current!.layout.pages![0]!.tiles[0]!.id;
+
+    store.duplicateTile(tileId);
+
+    const tiles = store.store.getState().current!.layout.pages![0]!.tiles;
+    expect(tiles).toHaveLength(2);
+    expect(tiles[1]!.kind).toBe('button');
+    expect(tiles[1]!.button).toEqual(tiles[0]!.button);
+    expect(tiles[1]!.button).not.toBe(tiles[0]!.button); // deep clone, not shared
+  });
+});
+
 describe('cloneChartForCopy (the shared copy-path clone)', () => {
   /** Frameless seeded-tile pattern: the INNER title carries the visible name. */
   const framelessChart = (): ChartSpec => ({

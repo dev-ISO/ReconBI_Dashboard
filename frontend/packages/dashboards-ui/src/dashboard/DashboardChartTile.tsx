@@ -274,7 +274,8 @@ export interface DashboardChartTileProps {
   onSelect: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
-  onDelete: () => void;
+  /** Absent = the caller lacks the delete right (0.11.1) — the affordance hides. */
+  onDelete?: () => void;
   /** Edit-mode right-click on the tile (opens the chart context card). */
   onTileContextMenu?: (position: { x: number; y: number }) => void;
   /**

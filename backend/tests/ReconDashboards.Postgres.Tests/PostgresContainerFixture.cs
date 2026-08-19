@@ -110,6 +110,17 @@ public sealed class PostgresContainerFixture : IAsyncLifetime
     public NpgsqlDataSource DataSource =>
         _dataSource ?? throw new InvalidOperationException("Fixture not initialized.");
 
+    /// <summary>
+    /// The container's FULL connection string, password included —
+    /// NpgsqlDataSource.ConnectionString redacts credentials, so tests that
+    /// build their own connections (e.g. the migration-backfill test's
+    /// throwaway database) must start from this.
+    /// </summary>
+    public string ConnectionString =>
+        _connectionString ?? throw new InvalidOperationException("Fixture not initialized.");
+
+    private string? _connectionString;
+
     public PostgresSchemaIntrospector Introspector =>
         _introspector ?? throw new InvalidOperationException("Fixture not initialized.");
 
@@ -120,7 +131,8 @@ public sealed class PostgresContainerFixture : IAsyncLifetime
     public async Task InitializeAsync()
     {
         await _container.StartAsync();
-        _dataSource = NpgsqlDataSource.Create(_container.GetConnectionString());
+        _connectionString = _container.GetConnectionString();
+        _dataSource = NpgsqlDataSource.Create(_connectionString);
 
         await using (var connection = await _dataSource.OpenConnectionAsync())
         {

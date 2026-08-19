@@ -66,6 +66,14 @@ export interface ChartBuilderProps {
   /** Tab shown when the builder opens (a dashboard-side "Format chart" flow passes 'format'). */
   initialTab?: 'fields' | 'format';
   /**
+   * False disables the Title input with a hint (0.11.1): chart renames are
+   * OWNER/ADMIN-only server-side (the differ's ChartsRenamed class) — grantees
+   * with chart rights edit fields/format but never retitle. A disabled title
+   * also means withRetitledInnerTitle never fires (it keys on a title CHANGE),
+   * so the rich inner title rides through untouched. Default true.
+   */
+  canRenameTitle?: boolean;
+  /**
    * Receives the builder's GUARDED close entry point (the Cancel button's
    * flow: dirty → "Discard chart changes?" confirm, clean → onCancel). The
    * hosting dialog routes its own onClose (Escape, backdrop click, ✕) through
@@ -140,6 +148,7 @@ export function ChartBuilder({
   catalog,
   parameters,
   initialTab = 'fields',
+  canRenameTitle = true,
   requestCloseRef,
 }: ChartBuilderProps) {
   const runtime = useRuntime();
@@ -461,12 +470,22 @@ export function ChartBuilder({
                   </span>
                   <RcdInput
                     value={draft.title}
+                    disabled={!canRenameTitle}
                     onChange={(event) =>
                       setDraft((current) => ({ ...current, title: event.target.value }))
                     }
                     placeholder="Chart title"
+                    className={canRenameTitle ? undefined : 'opacity-60'}
                   />
-                  {Boolean(draft.format.container?.hideHeader) &&
+                  {!canRenameTitle && (
+                    // Owner-only rename (0.11.1): the server rejects grantee
+                    // retitles outright, so the input locks with the reason.
+                    <p className="text-[11px] leading-snug text-rcd-muted">
+                      Only the dashboard owner (or an administrator) can rename charts.
+                    </p>
+                  )}
+                  {canRenameTitle &&
+                    Boolean(draft.format.container?.hideHeader) &&
                     Boolean(draft.format.container?.innerTitleHtml) && (
                       // Frameless tiles show the INNER title, not this field —
                       // without the hint a rename looks like it did nothing.

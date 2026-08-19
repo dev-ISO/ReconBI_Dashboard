@@ -60,6 +60,51 @@ const bandHeightPx = (rows: number) => rows * (GRID_ROW_H + GRID_GAP) - GRID_GAP
 /** Header with title + timestamp, no filter line: 28 + 4 + 16 + 16 bottom. */
 const HEADER_DEFAULT = 64;
 
+/* ----------------------------------------------------- printable-kind filter */
+
+describe('computePrintLayout printable-kind filter', () => {
+  it('excludes slicer and button tiles (interactive chrome) but keeps text/image', () => {
+    const tiles: DashboardTile[] = [
+      tile('chart-1', 0, 0, 12, 4),
+      {
+        id: 'text-1',
+        layout: { x: 12, y: 0, w: 6, h: 4 },
+        kind: 'text',
+        text: { html: '<p>note</p>' },
+      },
+      {
+        id: 'image-1',
+        layout: { x: 18, y: 0, w: 6, h: 4 },
+        kind: 'image',
+        image: { src: 'https://x/y.png', fit: 'contain' },
+      },
+      {
+        id: 'slicer-1',
+        layout: { x: 0, y: 4, w: 6, h: 3 },
+        kind: 'slicer',
+        slicer: { table: 't', column: 'c', label: 'Status', variant: 'checklist' },
+      },
+      // Buttons are page NAVIGATION — meaningless on paper, so they neither
+      // render nor reserve space (same rule as slicers).
+      {
+        id: 'button-1',
+        layout: { x: 6, y: 4, w: 4, h: 2 },
+        kind: 'button',
+        button: { html: '<p>Go</p>', targetPageId: 'p2' },
+      },
+    ];
+
+    const layout = computePrintLayout(tiles, opts(), false);
+    const printedIds = layout.pages
+      .flatMap((page) => page.blocks)
+      .flatMap((block) => block.tiles)
+      .map((placed) => placed.tile.id)
+      .sort();
+
+    expect(printedIds).toEqual(['chart-1', 'image-1', 'text-1']);
+  });
+});
+
 /* ------------------------------------------------------------ pageGeometry */
 
 describe('pageGeometry', () => {

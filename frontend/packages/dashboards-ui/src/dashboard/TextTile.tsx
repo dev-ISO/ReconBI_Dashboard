@@ -24,7 +24,7 @@ import {
 } from 'lucide-react';
 import { sanitizeRichHtml, type TextTileSpec } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
-import { ConfirmDialog, RcdSelect } from '../primitives';
+import { ConfirmDialog, RcdInput, RcdSelect } from '../primitives';
 import { TileBackgroundSwatches } from './TileBackgroundSwatches';
 import { TileFrame } from './TileFrame';
 
@@ -111,7 +111,9 @@ export function TextTile({ tileId, spec, editable }: TextTileProps) {
 
   return (
     <TileFrame
-      title="Text"
+      // Author-given name (config card); trimmed-empty falls back to the
+      // generic label. View mode stays frameless, so this is edit-only chrome.
+      title={spec.title?.trim() || 'Text'}
       editable
       onMenu={(position) => setMenuPos(position)}
       onContextMenu={(event) => {
@@ -425,6 +427,22 @@ function TextTileConfigMenu({
         onContextMenu={(event) => event.preventDefault()}
         className="fixed z-50 flex w-56 flex-col rounded-md border border-rcd-border bg-rcd-surface py-1 shadow-[var(--rcd-shadow-2)]"
       >
+        {/* Name: edit-mode frame title + the phone editor's row label (the
+            image tile's alt-text precedent). Written per keystroke — the store
+            spreads the Partial and only special-cases html. */}
+        <SectionLabel>Name</SectionLabel>
+        <div className="px-3 pb-1.5">
+          <RcdInput
+            value={spec.title ?? ''}
+            placeholder="Text"
+            aria-label="Text tile name"
+            maxLength={80}
+            onChange={(event) => runtime.dashboards.updateTextTile(tileId, { title: event.target.value })}
+            className="w-full"
+          />
+        </div>
+
+        <Divider />
         <SectionLabel>Background</SectionLabel>
         <TileBackgroundSwatches
           value={spec.background ?? null}

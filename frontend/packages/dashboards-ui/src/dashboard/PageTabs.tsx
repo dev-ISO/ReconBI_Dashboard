@@ -13,8 +13,15 @@ import { ConfirmDialog, RcdButton, RcdInput, RcdSelect } from '../primitives';
 export interface PageTabsProps {
   pages: DashboardPage[];
   activePageId: string | null;
-  /** Edit mode: add / rename / color / reorder / delete affordances. */
+  /** Edit mode: add / rename / color / reorder affordances. */
   editable: boolean;
+  /**
+   * Deleting a page additionally requires the CanDeleteContent right (0.11.1)
+   * — gated separately from `editable` so a pages-only grantee can still
+   * rename/reorder while the Delete item stays disabled (honest UX; the
+   * server enforces regardless). Absent = follow `editable`.
+   */
+  canDeletePages?: boolean;
 }
 
 /**
@@ -39,7 +46,7 @@ const PAGE_COLORS = [
  * rename, and a right-click context card (rename / color / reorder / delete).
  * All destructive paths go through ConfirmDialog — no native menus.
  */
-export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
+export function PageTabs({ pages, activePageId, editable, canDeletePages }: PageTabsProps) {
   const runtime = useRuntime();
   const [renaming, setRenaming] = useState<{ pageId: string; draft: string } | null>(null);
   const [menu, setMenu] = useState<{ pageId: string; x: number; y: number } | null>(null);
@@ -161,6 +168,7 @@ export function PageTabs({ pages, activePageId, editable }: PageTabsProps) {
           index={menuIndex}
           pageCount={pages.length}
           position={menuPosition}
+          canDelete={canDeletePages ?? editable}
           onRename={() => startRename(menuPage)}
           onDelete={() => setConfirmDelete(menuPage)}
           onClose={() => setMenu(null)}
@@ -197,6 +205,7 @@ function PageTabMenu({
   index,
   pageCount,
   position,
+  canDelete,
   onRename,
   onDelete,
   onClose,
@@ -205,6 +214,8 @@ function PageTabMenu({
   index: number;
   pageCount: number;
   position: { x: number; y: number };
+  /** CanDeleteContent right — the Delete item disables without it. */
+  canDelete: boolean;
   onRename: () => void;
   onDelete: () => void;
   onClose: () => void;
@@ -330,8 +341,14 @@ function PageTabMenu({
       <button
         type="button"
         role="menuitem"
-        disabled={pageCount <= 1}
-        title={pageCount <= 1 ? 'A dashboard keeps at least one page' : undefined}
+        disabled={pageCount <= 1 || !canDelete}
+        title={
+          pageCount <= 1
+            ? 'A dashboard keeps at least one page'
+            : !canDelete
+              ? 'Your access does not allow deleting pages'
+              : undefined
+        }
         onClick={() => {
           onDelete();
           onClose();

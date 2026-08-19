@@ -58,10 +58,13 @@ public class DashboardSharingTests : IDisposable
         return created.Value!.Id;
     }
 
-    private async Task ShareWithAsync(int id, string userId, bool layout = false, bool pages = false, bool charts = false)
+    private async Task ShareWithAsync(
+        int id, string userId,
+        bool layout = false, bool pages = false, bool charts = false,
+        bool move = false, bool delete = false)
     {
         var result = await _service.ReplaceSharesAsync(
-            id, [new DashboardShareGrant(userId, layout, pages, charts)], CancellationToken.None);
+            id, [new DashboardShareGrant(userId, layout, pages, charts, move, delete)], CancellationToken.None);
         Assert.True(result.Succeeded, result.Error?.Message);
     }
 
@@ -75,6 +78,30 @@ public class DashboardSharingTests : IDisposable
     private static string EditChart(string layout) => layout.Replace("\"type\":\"column\"", "\"type\":\"line\"");
 
     private static string RenamePage(string layout) => layout.Replace("\"name\":\"Main\"", "\"name\":\"Renamed\"");
+
+    private static string EditText(string layout) => layout.Replace("\"content\":\"hello\"", "\"content\":\"edited\"");
+
+    private static string RenameChart(string layout) => layout.Replace("\"title\":\"Orders\"", "\"title\":\"Sales\"");
+
+    /// <summary>TwoTileLayout minus the text tile t2 (a layout-class removal → also the delete gate).</summary>
+    private const string ChartTileOnlyLayout = """
+        {"pages":[{"id":"p1","name":"Main","tiles":[
+          {"id":"t1","kind":"chart","layout":{"x":0,"y":0,"w":4,"h":3},"chart":{"title":"Orders","type":"column"}}]}]}
+        """;
+
+    /// <summary>TwoTileLayout minus the chart tile t1 (a charts-class removal → also the delete gate).</summary>
+    private const string TextTileOnlyLayout = """
+        {"pages":[{"id":"p1","name":"Main","tiles":[
+          {"id":"t2","kind":"text","layout":{"x":4,"y":0,"w":2,"h":1},"text":{"content":"hello"}}]}]}
+        """;
+
+    /// <summary>TwoTileLayout plus a second, empty page (page-removal tests).</summary>
+    private const string TwoPageLayout = """
+        {"pages":[{"id":"p1","name":"Main","tiles":[
+          {"id":"t1","kind":"chart","layout":{"x":0,"y":0,"w":4,"h":3},"chart":{"title":"Orders","type":"column"}},
+          {"id":"t2","kind":"text","layout":{"x":4,"y":0,"w":2,"h":1},"text":{"content":"hello"}}]},
+          {"id":"p2","name":"Extra","tiles":[]}]}
+        """;
 
     // ------------------------------ visibility ------------------------------
 
@@ -141,17 +168,22 @@ public class DashboardSharingTests : IDisposable
     // ---------------------------- grantee saves ----------------------------
 
     [Theory]
-    [InlineData(true, false, false)]
-    [InlineData(false, true, false)]
-    [InlineData(false, false, true)]
-    public async Task GranteeSave_EachFlagCoversExactlyItsClass(bool layout, bool pages, bool charts)
+    [InlineData(true, false, false, false)]
+    [InlineData(false, true, false, false)]
+    [InlineData(false, false, true, false)]
+    [InlineData(false, false, false, true)]
+    public async Task GranteeSave_EachFlagCoversExactlyItsClass(bool layout, bool pages, bool charts, bool move)
     {
         var id = await CreateOwnedDashboardAsync();
-        await ShareWithAsync(id, Grantee, layout, pages, charts);
+        await ShareWithAsync(id, Grantee, layout, pages, charts, move);
         ActAs(Grantee);
 
+        // 0.11.1: pure move/resize rides CanMoveTiles, NOT CanEditLayout.
         var moveResult = await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
-        Assert.Equal(layout, moveResult.Succeeded);
+        Assert.Equal(move, moveResult.Succeeded);
+
+        var textResult = await _service.UpdateAsync(id, SaveRequest(layout: EditText(TwoTileLayout)), CancellationToken.None);
+        Assert.Equal(layout, textResult.Succeeded);
 
         var pageResult = await _service.UpdateAsync(id, SaveRequest(layout: RenamePage(TwoTileLayout)), CancellationToken.None);
         Assert.Equal(pages, pageResult.Succeeded);
@@ -159,8 +191,112 @@ public class DashboardSharingTests : IDisposable
         var chartResult = await _service.UpdateAsync(id, SaveRequest(layout: EditChart(TwoTileLayout)), CancellationToken.None);
         Assert.Equal(charts, chartResult.Succeeded);
 
-        var denied = new[] { moveResult, pageResult, chartResult }.First(r => !r.Succeeded);
+        var denied = new[] { moveResult, textResult, pageResult, chartResult }.First(r => !r.Succeeded);
         Assert.Equal("rcd.dashboard.permission_denied", denied.Error!.Code);
+    }
+
+    // ------------------------ move / delete / rename gates (0.11.1) ------------------------
+
+    [Fact]
+    public async Task GranteeMove_DeniedWithoutMoveTiles_MessageNamesIt()
+    {
+        var id = await CreateOwnedDashboardAsync();
+        await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, delete: true);
+        ActAs(Grantee);
+
+        var result = await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
+
+        Assert.Equal("rcd.dashboard.permission_denied", result.Error!.Code);
+        Assert.Contains("moving or resizing tiles", result.Error.Message);
+    }
+
+    [Fact]
+    public async Task GranteeChartTileRemoval_NeedsChartsAndDeleteFlags()
+    {
+        var id = await CreateOwnedDashboardAsync();
+
+        // Charts alone: the removal is charts-class but the delete gate is missing.
+        await ShareWithAsync(id, Grantee, charts: true);
+        ActAs(Grantee);
+        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
+        Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
+
+        // Delete alone: the charts-class flag is missing (delete narrows, never widens).
+        ActAs(Owner);
+        await ShareWithAsync(id, Grantee, delete: true);
+        ActAs(Grantee);
+        var withoutCharts = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        Assert.Equal("rcd.dashboard.permission_denied", withoutCharts.Error!.Code);
+        Assert.Contains("chart changes", withoutCharts.Error.Message);
+
+        // Both: allowed.
+        ActAs(Owner);
+        await ShareWithAsync(id, Grantee, charts: true, delete: true);
+        ActAs(Grantee);
+        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
+    }
+
+    [Fact]
+    public async Task GranteeTextTileRemoval_NeedsLayoutAndDeleteFlags()
+    {
+        var id = await CreateOwnedDashboardAsync();
+        await ShareWithAsync(id, Grantee, layout: true);
+        ActAs(Grantee);
+
+        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: ChartTileOnlyLayout), CancellationToken.None);
+        Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
+        Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
+
+        ActAs(Owner);
+        await ShareWithAsync(id, Grantee, layout: true, delete: true);
+        ActAs(Grantee);
+        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: ChartTileOnlyLayout), CancellationToken.None);
+        Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
+    }
+
+    [Fact]
+    public async Task GranteePageRemoval_NeedsPagesAndDeleteFlags()
+    {
+        var id = await CreateOwnedDashboardAsync(layout: TwoPageLayout);
+
+        await ShareWithAsync(id, Grantee, pages: true);
+        ActAs(Grantee);
+        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: TwoTileLayout), CancellationToken.None);
+        Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
+        Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
+
+        ActAs(Owner);
+        await ShareWithAsync(id, Grantee, pages: true, delete: true);
+        ActAs(Grantee);
+        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: TwoTileLayout), CancellationToken.None);
+        Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
+    }
+
+    [Fact]
+    public async Task GranteeChartRename_DeniedEvenWithEveryFlag()
+    {
+        var id = await CreateOwnedDashboardAsync();
+        await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, move: true, delete: true);
+        ActAs(Grantee);
+
+        var result = await _service.UpdateAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)), CancellationToken.None);
+
+        Assert.Equal("rcd.dashboard.permission_denied", result.Error!.Code);
+        Assert.Contains("renaming charts", result.Error.Message);
+    }
+
+    [Fact]
+    public async Task OwnerChartRename_Succeeds_AndAccessCarriesNewFlags()
+    {
+        var id = await CreateOwnedDashboardAsync();
+
+        var renamed = await _service.UpdateAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)), CancellationToken.None);
+        Assert.True(renamed.Succeeded, renamed.Error?.Message);
+
+        var access = renamed.Value!.MyAccess;
+        Assert.True(access is { CanMoveTiles: true, CanDeleteContent: true });
     }
 
     [Fact]
@@ -210,7 +346,7 @@ public class DashboardSharingTests : IDisposable
     public async Task GranteeWithAllFlags_CanRestructureLayout()
     {
         var id = await CreateOwnedDashboardAsync();
-        await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true);
+        await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, move: true, delete: true);
         ActAs(Grantee);
 
         var result = await _service.UpdateAsync(
@@ -321,6 +457,26 @@ public class DashboardSharingTests : IDisposable
         Assert.Contains(activity, a => a.Action == "shared" && a.DetailJson!.Contains("user-b"));
         Assert.Contains(activity, a => a.Action == "unshared" && a.DetailJson!.Contains("user-a"));
         Assert.Single(activity, a => a.Action == "shared" && a.DetailJson!.Contains("user-a"));
+    }
+
+    [Fact]
+    public async Task ShareInfos_RoundTripNewFlags_AndCarryGrantProvenance()
+    {
+        var id = await CreateOwnedDashboardAsync();
+
+        var result = await _service.ReplaceSharesAsync(
+            id,
+            [new DashboardShareGrant(Grantee, true, false, false, CanMoveTiles: true, CanDeleteContent: true)],
+            CancellationToken.None);
+
+        Assert.True(result.Succeeded, result.Error?.Message);
+        var share = Assert.Single(result.Value!);
+        Assert.True(share is { CanEditLayout: true, CanManagePages: false, CanMoveTiles: true, CanDeleteContent: true });
+        // "granted by X on date": the granter id travels (display name falls
+        // back to the id under the null directory) with the grant timestamp.
+        Assert.Equal(Owner, share.GrantedByUserId);
+        Assert.Equal(Owner, share.GrantedByDisplayName);
+        Assert.NotEqual(default, share.CreatedAtUtc);
     }
 
     [Fact]
@@ -495,7 +651,9 @@ public class DashboardSharingTests : IDisposable
         Assert.Equal(["created", "saved", "renamed", "deleted"], actions);
 
         var saved = _harness.Db.DashboardActivity.Single(a => a.DashboardId == id && a.Action == "saved");
-        Assert.Contains("\"layoutChanged\":true", saved.DetailJson);
+        // The lifecycle's layout change is a tile MOVE — geometry class since 0.11.1.
+        Assert.Contains("\"geometryChanged\":true", saved.DetailJson);
+        Assert.Contains("\"layoutChanged\":false", saved.DetailJson);
         Assert.Contains("\"chartsChanged\":false", saved.DetailJson);
 
         var renamed = _harness.Db.DashboardActivity.Single(a => a.DashboardId == id && a.Action == "renamed");

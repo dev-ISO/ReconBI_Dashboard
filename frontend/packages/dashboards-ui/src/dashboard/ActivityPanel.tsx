@@ -3,6 +3,7 @@ import {
   rcdErrorMessage,
   type ActivityEntry,
   type LayoutChangeSummaryJson,
+  type RenameDetailJson,
   type ShareDetailJson,
 } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
@@ -51,11 +52,18 @@ const relativeTime = (iso: string): string => {
 const plural = (count: number, noun: string): string =>
   `${count} ${noun}${count === 1 ? '' : 's'}`;
 
-/** Human detail lines from a saved LayoutChangeSummary / share detail. */
+/** Human detail lines from a saved LayoutChangeSummary / share / rename detail. */
 const detailLinesOf = (entry: ActivityEntry): string[] => {
   const detail = entry.detail;
   if (detail === null || detail === undefined) return [];
   const lines: string[] = [];
+
+  // "renamed the dashboard" detail: {from, to}.
+  if (entry.action === 'renamed') {
+    const rename = detail as RenameDetailJson;
+    if (rename.from && rename.to) lines.push(`“${rename.from}” → “${rename.to}”`);
+    return lines;
+  }
 
   const share = detail as ShareDetailJson;
   if (Array.isArray(share.targetUserIds) && share.targetUserIds.length > 0) {
@@ -74,6 +82,15 @@ const detailLinesOf = (entry: ActivityEntry): string[] => {
   if (summary.chartsModified && summary.chartsModified.length > 0) {
     lines.push(`Charts modified: ${summary.chartsModified.join(', ')}`);
   }
+  for (const rename of summary.chartsRenamed ?? []) {
+    // from === to means only the (visible) rich inner title changed.
+    lines.push(
+      rename.from === rename.to
+        ? `Retitled chart “${rename.to}”`
+        : `Renamed chart “${rename.from}” to “${rename.to}”`,
+    );
+  }
+  if (summary.geometryChanged) lines.push('Tiles moved or resized');
   if (summary.settingsChanged) lines.push('Dashboard settings changed');
   return lines;
 };

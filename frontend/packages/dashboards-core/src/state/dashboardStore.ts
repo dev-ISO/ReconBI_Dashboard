@@ -36,6 +36,7 @@ import {
   type FilterIndicatorStyle,
   type PageDrillthrough,
   type PageMobileLayout,
+  type ButtonTileSpec,
   type ImageTileSpec,
   type SlicerTileSpec,
   type SlicerValue,
@@ -957,6 +958,7 @@ export class DashboardStore {
           : {}),
         ...(source.text ? { text: structuredClone(source.text) } : {}),
         ...(source.image ? { image: structuredClone(source.image) } : {}),
+        ...(source.button ? { button: structuredClone(source.button) } : {}),
       };
       return [...tiles, copy];
     });
@@ -1103,6 +1105,29 @@ export class DashboardStore {
     const safe = patch.src === undefined ? patch : { ...patch, src: safeImageSrc(patch.src) };
     this.mutateActiveTiles((tiles) =>
       tiles.map((t) => (t.id === tileId && t.image ? { ...t, image: { ...t.image, ...safe } } : t)),
+    );
+  }
+
+  /** Adds a navigation-button tile to the active page (spec built by the add dialog).
+   *  The rich label sanitizes on EVERY write, same doctrine as text tiles. */
+  addButtonTile(spec: ButtonTileSpec): void {
+    this.mutateActiveTiles((tiles) => {
+      const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+      const tile: DashboardTile = {
+        id: newId(),
+        kind: 'button',
+        layout: { x: 0, y: maxY, w: 4, h: 2, minW: 2, minH: 1 },
+        button: { ...spec, html: sanitizeRichHtml(spec.html) },
+      };
+      return [...tiles, tile];
+    });
+  }
+
+  /** Patches a button tile's spec; html always passes through the sanitizer. */
+  updateButtonTile(tileId: string, patch: Partial<ButtonTileSpec>): void {
+    const safe = patch.html === undefined ? patch : { ...patch, html: sanitizeRichHtml(patch.html) };
+    this.mutateActiveTiles((tiles) =>
+      tiles.map((t) => (t.id === tileId && t.button ? { ...t, button: { ...t.button, ...safe } } : t)),
     );
   }
 
@@ -2055,6 +2080,68 @@ export class DashboardStore {
       if (live && live.id === current.id) {
         this.set({
           current: { ...live, isShared: saved.isShared, expectedUpdatedAtUtc: saved.updatedAtUtc },
+        });
+      }
+      void this.loadList();
+      return true;
+    } catch (error) {
+      this.set({ error: messageOf(error) });
+      return false;
+    }
+  }
+
+  /**
+   * Renames a dashboard (name + optional description) through the normal
+   * update PUT — the server logs the "renamed" activity and enforces rights
+   * (grantee renames 403 as share_forbidden_fields; over-long names 400 as
+   * rcd.dashboard.name_too_long). Two shapes, mirroring setPublish:
+   *
+   *  - the OPEN dashboard: PUT with the current IN-MEMORY layout (mid-edit
+   *    drafts persist as they stand, exactly like setPublish), patch
+   *    `current` and adopt the fresh concurrency stamp without leaving the
+   *    caller's mode;
+   *  - any other row: fetch-then-PUT — the fetched detail supplies layout,
+   *    fields and the expected stamp, so a rename can never clobber content
+   *    this session has not seen.
+   *
+   * `description === undefined` keeps the existing description. Refreshes the
+   * list either way (the rail and toolbar read names from it). Returns false
+   * and surfaces the error in store state on failure.
+   */
+  async renameDashboard(id: number, name: string, description?: string | null): Promise<boolean> {
+    const current = this.state.current;
+    try {
+      if (current && current.id === id) {
+        const saved = await this.api.updateDashboard(id, {
+          name,
+          description: description === undefined ? current.description : description,
+          modelId: current.modelId,
+          layout: current.layout,
+          isShared: current.isShared,
+          expectedUpdatedAtUtc: current.expectedUpdatedAtUtc,
+        });
+        const live = this.state.current;
+        if (live && live.id === id) {
+          this.set({
+            current: {
+              ...live,
+              name: saved.name,
+              description: saved.description,
+              expectedUpdatedAtUtc: saved.updatedAtUtc,
+            },
+          });
+        }
+      } else {
+        const detail = await this.api.getDashboard(id);
+        await this.api.updateDashboard(id, {
+          name,
+          description: description === undefined ? detail.description : description,
+          modelId: detail.modelId,
+          // Same defensive shape-check as appendChartRemote: a malformed
+          // detail must never round-trip as a clobbered layout.
+          layout: detail.layout?.tiles ? detail.layout : emptyLayout(),
+          isShared: detail.isShared,
+          expectedUpdatedAtUtc: detail.updatedAtUtc,
         });
       }
       void this.loadList();

@@ -14,7 +14,7 @@ import {
 } from '@recon/dashboards-core';
 import type { PrintMargin, PrintOptions, PrintOrientation, PrintPaper } from './PrintConfigDialog';
 
-/** A printable tile: chart, text, or image (slicers never print). */
+/** A printable tile: chart, text, or image (slicers and buttons never print). */
 export type ChartTileEntry = DashboardTile;
 
 /* ---------------------------------------------------------------- paper math
@@ -271,6 +271,10 @@ export function computePrintLayout(
   const userScale = options.scale === 'fit' ? 1 : options.scale / 100;
   const layoutWidth = geometry.contentWidthPx / userScale;
   const headerHeight = headerHeightPx(options, hasFilterSummary);
+  // Printable tiles ONLY: slicers and navigation BUTTONS are interactive
+  // chrome — a slicer's picker and a button's page-switch mean nothing on
+  // paper — so both are excluded outright (not rendered, no space reserved;
+  // the bands below simply never see them).
   const chartTiles = tiles.filter(
     (tile) => isChartTile(tile) || isTextTile(tile) || isImageTile(tile),
   );

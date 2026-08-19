@@ -131,6 +131,8 @@ public sealed record DashboardAccessResponse(
     bool CanEditLayout,
     bool CanManagePages,
     bool CanEditCharts,
+    bool CanMoveTiles,
+    bool CanDeleteContent,
     bool ViaShare,
     bool ViaPublish);
 
@@ -176,15 +178,23 @@ public sealed record DashboardShareResponse(
     bool CanEditLayout,
     bool CanManagePages,
     bool CanEditCharts,
+    bool CanMoveTiles,
+    bool CanDeleteContent,
+    string GrantedByUserId,
+    string? GrantedByDisplayName,
+    DateTime CreatedAtUtc,
     DateTime UpdatedAtUtc);
 
 public sealed record DashboardSharesResponse(IReadOnlyList<DashboardShareResponse> Shares);
 
+/// <summary>The 0.11.1 flags default false so pre-0.11.1 bodies still bind.</summary>
 public sealed record ShareGrantRequest(
     string UserId,
     bool CanEditLayout,
     bool CanManagePages,
-    bool CanEditCharts);
+    bool CanEditCharts,
+    bool CanMoveTiles = false,
+    bool CanDeleteContent = false);
 
 /// <summary>PUT dashboards/{id}/shares body: REPLACES the full grant set.</summary>
 public sealed record SaveDashboardSharesRequest(IReadOnlyList<ShareGrantRequest> Shares);

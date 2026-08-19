@@ -2,6 +2,7 @@ import { useCallback, type ReactNode } from 'react';
 import { ArrowDown, ArrowUp, Eye, EyeOff } from 'lucide-react';
 import { isChartTile, type DashboardTile, type PageMobileLayout } from '@recon/dashboards-core';
 import { RcdIconButton, RcdInput } from '../primitives';
+import { buttonLabelText } from './ButtonTile';
 
 /** Container width (px) below which view mode renders the mobile stack. */
 export const MOBILE_BREAKPOINT = 640;
@@ -11,11 +12,13 @@ const EDITOR_COLUMN_WIDTH = 380;
 
 /**
  * Kind-based default stack height (px). Slicers and text size to content
- * (null = auto); charts get a readable fixed height, KPIs stay short.
+ * (null = auto); charts get a readable fixed height, KPIs stay short, and
+ * navigation buttons are a compact tap target.
  */
 export const defaultMobileHeight = (tile: DashboardTile): number | null => {
   if (isChartTile(tile)) return tile.chart.type === 'kpi' ? 120 : 260;
   if (tile.kind === 'image') return 200;
+  if (tile.kind === 'button') return 56;
   return null; // slicer / text: auto
 };
 
@@ -140,8 +143,11 @@ export function MobileLayoutEditor({ tiles, layout, onChange, renderTile }: Mobi
   const titleOf = (tile: DashboardTile): string => {
     if (isChartTile(tile)) return tile.chart.title;
     if (tile.kind === 'slicer' && tile.slicer) return tile.slicer.label;
-    if (tile.kind === 'text') return 'Text';
+    // Author-given text-tile name (0.11.1); generic label when unset.
+    if (tile.kind === 'text') return tile.text?.title?.trim() || 'Text';
     if (tile.kind === 'image') return 'Image';
+    // Plain-text of the rich button label; generic fallback for empty labels.
+    if (tile.kind === 'button' && tile.button) return buttonLabelText(tile.button) || 'Button';
     return tile.id;
   };
 
