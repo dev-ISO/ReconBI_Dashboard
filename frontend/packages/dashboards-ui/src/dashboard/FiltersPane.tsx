@@ -166,6 +166,10 @@ export function FiltersPane({ pageId, tiles, modelId, editable, onClose }: Filte
         card={card}
         modelId={modelId}
         editable={editable}
+        // COLLAB wave 2 labeling: in view mode a card tweaked by THIS viewer
+        // (transient override) reads "Your view"; an untouched one reads
+        // "Global filter" — the owner-authored doc state everyone shares.
+        overridden={overrides[card.id] !== undefined}
         columnLabel={columnLabel(card.table, card.column)}
         tableLabel={tableLabelOf(card.table)}
         expanded={expanded[card.id] ?? false}
@@ -438,6 +442,8 @@ interface FilterCardViewProps {
   card: FilterCard;
   modelId: number | null;
   editable: boolean;
+  /** View mode: this viewer holds a transient override on the card. */
+  overridden: boolean;
   columnLabel: string;
   tableLabel: string;
   expanded: boolean;
@@ -448,6 +454,7 @@ function FilterCardView({
   card,
   modelId,
   editable,
+  overridden,
   columnLabel,
   tableLabel,
   expanded,
@@ -504,6 +511,27 @@ function FilterCardView({
             <span className="shrink-0 rounded-full border border-rcd-border px-1.5 text-[10px] leading-4 text-rcd-muted">
               {SCOPE_BADGES[card.scope]}
             </span>
+            {/* COLLAB wave 2 labeling (view mode only — edit mode always
+                shows/writes the authored doc, overrides don't exist there):
+                whose truth is this card showing? "Global filter" = the
+                owner-authored state everyone shares; "Your view" = this
+                viewer's transient tweak, visible to nobody else. */}
+            {!editable &&
+              (overridden ? (
+                <span
+                  className="shrink-0 rounded-full border border-[color-mix(in_srgb,var(--rcd-accent)_45%,transparent)] bg-[color-mix(in_srgb,var(--rcd-accent)_10%,transparent)] px-1.5 text-[10px] leading-4 text-rcd-accent"
+                  title="You changed this filter for yourself. Only your view is affected — the dashboard's saved filter is unchanged."
+                >
+                  Your view
+                </span>
+              ) : (
+                <span
+                  className="shrink-0 rounded-full border border-rcd-border px-1.5 text-[10px] leading-4 text-rcd-muted"
+                  title="Set by the dashboard's author and shared by everyone. Changes you make here affect only your view."
+                >
+                  Global filter
+                </span>
+              ))}
           </div>
           <p className="truncate text-[11px] text-rcd-muted" title={tableLabel}>
             {tableLabel}
@@ -523,7 +551,17 @@ function FilterCardView({
 
         <label
           className="mt-0.5 flex shrink-0 cursor-pointer items-center"
-          title={enabled ? 'Disable this filter' : 'Enable this filter'}
+          // View-mode toggles are personal overrides (wave-2 copy polish);
+          // edit-mode toggles write the shared doc.
+          title={
+            editable
+              ? enabled
+                ? 'Disable this filter'
+                : 'Enable this filter'
+              : enabled
+                ? 'Disable this filter (affects only your view)'
+                : 'Enable this filter (affects only your view)'
+          }
         >
           <input
             type="checkbox"

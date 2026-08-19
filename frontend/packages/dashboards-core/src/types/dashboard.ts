@@ -145,6 +145,16 @@ export interface SlicerTileSpec {
    * capture them there); edit-mode choices also write here so they reload.
    */
   preset?: string | null;
+  /**
+   * SHARED slicer (COLLAB-DESIGN wave 2, owner-configured): in live
+   * collaborative sessions a value picked on this slicer broadcasts as an
+   * EPHEMERAL session value to everyone viewing the dashboard (never
+   * persisted — the doc carries only this flag). Absent/false keeps today's
+   * per-user selections. relativeDate `preset` writes stay authored doc
+   * defaults and never ride this channel (each client derives the preset's
+   * dates locally).
+   */
+  shared?: boolean;
 }
 
 /** Static rich-text tile content. `html` is ALWAYS a sanitized subset — every

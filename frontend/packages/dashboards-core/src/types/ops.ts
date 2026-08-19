@@ -179,6 +179,76 @@ export const opConflictKey = (
   return `${targetKind}:`;
 };
 
+/* ===================================================== wave 2 — presence,
+ * cursors, shared interactions. These are the INBOUND host→store event shapes
+ * (the pinned wire contract): the host's realtime bridge forwards each hub
+ * event verbatim into the matching runtime.dashboards.apply* action, exactly
+ * like RcdDashboardOp → applyRemoteOp. All four channels are HOST-owned
+ * ephemera — presence, cursor and shared-slicer traffic never touches the
+ * library backend; only tile-lock changes originate there (via
+ * IRcdDashboardTileLockNotifier). User ids are the HOST's numeric ids
+ * (translated by the host, same as DashboardOpEvent.actorUserId).
+ */
+
+/** One editor in the dashboard's "editing now" presence set. */
+export interface DashboardCollabEditor {
+  userId: number;
+  userName: string;
+}
+
+/** Presence roster change → runtime.dashboards.applyEditorsChanged(event).
+ * The host's presence tracker owns membership; every event carries the FULL
+ * current set (never deltas), so a missed frame self-heals on the next. */
+export interface DashboardEditorsChangedEvent {
+  dashboardId: number;
+  editors: DashboardCollabEditor[];
+}
+
+/** A collaborator's pointer → runtime.dashboards.applyRemoteCursor(event).
+ *
+ * xFrac/yFrac are the pointer's position as 0..1 FRACTIONS of the grid
+ * content box's layout size — zoom-independent by construction, so every
+ * client renders the pointer over the same tile regardless of its own
+ * fit-to-page scale. THE HOST FILTERS THE SENDER'S OWN ECHO before
+ * forwarding: the store cannot (it never learns the local user's numeric
+ * host id) and therefore keeps every cursor it receives. */
+export interface DashboardRemoteCursorEvent {
+  dashboardId: number;
+  userId: number;
+  userName: string;
+  /** Page the pointer is on — receivers render it on that page only. */
+  pageId: string;
+  xFrac: number;
+  yFrac: number;
+  /** Sender timestamp (ISO); informational — receivers TTL on arrival time. */
+  at: string;
+}
+
+/** A soft tile lock changed → runtime.dashboards.applyTileLock(event).
+ * Broadcast for fresh acquires, steals and explicit releases only — never
+ * heartbeat extensions — so receivers ALSO drop a lock once expiresAtUtc
+ * passes (the holder may well still hold it; a vanished chip is the accepted
+ * cost of a quiet channel, and the next steal/release still lands). */
+export interface DashboardTileLockEvent {
+  dashboardId: number;
+  tileId: string;
+  holderUserId: number;
+  holderName: string;
+  expiresAtUtc: string;
+  released: boolean;
+}
+
+/** A SHARED slicer's value picked by a collaborator →
+ * runtime.dashboards.applyRemoteSlicerValue(event). valueJson is the
+ * serialized SlicerValue (JSON `null` = cleared); ephemeral session state —
+ * never persisted, never rebroadcast by receivers. */
+export interface DashboardRemoteSlicerValueEvent {
+  dashboardId: number;
+  tileId: string;
+  userId: number;
+  valueJson: string;
+}
+
 /** Error code the tile-lock endpoints return when another user holds the lock. */
 export const TILE_LOCKED_ERROR = 'rcd.dashboard.tile_locked';
 

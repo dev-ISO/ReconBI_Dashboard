@@ -78,8 +78,14 @@ public static class AddReconDashboardsExtensions
         // Collaborative-op broadcast seam (COLLAB-DESIGN wave 1): no-op default,
         // the host's SignalR bridge registration wins.
         services.TryAddSingleton<IRcdDashboardOpNotifier, NullRcdDashboardOpNotifier>();
+        // Tile-lock visibility seam (wave 2): same doctrine. The lock service
+        // resolves it per fire through a DI scope (never captively), so hosts
+        // may register their bridge with ANY lifetime.
+        services.TryAddSingleton<IRcdDashboardTileLockNotifier, NullRcdDashboardTileLockNotifier>();
         // Soft tile locks are process-local state (single-instance constraint is
         // an accepted design tradeoff) — a plain singleton, not a host seam.
+        // (IServiceScopeFactory rides in via the optional ctor parameter and
+        // powers the wave-2 lock-change broadcasts.)
         services.AddSingleton<DashboardTileLockService>();
         // The dispatcher lives HERE (not in AddReconDashboardsScheduling):
         // send-now must work on hosts that never enable the background

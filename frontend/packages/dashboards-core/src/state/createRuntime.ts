@@ -1,6 +1,6 @@
 import { DashboardsApi } from '../api/DashboardsApi';
 import type { RcdFetcher } from '../api/fetcher';
-import { DashboardStore } from './dashboardStore';
+import { DashboardStore, type DashboardCollabSenders } from './dashboardStore';
 import { ModelStore } from './modelStore';
 import { QueryCache, type QueryCacheOptions } from './queryCache';
 
@@ -33,6 +33,19 @@ export interface DashboardsRuntimeOptions {
   scheduleTimeZoneId?: string;
   /** Display label for scheduleTimeZoneId ("CT"). Default 'UTC'. */
   scheduleTimeLabel?: string;
+  /**
+   * COLLAB wave 2 outbound ephemera: host callback publishing one throttled
+   * cursor frame ({pageId, xFrac, yFrac}) to the dashboard's realtime group.
+   * Absent = cursor sending silently disabled (portal/demo hosts); inbound
+   * cursors still render via runtime.dashboards.applyRemoteCursor.
+   */
+  onSendCursor?: DashboardCollabSenders['onSendCursor'];
+  /**
+   * COLLAB wave 2: host callback publishing a SHARED slicer's new value
+   * ({tileId, valueJson}) to the group. Absent = shared-slicer sending
+   * silently disabled; inbound values still apply.
+   */
+  onSendSlicerValue?: DashboardCollabSenders['onSendSlicerValue'];
 }
 
 /**
@@ -48,7 +61,10 @@ export const createDashboardsRuntime = (
   return {
     api,
     models: new ModelStore(api),
-    dashboards: new DashboardStore(api),
+    dashboards: new DashboardStore(api, {
+      onSendCursor: options?.onSendCursor,
+      onSendSlicerValue: options?.onSendSlicerValue,
+    }),
     queries: new QueryCache(api, options?.queryOptions),
     options: {
       scheduleTimeZoneId: options?.scheduleTimeZoneId ?? 'UTC',

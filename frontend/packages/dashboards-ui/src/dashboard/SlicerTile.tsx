@@ -170,7 +170,12 @@ export function SlicerTile({ tileId, spec, modelId, editable, chartTiles }: Slic
     const initial = relativePresetClause(spec.preset, spec.table, spec.column, columnType);
     const next = initial === null ? null : { clause: initial, presetId: spec.preset };
     if (!untouched && JSON.stringify(next) === JSON.stringify(value)) return;
-    runtime.dashboards.setSlicerValue(tileId, next);
+    // broadcast: false — applying the AUTHORED default on open is not a user
+    // pick (COLLAB wave 2: on a shared slicer, broadcasting it would blast
+    // the default over collaborators' current shared value every time anyone
+    // merely opens the dashboard). Actual preset PICKS go through
+    // pickRelativePreset below and broadcast normally.
+    runtime.dashboards.setSlicerValue(tileId, next, { broadcast: false });
   }, [
     runtime,
     tileId,

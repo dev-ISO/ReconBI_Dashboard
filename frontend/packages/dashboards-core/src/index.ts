@@ -39,15 +39,19 @@ export {
   dateBucketRange,
   dateRangeClauseFor,
   formatDateOnly,
+  isCollabLiveDashboard,
 } from './state/dashboardStore';
 export type {
   CalendarDate,
   CrossFilterClauseOptions,
+  DashboardCollabSenders,
   DashboardStoreState,
   DispatchLiveProgress,
   FilterCardOverride,
   HoverHighlight,
   OpenDashboard,
+  RemoteCursor,
+  RemoteTileLock,
 } from './state/dashboardStore';
 export { applyOpToDoc, diffLayoutDocs, invertLocalOp } from './state/collabOps';
 export { createDashboardsRuntime } from './state/createRuntime';

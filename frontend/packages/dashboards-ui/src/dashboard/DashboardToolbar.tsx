@@ -34,7 +34,8 @@ import {
   UserMinus,
   Variable,
 } from 'lucide-react';
-import type { AlertFiring, ViewFitMode } from '@recon/dashboards-core';
+import type { AlertFiring, DashboardCollabEditor, ViewFitMode } from '@recon/dashboards-core';
+import { PresenceStrip } from './CollabPresence';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdInput, RcdSelect } from '../primitives';
 
 /** Bookmark row data the toolbar menu needs (name + identity only). */
@@ -75,6 +76,14 @@ export interface DashboardToolbarProps {
    * affordance). Draft (solo) sessions are untouched.
    */
   liveMode?: boolean;
+  /**
+   * COLLAB wave 2 presence: who is editing this dashboard right now (host-fed
+   * roster, already deduped by the store). Renders as the compact avatar
+   * strip next to the dashboard name; hidden while empty or absent. The
+   * caller passes it only for live (shared) dashboards — solo dashboards
+   * never have collaborators to show.
+   */
+  presenceEditors?: DashboardCollabEditor[];
   /** View-mode auto-refresh interval (persisted with the layout); null = off. */
   refreshSeconds?: number | null;
   /** Edit-mode change of the auto-refresh interval. */
@@ -192,6 +201,7 @@ export function DashboardToolbar({
   onSave,
   onDiscard,
   liveMode = false,
+  presenceEditors,
   refreshSeconds = null,
   onChangeRefreshSeconds,
   onRefresh,
@@ -327,6 +337,9 @@ export function DashboardToolbar({
         ) : (
           dirty && <span className="shrink-0 text-xs text-rcd-muted">Unsaved changes</span>
         ))}
+
+      {/* Wave 2: "editing now" avatar strip (renders nothing while empty). */}
+      {presenceEditors !== undefined && <PresenceStrip editors={presenceEditors} />}
 
       {/* Flexible middle: the DEFAULT home of the active-filter chips. Its
           width comes from the flex line (flex-1 + basis 0), never from its

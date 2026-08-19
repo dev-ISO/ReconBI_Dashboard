@@ -360,6 +360,36 @@ export function SlicerConfigMenu({
               </>
             )}
 
+            {/* COLLAB wave 2: shared slicer. Gated to this config surface
+                (canEditLayout, like every slicer setting — the caller passes
+                editable accordingly). fieldParam slicers are excluded: their
+                selection is a parameter index outside the slicer-value
+                channel this flag broadcasts on. */}
+            {spec.variant !== 'fieldParam' && (
+              <>
+                <Divider />
+                <SectionLabel>Collaboration</SectionLabel>
+                <label className="flex cursor-pointer items-start gap-2 px-3 py-1 text-sm text-rcd-text hover:bg-black/5 dark:hover:bg-white/10">
+                  <input
+                    type="checkbox"
+                    className="mt-1 accent-[var(--rcd-accent)]"
+                    checked={spec.shared === true}
+                    onChange={() =>
+                      runtime.dashboards.updateSlicer(tileId, { shared: !(spec.shared === true) })
+                    }
+                  />
+                  <span className="min-w-0 flex-1">
+                    Shared with viewers (live)
+                    <span className="block text-[11px] leading-tight text-rcd-muted">
+                      On shared dashboards, picking a value updates this slicer for
+                      everyone viewing right now (never saved). Off: selections stay
+                      personal.
+                    </span>
+                  </span>
+                </label>
+              </>
+            )}
+
             {spec.variant === 'buttons' && (
               <>
                 <Divider />

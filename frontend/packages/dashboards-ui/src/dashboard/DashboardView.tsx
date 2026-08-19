@@ -17,6 +17,7 @@ import {
   filterCardIsActive,
   isChartTile,
   isButtonTile,
+  isCollabLiveDashboard,
   isImageTile,
   isRunnable,
   isSlicerTile,
@@ -57,6 +58,7 @@ import { AddSlicerDialog } from './AddSlicerDialog';
 import { ShareDialog } from './ShareDialog';
 import { AlertDialog, type AlertSource } from './AlertDialog';
 import { ChartContextMenu } from './ChartContextMenu';
+import { RemoteCursorOverlay, TileLockOverlay } from './CollabPresence';
 import { CopyChartDialog } from './CopyChartDialog';
 import { DashboardChartTile, type TileEffectiveState } from './DashboardChartTile';
 import { DashboardGrid, type DashboardGridItem } from './DashboardGrid';
@@ -285,6 +287,10 @@ export function DashboardView({
   const liveMode = useDashboardState((state) => state.liveMode);
   /** Soft-lock refusal/expiry notice raised by the store. */
   const lockNotice = useDashboardState((state) => state.lockNotice);
+  /** Wave 2 presence roster (host-fed; empty on solo dashboards). */
+  const collabEditors = useDashboardState((state) => state.collabEditors);
+  /** Wave 2 foreign tile locks (host-fed; own locks never land here). */
+  const tileLocks = useDashboardState((state) => state.tileLocks);
   const canUndo = useDashboardState((state) => state.canUndo);
   const canRedo = useDashboardState((state) => state.canRedo);
   const saveStatus = useDashboardState((state) => state.saveStatus);
@@ -475,6 +481,15 @@ export function DashboardView({
   const activePage = pages.find((page) => page.id === activePageId) ?? pages[0] ?? null;
   const tiles = activePage?.tiles ?? [];
   const editable = mode === 'edit' && !readonly;
+
+  /**
+   * Wave 2: does this dashboard have a live collaborative audience (shared —
+   * so presence/cursors/shared slicers can flow)? BOTH modes, view included:
+   * viewers see collaborators' cursors and send their own. Broader than the
+   * live-EDIT flag on purpose (view-only grantees participate); the store's
+   * senders re-check the same predicate, so this is render gating only.
+   */
+  const collabLive = current !== null && current.id === dashboardId && isCollabLiveDashboard(current);
 
   /* ------------------------------------------------ access rights (0.8.0)
    * `myAccess` is server-authoritative (the store defaults it for pre-0.8
@@ -1368,9 +1383,14 @@ export function DashboardView({
         const currentClause =
           current != null && 'presetId' in current ? current.clause : null;
         if (JSON.stringify(clause) === JSON.stringify(currentClause)) continue;
+        // broadcast: false — this is a DERIVED write (recomputing a preset's
+        // dates on refresh/bookmark ticks), not a user pick. Every client
+        // derives the same dates from the shared preset locally; broadcasting
+        // would have N clients spamming identical values per refresh tick.
         runtime.dashboards.setSlicerValue(
           tile.id,
           clause === null ? null : { clause, presetId },
+          { broadcast: false },
         );
       }
     }
@@ -1687,7 +1707,7 @@ export function DashboardView({
     );
   }
 
-  const renderTile = (id: string) => {
+  const renderTileContent = (id: string) => {
     const tile = tiles.find((t) => t.id === id);
     if (!tile) return null;
 
@@ -1783,6 +1803,27 @@ export function DashboardView({
         onChartMenu={editable && canEditCharts ? undefined : setTileMenu}
         reportEffective={reportEffective}
       />
+    );
+  };
+
+  /**
+   * Wave 2 lock visibility: every tile renders inside one stable relative
+   * wrapper, and a FOREIGN soft lock (another editor's — the store never
+   * stores our own) dresses it with an outline + "Editing: {name}" chip.
+   * The wrapper is UNCONDITIONAL on purpose: wrapping only locked tiles
+   * would change the React tree shape when a lock arrives/expires and
+   * remount the tile — a chart would refetch because a colleague started
+   * dragging it. The overlay itself mounts/unmounts freely inside.
+   */
+  const renderTile = (id: string) => {
+    const lock = tileLocks[id];
+    return (
+      <div className="relative h-full">
+        {renderTileContent(id)}
+        {lock !== undefined && (
+          <TileLockOverlay holderUserId={lock.holderUserId} holderName={lock.holderName} />
+        )}
+      </div>
     );
   };
 
@@ -1928,6 +1969,8 @@ export function DashboardView({
         onDiscard={() => runtime.dashboards.discardEdits()}
         // Collaborative session: "Live editing" caption, Save→Done, no Discard.
         liveMode={liveMode}
+        // Wave 2 presence strip (live dashboards only; hidden while empty).
+        presenceEditors={collabLive ? collabEditors : undefined}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={editable ? () => runtime.dashboards.undo() : undefined}
@@ -2203,6 +2246,25 @@ export function DashboardView({
                 renderItem={renderTile}
                 draggableHandle=".rcd-tile-drag-handle"
                 boundaryHeight={editable ? canvasBoundary : null}
+                // Wave 2 cursors, LIVE (shared) dashboards only, view AND
+                // edit: outbound pointer fractions of the grid content box
+                // (throttled ~10 Hz in the store; pointerleave drops the
+                // pending trailing frame) and the inbound overlay of
+                // collaborators' named pointers on the ACTIVE page. Both
+                // sides use the grid's own content box, so fractions are
+                // zoom- and mode-independent (see DashboardGridProps).
+                onPointerFraction={
+                  collabLive && activePage
+                    ? (xFrac, yFrac) =>
+                        runtime.dashboards.sendCursorThrottled(activePage.id, xFrac, yFrac)
+                    : undefined
+                }
+                onPointerLeaveGrid={
+                  collabLive ? () => runtime.dashboards.cancelCursorSend() : undefined
+                }
+                overlay={
+                  collabLive ? <RemoteCursorOverlay pageId={activePage?.id ?? null} /> : undefined
+                }
               />
             </FitPageViewport>
           )}

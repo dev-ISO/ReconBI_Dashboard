@@ -18,9 +18,14 @@ import {
   opConflictKey,
   OP_TARGET_MISSING_ERROR,
   TILE_LOCKED_ERROR,
+  type DashboardCollabEditor,
+  type DashboardEditorsChangedEvent,
   type DashboardLocalOp,
   type DashboardOpEvent,
   type DashboardOpPayload,
+  type DashboardRemoteCursorEvent,
+  type DashboardRemoteSlicerValueEvent,
+  type DashboardTileLockEvent,
 } from '../types/ops';
 import type { ChartSpec } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
@@ -235,6 +240,35 @@ export interface DashboardStoreState {
    * clearLockNotice(). The toolbar area renders it as a dismissible chip.
    */
   lockNotice: string | null;
+  /**
+   * WAVE 2 presence: who is editing this dashboard right now, as reported by
+   * the host's presence tracker (applyEditorsChanged — full set per event,
+   * never deltas). Host-owned ephemera: view-mode safe, never dirties, reset
+   * on open/close. The toolbar renders it as the avatar strip; the set may
+   * include the local user (the store never learns its own numeric host id,
+   * so it cannot filter self — hosts that want self-free strips filter before
+   * forwarding).
+   */
+  collabEditors: DashboardCollabEditor[];
+  /**
+   * WAVE 2 cursors: collaborators' pointers keyed by HOST user id, each
+   * stamped with its local arrival time. Aged out ~6 s after the last frame
+   * (the collabSweep interval) — cursors have no "gone" wire event; silence
+   * IS the signal. All received cursors are kept: the HOST filters the
+   * sender's own echo before forwarding (pinned contract), because the store
+   * cannot compare host-numeric ids to a self it never learns.
+   */
+  remoteCursors: Record<number, RemoteCursor>;
+  /**
+   * WAVE 2 lock visibility: OTHER editors' soft tile locks keyed by tile id,
+   * for the "Editing: {name}" chip + outline. Removed on the released event
+   * and aged out at expiresAtUtc (heartbeat extensions are deliberately not
+   * broadcast — a chip fading before the holder finishes is the accepted
+   * cost; the hold/409 machinery underneath is wave 1 and unaffected). Locks
+   * THIS client holds never land here (applyTileLock drops them while our
+   * heartbeat runs, and a successful acquire clears any echo that raced in).
+   */
+  tileLocks: Record<string, RemoteTileLock>;
   saveStatus: AsyncStatus;
   error: string | null;
   /**
@@ -250,6 +284,55 @@ export interface FilterCardOverride {
   disabled?: boolean;
   basicValues?: FilterValue[] | null;
 }
+
+/** One remote pointer (wave 2): the cursor event + its local arrival stamp. */
+export interface RemoteCursor {
+  userId: number;
+  userName: string;
+  pageId: string;
+  /** 0..1 fractions of the grid content box (zoom-independent — see ops.ts). */
+  xFrac: number;
+  yFrac: number;
+  /** Sender timestamp (informational). */
+  at: string;
+  /** LOCAL Date.now() at arrival — the TTL clock (immune to sender skew). */
+  receivedAt: number;
+}
+
+/** One OTHER editor's soft tile lock (wave 2 lock visibility). */
+export interface RemoteTileLock {
+  tileId: string;
+  holderUserId: number;
+  holderName: string;
+  /** Receivers age the lock out at this edge (heartbeats never broadcast). */
+  expiresAtUtc: string;
+}
+
+/**
+ * Host-injected senders for the wave-2 OUTBOUND ephemeral channels (pinned
+ * contract): DashboardsProvider threads its optional onSendCursor /
+ * onSendSlicerValue props here via createDashboardsRuntime. Absent members
+ * silently disable the corresponding sending (portal/demo hosts) — receiving
+ * still works, since inbound events arrive through the apply* actions.
+ */
+export interface DashboardCollabSenders {
+  onSendCursor?: (cursor: { pageId: string; xFrac: number; yFrac: number }) => void;
+  onSendSlicerValue?: (value: { tileId: string; valueJson: string }) => void;
+}
+
+/**
+ * Is this dashboard part of a LIVE collaborative session's audience — i.e.
+ * may wave-2 ephemera (presence, cursors, shared-slicer values) flow for it?
+ * Deliberately BROADER than the wave-1 live-EDIT predicate
+ * (isLiveCollaborative): a view-only grantee never live-edits, but they DO
+ * see presence/cursors and participate in shared slicers, so the edit right
+ * is not required — any share relationship (being a grantee, or owning/
+ * managing a dashboard with grants) qualifies. Built-ins and merely-published
+ * ("Everyone") dashboards stay out, mirroring wave 1's rule that the legacy
+ * publish flag never makes a dashboard collaborative.
+ */
+export const isCollabLiveDashboard = (dashboard: OpenDashboard): boolean =>
+  !dashboard.isSystem && (dashboard.myAccess.viaShare || dashboard.shareCount > 0);
 
 /** Transient hover cross-highlight payload (see DashboardStoreState.hoverHighlight). */
 export interface HoverHighlight {
@@ -547,6 +630,9 @@ const initialState: DashboardStoreState = {
   liveMode: false,
   heldRemoteOps: {},
   lockNotice: null,
+  collabEditors: [],
+  remoteCursors: {},
+  tileLocks: {},
   saveStatus: 'idle',
   error: null,
   chartClipboard: null,
@@ -575,6 +661,21 @@ const SENT_OP_CAP = 500;
  * lock alive under any plausible TTL (~60s) while staying negligible traffic.
  */
 const TILE_LOCK_HEARTBEAT_MS = 20_000;
+
+/**
+ * Remote-cursor lifetime after its LAST frame (wave 2). Cursors have no
+ * "gone" wire event — pointerleave simply stops the ~10 Hz stream — so
+ * receivers age them out. 6 s (the design's "TTL like chat typing
+ * indicators") is long enough that a paused-but-present pointer survives the
+ * send throttle, short enough that a departed one doesn't haunt the grid.
+ */
+const CURSOR_TTL_MS = 6_000;
+
+/** Trailing-throttle window for outbound cursor frames (~10 Hz per design). */
+const CURSOR_SEND_MS = 100;
+
+/** Cadence of the cursor/lock expiry sweep (armed only while any exist). */
+const COLLAB_SWEEP_MS = 1_000;
 
 /**
  * Is this dashboard COLLABORATIVE (live-mode editing) for this caller? True
@@ -634,7 +735,24 @@ export class DashboardStore {
   /** Heartbeat timers of soft tile locks THIS client holds, keyed by tile id. */
   private tileLockHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
 
-  constructor(private readonly api: DashboardsApi) {
+  /* ---- wave-2 ephemera plumbing (same non-reactive doctrine as above). */
+
+  /** Expiry sweep for remoteCursors/tileLocks; armed only while any exist. */
+  private collabSweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Trailing-throttle timer for outbound cursor frames. */
+  private cursorSendTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Newest cursor authored inside the throttle window (sent on its edge). */
+  private pendingCursor: { pageId: string; xFrac: number; yFrac: number } | null = null;
+  /** Reentry guard: true while applyRemoteSlicerValue writes slicerValues, so
+   * no code path can bounce an inbound shared-slicer value back out. */
+  private applyingRemoteSlicerValue = false;
+
+  constructor(
+    private readonly api: DashboardsApi,
+    /** Wave-2 outbound senders (host props threaded through the runtime);
+     * absent members disable the corresponding channel. */
+    private readonly collab: DashboardCollabSenders = {},
+  ) {
     this.store = createStore<DashboardStoreState>(() => ({ ...initialState }));
   }
 
@@ -1372,6 +1490,14 @@ export class DashboardStore {
       return { ok: false, message };
     }
     this.startLockHeartbeat(current.id, tileId);
+    // Wave-2 echo race: the broadcast of OUR acquire can beat this HTTP
+    // response (the sentOpIds lesson) and land in tileLocks before the
+    // heartbeat exists to identify it as ours — clear it, or the user's own
+    // tile would wear an "Editing: you" chip for the next 30 s.
+    if (tileId in this.state.tileLocks) {
+      const { [tileId]: _ownEcho, ...rest } = this.state.tileLocks;
+      this.set({ tileLocks: rest });
+    }
     return { ok: true };
   }
 
@@ -1428,6 +1554,234 @@ export class DashboardStore {
       }
     }
     this.tileLockHeartbeats.clear();
+  }
+
+  /* ==================================== wave 2 — presence, cursors, locks,
+   * shared slicers. All four inbound apply* actions are host→store event
+   * forwarders (the applyDispatchProgress / applyRemoteOp pattern): guarded
+   * on the open dashboard's id, VIEW-MODE SAFE, and they never touch dirty
+   * or history — this is ephemeral session state, not document state. The
+   * outbound half (cursor frames, shared-slicer values) goes through the
+   * host-injected DashboardCollabSenders; without those props the sends
+   * silently no-op (portal/demo hosts) while receiving keeps working.
+   */
+
+  /**
+   * Presence roster from the host's tracker (full set per event, never
+   * deltas). Deduped by user id — a user editing in two tabs is one person —
+   * and no-op frames are skipped so identical rosters never re-render.
+   */
+  applyEditorsChanged(event: DashboardEditorsChangedEvent): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    const editors: DashboardCollabEditor[] = [];
+    const seen = new Set<number>();
+    for (const editor of event.editors ?? []) {
+      if (typeof editor?.userId !== 'number' || seen.has(editor.userId)) continue;
+      seen.add(editor.userId);
+      editors.push({ userId: editor.userId, userName: editor.userName || String(editor.userId) });
+    }
+    const prev = this.state.collabEditors;
+    const unchanged =
+      prev.length === editors.length &&
+      prev.every((p, i) => p.userId === editors[i]!.userId && p.userName === editors[i]!.userName);
+    if (unchanged) return;
+    this.set({ collabEditors: editors });
+  }
+
+  /**
+   * One collaborator pointer frame. ALL received cursors are kept — the HOST
+   * filters the sender's own echo before forwarding (pinned contract: the
+   * store never learns the local user's numeric host id, so it could not
+   * drop self reliably). Fractions clamp defensively into 0..1; the arrival
+   * stamp drives the ~6 s TTL sweep (local clock — immune to sender skew).
+   */
+  applyRemoteCursor(event: DashboardRemoteCursorEvent): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    if (
+      typeof event.userId !== 'number' ||
+      typeof event.pageId !== 'string' ||
+      !Number.isFinite(event.xFrac) ||
+      !Number.isFinite(event.yFrac)
+    ) {
+      return; // malformed frame — never render a pointer at NaN
+    }
+    const cursor: RemoteCursor = {
+      userId: event.userId,
+      userName: event.userName || String(event.userId),
+      pageId: event.pageId,
+      xFrac: clamp01(event.xFrac),
+      yFrac: clamp01(event.yFrac),
+      at: event.at,
+      receivedAt: Date.now(),
+    };
+    this.set({ remoteCursors: { ...this.state.remoteCursors, [event.userId]: cursor } });
+    this.armCollabSweep();
+  }
+
+  /**
+   * A soft tile lock changed hands (fresh acquire / steal / release — never
+   * heartbeats; see the state field's doc for the aging consequence). Locks
+   * THIS client holds are dropped here: while our heartbeat runs, any lock
+   * event for that tile is the echo of our own acquire (or of a steal our
+   * heartbeat-failure path already surfaces via lockNotice) — storing it
+   * would badge the user's own tile "Editing: you". No tile-existence check
+   * on purpose: a lock can precede its tile's first op (chart builder).
+   */
+  applyTileLock(event: DashboardTileLockEvent): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    if (typeof event.tileId !== 'string' || event.tileId === '') return;
+    if (event.released) {
+      if (!(event.tileId in this.state.tileLocks)) return;
+      const { [event.tileId]: _released, ...rest } = this.state.tileLocks;
+      this.set({ tileLocks: rest });
+      return;
+    }
+    if (this.tileLockHeartbeats.has(event.tileId)) return; // own claim's echo
+    this.set({
+      tileLocks: {
+        ...this.state.tileLocks,
+        [event.tileId]: {
+          tileId: event.tileId,
+          holderUserId: event.holderUserId,
+          holderName: event.holderName || String(event.holderUserId),
+          expiresAtUtc: event.expiresAtUtc,
+        },
+      },
+    });
+    this.armCollabSweep();
+  }
+
+  /**
+   * A collaborator picked a value on a SHARED slicer. Applies to the local
+   * runtime selection WITHOUT rebroadcast — the write happens under the
+   * reentry guard and bypasses setSlicerValue entirely, so no future funnel
+   * through that action can bounce an inbound value back out (echo loops are
+   * structurally impossible: receivers never send). Unknown/non-slicer tiles
+   * drop the frame (a tileRemove op may have raced it); malformed JSON drops
+   * rather than guesses.
+   */
+  applyRemoteSlicerValue(event: DashboardRemoteSlicerValueEvent): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    const tile = pagesOf(current.layout)
+      .flatMap((page) => page.tiles)
+      .find((t) => t.id === event.tileId);
+    if (!tile || !isSlicerTile(tile)) return;
+    let value: SlicerValue;
+    try {
+      value = JSON.parse(event.valueJson) as SlicerValue;
+    } catch {
+      return;
+    }
+    this.applyingRemoteSlicerValue = true;
+    try {
+      // Same shape as setSlicerValue's write, including the bookmark-current
+      // reset — the view diverged from any applied bookmark either way.
+      this.set({
+        slicerValues: { ...this.state.slicerValues, [event.tileId]: value },
+        lastAppliedBookmarkId: null,
+      });
+    } finally {
+      this.applyingRemoteSlicerValue = false;
+    }
+  }
+
+  /**
+   * Outbound pointer frame, trailing-throttled to ~10 Hz (CURSOR_SEND_MS):
+   * the first frame of a burst sends immediately (a pointer that appears
+   * NOW, not 100 ms late), every further frame inside the window replaces
+   * the pending one, and the window's edge sends the newest — so a stroke's
+   * final position always lands even though intermediate frames drop. No-ops
+   * without the host's onSendCursor prop and outside live (shared) sessions.
+   */
+  sendCursorThrottled(pageId: string, xFrac: number, yFrac: number): void {
+    const send = this.collab.onSendCursor;
+    const current = this.state.current;
+    if (!send || !current || !isCollabLiveDashboard(current)) return;
+    if (!Number.isFinite(xFrac) || !Number.isFinite(yFrac)) return;
+    const cursor = { pageId, xFrac: clamp01(xFrac), yFrac: clamp01(yFrac) };
+    if (this.cursorSendTimer !== null) {
+      this.pendingCursor = cursor;
+      return;
+    }
+    try {
+      send(cursor);
+    } catch {
+      // Host bridge hiccup — drop the frame; the next one repaints anyway.
+    }
+    this.cursorSendTimer = setTimeout(() => {
+      this.cursorSendTimer = null;
+      const pending = this.pendingCursor;
+      this.pendingCursor = null;
+      // Re-entering delivers the trailing frame AND re-arms the window, so a
+      // continuous drag settles into one send per window.
+      if (pending !== null) this.sendCursorThrottled(pending.pageId, pending.xFrac, pending.yFrac);
+    }, CURSOR_SEND_MS);
+  }
+
+  /**
+   * Stops the cursor stream (pointerleave): drops the pending trailing frame
+   * so a stale position never fires after the pointer left the grid. There
+   * is deliberately no "cursor gone" wire event — receivers age the pointer
+   * out by TTL, exactly like chat typing indicators.
+   */
+  cancelCursorSend(): void {
+    this.pendingCursor = null;
+    if (this.cursorSendTimer !== null) {
+      clearTimeout(this.cursorSendTimer);
+      this.cursorSendTimer = null;
+    }
+  }
+
+  /** Arms the shared cursor/lock expiry sweep (idempotent). */
+  private armCollabSweep(): void {
+    if (this.collabSweepTimer !== null) return;
+    this.collabSweepTimer = setInterval(() => this.sweepCollabEphemera(), COLLAB_SWEEP_MS);
+  }
+
+  /**
+   * Ages out cursors (~6 s after their last frame, LOCAL clock) and locks
+   * (past expiresAtUtc — the server's clock; skew within the 30 s TTL only
+   * shifts when a chip fades, never correctness, since released events clear
+   * eagerly). Disarms itself once both maps are empty so an idle dashboard
+   * runs zero timers.
+   */
+  private sweepCollabEphemera(): void {
+    const now = Date.now();
+    const state = this.state;
+    const patch: Partial<DashboardStoreState> = {};
+    const cursorEntries = Object.entries(state.remoteCursors);
+    const liveCursors = cursorEntries.filter(([, c]) => now - c.receivedAt < CURSOR_TTL_MS);
+    if (liveCursors.length !== cursorEntries.length) {
+      patch.remoteCursors = Object.fromEntries(liveCursors) as Record<number, RemoteCursor>;
+    }
+    const lockEntries = Object.entries(state.tileLocks);
+    // NaN parse (malformed stamp) compares false → dropped now: a lock we
+    // cannot age honestly must not stick forever.
+    const liveLocks = lockEntries.filter(([, l]) => Date.parse(l.expiresAtUtc) > now);
+    if (liveLocks.length !== lockEntries.length) {
+      patch.tileLocks = Object.fromEntries(liveLocks);
+    }
+    if (Object.keys(patch).length > 0) this.set(patch);
+    const empty =
+      Object.keys(patch.remoteCursors ?? state.remoteCursors).length === 0 &&
+      Object.keys(patch.tileLocks ?? state.tileLocks).length === 0;
+    if (empty && this.collabSweepTimer !== null) {
+      clearInterval(this.collabSweepTimer);
+      this.collabSweepTimer = null;
+    }
+  }
+
+  /** Drops the wave-2 timers + pending sends (dashboard open/close). */
+  private stopCollabEphemera(): void {
+    this.cancelCursorSend();
+    if (this.collabSweepTimer !== null) {
+      clearInterval(this.collabSweepTimer);
+      this.collabSweepTimer = null;
+    }
   }
 
   /* ------------------------------------------------------------- resync */
@@ -1583,6 +1937,11 @@ export class DashboardStore {
     const current = toOpen(detail);
     this.clearHistory();
     this.resetCollabSession();
+    // Wave-2 ephemera are per-dashboard: presence/cursors/locks of the
+    // previous dashboard must never bleed into this one (the host re-joins
+    // the new group and re-seeds presence). enterEdit deliberately does NOT
+    // do this — presence survives mode switches within one dashboard.
+    this.stopCollabEphemera();
     this.set({
       current,
       mode: 'view',
@@ -1601,6 +1960,9 @@ export class DashboardStore {
       liveMode: false,
       heldRemoteOps: {},
       lockNotice: null,
+      collabEditors: [],
+      remoteCursors: {},
+      tileLocks: {},
       saveStatus: 'idle',
       error: null,
     });
@@ -1646,6 +2008,8 @@ export class DashboardStore {
     // before the TTL); pending unsent ops are dropped with the doc they edit.
     this.stopAllLockHeartbeats(true);
     this.resetCollabSession();
+    // Wave-2 timers/pending sends die too (state resets via initialState).
+    this.stopCollabEphemera();
     this.set({
       ...initialState,
       list: this.state.list,
@@ -1923,12 +2287,41 @@ export class DashboardStore {
     this.removeTile(tileId);
   }
 
-  setSlicerValue(slicerId: string, value: SlicerValue): void {
+  /**
+   * Sets a slicer's runtime value. WAVE 2 (`options.broadcast`): when the
+   * slicer is marked SHARED (SlicerTileSpec.shared) and this dashboard is a
+   * live collaborative one, the new value also goes out through the host's
+   * onSendSlicerValue prop so every viewer's slicer follows — ephemeral
+   * session state on the wire, never persisted. `broadcast: false` is the
+   * escape hatch for NON-GESTURE writes that merely derive local state:
+   * the relativeDate default-preset seeding on open (broadcasting it would
+   * blast the authored default over collaborators' current shared pick every
+   * time anyone opens the dashboard) and the periodic preset re-computation
+   * (every client derives the same dates from the shared preset locally —
+   * broadcasting would have N clients spamming identical values per refresh
+   * tick). Inbound values never re-enter here (applyRemoteSlicerValue writes
+   * directly), and the reentry guard makes that a hard invariant.
+   */
+  setSlicerValue(slicerId: string, value: SlicerValue, options?: { broadcast?: boolean }): void {
     // Any slicer change diverges from the last-applied bookmark's snapshot.
     this.set({
       slicerValues: { ...this.state.slicerValues, [slicerId]: value },
       lastAppliedBookmarkId: null,
     });
+    if (options?.broadcast === false || this.applyingRemoteSlicerValue) return;
+    const send = this.collab.onSendSlicerValue;
+    const current = this.state.current;
+    if (!send || !current || !isCollabLiveDashboard(current)) return;
+    const tile = pagesOf(current.layout)
+      .flatMap((page) => page.tiles)
+      .find((t) => t.id === slicerId);
+    if (!tile || !isSlicerTile(tile) || tile.slicer.shared !== true) return;
+    try {
+      // JSON `null` travels for a cleared slicer — receivers clear too.
+      send({ tileId: slicerId, valueJson: JSON.stringify(value ?? null) });
+    } catch {
+      // Host bridge hiccup — the local selection stands; sharing is best-effort.
+    }
   }
 
   /**
@@ -3331,6 +3724,9 @@ const toOpen = (detail: DashboardDetail): OpenDashboard => ({
 });
 
 const pagesOf = (layout: DashboardLayoutDoc): DashboardPage[] => layout.pages ?? [];
+
+/** Defensive 0..1 clamp for cursor fractions (both directions of the wire). */
+const clamp01 = (n: number): number => Math.min(1, Math.max(0, n));
 
 const firstPageId = (layout: DashboardLayoutDoc): string | null =>
   pagesOf(layout)[0]?.id ?? null;

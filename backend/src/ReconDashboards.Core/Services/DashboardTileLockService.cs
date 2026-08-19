@@ -1,3 +1,6 @@
+using Microsoft.Extensions.DependencyInjection;
+using ReconDashboards.Core.Abstractions;
+
 namespace ReconDashboards.Core.Services;
 
 /// <summary>One live soft claim on (dashboard, tile): who holds it and until when.</summary>
@@ -27,8 +30,29 @@ public sealed record DashboardTileLock(
 /// when touched (plus a periodic full sweep amortized over acquires) rather
 /// than by a timer, which keeps the service trivially testable through
 /// <see cref="TimeProvider"/>.
+///
+/// WAVE 2 (lock visibility): the three transitions collaborators can see —
+/// fresh acquire, steal, explicit release — fire
+/// <see cref="IRcdDashboardTileLockNotifier"/>; heartbeat extensions never do
+/// (the interface doc carries the why). Firing lives HERE rather than in the
+/// endpoint layer so every state change broadcasts no matter who drove it —
+/// the ops endpoints today, a host's disconnect cleanup calling
+/// <see cref="Release"/> directly tomorrow. Mechanics:
+///  - fire-and-forget AFTER the state change, outside <see cref="_gate"/>
+///    (the lock methods are synchronous; a broadcast must never extend the
+///    critical section or fail the caller — best-effort by doctrine);
+///  - notifier + <see cref="IUserDirectory"/> (holder display name) resolve
+///    per fire through a fresh DI scope, NOT the singleton's constructor:
+///    hosts may register either as SCOPED ("a later AddScoped wins" is the
+///    documented directory contract) and a captive scoped dependency inside
+///    this singleton would throw under scope validation. Same pattern as
+///    SubscriptionDispatcher/SchedulingEvaluator.
+///  - a null <paramref name="scopeFactory"/> (plain unit-test construction)
+///    disables firing entirely — the wave-1 behavior.
 /// </summary>
-public sealed class DashboardTileLockService(TimeProvider timeProvider)
+public sealed class DashboardTileLockService(
+    TimeProvider timeProvider,
+    IServiceScopeFactory? scopeFactory = null)
 {
     /// <summary>
     /// Lock lifetime per heartbeat. ~30 s per the design contract: long enough
@@ -54,6 +78,7 @@ public sealed class DashboardTileLockService(TimeProvider timeProvider)
     public bool TryAcquire(int dashboardId, string tileId, string userId, out DashboardTileLock current)
     {
         var now = timeProvider.GetUtcNow().UtcDateTime;
+        bool announce;
         lock (_gate)
         {
             SweepIfDue(now);
@@ -70,15 +95,26 @@ public sealed class DashboardTileLockService(TimeProvider timeProvider)
             // Fresh acquire, heartbeat, or steal-after-expiry all land here.
             // AcquiredAtUtc is preserved across heartbeats so "editing since"
             // stays honest when wave 2 renders locks.
-            var acquiredAt = existing is not null
+            var heartbeat = existing is not null
                 && string.Equals(existing.HolderUserId, userId, StringComparison.Ordinal)
-                && existing.ExpiresAtUtc > now
-                    ? existing.AcquiredAtUtc
-                    : now;
-            current = new DashboardTileLock(dashboardId, tileId, userId, acquiredAt, now + Ttl);
+                && existing.ExpiresAtUtc > now;
+            current = new DashboardTileLock(
+                dashboardId, tileId, userId, heartbeat ? existing!.AcquiredAtUtc : now, now + Ttl);
             _locks[key] = current;
-            return true;
+            // Wave 2 visibility: fresh acquires and steals broadcast, heartbeat
+            // extensions never do (see the class header). A SAME-holder
+            // re-acquire after expiry counts as fresh — receivers aged the old
+            // claim out at its TTL edge, so the chip needs re-establishing.
+            announce = !heartbeat;
         }
+
+        // Outside the gate: a broadcast must never extend the critical section.
+        if (announce)
+        {
+            NotifyChanged(current, released: false);
+        }
+
+        return true;
     }
 
     /// <summary>
@@ -90,6 +126,7 @@ public sealed class DashboardTileLockService(TimeProvider timeProvider)
     /// </summary>
     public bool Release(int dashboardId, string tileId, string userId)
     {
+        DashboardTileLock? removed = null;
         lock (_gate)
         {
             var key = (dashboardId, tileId);
@@ -97,11 +134,21 @@ public sealed class DashboardTileLockService(TimeProvider timeProvider)
                 && string.Equals(existing.HolderUserId, userId, StringComparison.Ordinal))
             {
                 _locks.Remove(key);
-                return true;
+                removed = existing;
             }
+        }
 
+        if (removed is null)
+        {
             return false;
         }
+
+        // Wave 2 visibility: an explicit release clears collaborators' chips
+        // immediately instead of letting them wait out the TTL. A release of
+        // an already-expired own claim still fires — receivers dropped the
+        // chip anyway, and the released event is idempotent by design.
+        NotifyChanged(removed, released: true);
+        return true;
     }
 
     /// <summary>The unexpired claim on one tile, or null. Prunes an expired entry it finds.</summary>
@@ -136,6 +183,71 @@ public sealed class DashboardTileLockService(TimeProvider timeProvider)
                 .Where(l => l.DashboardId == dashboardId && l.ExpiresAtUtc > now)
                 .OrderBy(l => l.AcquiredAtUtc)
                 .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Fire-and-forget broadcast of one lock transition. Fire-and-forget is
+    /// forced by the synchronous lock API and HONEST here: the state change
+    /// already happened, the broadcast is best-effort visibility, and nothing
+    /// can meaningfully await it. Everything inside is defensive — a resolver
+    /// or notifier failure is swallowed (never observed as an unhandled task
+    /// exception) because a lost chip update self-heals at the TTL edge.
+    /// </summary>
+    private void NotifyChanged(DashboardTileLock lockState, bool released)
+    {
+        if (scopeFactory is null)
+        {
+            return; // no host wiring (plain construction) — wave-1 behavior
+        }
+
+        _ = NotifyChangedAsync(lockState, released);
+    }
+
+    private async Task NotifyChangedAsync(DashboardTileLock lockState, bool released)
+    {
+        try
+        {
+            // Fresh scope per fire: the notifier and the directory may both be
+            // host-registered SCOPED (see the class header) — resolving them
+            // through this singleton's constructor would be a captive
+            // dependency. The scope also gives the host bridge its usual
+            // per-operation service graph (e.g. a scoped DbContext).
+            using var scope = scopeFactory.CreateScope();
+            var notifier = scope.ServiceProvider.GetService<IRcdDashboardTileLockNotifier>();
+            if (notifier is null or NullRcdDashboardTileLockNotifier)
+            {
+                return; // no bridge — skip the directory lookup entirely
+            }
+
+            // Holder display name via the directory, raw id as the fallback —
+            // the exact resolution the ops endpoint's 409 message uses.
+            var displayName = lockState.HolderUserId;
+            var directory = scope.ServiceProvider.GetService<IUserDirectory>();
+            if (directory is not null)
+            {
+                var users = await directory.ResolveAsync([lockState.HolderUserId], CancellationToken.None);
+                if (users.TryGetValue(lockState.HolderUserId, out var user))
+                {
+                    displayName = user.DisplayName;
+                }
+            }
+
+            // CancellationToken.None on purpose: the triggering request may
+            // already be complete/aborted; the broadcast rides its own life.
+            await notifier.TileLockChangedAsync(
+                new RcdTileLockChange(
+                    lockState.DashboardId,
+                    lockState.TileId,
+                    lockState.HolderUserId,
+                    displayName,
+                    lockState.ExpiresAtUtc,
+                    released),
+                CancellationToken.None);
+        }
+        catch
+        {
+            // Best-effort by contract — a failed broadcast must never surface.
         }
     }
 

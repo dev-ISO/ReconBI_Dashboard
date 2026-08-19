@@ -51,6 +51,28 @@ export interface DashboardGridProps {
    * existing dashboards simply show content past the line).
    */
   boundaryHeight?: number | null;
+  /**
+   * COLLAB wave 2 cursor tap: pointer position over the GRID CONTENT BOX as
+   * 0..1 fractions of its layout size. The content box is the tight wrapper
+   * around react-grid-layout's root — deliberately NOT the outer canvas: the
+   * canvas carries the edit-mode min-height workspace (viewport-dependent, so
+   * DIFFERENT per client), while the RGL content box derives purely from the
+   * shared document, making fractions comparable across every client and
+   * mode. Measured via getBoundingClientRect, so any ancestor zoom/scale
+   * cancels out (visual px over visual px). Fires on every pointermove
+   * (capture phase — tiles can't swallow it); the consumer throttles.
+   */
+  onPointerFraction?: (xFrac: number, yFrac: number) => void;
+  /** Companion to onPointerFraction: the pointer left the grid content box. */
+  onPointerLeaveGrid?: () => void;
+  /**
+   * COLLAB wave 2 overlay slot (remote cursors): rendered absolutely over the
+   * grid content box, INSIDE the same wrapper onPointerFraction measures — so
+   * a fraction sent from one client renders over the same spot on every
+   * other, and under fit-to-page zoom the overlay inherits the scale exactly
+   * like the tiles. Must be pointer-events-none chrome.
+   */
+  overlay?: ReactNode;
 }
 
 /**
@@ -68,6 +90,9 @@ export function DashboardGrid({
   draggableHandle,
   minRows = 24,
   boundaryHeight = null,
+  onPointerFraction,
+  onPointerLeaveGrid,
+  overlay,
 }: DashboardGridProps) {
   const layout: Layout[] = useMemo(
     () =>
@@ -110,42 +135,67 @@ export function DashboardGrid({
           </span>
         </div>
       )}
-      <Grid
-        className="rcd-dashboard-grid"
-        layout={layout}
-        cols={24}
-        rowHeight={ROW_HEIGHT}
-        margin={[MARGIN, MARGIN]}
-        compactType={null}
-        preventCollision
-        isDraggable={editable && !locked}
-        isResizable={editable && !locked}
-        draggableHandle={draggableHandle}
-        // Move AND resize both report as drag start/stop — either gesture
-        // rewrites the tile's geometry (the soft-lock consumer treats them
-        // identically).
-        onDragStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
-        onDragStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
-        onResizeStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
-        onResizeStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
-        onLayoutChange={(next: Layout[]) =>
-          onLayoutChange?.(
-            next.map((l) => ({
-              id: l.i,
-              x: l.x,
-              y: l.y,
-              w: l.w,
-              h: l.h,
-              minW: l.minW ?? undefined,
-              minH: l.minH ?? undefined,
-            })),
-          )
+      {/* GRID CONTENT BOX (wave 2): the tight relative wrapper the cursor
+          contract measures against and the overlay paints over. Its height is
+          the RGL content height — purely document-derived, so identical on
+          every client in every mode (the min-height workspace above never
+          leaks in). Handlers ride the CAPTURE phase so tiles/charts cannot
+          swallow the moves; fractions divide the box's own visual rect, which
+          cancels any ancestor fit-to-page zoom. */}
+      <div
+        className="relative"
+        onPointerMoveCapture={
+          onPointerFraction === undefined
+            ? undefined
+            : (event) => {
+                const rect = event.currentTarget.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return;
+                onPointerFraction(
+                  (event.clientX - rect.left) / rect.width,
+                  (event.clientY - rect.top) / rect.height,
+                );
+              }
         }
+        onPointerLeave={onPointerLeaveGrid}
       >
-        {items.map((item) => (
-          <div key={item.id}>{renderItem(item.id)}</div>
-        ))}
-      </Grid>
+        <Grid
+          className="rcd-dashboard-grid"
+          layout={layout}
+          cols={24}
+          rowHeight={ROW_HEIGHT}
+          margin={[MARGIN, MARGIN]}
+          compactType={null}
+          preventCollision
+          isDraggable={editable && !locked}
+          isResizable={editable && !locked}
+          draggableHandle={draggableHandle}
+          // Move AND resize both report as drag start/stop — either gesture
+          // rewrites the tile's geometry (the soft-lock consumer treats them
+          // identically).
+          onDragStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
+          onDragStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
+          onResizeStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
+          onResizeStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
+          onLayoutChange={(next: Layout[]) =>
+            onLayoutChange?.(
+              next.map((l) => ({
+                id: l.i,
+                x: l.x,
+                y: l.y,
+                w: l.w,
+                h: l.h,
+                minW: l.minW ?? undefined,
+                minH: l.minH ?? undefined,
+              })),
+            )
+          }
+        >
+          {items.map((item) => (
+            <div key={item.id}>{renderItem(item.id)}</div>
+          ))}
+        </Grid>
+        {overlay}
+      </div>
     </div>
   );
 }
