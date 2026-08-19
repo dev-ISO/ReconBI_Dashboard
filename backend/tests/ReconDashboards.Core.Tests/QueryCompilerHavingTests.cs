@@ -226,11 +226,11 @@ LIMIT @p2
 
         AssertSql("""
 SELECT "t1"."region" AS "dim0",
-       (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
+       ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 GROUP BY "t1"."region"
-HAVING (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) >= @p0
+HAVING ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) >= @p0
 ORDER BY "t1"."region" ASC NULLS LAST
 LIMIT @p1
 """, compiled);

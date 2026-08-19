@@ -12,6 +12,7 @@ import { AlertTriangle, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   boldRunText,
   isRunnable,
+  pathToWell,
   retitleInnerTitleHtml,
   stableStringify,
   toWireSpec,
@@ -350,6 +351,32 @@ export function ChartBuilder({
   );
   const previewResult =
     previewEntry?.status === 'ok' && previewEntry.data ? previewEntry.data : null;
+  /**
+   * FIELD-LEVEL faults the SERVER reported for the last preview run, mapped
+   * back onto builder wells through the pinned wire-path grammar (the
+   * backend's ValidationIssue.Path speaks it; pathToWell resolves the
+   * dimension index against THIS draft's wire order). They badge exactly the
+   * wells the client mirror badges and join the same summary list, so a
+   * compile fault the mirror does not model stops being an opaque error card.
+   */
+  const serverIssues = useMemo<ChartIssue[]>(() => {
+    if (previewEntry?.status !== 'error') return [];
+    return (previewEntry.issues ?? []).map((issue): ChartIssue => {
+      const well = issue.path !== null ? pathToWell(issue.path, draft) : undefined;
+      return {
+        severity: issue.severity === 'warning' ? 'warning' : 'error',
+        code: issue.code,
+        message: issue.message,
+        ...(well !== undefined ? { well } : {}),
+        ...(issue.path !== null ? { path: issue.path } : {}),
+      };
+    });
+  }, [previewEntry, draft]);
+  /** Client mirror + server report: what the wells badge and the list lists. */
+  const allIssues = useMemo<ChartIssue[]>(
+    () => (serverIssues.length === 0 ? issues : [...issues, ...serverIssues]),
+    [issues, serverIssues],
+  );
   const previewShaped = useMemo(
     () => (previewResult ? shapeChartData(previewResult, draft) : null),
     [previewResult, draft],
@@ -510,6 +537,7 @@ export function ChartBuilder({
                   catalog={catalog ?? null}
                   parameters={parameters}
                   ordering={ordering}
+                  issues={allIssues}
                   onChange={(query) => setDraft((current) => ({ ...current, query }))}
                   onEditFilter={(index) => {
                     const clause = draft.query.filters[index];
@@ -538,13 +566,13 @@ export function ChartBuilder({
             <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
               Preview
             </span>
-            {issues.length > 0 && (
+            {allIssues.length > 0 && (
               <div
                 role="status"
                 aria-label="Chart validation issues"
                 className="flex max-h-28 shrink-0 flex-col gap-1 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface px-2 py-1.5"
               >
-                {issues.map((issue, index) => (
+                {allIssues.map((issue, index) => (
                   <p
                     key={index}
                     className={`flex items-start gap-1.5 text-xs ${

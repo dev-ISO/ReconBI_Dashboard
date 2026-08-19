@@ -26,6 +26,7 @@ export type {
   SendDashboardOpBody,
   SendDashboardOpResult,
   DashboardTileLockResult,
+  PatchDashboardMetaBody,
 } from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';
@@ -57,13 +58,14 @@ export { applyOpToDoc, diffLayoutDocs, invertLocalOp } from './state/collabOps';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
 
-export { validateChartSpec } from './validation/chartValidation';
+export { pathToWell, validateChartSpec, wireDimensionWells } from './validation/chartValidation';
 export type { ChartIssue } from './validation/chartValidation';
 
 export { dateOnlyPartOf, displayDateBound, inclusiveDateUpperBound } from './util/dateBounds';
 export { stableStringify } from './util/hash';
 export { newId } from './util/ids';
 export { boldRunText, retitleInnerTitleHtml, sanitizeRichHtml } from './util/richText';
+export { BUTTON_STYLE_PROPERTIES, buttonStyleFromCss, sanitizeButtonCss } from './util/buttonStyle';
 export { reconcileOrder, reconcileOrderBy } from './util/ordering';
 export { composeDataLabel } from './util/dataLabels';
 export {

@@ -761,6 +761,53 @@ const BUTTON_VALIGN_CLASSES = {
 } as const;
 
 /**
+ * Shared pill geometry for EVERY slicer button surface (ButtonsSlicer and
+ * FieldParamSlicer): one size scale, centered content, truncation-safe.
+ * State colors (active/idle/unavailable) stay with each variant.
+ */
+export const slicerPillClasses = (size: ButtonSize): string =>
+  `inline-flex items-center justify-center overflow-hidden rounded-md border transition-colors ${BUTTON_SIZE_CLASSES[size]}`;
+
+/**
+ * Container classes (+ inline grid template) for a buttons group.
+ *
+ * Fill mode is a CSS GRID of uniform auto-fill tracks — flex with
+ * `flex-1 basis-24` distributed the leftover space PER LINE, so a 2-pill
+ * last row grew to half the tile while the 5-pill rows above stayed narrow
+ * (the ragged-widths bug); minmax(6rem, 1fr) keeps every pill the same width
+ * on every row while wrapping stays intact. Explicit `columns` keeps its
+ * fixed-track grid exactly as before; items-center rides every branch.
+ */
+export const slicerButtonLayout = (
+  size: ButtonSize,
+  align: keyof typeof BUTTON_JUSTIFY_CLASSES,
+  fill: boolean,
+  columns: number | null,
+): { group: string; item: string; gridTemplateColumns?: string } => {
+  const gap = BUTTON_GAP_CLASSES[size];
+  if (columns !== null) {
+    return {
+      group: `grid ${gap} content-start items-center ${
+        fill ? 'justify-items-stretch' : BUTTON_JUSTIFY_ITEMS_CLASSES[align]
+      }`,
+      item: fill ? 'w-full min-w-0' : 'max-w-full',
+      gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
+    };
+  }
+  if (fill) {
+    return {
+      group: `grid ${gap} content-start items-center justify-items-stretch`,
+      item: 'w-full min-w-0',
+      gridTemplateColumns: 'repeat(auto-fill, minmax(6rem, 1fr))',
+    };
+  }
+  return {
+    group: `flex flex-wrap content-start items-center ${gap} ${BUTTON_JUSTIFY_CLASSES[align]}`,
+    item: 'max-w-full',
+  };
+};
+
+/**
  * Value pills honoring the buttons-variant style block: size, fill (stretch to
  * share the width), fixed column grid, and horizontal/vertical placement of
  * the group inside the tile. Multi-select semantics are unchanged (each pill
@@ -890,17 +937,7 @@ function ButtonsSlicer({
       ? Math.min(Math.trunc(style.buttonColumns), 12)
       : null;
 
-  const gap = BUTTON_GAP_CLASSES[size];
-  const groupClasses =
-    columns !== null
-      ? `grid ${gap} ${fill ? 'justify-items-stretch' : BUTTON_JUSTIFY_ITEMS_CLASSES[align]}`
-      : fill
-        ? // basis-24 (not basis-0) so pills still wrap instead of shrinking to
-          // unreadable slivers; flex-1 then shares the leftover width evenly.
-          `flex flex-wrap content-start ${gap}`
-        : `flex flex-wrap content-start items-center ${gap} ${BUTTON_JUSTIFY_CLASSES[align]}`;
-  const itemClasses =
-    columns !== null ? (fill ? 'w-full' : '') : fill ? 'min-w-0 flex-1 basis-24' : 'max-w-full';
+  const layout = slicerButtonLayout(size, align, fill, columns);
 
   return (
     // min-h-full on the inner column (rather than justify on the scroller)
@@ -908,11 +945,11 @@ function ButtonsSlicer({
     <div className="h-full min-h-0 overflow-y-auto p-0.5">
       <div className={`flex min-h-full flex-col ${BUTTON_VALIGN_CLASSES[verticalAlign]}`}>
         <div
-          className={groupClasses}
+          className={layout.group}
           style={
-            columns === null
-              ? undefined
-              : { gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }
+            layout.gridTemplateColumns !== undefined
+              ? { gridTemplateColumns: layout.gridTemplateColumns }
+              : undefined
           }
         >
           {listed.map((value) => {
@@ -934,9 +971,9 @@ function ButtonsSlicer({
                 // the selected state is an accent FILL with inverted text; a
                 // selected-but-unavailable value keeps the fill at low opacity
                 // behind a dashed border so it still reads as "click to clear".
-                className={`inline-flex items-center justify-center overflow-hidden rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] ${
-                  BUTTON_SIZE_CLASSES[size]
-                } ${itemClasses} ${unavailable ? 'border-dashed italic opacity-50' : ''} ${
+                className={`${slicerPillClasses(size)} focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--rcd-accent-interactive)] ${
+                  layout.item
+                } ${unavailable ? 'border-dashed italic opacity-50' : ''} ${
                   isActive
                     ? 'border-rcd-accent bg-rcd-accent font-medium text-white shadow-[var(--rcd-shadow-1)] hover:opacity-90'
                     : 'border-rcd-border bg-rcd-surface text-rcd-text-2 hover:border-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
@@ -1141,8 +1178,12 @@ function FieldParamSlicer({
     );
   }
 
+  // Same pill geometry as ButtonsSlicer (slicerPillClasses): the field-param
+  // pills used to hard-code their own divergent sizing and ignored
+  // style.buttonSize entirely, so mixed slicer tiles looked mismatched.
+  const size: ButtonSize = spec.style?.buttonSize ?? (compact ? 'sm' : 'md');
   return (
-    <div className="flex flex-wrap content-start items-center gap-1.5 p-0.5">
+    <div className={`flex flex-wrap content-start items-center ${BUTTON_GAP_CLASSES[size]} p-0.5`}>
       {parameter.options.map((option, index) => {
         const isActive = index === selectedIndex;
         return (
@@ -1152,15 +1193,13 @@ function FieldParamSlicer({
             aria-pressed={isActive}
             onClick={() => onPick(index)}
             title={option.label}
-            className={`inline-flex max-w-full items-center truncate rounded-md border transition-colors ${
-              compact ? 'h-6 px-2.5 text-xs' : 'h-8 px-3 text-sm'
-            } ${
+            className={`${slicerPillClasses(size)} max-w-full ${
               isActive
                 ? 'border-rcd-accent bg-rcd-accent font-medium text-white hover:opacity-90'
                 : 'border-rcd-border text-rcd-text-2 hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10'
             }`}
           >
-            <span className="truncate">{option.label}</span>
+            <span className="min-w-0 truncate">{option.label}</span>
           </button>
         );
       })}

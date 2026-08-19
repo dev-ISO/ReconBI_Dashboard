@@ -20,6 +20,7 @@ import {
 import { sanitizeRichHtml, type ContainerStyle, type TextStyle } from '@recon/dashboards-core';
 import { textStyleToCss } from '../chart/textStyle';
 import { ConfirmDialog, RcdIconButton } from '../primitives';
+import { LIST_CLASSES } from '../richtext/richTextClasses';
 
 export interface TileFrameProps {
   title: string;
@@ -67,7 +68,9 @@ const SHADOWS: Record<NonNullable<ContainerStyle['shadow']>, string> = {
  * Element styling for the sanitized inner-title subset (Tailwind preflight
  * strips default margins/list styles). Literal classes so host builds keep
  * them. Exported for DashboardPrintView's PrintTileBox, which renders the
- * same inner title on paper.
+ * same inner title on paper. LIST_CLASSES carries the shared marker defaults
+ * (incl. the Word-like nested ladder) so lists authored in the rich-text
+ * dialog render here exactly as they did in the editor.
  */
 export const INNER_TITLE_CLASSES =
   'shrink-0 pb-1 text-sm leading-snug text-rcd-text [overflow-wrap:anywhere] ' +
@@ -75,7 +78,8 @@ export const INNER_TITLE_CLASSES =
   '[&_h1]:my-0.5 [&_h1]:text-xl [&_h1]:font-semibold ' +
   '[&_h2]:my-0.5 [&_h2]:text-lg [&_h2]:font-semibold ' +
   '[&_h3]:my-0.5 [&_h3]:text-base [&_h3]:font-semibold ' +
-  '[&_ol]:list-decimal [&_ol]:pl-5 [&_p]:my-0 [&_ul]:list-disc [&_ul]:pl-5';
+  '[&_p]:my-0 ' +
+  LIST_CLASSES;
 
 /** Inline overrides for the frame; defaults (classes) stay when fields are absent. */
 const frameStyleOf = (container: ContainerStyle | null | undefined): CSSProperties => ({

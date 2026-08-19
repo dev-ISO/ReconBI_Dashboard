@@ -231,6 +231,37 @@ public class DashboardOpServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task PageRemove_RefusesTheLastPage_SoPagesNeverReachZero()
+    {
+        const string layout = """{"pages":[{"id":"p1","name":"Only","tiles":[]}]}""";
+        var id = await CreateOwnedDashboardAsync(layout);
+
+        var result = await ApplyAsync(id, "page", "p1", """{"kind":"pageRemove"}""");
+
+        // Mirrors the client guard: op_target_missing pushes the sender to
+        // refetch, where the surviving page is the truth.
+        Assert.False(result.Succeeded);
+        Assert.Equal("rcd.dashboard.op_target_missing", result.Error!.Code);
+        using var doc = System.Text.Json.JsonDocument.Parse(StoredLayout(id));
+        Assert.Equal(1, doc.RootElement.GetProperty("pages").GetArrayLength());
+    }
+
+    [Fact]
+    public async Task PageRemove_OfAMissingPage_StaysAnIdempotentNoOp_EvenOnASinglePageDoc()
+    {
+        const string layout = """{"pages":[{"id":"p1","name":"Only","tiles":[]}]}""";
+        var id = await CreateOwnedDashboardAsync(layout);
+
+        // The last-page guard applies only when the TARGET exists — a replayed
+        // remove of an already-gone page keeps its idempotent success.
+        var result = await ApplyAsync(id, "page", "p-gone", """{"kind":"pageRemove"}""");
+
+        Assert.True(result.Succeeded, result.Error?.Message);
+        using var doc = System.Text.Json.JsonDocument.Parse(StoredLayout(id));
+        Assert.Equal(1, doc.RootElement.GetProperty("pages").GetArrayLength());
+    }
+
+    [Fact]
     public async Task PageSet_PatchSemantics_AbsentUntouched_NullClears()
     {
         // Seed with BOTH page scalars present so all three patch states are observable.

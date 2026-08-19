@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { RcdApiError } from '../api/fetcher';
 import type { DashboardsApi } from '../api/DashboardsApi';
 import type { ChartQuerySpec, QueryResult } from '../types/query';
 import { QueryCache } from './queryCache';
@@ -120,6 +121,53 @@ describe('QueryCache TTL reuse', () => {
     expect(runQuery).toHaveBeenCalledTimes(2);
     calls[1]!.resolve(resultFor(2));
     await expect(second).resolves.toEqual(resultFor(2));
+  });
+
+  /* ITEM 6 — field-level issues off a failed run. The builder badges wells
+   * from them and the tile error card shows the first one, so they must
+   * survive the rejection into the cache entry (and only when present). */
+  it('banks RcdApiError.issues on the error entry', async () => {
+    const { api, calls } = apiWithQueue();
+    const cache = new QueryCache(api);
+
+    const run = cache.run(specFor(1));
+    await tick();
+    const issues = [
+      {
+        code: 'rcd.query.unknown_column',
+        severity: 'error',
+        message: "Column 'nope' does not exist on 'public.orders'.",
+        path: 'dimensions[1].column',
+      },
+    ];
+    calls[0]!.reject(
+      new RcdApiError('Query failed.', 400, 'rcd.query.unknown_column', issues),
+    );
+    await expect(run).rejects.toThrow('Query failed.');
+
+    const entry = cache.entryFor(cache.keyFor(specFor(1)));
+    expect(entry).toMatchObject({
+      status: 'error',
+      errorCode: 'rcd.query.unknown_column',
+      issues,
+    });
+  });
+
+  it('leaves issues absent for a plain error and for an empty issue list', async () => {
+    const { api, calls } = apiWithQueue();
+    const cache = new QueryCache(api);
+
+    const plain = cache.run(specFor(1));
+    await tick();
+    calls[0]!.reject(new Error('boom'));
+    await expect(plain).rejects.toThrow('boom');
+    expect(cache.entryFor(cache.keyFor(specFor(1)))?.issues).toBeUndefined();
+
+    const empty = cache.run(specFor(2));
+    await tick();
+    calls[1]!.reject(new RcdApiError('Nope.', 500, 'rcd.query.failed'));
+    await expect(empty).rejects.toThrow('Nope.');
+    expect(cache.entryFor(cache.keyFor(specFor(2)))?.issues).toBeUndefined();
   });
 });
 

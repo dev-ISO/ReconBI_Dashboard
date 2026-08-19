@@ -4,8 +4,8 @@
  * DOMParser-based allowlist walk — no dependencies. The output contains ONLY:
  *   - tags: p, br, b, strong, i, em, u, s, h1, h2, h3, ul, ol, li, span, a
  *   - a: href (http/https only) + forced rel="noopener noreferrer" target="_blank"
- *   - style (span/p/h1-h3 only): color, font-size, text-align, font-weight,
- *     font-style, text-decoration
+ *   - style (span/p/h1-h3/ul/ol/li only): color, font-size, text-align,
+ *     font-weight, font-style, text-decoration, list-style-type
  * Everything else is stripped: every other attribute (including all on* event
  * handlers), script/style/iframe/etc. subtrees entirely, unknown wrappers are
  * unwrapped to their children. Chromium contentEditable block <div>s and legacy
@@ -36,10 +36,22 @@ const ALLOWED_TAGS = new Set([
   'a',
 ]);
 
-/** Tags allowed to carry a (filtered) style attribute. */
-const STYLE_TAGS = new Set(['span', 'p', 'h1', 'h2', 'h3']);
+/**
+ * Tags allowed to carry a (filtered) style attribute. ul/ol/li joined for the
+ * rich-text list galleries (Word-like marker choice = an explicit
+ * list-style-type on the list element).
+ */
+const STYLE_TAGS = new Set(['span', 'p', 'h1', 'h2', 'h3', 'ul', 'ol', 'li']);
 
-/** The only style properties that survive. */
+/**
+ * The only style properties that survive. list-style-type carries the marker
+ * galleries (disc/circle/square/none, decimal/alpha/roman); list-style-image
+ * (and the list-style shorthand) stay OUT deliberately — they can reference
+ * url(), which the value guard below also blocks as a second belt. Margin and
+ * padding stay out too: list indentation is expressed as NESTED lists, never
+ * as spacing styles (Chromium only emits margin spans when styleWithCSS is
+ * left on around list execCommands — the editors flip it off).
+ */
 const ALLOWED_STYLES = [
   'color',
   'font-size',
@@ -47,6 +59,7 @@ const ALLOWED_STYLES = [
   'font-weight',
   'font-style',
   'text-decoration',
+  'list-style-type',
 ] as const;
 
 /**

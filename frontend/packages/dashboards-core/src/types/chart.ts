@@ -132,6 +132,25 @@ export interface TableOptions {
    *   (one clause per dimension column, AND-composed, applied as one action).
    */
   clickFilter?: 'cell' | 'firstColumn' | 'row';
+  /**
+   * Row hierarchy rendering for tables whose query carries extra "Rows"
+   * fields (query.drillLevels). DEFAULT ON while such fields exist
+   * (undefined = on): the extra fields become real wire dimensions and the
+   * table renders expandable parent rows with rolled-up values (matrix).
+   * `false` restores the legacy behavior: the extra fields are drill levels
+   * the tile swaps through and never reach the wire. Non-table charts and
+   * tables without drillLevels ignore it.
+   */
+  matrix?: boolean;
+  /**
+   * How TEMPORAL measure columns roll up — in the grand-total row and in
+   * matrix parent rows — keyed by result column NAME (like columnAlign).
+   * 'earliest' (the DEFAULT) rolls the column up as MIN, 'latest' as MAX:
+   * the only two aggregations that mean anything for dates. Only inline
+   * Min/Max measures over date columns are affected; model measures keep
+   * their own server-side aggregation.
+   */
+  dateAggregation?: Record<string, 'earliest' | 'latest'>;
 }
 
 /**
@@ -607,24 +626,58 @@ export const emptyChart = (id: string): ChartSpec => ({
   format: {},
 });
 
+/**
+ * True when a table chart renders its extra "Rows" fields as a matrix row
+ * hierarchy: type 'table', an axis plus at least one drill level, and
+ * format.table.matrix not explicitly off. Matrix charts emit those levels as
+ * REAL wire dimensions (see toWireSpec) and hide the drill affordances.
+ */
+export const isMatrixChart = (chart: ChartSpec): boolean =>
+  chart.type === 'table' &&
+  chart.query.axis != null &&
+  (chart.query.drillLevels?.length ?? 0) > 0 &&
+  chart.format.table?.matrix !== false;
+
 /** Dashboard slicer + per-chart filters are merged by the caller into extraFilters. */
 export const toWireSpec = (
   chart: ChartSpec,
   modelId: number,
   extraFilters: FilterClause[] = [],
 ): ChartQuerySpec => {
-  // Order matters downstream: [axis, legend?, smallMultiples?].
+  // Order matters downstream. Non-table charts KEEP the
+  // [axis, legend?, smallMultiples?] guarantee — LayoutSnapshotParser and the
+  // email renderer rely on it. Matrix tables (and ONLY matrix tables) splice
+  // the row hierarchy in: [axis, drill1..drillN, legend?].
+  const matrix = isMatrixChart(chart);
   const dimensions: DimensionRef[] = [];
   if (chart.query.axis) dimensions.push(chart.query.axis);
+  if (matrix) dimensions.push(...(chart.query.drillLevels ?? []));
   if (chart.query.legend) dimensions.push(chart.query.legend);
   if (chart.query.smallMultiples) dimensions.push(chart.query.smallMultiples);
+
+  // Matrix prepends one asc sort per hierarchy dimension so parent groups
+  // arrive in stable, contiguous order; the user's sort follows and orders
+  // the LEAVES within their parent (the engine composes one ORDER BY).
+  const userSort = chart.query.sort ?? [];
+  const sort = matrix
+    ? [
+        ...Array.from(
+          { length: 1 + (chart.query.drillLevels?.length ?? 0) },
+          (_, index): SortSpec => ({
+            target: { kind: 'dimension', index },
+            direction: 'asc',
+          }),
+        ),
+        ...userSort,
+      ]
+    : userSort;
 
   return {
     modelId,
     dimensions,
     measures: chart.query.measures,
     filters: [...chart.query.filters, ...extraFilters],
-    sort: chart.query.sort ?? [],
+    sort,
     limit: chart.query.limit ?? null,
   };
 };

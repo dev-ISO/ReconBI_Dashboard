@@ -26,8 +26,9 @@ const H_GAP = 6;
  */
 const ANGLE_MIN_SLOT = 20;
 
-/** Vertical labels need one line height per slot. */
-const VERT_MIN_SLOT = LINE_H + 1;
+/** Vertical labels need one line height per slot (also the horizontal-bar
+ *  row band below which category ticks fall back to the thinned pattern). */
+export const VERT_MIN_SLOT = LINE_H + 1;
 
 const ANGLE_SIN = 0.574; // sin 35°
 
@@ -160,6 +161,84 @@ export function resolveLabelFit(
     mode = 'thin';
   }
   return { mode, height: heightFor(mode), wrapLines, slotWidth };
+}
+
+/* ------------------------------------------------------------------------- *
+ * Horizontal-bar category rail (the <YAxis type="category"> of bar/stackedBar)
+ * ------------------------------------------------------------------------- */
+
+/** Hard ceiling for the horizontal-bar category rail width (px). */
+export const CATEGORY_AXIS_MAX_PX = 224;
+
+/** The rail never shrinks below this (px) — a sliver rail reads as broken. */
+export const CATEGORY_AXIS_MIN_PX = 40;
+
+/** Rail padding the tick text cannot use: tick margin + breathing room. */
+const CATEGORY_AXIS_PAD = 16;
+
+/**
+ * Measured width for the horizontal-bar category rail: the widest label plus
+ * padding, clamped to [CATEGORY_AXIS_MIN_PX, min(CATEGORY_AXIS_MAX_PX, capPx)]
+ * — callers pass capPx as a fraction of the measured plot wrap (40%), so a
+ * narrow tile never loses its plot to labels. Replaces the old hard-coded 110;
+ * the plot-width estimate and the <YAxis width> MUST both read this one value.
+ */
+export function resolveCategoryAxisWidth(labels: readonly string[], capPx: number): number {
+  let maxW = 0;
+  for (const label of labels) {
+    const w = measureTickLabel(label);
+    if (w > maxW) maxW = w;
+  }
+  const cap = Math.max(CATEGORY_AXIS_MIN_PX, Math.min(CATEGORY_AXIS_MAX_PX, capPx));
+  return Math.max(CATEGORY_AXIS_MIN_PX, Math.min(cap, Math.ceil(maxW) + CATEGORY_AXIS_PAD));
+}
+
+/**
+ * Interval for the horizontal category axis: 0 (label EVERY row) while each
+ * row band can carry a text line, else recharts' thinned preserveStartEnd.
+ * Without an explicit interval recharts defaults to 'preserveEnd' and drops
+ * interior ticks on its own heuristic — rows lose their names while plenty of
+ * space remains (the GanttChart documents and defeats the same behavior).
+ */
+export function categoryAxisInterval(
+  plotHeight: number | null,
+  rowCount: number,
+): 0 | 'preserveStartEnd' {
+  if (plotHeight === null || rowCount <= 0) return 'preserveStartEnd';
+  return plotHeight / rowCount >= VERT_MIN_SLOT ? 0 : 'preserveStartEnd';
+}
+
+interface CategoryAxisTickProps {
+  /** Injected by recharts when it clones the tick element. */
+  x?: number;
+  y?: number;
+  payload?: { value?: unknown };
+  /** Text budget (px): the rail width minus the tick margin/padding. */
+  maxPx: number;
+}
+
+/**
+ * Horizontal-bar category tick: ellipsized to the rail, with the FULL label as
+ * a native <title> tooltip when truncated (GanttChart's LaneTick idiom).
+ * recharts-3 GOTCHA: pass as an ELEMENT (`tick={<CategoryAxisTick …/>}`) —
+ * a bare render FUNCTION silently produces empty tick groups.
+ */
+export function CategoryAxisTick({ x = 0, y = 0, payload, maxPx }: CategoryAxisTickProps) {
+  const value = String(payload?.value ?? '');
+  const text = truncateToWidth(value, maxPx);
+  return (
+    <text
+      x={x}
+      y={y}
+      textAnchor="end"
+      dominantBaseline="central"
+      fontSize={11}
+      fill="var(--rcd-muted)"
+    >
+      {text !== value && <title>{value}</title>}
+      {text}
+    </text>
+  );
 }
 
 interface AxisFitTickProps {

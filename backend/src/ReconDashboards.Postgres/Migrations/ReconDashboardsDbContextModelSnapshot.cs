@@ -497,6 +497,9 @@ namespace ReconDashboards.Postgres.Migrations
 
                     NpgsqlPropertyBuilderExtensions.UseIdentityByDefaultColumn(b.Property<int>("Id"));
 
+                    b.Property<string>("ContentJson")
+                        .HasColumnType("jsonb");
+
                     b.Property<DateTime>("CreatedUtc")
                         .HasColumnType("timestamp without time zone");
 

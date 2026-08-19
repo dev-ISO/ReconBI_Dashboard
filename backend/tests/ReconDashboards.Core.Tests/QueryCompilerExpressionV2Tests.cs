@@ -125,7 +125,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
+SELECT ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -138,7 +138,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT CASE WHEN COUNT(*) IS NULL OR COUNT(*) = 0 THEN 0 ELSE (CAST(SUM("t0"."order_total") AS decimal) / COUNT(*)) END AS "meas0"
+SELECT CASE WHEN COUNT(*) IS NULL OR COUNT(*) = 0 THEN 0 ELSE ROUND(CAST(SUM("t0"."order_total") AS decimal) / COUNT(*), 12) END AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -169,7 +169,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(measure), ModelWith(measure));
 
         AssertSql("""
-SELECT ((CAST(POWER(ABS(SUM("t0"."order_total")), 2) AS decimal) / NULLIF(SQRT(COUNT(*)), 0)) + FLOOR(CEILING(EXP(LN(COUNT(*)))))) AS "meas0"
+SELECT (ROUND(CAST(POWER(ABS(SUM("t0"."order_total")), 2) AS decimal) / NULLIF(SQRT(COUNT(*)), 0), 12) + FLOOR(CEILING(EXP(LN(COUNT(*)))))) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -219,7 +219,7 @@ LIMIT @p1
         var compiled = Compile(SpecFor(outer), model);
 
         AssertSql("""
-SELECT ((CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0)) * 100) AS "meas0"
+SELECT (ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0), 12) * 100) AS "meas0"
 FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 LIMIT @p0
@@ -284,7 +284,7 @@ LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 GROUP BY "t1"."region"
 )
 SELECT "dim0",
-       (CAST("meas0" AS decimal) / NULLIF(SUM("meas0") OVER (), 0)) AS "meas0"
+       ROUND(CAST("meas0" AS decimal) / NULLIF(SUM("meas0") OVER (), 0), 12) AS "meas0"
 FROM "__rcd_base"
 ORDER BY "dim0" ASC NULLS LAST
 LIMIT @p0
@@ -302,7 +302,7 @@ WITH "__rcd_base" AS (
 SELECT SUM("t0"."order_total") AS "meas0"
 FROM "public"."orders" AS "t0"
 )
-SELECT (CAST("meas0" AS decimal) / NULLIF(SUM("meas0") OVER (), 0)) AS "meas0"
+SELECT ROUND(CAST("meas0" AS decimal) / NULLIF(SUM("meas0") OVER (), 0), 12) AS "meas0"
 FROM "__rcd_base"
 LIMIT @p0
 """, compiled);
@@ -384,7 +384,7 @@ LIMIT @p0
         // computed over exactly the displayed rows.
         Assert.Contains("\"__rcd_base\"", compiled.Sql, StringComparison.Ordinal);
         Assert.Contains(
-            "(CAST(\"meas1\" AS decimal) / NULLIF(SUM(\"meas1\") OVER (), 0)) AS \"meas1\"",
+            "ROUND(CAST(\"meas1\" AS decimal) / NULLIF(SUM(\"meas1\") OVER (), 0), 12) AS \"meas1\"",
             compiled.Sql, StringComparison.Ordinal);
     }
 

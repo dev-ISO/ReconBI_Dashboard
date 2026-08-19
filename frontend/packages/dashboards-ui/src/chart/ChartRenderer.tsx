@@ -85,7 +85,13 @@ import {
   type ResolvedAxisScale,
   type TrendlineOverlay,
 } from './analytics';
-import { AxisFitTick, resolveLabelFit } from './axisFit';
+import {
+  AxisFitTick,
+  CategoryAxisTick,
+  categoryAxisInterval,
+  resolveCategoryAxisWidth,
+  resolveLabelFit,
+} from './axisFit';
 import { textStyleToCss } from './textStyle';
 import { TableChart, type TableColumnFilter } from './TableChart';
 // Intentional import cycle (module-eval safe: every cross-reference is inside
@@ -283,8 +289,9 @@ export interface ChartRendererProps {
   onTablePageChange?: (page: number) => void;
   /** Total row count over the full filtered result; null = unknown. */
   tableTotalRows?: number | null;
-  /** Full-data totals aligned to the measure columns (bold pinned bottom row). */
-  totalsRow?: (number | null)[] | null;
+  /** Full-data totals aligned to the measure columns (bold pinned bottom row).
+   *  CellValue-wide: date totals arrive as ISO strings and format per column. */
+  totalsRow?: (CellValue | null)[] | null;
   /** Column resize / header drag-to-reorder patches for the tile to persist. */
   onTableLayoutChange?: (patch: { columnWidths?: Record<string, number>; columnOrder?: string[] }) => void;
   /**
@@ -2082,21 +2089,27 @@ function CartesianChart({
   if (y2Scale.logFallback) logNotes.push('Log right axis needs positive values — kept linear');
 
   // ---- category label fit (format.xLabelFit) -------------------------------
-  // Vertical category axes only (the horizontal-bar category axis is the
-  // fixed-width y rail). Until the first container measure lands the axis
-  // keeps the classic thinned pattern, then re-renders fitted; the zoomed
-  // view re-fits for the labels actually shown.
-  const yAxisWidth = horizontal ? 110 : panel ? (panel.showYTicks ? 42 : 8) : 56;
+  // Vertical charts fit their X labels (angled/wrap/…). HORIZONTAL bars fit
+  // the category rail itself: its width is measured from the labels (capped
+  // at 40% of the wrap, 224px hard max — 110 before the first measure lands,
+  // the legacy constant) and its ticks ellipsize with a native tooltip. The
+  // plot-width estimate and the <YAxis width> both read categoryAxisWidth so
+  // the two can never drift apart again.
+  const categoryLabels = displayRows.map((row) => String(row[shaped.axisKey] ?? ''));
+  const categoryAxisWidth = !horizontal
+    ? 0
+    : panel
+      ? panel.showYTicks
+        ? 70
+        : 8
+      : resolveCategoryAxisWidth(categoryLabels, (wrapSize?.width ?? 275) * 0.4);
+  const yAxisWidth = horizontal ? categoryAxisWidth : panel ? (panel.showYTicks ? 42 : 8) : 56;
   const y2AxisWidth = hasSecondary ? (panel ? 8 : 56) : 0;
   const xTicksVisible = !(panel && !panel.showXTicks);
   const plotWidth = wrapSize ? Math.max(0, wrapSize.width - yAxisWidth - y2AxisWidth - 18) : null;
   const labelFit =
     !horizontal && xTicksVisible && plotWidth !== null && plotWidth > 0 && displayRows.length > 0
-      ? resolveLabelFit(
-          displayRows.map((row) => String(row[shaped.axisKey] ?? '')),
-          plotWidth / displayRows.length,
-          format.xLabelFit,
-        )
+      ? resolveLabelFit(categoryLabels, plotWidth / displayRows.length, format.xLabelFit)
       : null;
   const fittedTicks = labelFit !== null && labelFit.mode !== 'thin';
 
@@ -2615,8 +2628,21 @@ function CartesianChart({
           <YAxis
             type="category"
             dataKey={shaped.axisKey}
-            width={panel ? (panel.showYTicks ? 70 : 8) : 110}
-            tick={panel && !panel.showYTicks ? false : axisTickStyle}
+            width={categoryAxisWidth}
+            // Single charts get the measured rail + ellipsized-with-tooltip
+            // ticks (ELEMENT, never a function — recharts 3 renders empty
+            // groups otherwise); panels keep the plain compact style.
+            tick={
+              panel
+                ? panel.showYTicks
+                  ? axisTickStyle
+                  : false
+                : <CategoryAxisTick maxPx={Math.max(24, categoryAxisWidth - 16)} />
+            }
+            // recharts defaults a category axis to 'preserveEnd' and drops
+            // interior row labels on its own heuristic; label every row while
+            // each row band can carry a text line (Gantt's laneTicks guard).
+            interval={categoryAxisInterval(wrapSize?.height ?? null, displayRows.length)}
             tickLine={false}
             axisLine={false}
             tickMargin={panel ? 3 : TICK_MARGIN}

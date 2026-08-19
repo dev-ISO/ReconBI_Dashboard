@@ -58,6 +58,8 @@ import {
   type FilterIndicatorStyle,
   type PageDrillthrough,
   type PageMobileLayout,
+  type ButtonGroupButton,
+  type ButtonGroupTileSpec,
   type ButtonTileSpec,
   type ImageTileSpec,
   type SlicerTileSpec,
@@ -77,6 +79,7 @@ import type {
 import type { ColumnType } from '../types/schema';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
+import { sanitizeButtonCss } from '../util/buttonStyle';
 import { boldRunText, retitleInnerTitleHtml, sanitizeRichHtml } from '../util/richText';
 import type { AsyncStatus } from './modelStore';
 
@@ -269,6 +272,35 @@ export interface DashboardStoreState {
    * heartbeat runs, and a successful acquire clears any echo that raced in).
    */
   tileLocks: Record<string, RemoteTileLock>;
+  /**
+   * LIVE-VISIBILITY quiesce: true while ANY quiesce source is active — the
+   * user's "Pause live updates" toggle, an open print preview, an open print
+   * config dialog (its live thumbnail renders store state), or an image-export
+   * rasterization in flight. Gates ALL FOUR inbound ephemeral channels
+   * (applyEditorsChanged / applyRemoteCursor / applyTileLock /
+   * applyRemoteSlicerValue) AND applyRemoteOp AND our own outbound cursor
+   * sends. Gated events are DROPPED, never queued — on the resume edge the
+   * store resyncFromServer instead (never trust what was missed).
+   */
+  collabQuiesced: boolean;
+  /** The user-held quiesce source ("Pause live updates") — session-only,
+   * default off; the Live menu's checkbox state. */
+  collabPaused: boolean;
+  /**
+   * "Show live cursors" (Live menu). ONE toggle governs BOTH directions: off
+   * hides the overlay (the view gates rendering on it), drops inbound frames,
+   * and no-ops sendCursorThrottled. Persisted per user in localStorage
+   * (rcd.collab.showCursors); default on.
+   */
+  collabShowCursors: boolean;
+  /**
+   * The local doc may no longer match server truth: a remote change was
+   * dropped un-applied (a held op superseded by our commit, wiped by session
+   * exit, malformed, or inapplicable to this doc). Repaired by
+   * resyncFromServer at the next quiet point (empty op buffer, no drain in
+   * flight); the toolbar renders it as the "Syncing…" chip meanwhile.
+   */
+  collabDiverged: boolean;
   saveStatus: AsyncStatus;
   error: string | null;
   /**
@@ -633,9 +665,33 @@ const initialState: DashboardStoreState = {
   collabEditors: [],
   remoteCursors: {},
   tileLocks: {},
+  collabQuiesced: false,
+  collabPaused: false,
+  collabShowCursors: true,
+  collabDiverged: false,
   saveStatus: 'idle',
   error: null,
   chartClipboard: null,
+};
+
+/** localStorage key of the per-user "Show live cursors" preference. */
+const SHOW_CURSORS_STORAGE_KEY = 'rcd.collab.showCursors';
+
+/** Persisted cursor preference; default ON (missing key, no storage, SSR). */
+const readShowCursorsPreference = (): boolean => {
+  try {
+    return globalThis.localStorage?.getItem(SHOW_CURSORS_STORAGE_KEY) !== '0';
+  } catch {
+    return true; // storage blocked (private mode) — behave like default
+  }
+};
+
+const writeShowCursorsPreference = (show: boolean): void => {
+  try {
+    globalThis.localStorage?.setItem(SHOW_CURSORS_STORAGE_KEY, show ? '1' : '0');
+  } catch {
+    // storage blocked — the toggle still works for this session
+  }
 };
 
 /** One undo/redo step: the whole document + which page was active. */
@@ -657,10 +713,17 @@ const SENT_OP_CAP = 500;
 
 /**
  * Soft tile-lock heartbeat cadence. Locks are a GridPresenceTracker clone —
- * a server-side TTL claim the holder refreshes by re-acquiring; 20s keeps a
- * lock alive under any plausible TTL (~60s) while staying negligible traffic.
+ * a server-side TTL claim the holder refreshes by re-acquiring. The server
+ * TTL is 30s, so 10s gives a 3× margin: two whole heartbeats can be lost to
+ * a network blip before the lock lapses (20s left exactly one, and a single
+ * dropped POST let a held lock expire under an open chart builder).
  */
-const TILE_LOCK_HEARTBEAT_MS = 20_000;
+const TILE_LOCK_HEARTBEAT_MS = 10_000;
+
+/** Bound on the best-effort op-buffer drain that runs before an open()
+ * dashboard switch / close() clears the session — navigation must not wedge
+ * behind a dead network; whatever misses the window is lost with the session. */
+const FLUSH_ON_EXIT_TIMEOUT_MS = 2_000;
 
 /**
  * Remote-cursor lifetime after its LAST frame (wave 2). Cursors have no
@@ -728,12 +791,26 @@ export class DashboardStore {
   private flushChain: Promise<void> = Promise.resolve();
   /** Ids of ops THIS client sent — the broadcast echo is dropped by them. */
   private sentOpIds = new Set<string>();
-  /** True while remote application is suspended (print preview mounted). */
-  private remoteSuspended = false;
-  /** Ops received while suspended, applied in order on resume. */
-  private suspendedRemoteOps: DashboardOpEvent[] = [];
+  /** Active quiesce sources (pause toggle / print preview / print config /
+   * image export). state.collabQuiesced is `size > 0`; the resume edge is the
+   * last source clearing. */
+  private quiesceSources = new Set<string>();
+  /** Drains currently inside drainPending — with pendingOps.size, the L7
+   * "quiet point" predicate (and the beforeunload prompt's). */
+  private drainsInFlight = 0;
+  /** True while a pagehide flush runs — sendOp rides fetch keepalive. */
+  private flushKeepalive = false;
   /** Heartbeat timers of soft tile locks THIS client holds, keyed by tile id. */
   private tileLockHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
+  /** In-flight lock acquires, keyed by tile id. releaseTileLock during the
+   * flight marks `cancelled`; the resolving acquire then sends the wire
+   * DELETE and never installs the heartbeat — a short drag / instant blur can
+   * no longer leave a 30s orphan lock on the server. */
+  private pendingLockAcquires = new Map<string, { cancelled: boolean }>();
+  /** OUR opaque holder id, learned from the first successful lock acquire —
+   * lets applyTileLock tell our own acquire echo from a STEAL of a tile we
+   * still heartbeat (the store never learns the host user id any other way). */
+  private ownLockHolderId: string | null = null;
 
   /* ---- wave-2 ephemera plumbing (same non-reactive doctrine as above). */
 
@@ -753,7 +830,11 @@ export class DashboardStore {
      * absent members disable the corresponding channel. */
     private readonly collab: DashboardCollabSenders = {},
   ) {
-    this.store = createStore<DashboardStoreState>(() => ({ ...initialState }));
+    this.store = createStore<DashboardStoreState>(() => ({
+      ...initialState,
+      // The cursor toggle is a per-user preference, not session state.
+      collabShowCursors: readShowCursorsPreference(),
+    }));
   }
 
   private set(patch: Partial<DashboardStoreState>): void {
@@ -1162,72 +1243,128 @@ export class DashboardStore {
   }
 
   private async drainPending(): Promise<void> {
-    while (this.pendingOps.size > 0) {
-      const current = this.state.current;
-      if (!current || !this.state.liveMode) {
-        // Session ended / degraded mid-drain — the doc still carries every
-        // change (draft semantics take over); the buffer is moot.
-        this.pendingOps.clear();
-        return;
-      }
-      const first = this.pendingOps.entries().next().value as [string, PendingOp];
-      const [key, pending] = first;
-      // Take BEFORE the await: an edit landing on this element mid-send
-      // becomes a fresh pending entry and goes out on the next iteration
-      // instead of being silently dropped by a post-send delete.
-      this.pendingOps.delete(key);
-      const op = pending.op;
-      const body: SendDashboardOpBody = {
-        opId: newId(),
-        targetKind: op.targetKind,
-        targetId: op.targetId,
-        payload: op.payload,
-        baseUpdatedAtUtc: current.expectedUpdatedAtUtc,
-      };
-      // Remember BEFORE the await: the SignalR echo can beat the HTTP response.
-      this.rememberSentOp(body.opId);
-      try {
-        const result = await this.sendOpWithRetry(current.id, body);
-        const live = this.state.current;
-        if (live && live.id === current.id) {
-          // Our commit is the element's newest server state — any held remote
-          // op for it is superseded (the collaborator's earlier write lost the
-          // per-element race; theirs would arrive again only via a newer op).
-          const conflictKey = opConflictKey(op.targetKind, op.targetId, op.payload);
-          const { [conflictKey]: _superseded, ...held } = this.state.heldRemoteOps;
-          const stamp = opResultStampOf(result) ?? live.expectedUpdatedAtUtc;
-          this.set({
-            current: { ...live, expectedUpdatedAtUtc: stamp },
-            ...(conflictKey in this.state.heldRemoteOps ? { heldRemoteOps: held } : {}),
-          });
-        }
-      } catch (error) {
-        // op_target_missing (409): the op's required target vanished under a
-        // collaborator's concurrent structure change. Per the server contract
-        // this is the resync cue, NOT a delivery failure — drop the op (its
-        // element no longer exists), refetch, and stop this drain: whatever
-        // is still buffered flushes against the fresh baseline afterwards
-        // (resyncFromServer re-arms the flush timer). The session stays live.
-        if (error instanceof RcdApiError && error.errorCode === OP_TARGET_MISSING_ERROR) {
-          void this.resyncFromServer();
-          if (
-            this.pendingOps.size === 0 &&
-            this.state.liveMode &&
-            this.state.mode === 'edit' &&
-            this.state.dirty
-          ) {
-            this.set({ dirty: false });
-          }
+    this.drainsInFlight += 1;
+    try {
+      while (this.pendingOps.size > 0) {
+        const current = this.state.current;
+        if (!current || !this.state.liveMode) {
+          // Session ended / degraded mid-drain — the doc still carries every
+          // change (draft semantics take over); the buffer is moot.
+          this.pendingOps.clear();
           return;
         }
-        this.degradeToDraft(error);
-        return;
+        const first = this.pendingOps.entries().next().value as [string, PendingOp];
+        const [key, pending] = first;
+        // Take BEFORE the await: an edit landing on this element mid-send
+        // becomes a fresh pending entry and goes out on the next iteration
+        // instead of being silently dropped by a post-send delete.
+        this.pendingOps.delete(key);
+        const op = pending.op;
+        const body: SendDashboardOpBody = {
+          opId: newId(),
+          targetKind: op.targetKind,
+          targetId: op.targetId,
+          payload: op.payload,
+          baseUpdatedAtUtc: current.expectedUpdatedAtUtc,
+        };
+        // Remember BEFORE the await: the SignalR echo can beat the HTTP response.
+        this.rememberSentOp(body.opId);
+        try {
+          const result = await this.sendOpWithRetry(current.id, body);
+          const live = this.state.current;
+          if (live && live.id === current.id) {
+            // Our commit is the element's newest server state — any held remote
+            // op for it is superseded (the collaborator's earlier write lost the
+            // per-element race; theirs would arrive again only via a newer op).
+            // A superseded hold is a DROPPED remote change: mark diverged so the
+            // quiet-point resync re-fetches server truth instead of trusting
+            // that nothing else rode on it.
+            const conflictKey = opConflictKey(op.targetKind, op.targetId, op.payload);
+            const superseded = conflictKey in this.state.heldRemoteOps;
+            const { [conflictKey]: _superseded, ...held } = this.state.heldRemoteOps;
+            const stamp = opResultStampOf(result) ?? live.expectedUpdatedAtUtc;
+            this.set({
+              current: { ...live, expectedUpdatedAtUtc: stamp },
+              ...(superseded ? { heldRemoteOps: held, collabDiverged: true } : {}),
+            });
+          }
+        } catch (error) {
+          // op_target_missing (409): the op's required target vanished under a
+          // collaborator's concurrent structure change. Per the server contract
+          // this is the resync cue, NOT a delivery failure — drop the op (its
+          // element no longer exists), refetch, and stop this drain: whatever
+          // is still buffered flushes against the fresh baseline afterwards
+          // (resyncFromServer re-arms the flush timer). The session stays live.
+          if (error instanceof RcdApiError && error.errorCode === OP_TARGET_MISSING_ERROR) {
+            void this.resyncFromServer();
+            if (
+              this.pendingOps.size === 0 &&
+              this.state.liveMode &&
+              this.state.mode === 'edit' &&
+              this.state.dirty
+            ) {
+              this.set({ dirty: false });
+            }
+            return;
+          }
+          // Any other deterministic 4xx (tile_locked, permission_denied,
+          // op_invalid, layout_size…) is a PER-OP verdict, never a session
+          // failure: drop the op, tell the user, and mark diverged — the
+          // quiet-point resync reverts the optimistic local apply to server
+          // truth. The drain continues; the session STAYS LIVE.
+          if (isOpScopedRejection(error)) {
+            this.raiseOpBlockedNotice(op, error);
+            this.set({ collabDiverged: true });
+            continue;
+          }
+          // Transport / 5xx after the retry: the documented degrade doctrine.
+          this.degradeToDraft(error);
+          return;
+        }
       }
+      // Buffer drained: nothing un-persisted remains.
+      if (this.state.liveMode && this.state.mode === 'edit' && this.state.dirty) {
+        this.set({ dirty: false });
+      }
+    } finally {
+      this.drainsInFlight -= 1;
+      this.maybeResyncDiverged();
     }
-    // Buffer drained: nothing un-persisted remains.
-    if (this.state.liveMode && this.state.mode === 'edit' && this.state.dirty) {
-      this.set({ dirty: false });
+  }
+
+  /**
+   * Toolbar toast for a per-op rejection (see drainPending). tile_locked names
+   * the holder when the wave-2 lock chip already told us who it is.
+   */
+  private raiseOpBlockedNotice(op: DashboardLocalOp, error: RcdApiError): void {
+    if (error.errorCode === TILE_LOCKED_ERROR) {
+      const holder = op.targetId === null ? undefined : this.state.tileLocks[op.targetId]?.holderName;
+      this.set({
+        lockNotice:
+          holder !== undefined
+            ? `Your change was blocked — this tile is being edited by ${holder}.`
+            : 'Your change was blocked — this tile is being edited by someone else.',
+      });
+      return;
     }
+    this.set({ lockNotice: `Your change was blocked — ${messageOf(error)}` });
+  }
+
+  /**
+   * L7 quiet point: once no local op is buffered or in flight, a diverged doc
+   * re-fetches server truth and the flag clears. Runs after every drain and on
+   * the quiesce resume edge; deferred while quiesced (the resume edge resyncs
+   * anyway). resyncFromServer refuses a dirty post-degrade DRAFT — the flag
+   * still clears then: the degrade banner and the save-time 409 own conflict
+   * surfacing in that world, and a stuck "Syncing…" chip would lie.
+   */
+  private maybeResyncDiverged(): void {
+    if (!this.state.collabDiverged) return;
+    if (this.state.collabQuiesced) return;
+    if (this.pendingOps.size > 0 || this.drainsInFlight > 0) return;
+    void this.resyncFromServer().finally(() => {
+      if (this.state.collabDiverged) this.set({ collabDiverged: false });
+    });
   }
 
   /**
@@ -1237,17 +1374,12 @@ export class DashboardStore {
    * layout_size…) never retry — a deterministic answer cannot change.
    */
   private async sendOpWithRetry(dashboardId: number, body: SendDashboardOpBody) {
+    const options = this.flushKeepalive ? { keepalive: true } : undefined;
     try {
-      return await this.api.sendOp(dashboardId, body);
+      return await this.api.sendOp(dashboardId, body, options);
     } catch (error) {
-      const deterministic =
-        error instanceof RcdApiError &&
-        error.status >= 400 &&
-        error.status < 500 &&
-        error.status !== 408 &&
-        error.status !== 429;
-      if (deterministic) throw error;
-      return await this.api.sendOp(dashboardId, body);
+      if (isOpScopedRejection(error)) throw error;
+      return await this.api.sendOp(dashboardId, body, options);
     }
   }
 
@@ -1260,14 +1392,19 @@ export class DashboardStore {
   }
 
   /**
-   * Op delivery failed twice → the session DEGRADES TO DRAFT SEMANTICS
-   * (documented failure doctrine): emission stops (liveMode false gates it),
-   * saveStatus surfaces the error, dirty stays true, and Save/Discard return
-   * to the toolbar. Every change is still in the local doc, so Save PUTs the
-   * whole doc over the last known baseline — a concurrent editor's newer op
-   * still 409s that PUT honestly (rcd.dashboard.stale). Ops committed BEFORE
-   * the failure are already persisted; the baseline reflects them. The live
-   * inverse-op history cannot drive snapshot undo, so history clears.
+   * TRANSPORT/5xx delivery failed twice → the session DEGRADES TO DRAFT
+   * SEMANTICS (documented failure doctrine; deterministic 4xx never lands
+   * here — drainPending handles those per-op): emission stops (liveMode false
+   * gates it), saveStatus surfaces the error, dirty stays true, and
+   * Save/Discard return to the toolbar. Every change is still in the local
+   * doc, so Save PUTs the whole doc over the last known baseline — a
+   * concurrent editor's newer op still 409s that PUT honestly
+   * (rcd.dashboard.stale). Ops committed BEFORE the failure are already
+   * persisted; the baseline reflects them. The live inverse-op history cannot
+   * drive snapshot undo, so history clears. Wiped holds count as dropped
+   * remote changes (collabDiverged) — the quiet-point resync is refused while
+   * the draft is dirty, which clears the flag and leaves conflict surfacing
+   * to this banner + the save-time 409.
    */
   private degradeToDraft(error: unknown): void {
     this.pendingOps.clear();
@@ -1284,6 +1421,7 @@ export class DashboardStore {
       dirty: true,
       saveStatus: 'error',
       error: `Live sync failed — working offline from here. Save to retry. (${messageOf(error)})`,
+      ...(Object.keys(this.state.heldRemoteOps).length > 0 ? { collabDiverged: true } : {}),
       heldRemoteOps: {},
       canUndo: false,
       canRedo: false,
@@ -1329,21 +1467,24 @@ export class DashboardStore {
    * (tracker applyRealtimeSystemInput): an op targeting an element with local
    * uncommitted changes is HELD — the concurrency baseline advances, the local
    * element stays untouched, and the hold is surfaced in heldRemoteOps for the
-   * UI to badge. Application is suspended while a print preview is mounted
-   * (setRemoteOpsSuspended mirrors the auto-refresh printOptions guard);
-   * suspended ops queue and apply in order on resume.
+   * UI to badge.
+   *
+   * Gates, in order: while QUIESCED (pause toggle / print / export) events are
+   * DROPPED, never queued — the resume edge resyncFromServer instead, so a
+   * long pause can never replay a stale backlog over fresh truth. And ops
+   * apply only in VIEW mode or a LIVE edit session: a degraded (or solo
+   * draft) edit session left the realtime group and its doc is a draft — a
+   * late frame must not silently mutate what Save will PUT.
    */
   applyRemoteOp(event: DashboardOpEvent): void {
     const current = this.state.current;
     if (!current || current.id !== event.dashboardId) return;
+    if (this.state.collabQuiesced) return;
+    if (this.state.mode !== 'view' && !this.state.liveMode) return;
     if (this.sentOpIds.has(event.opId)) {
       // Our own echo: the POST response already applied it; only the baseline
       // may be newer (another op serialized between response and broadcast).
       this.advanceBaseline(event.resultUpdatedAtUtc);
-      return;
-    }
-    if (this.remoteSuspended) {
-      this.suspendedRemoteOps.push(event);
       return;
     }
     // Parse BEFORE the hold check: the conflict key of a doc-level op depends
@@ -1353,9 +1494,12 @@ export class DashboardStore {
     try {
       payload = JSON.parse(event.payloadJson) as DashboardOpPayload;
     } catch {
-      // Malformed frame — never guess; the baseline still advances and a
-      // resync repairs any real divergence.
+      // Malformed frame — never guess; the baseline still advances, and the
+      // dropped change marks the doc diverged so the quiet-point resync
+      // repairs it (the frame's content is lost for good).
       this.advanceBaseline(event.resultUpdatedAtUtc);
+      this.set({ collabDiverged: true });
+      this.maybeResyncDiverged();
       return;
     }
     const conflictKey = opConflictKey(event.targetKind, event.targetId, payload);
@@ -1382,7 +1526,12 @@ export class DashboardStore {
     this.purgeLocalHistoryFor(conflictKey);
     const next = applyOpToDoc(current.layout, event.targetId, payload);
     if (next === null) {
+      // Inapplicable to THIS doc (unknown target / newer-peer kind): the
+      // change is dropped locally, so the doc is provisionally diverged from
+      // the server truth that DID apply it — quiet-point resync repairs.
       this.advanceBaseline(event.resultUpdatedAtUtc);
+      this.set({ collabDiverged: true });
+      this.maybeResyncDiverged();
       return;
     }
     this.set({
@@ -1446,23 +1595,84 @@ export class DashboardStore {
       const payload = JSON.parse(held.payloadJson) as DashboardOpPayload;
       this.applyRemotePayload(held, payload, conflictKey);
     } catch {
-      // Malformed payload — the hold is dropped; resync repairs.
+      // Malformed payload — the hold is dropped un-applied; quiet-point
+      // resync repairs (see collabDiverged).
+      this.set({ collabDiverged: true });
+      this.maybeResyncDiverged();
     }
   }
 
+  /* --------------------------------------------------- live-visibility L1/L2 */
+
   /**
-   * Suspends/resumes inbound op application. The VIEW calls this while its
-   * print preview is mounted (printOptions !== null) — the same guard the
-   * auto-refresh path applies — so tiles never re-render mid-print. Suspended
-   * ops queue and apply in arrival order on resume.
+   * Adds/removes one named QUIESCE source (see state.collabQuiesced): the
+   * user's pause toggle ('pause'), the print preview, the print config
+   * dialog's live thumbnail, an image-export rasterization. The flag is the
+   * OR of all sources; on the resume edge (last source cleared) during a live
+   * session or view membership the store ALWAYS resyncFromServer — gated
+   * events were dropped, never queued, so refetch is the only honest recovery.
    */
-  setRemoteOpsSuspended(suspended: boolean): void {
-    if (this.remoteSuspended === suspended) return;
-    this.remoteSuspended = suspended;
-    if (suspended) return;
-    const queued = this.suspendedRemoteOps;
-    this.suspendedRemoteOps = [];
-    for (const event of queued) this.applyRemoteOp(event);
+  setCollabQuiesce(source: string, quiesced: boolean): void {
+    const before = this.quiesceSources.size > 0;
+    if (quiesced) this.quiesceSources.add(source);
+    else this.quiesceSources.delete(source);
+    const after = this.quiesceSources.size > 0;
+    if (before === after) return;
+    this.set({ collabQuiesced: after });
+    if (after) return;
+    const current = this.state.current;
+    const member =
+      current !== null &&
+      isCollabLiveDashboard(current) &&
+      (this.state.liveMode || this.state.mode === 'view');
+    if (member) {
+      void this.resyncFromServer().finally(() => {
+        // The refetch IS the divergence repair — don't chase it with another.
+        if (this.state.collabDiverged) this.set({ collabDiverged: false });
+      });
+      return;
+    }
+    this.maybeResyncDiverged();
+  }
+
+  /** "Pause live updates" (Live menu) — the user-held quiesce source.
+   * Session-only; unpausing resyncs via the shared resume edge. */
+  setLiveUpdatesPaused(paused: boolean): void {
+    if (this.state.collabPaused === paused) return;
+    this.set({ collabPaused: paused });
+    this.setCollabQuiesce('pause', paused);
+  }
+
+  /**
+   * "Show live cursors" (Live menu) — one toggle for BOTH directions: off
+   * stops our outbound frames (sendCursorThrottled no-ops), drops inbound
+   * ones, and clears what is already rendered; the view hides the overlay on
+   * the same flag. Persisted per user (localStorage).
+   */
+  setShowLiveCursors(show: boolean): void {
+    if (this.state.collabShowCursors === show) return;
+    this.set({ collabShowCursors: show, ...(show ? {} : { remoteCursors: {} }) });
+    if (!show) this.cancelCursorSend();
+    writeShowCursorsPreference(show);
+  }
+
+  /** True while authored ops are still unsent/in flight — the view's
+   * beforeunload prompt reads this synchronously. */
+  hasUnsentOps(): boolean {
+    return this.pendingOps.size > 0 || this.drainsInFlight > 0;
+  }
+
+  /**
+   * Public drain of the pending op buffer (the view wires `pagehide` here).
+   * With `keepalive` the sends ride fetch's keepalive so they can outlive the
+   * page — best effort by nature (host fetchers may ignore the flag).
+   */
+  flushPendingOps(options?: { keepalive?: boolean }): Promise<void> {
+    if (options?.keepalive !== true) return this.flushOps();
+    this.flushKeepalive = true;
+    return this.flushOps().finally(() => {
+      this.flushKeepalive = false;
+    });
   }
 
   /* ------------------------------------------------------ soft tile locks */
@@ -1478,9 +1688,17 @@ export class DashboardStore {
   async acquireTileLock(tileId: string): Promise<{ ok: boolean; message?: string }> {
     const current = this.state.current;
     if (!current || !this.state.liveMode) return { ok: true };
+    // Track the flight: releaseTileLock landing BEFORE this resolves (a short
+    // drag, an instant editor blur) marks it cancelled — then the resolved
+    // claim is released on the wire immediately and no heartbeat ever starts,
+    // instead of the tile staying server-locked for the full TTL.
+    const flight = { cancelled: false };
+    this.pendingLockAcquires.set(tileId, flight);
+    let claim: Awaited<ReturnType<DashboardsApi['acquireTileLock']>> | undefined;
     try {
-      await this.api.acquireTileLock(current.id, tileId);
+      claim = await this.api.acquireTileLock(current.id, tileId);
     } catch (error) {
+      if (this.pendingLockAcquires.get(tileId) === flight) this.pendingLockAcquires.delete(tileId);
       const locked =
         error instanceof RcdApiError &&
         (error.errorCode === TILE_LOCKED_ERROR || error.status === 409);
@@ -1488,6 +1706,14 @@ export class DashboardStore {
       const message = 'This tile is being edited by someone else right now.';
       this.set({ lockNotice: message });
       return { ok: false, message };
+    }
+    if (this.pendingLockAcquires.get(tileId) === flight) this.pendingLockAcquires.delete(tileId);
+    // Our opaque holder id (host user id as the library stores it) — the only
+    // way applyTileLock can tell our own echo from a steal of our tile.
+    if (claim?.holderUserId != null) this.ownLockHolderId = String(claim.holderUserId);
+    if (flight.cancelled) {
+      void this.api.releaseTileLock(current.id, tileId).catch(() => undefined);
+      return { ok: true };
     }
     this.startLockHeartbeat(current.id, tileId);
     // Wave-2 echo race: the broadcast of OUR acquire can beat this HTTP
@@ -1508,6 +1734,11 @@ export class DashboardStore {
    * it applies NOW — the collaborator's edit was only deferred, never lost.
    */
   releaseTileLock(tileId: string): void {
+    // Acquire still in flight: cancel it — the resolving acquire sends the
+    // wire DELETE itself (racing a DELETE past the un-committed POST could
+    // release nothing and then leave the late claim orphaned).
+    const flight = this.pendingLockAcquires.get(tileId);
+    if (flight !== undefined) flight.cancelled = true;
     const timer = this.tileLockHeartbeats.get(tileId);
     if (timer !== undefined) {
       clearInterval(timer);
@@ -1574,6 +1805,7 @@ export class DashboardStore {
   applyEditorsChanged(event: DashboardEditorsChangedEvent): void {
     const current = this.state.current;
     if (!current || current.id !== event.dashboardId) return;
+    if (this.state.collabQuiesced) return; // dropped — rosters are full-set, the next frame heals
     const editors: DashboardCollabEditor[] = [];
     const seen = new Set<number>();
     for (const editor of event.editors ?? []) {
@@ -1599,6 +1831,9 @@ export class DashboardStore {
   applyRemoteCursor(event: DashboardRemoteCursorEvent): void {
     const current = this.state.current;
     if (!current || current.id !== event.dashboardId) return;
+    // Quiesced OR cursors toggled off: frames drop (the overlay is hidden
+    // either way, and the ~10 Hz stream would churn state for nothing).
+    if (this.state.collabQuiesced || !this.state.collabShowCursors) return;
     if (
       typeof event.userId !== 'number' ||
       typeof event.pageId !== 'string' ||
@@ -1622,16 +1857,19 @@ export class DashboardStore {
 
   /**
    * A soft tile lock changed hands (fresh acquire / steal / release — never
-   * heartbeats; see the state field's doc for the aging consequence). Locks
-   * THIS client holds are dropped here: while our heartbeat runs, any lock
-   * event for that tile is the echo of our own acquire (or of a steal our
-   * heartbeat-failure path already surfaces via lockNotice) — storing it
-   * would badge the user's own tile "Editing: you". No tile-existence check
-   * on purpose: a lock can precede its tile's first op (chart builder).
+   * heartbeats; see the state field's doc for the aging consequence). While
+   * our heartbeat runs on the event's tile, an event carrying OUR holder id
+   * is the echo of our own acquire — dropped, or the user's own tile would
+   * badge "Editing: you". An event carrying ANOTHER user's id there is a
+   * STEAL (our TTL lapsed and they claimed it): stop claiming immediately —
+   * heartbeat + notice, then render the thief's chip — instead of waiting up
+   * to a heartbeat interval for our next 409. No tile-existence check on
+   * purpose: a lock can precede its tile's first op (chart builder).
    */
   applyTileLock(event: DashboardTileLockEvent): void {
     const current = this.state.current;
     if (!current || current.id !== event.dashboardId) return;
+    if (this.state.collabQuiesced) return;
     if (typeof event.tileId !== 'string' || event.tileId === '') return;
     if (event.released) {
       if (!(event.tileId in this.state.tileLocks)) return;
@@ -1639,7 +1877,16 @@ export class DashboardStore {
       this.set({ tileLocks: rest });
       return;
     }
-    if (this.tileLockHeartbeats.has(event.tileId)) return; // own claim's echo
+    if (this.tileLockHeartbeats.has(event.tileId)) {
+      const stolen =
+        this.ownLockHolderId !== null && String(event.holderUserId) !== this.ownLockHolderId;
+      if (!stolen) return; // own claim's echo (or an unidentifiable one — assume echo)
+      const timer = this.tileLockHeartbeats.get(event.tileId)!;
+      clearInterval(timer);
+      this.tileLockHeartbeats.delete(event.tileId);
+      this.set({ lockNotice: 'Your lock on a tile expired — someone else is editing it now.' });
+      // fall through: the thief's chip renders like any foreign lock
+    }
     this.set({
       tileLocks: {
         ...this.state.tileLocks,
@@ -1666,6 +1913,9 @@ export class DashboardStore {
   applyRemoteSlicerValue(event: DashboardRemoteSlicerValueEvent): void {
     const current = this.state.current;
     if (!current || current.id !== event.dashboardId) return;
+    // Dropped while quiesced (a shared pick is ephemeral session state — the
+    // next pick heals; the resume resync repairs the doc, not this channel).
+    if (this.state.collabQuiesced) return;
     const tile = pagesOf(current.layout)
       .flatMap((page) => page.tiles)
       .find((t) => t.id === event.tileId);
@@ -1701,6 +1951,9 @@ export class DashboardStore {
     const send = this.collab.onSendCursor;
     const current = this.state.current;
     if (!send || !current || !isCollabLiveDashboard(current)) return;
+    // ONE toggle, both directions: cursors off means we neither render others'
+    // nor broadcast our own; quiesced sessions go silent outbound too.
+    if (!this.state.collabShowCursors || this.state.collabQuiesced) return;
     if (!Number.isFinite(xFrac) || !Number.isFinite(yFrac)) return;
     const cursor = { pageId, xFrac: clamp01(xFrac), yFrac: clamp01(yFrac) };
     if (this.cursorSendTimer !== null) {
@@ -1933,6 +2186,11 @@ export class DashboardStore {
   }
 
   async open(id: number): Promise<void> {
+    // C3: a live session's authored-but-unsent ops must not die with a
+    // dashboard switch — drain them (bounded) BEFORE the reset clears them.
+    if (this.state.liveMode && this.state.mode === 'edit' && this.pendingOps.size > 0) {
+      await this.flushBounded();
+    }
     const detail = await this.api.getDashboard(id);
     const current = toOpen(detail);
     this.clearHistory();
@@ -1963,22 +2221,44 @@ export class DashboardStore {
       collabEditors: [],
       remoteCursors: {},
       tileLocks: {},
+      // Pause is session-only (dropped as a quiesce source in reset above);
+      // other sources (print/export overlays) clear via their own unmounts.
+      collabPaused: false,
+      collabQuiesced: this.quiesceSources.size > 0,
+      collabDiverged: false,
       saveStatus: 'idle',
       error: null,
     });
   }
 
-  /** Drops every non-reactive collab artifact of the previous session. */
+  /**
+   * Drops every non-reactive collab artifact of the previous session. Lock
+   * heartbeats RELEASE ON THE WIRE here (C13a): an open()-switch or session
+   * reset that merely stopped the timers left collaborators blocked behind a
+   * dying claim for the full 30s TTL.
+   */
   private resetCollabSession(): void {
-    this.stopAllLockHeartbeats(false);
+    this.stopAllLockHeartbeats(true);
+    for (const flight of this.pendingLockAcquires.values()) flight.cancelled = true;
+    this.pendingLockAcquires.clear();
     this.pendingOps.clear();
     if (this.flushTimer !== null) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
     this.sentOpIds.clear();
-    this.remoteSuspended = false;
-    this.suspendedRemoteOps = [];
+    this.quiesceSources.delete('pause');
+  }
+
+  /** Bounded best-effort drain for navigation seams (see FLUSH_ON_EXIT_TIMEOUT_MS). */
+  private flushBounded(): Promise<void> {
+    if (this.pendingOps.size === 0) return Promise.resolve();
+    return Promise.race([
+      this.flushOps(),
+      new Promise<void>((resolve) => {
+        setTimeout(resolve, FLUSH_ON_EXIT_TIMEOUT_MS);
+      }),
+    ]);
   }
 
   async create(name: string, modelId: number | null): Promise<number | null> {
@@ -2002,11 +2282,20 @@ export class DashboardStore {
     }
   }
 
-  close(): void {
+  async close(): Promise<void> {
+    // C3: drain authored-but-unsent live ops (bounded) before they die with
+    // the session. Callers may fire-and-forget — the guard below keeps a
+    // concurrent open() from being wiped by this close finishing late.
+    const closing = this.state.current;
+    if (closing && this.state.liveMode && this.pendingOps.size > 0) {
+      await this.flushBounded();
+      const live = this.state.current;
+      if (!live || live.id !== closing.id) return; // superseded by a newer open()
+    }
     this.clearHistory();
-    // Locks die with the session (release remotely so collaborators unblock
-    // before the TTL); pending unsent ops are dropped with the doc they edit.
-    this.stopAllLockHeartbeats(true);
+    // Locks die with the session (resetCollabSession releases them remotely so
+    // collaborators unblock before the TTL); leftover unsent ops drop with the
+    // doc they edit.
     this.resetCollabSession();
     // Wave-2 timers/pending sends die too (state resets via initialState).
     this.stopCollabEphemera();
@@ -2017,6 +2306,9 @@ export class DashboardStore {
       // The clipboard outlives the open dashboard on purpose — copy on one
       // dashboard, paste on the next (still never persisted).
       chartClipboard: this.state.chartClipboard,
+      // Per-user preference and any still-mounted overlay quiesce survive too.
+      collabShowCursors: this.state.collabShowCursors,
+      collabQuiesced: this.quiesceSources.size > 0,
     });
   }
 
@@ -2116,7 +2408,17 @@ export class DashboardStore {
       void this.loadList();
       return true;
     } catch (error) {
-      this.set({ saveStatus: 'error', error: messageOf(error) });
+      // Post-degrade (or plain draft) whole-doc conflict: the generic stale
+      // text says "reload" without saying what happens to the local work —
+      // spell out that the changes are safe HERE and reloading discards them,
+      // so the user copies anything vital first. The doc stays intact locally.
+      const stale = error instanceof RcdApiError && error.errorCode === 'rcd.dashboard.stale';
+      this.set({
+        saveStatus: 'error',
+        error: stale
+          ? 'This dashboard changed on the server while you were editing. Your changes are still here — copy anything important, then reload to get the latest version and re-apply them.'
+          : messageOf(error),
+      });
       return false;
     }
   }
@@ -2130,6 +2432,10 @@ export class DashboardStore {
     if (!this.state.liveMode) return false;
     this.stopAllLockHeartbeats(true);
     this.clearHistory();
+    // Holds wiped here were never applied — the exiting doc is stale where
+    // they landed server-side; the quiet-point resync (view mode: straight
+    // refresh) repairs it right after this set.
+    const droppedHolds = Object.keys(this.state.heldRemoteOps).length > 0;
     this.set({
       mode: 'view',
       liveMode: false,
@@ -2139,7 +2445,9 @@ export class DashboardStore {
       heldRemoteOps: {},
       lockNotice: null,
       saveStatus: 'ok',
+      ...(droppedHolds ? { collabDiverged: true } : {}),
     });
+    if (droppedHolds) this.maybeResyncDiverged();
     // The list's updatedAt moved with every op; refresh it like a save does.
     void this.loadList();
     return true;
@@ -2213,6 +2521,7 @@ export class DashboardStore {
         ...(source.text ? { text: structuredClone(source.text) } : {}),
         ...(source.image ? { image: structuredClone(source.image) } : {}),
         ...(source.button ? { button: structuredClone(source.button) } : {}),
+        ...(source.buttonGroup ? { buttonGroup: structuredClone(source.buttonGroup) } : {}),
       };
       return [...tiles, copy];
     });
@@ -2398,7 +2707,8 @@ export class DashboardStore {
   }
 
   /** Adds a navigation-button tile to the active page (spec built by the add dialog).
-   *  The rich label sanitizes on EVERY write, same doctrine as text tiles. */
+   *  The rich label + advanced CSS sanitize on EVERY write, same doctrine as
+   *  text tiles (sanitizeRichHtml / sanitizeButtonCss). */
   addButtonTile(spec: ButtonTileSpec): void {
     this.mutateActiveTiles((tiles) => {
       const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
@@ -2406,17 +2716,52 @@ export class DashboardStore {
         id: newId(),
         kind: 'button',
         layout: { x: 0, y: maxY, w: 4, h: 2, minW: 2, minH: 1 },
-        button: { ...spec, html: sanitizeRichHtml(spec.html) },
+        button: sanitizeButtonFields(spec),
       };
       return [...tiles, tile];
     });
   }
 
-  /** Patches a button tile's spec; html always passes through the sanitizer. */
+  /** Patches a button tile's spec; html/customCss always pass the sanitizers. */
   updateButtonTile(tileId: string, patch: Partial<ButtonTileSpec>): void {
-    const safe = patch.html === undefined ? patch : { ...patch, html: sanitizeRichHtml(patch.html) };
+    const safe = sanitizeButtonFieldsPatch(patch);
     this.mutateActiveTiles((tiles) =>
       tiles.map((t) => (t.id === tileId && t.button ? { ...t, button: { ...t.button, ...safe } } : t)),
+    );
+  }
+
+  /** Adds a button-GROUP tile to the active page (spec built by the group
+   *  dialog). Same layout class and sanitize doctrine as single buttons —
+   *  every button's rich label + advanced CSS pass the sanitizers here and on
+   *  every later write. */
+  addButtonGroupTile(spec: ButtonGroupTileSpec): void {
+    this.mutateActiveTiles((tiles) => {
+      const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+      const tile: DashboardTile = {
+        id: newId(),
+        kind: 'buttonGroup',
+        layout: { x: 0, y: maxY, w: 8, h: 2, minW: 4, minH: 2 },
+        buttonGroup: sanitizeButtonGroupSpec(spec),
+      };
+      return [...tiles, tile];
+    });
+  }
+
+  /** Patches a button-group tile's spec (group settings and/or the whole
+   *  buttons list); every button's html/customCss pass the sanitizers. Rides
+   *  the same mutateActiveTiles seam as updateButtonTile, so live-mode op
+   *  emission is automatic (the seam-diff decorator). */
+  updateButtonGroupTile(tileId: string, patch: Partial<ButtonGroupTileSpec>): void {
+    const safe =
+      patch.buttons === undefined
+        ? patch
+        : { ...patch, buttons: patch.buttons.map(sanitizeButtonFields) };
+    this.mutateActiveTiles((tiles) =>
+      tiles.map((t) =>
+        t.id === tileId && t.buttonGroup
+          ? { ...t, buttonGroup: { ...t.buttonGroup, ...safe } }
+          : t,
+      ),
     );
   }
 
@@ -3372,48 +3717,38 @@ export class DashboardStore {
   /* --------------------------------------------- sharing/activity (0.8.0) */
 
   /**
-   * Changes the linked model of the open dashboard (edit mode; persists
-   * through the normal Save like any other draft change). Owner/admin only —
-   * grantee saves carrying a modelId change are rejected server-side
+   * Changes the linked model of the open dashboard. Owner/admin only —
+   * grantee attempts are rejected server-side
    * ('rcd.dashboard.share_forbidden_fields'). Not part of the undo snapshot
-   * (history captures the layout document only).
+   * (history captures the layout document only). LIVE edit sessions persist
+   * it immediately through the metadata PATCH (modelId is a row column —
+   * never an op, and live mode has no Save PUT to carry it; the PATCH cannot
+   * clobber concurrent tile edits because it never touches LayoutJson).
+   * DRAFT sessions keep the historic shape: dirty now, persisted by Save's
+   * whole-doc PUT (which carries modelId), so Discard still reverts the pick.
    */
   setModelId(modelId: number | null): void {
     const current = this.state.current;
     if (!current || current.modelId === modelId) return;
     if (this.state.liveMode && this.state.mode === 'edit') {
-      // modelId is deliberately NOT an op (COLLAB-DESIGN: the server 403s
-      // grantees on it), and live mode has no Save PUT to carry it — so it
-      // persists immediately via the setPublish-precedent PUT. The op buffer
-      // flushes FIRST so the PUT's layout matches what the ops already wrote;
-      // an op committed by someone else in the gap 409s the PUT honestly.
       const prior = current.modelId;
       this.set({ current: { ...current, modelId } });
-      void this.flushOps().then(async () => {
-        const live = this.state.current;
-        if (!live || live.id !== current.id) return;
+      void (async () => {
         try {
-          const saved = await this.api.updateDashboard(live.id, {
-            name: live.name,
-            description: live.description,
-            modelId,
-            layout: live.layout,
-            isShared: live.isShared,
-            expectedUpdatedAtUtc: live.expectedUpdatedAtUtc,
-          });
+          const saved = await this.api.patchDashboardMeta(current.id, { modelId });
           const now = this.state.current;
-          if (now && now.id === live.id) {
+          if (now && now.id === current.id) {
             this.set({
               current: { ...now, modelId: saved.modelId, expectedUpdatedAtUtc: saved.updatedAtUtc },
             });
           }
         } catch (error) {
           const now = this.state.current;
-          if (now && now.id === live.id) {
+          if (now && now.id === current.id) {
             this.set({ current: { ...now, modelId: prior }, error: messageOf(error) });
           }
         }
-      });
+      })();
       return;
     }
     this.set({ current: { ...current, modelId }, dirty: true });
@@ -3421,24 +3756,18 @@ export class DashboardStore {
 
   /**
    * Writes ONLY the publish ("Everyone") flag of the open dashboard through
-   * updateDashboard, adopting the fresh concurrency stamp without leaving the
-   * caller's mode. Admin-gated server-side. NOTE: the body necessarily
-   * carries the CURRENT in-memory layout — flipping publish mid-edit persists
-   * the draft as it stands.
+   * the metadata PATCH, adopting the fresh concurrency stamp without leaving
+   * the caller's mode. Admin-gated server-side. Deliberately NEVER the
+   * whole-doc PUT (in any mode): the old shape carried the in-memory layout,
+   * so flipping publish mid-live-session could overwrite collaborators'
+   * concurrent tile edits with this client's stale copy.
    */
   async setPublish(isShared: boolean): Promise<boolean> {
     const current = this.state.current;
     if (!current) return false;
     if (current.isShared === isShared) return true;
     try {
-      const saved = await this.api.updateDashboard(current.id, {
-        name: current.name,
-        description: current.description,
-        modelId: current.modelId,
-        layout: current.layout,
-        isShared,
-        expectedUpdatedAtUtc: current.expectedUpdatedAtUtc,
-      });
+      const saved = await this.api.patchDashboardMeta(current.id, { isShared });
       const live = this.state.current;
       if (live && live.id === current.id) {
         this.set({
@@ -3454,57 +3783,34 @@ export class DashboardStore {
   }
 
   /**
-   * Renames a dashboard (name + optional description) through the normal
-   * update PUT — the server logs the "renamed" activity and enforces rights
+   * Renames a dashboard (name + optional description) through the metadata
+   * PATCH — the server logs the "renamed" activity and enforces rights
    * (grantee renames 403 as share_forbidden_fields; over-long names 400 as
-   * rcd.dashboard.name_too_long). Two shapes, mirroring setPublish:
+   * rcd.dashboard.name_too_long). NEVER the whole-doc PUT (in any mode, open
+   * row or not): a rename must not carry a layout at all — the old shape
+   * could clobber a live collaborator's tiles (open row) or round-trip a
+   * fetched doc for no reason (other rows). The open row additionally adopts
+   * the fresh name/stamp into `current` without leaving the caller's mode.
    *
-   *  - the OPEN dashboard: PUT with the current IN-MEMORY layout (mid-edit
-   *    drafts persist as they stand, exactly like setPublish), patch
-   *    `current` and adopt the fresh concurrency stamp without leaving the
-   *    caller's mode;
-   *  - any other row: fetch-then-PUT — the fetched detail supplies layout,
-   *    fields and the expected stamp, so a rename can never clobber content
-   *    this session has not seen.
-   *
-   * `description === undefined` keeps the existing description. Refreshes the
-   * list either way (the rail and toolbar read names from it). Returns false
-   * and surfaces the error in store state on failure.
+   * `description === undefined` keeps the existing description (the PATCH
+   * omits the field). Refreshes the list either way (the rail and toolbar
+   * read names from it). Returns false and surfaces the error on failure.
    */
   async renameDashboard(id: number, name: string, description?: string | null): Promise<boolean> {
-    const current = this.state.current;
     try {
-      if (current && current.id === id) {
-        const saved = await this.api.updateDashboard(id, {
-          name,
-          description: description === undefined ? current.description : description,
-          modelId: current.modelId,
-          layout: current.layout,
-          isShared: current.isShared,
-          expectedUpdatedAtUtc: current.expectedUpdatedAtUtc,
-        });
-        const live = this.state.current;
-        if (live && live.id === id) {
-          this.set({
-            current: {
-              ...live,
-              name: saved.name,
-              description: saved.description,
-              expectedUpdatedAtUtc: saved.updatedAtUtc,
-            },
-          });
-        }
-      } else {
-        const detail = await this.api.getDashboard(id);
-        await this.api.updateDashboard(id, {
-          name,
-          description: description === undefined ? detail.description : description,
-          modelId: detail.modelId,
-          // Same defensive shape-check as appendChartRemote: a malformed
-          // detail must never round-trip as a clobbered layout.
-          layout: detail.layout?.tiles ? detail.layout : emptyLayout(),
-          isShared: detail.isShared,
-          expectedUpdatedAtUtc: detail.updatedAtUtc,
+      const saved = await this.api.patchDashboardMeta(id, {
+        name,
+        ...(description === undefined ? {} : { description }),
+      });
+      const live = this.state.current;
+      if (live && live.id === id) {
+        this.set({
+          current: {
+            ...live,
+            name: saved.name,
+            description: saved.description,
+            expectedUpdatedAtUtc: saved.updatedAtUtc,
+          },
         });
       }
       void this.loadList();
@@ -3798,5 +4104,45 @@ const safeImageSrc = (src: string): string => {
   return /^data:image\//i.test(trimmed) || /^https:\/\//i.test(trimmed) ? trimmed : '';
 };
 
+/**
+ * Sanitizes the writable belt-critical fields every button shape shares —
+ * the rich label (sanitizeRichHtml) and the advanced-CSS override
+ * (sanitizeButtonCss). Generic over ButtonTileSpec and ButtonGroupButton so
+ * ALL four button write paths route through one helper.
+ */
+const sanitizeButtonFields = <T extends { html: string; customCss?: string }>(spec: T): T => ({
+  ...spec,
+  html: sanitizeRichHtml(spec.html),
+  ...(spec.customCss !== undefined ? { customCss: sanitizeButtonCss(spec.customCss) } : {}),
+});
+
+/** Patch-shaped variant: html/customCss sanitize only when present. */
+const sanitizeButtonFieldsPatch = <T extends { html?: string; customCss?: string }>(
+  patch: T,
+): T => ({
+  ...patch,
+  ...(patch.html !== undefined ? { html: sanitizeRichHtml(patch.html) } : {}),
+  ...(patch.customCss !== undefined ? { customCss: sanitizeButtonCss(patch.customCss) } : {}),
+});
+
+/** Full-spec sanitize for button-group writes (every button in the list). */
+const sanitizeButtonGroupSpec = (spec: ButtonGroupTileSpec): ButtonGroupTileSpec => ({
+  ...spec,
+  buttons: spec.buttons.map((button): ButtonGroupButton => sanitizeButtonFields(button)),
+});
+
 /** Error text for store state: RcdApiError-aware (friendly code fallbacks). */
 const messageOf = (error: unknown): string => rcdErrorMessage(error);
+
+/**
+ * A deterministic 4xx verdict on ONE op (tile_locked, permission_denied,
+ * op_invalid, layout_size…) — never retried (the answer cannot change) and
+ * never a session failure (drainPending drops the op and resyncs). 408/429
+ * stay transient: retryable, and degrading like transport failures.
+ */
+const isOpScopedRejection = (error: unknown): error is RcdApiError =>
+  error instanceof RcdApiError &&
+  error.status >= 400 &&
+  error.status < 500 &&
+  error.status !== 408 &&
+  error.status !== 429;

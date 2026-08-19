@@ -1,7 +1,20 @@
 namespace ReconDashboards.Core.Abstractions;
 
-/// <summary>Text attachment (CSV snapshots). Content is UTF-8 text.</summary>
-public sealed record RcdEmailAttachment(string FileName, string ContentType, string Content);
+/// <summary>
+/// One attachment. Exactly one of <see cref="Content"/> (UTF-8 text — CSV
+/// snapshots) or <see cref="Bytes"/> (binary — inline chart PNGs) carries the
+/// payload; senders resolve the bytes as Bytes ?? UTF8(Content ?? "").
+/// <see cref="Inline"/> + <see cref="ContentId"/> mark a cid-referenced inline
+/// image (&lt;img src="cid:{ContentId}"&gt; in the HTML body); transports must
+/// emit Content-ID and an inline content disposition for those.
+/// </summary>
+public sealed record RcdEmailAttachment(
+    string FileName,
+    string ContentType,
+    string? Content = null,
+    byte[]? Bytes = null,
+    string? ContentId = null,
+    bool Inline = false);
 
 /// <summary>One outbound message. Bodies are self-contained HTML (inline CSS only).</summary>
 public sealed record RcdEmailMessage(

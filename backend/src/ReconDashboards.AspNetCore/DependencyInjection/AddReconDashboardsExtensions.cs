@@ -13,6 +13,7 @@ using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
 using ReconDashboards.Core.Querying.Execution;
+using ReconDashboards.Core.Rendering;
 using ReconDashboards.Core.Scheduling;
 using ReconDashboards.Core.Services;
 
@@ -91,6 +92,15 @@ public static class AddReconDashboardsExtensions
         // send-now must work on hosts that never enable the background
         // scheduler, and its retry queue/manual guard are process state.
         services.TryAddSingleton<SubscriptionDispatcher>();
+        // Chart PNGs for subscription emails (EMAIL-CONTENT-DESIGN). The
+        // painter is stateless (typefaces are static+lazy), so a singleton;
+        // TryAdd so a host — or a test — can supply its own renderer instead.
+        services.TryAddSingleton<IChartImageRenderer, SkiaChartImageRenderer>();
+        // The ONE render path behind subscription emails, shared by the
+        // dispatcher and both preview endpoints. Scoped like the dispatcher's
+        // per-dispatch dependencies: it runs tiles through the query pipeline
+        // in the caller's scope.
+        services.AddScoped<SnapshotComposer>();
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
         services.AddScoped<DashboardOpService>();

@@ -3,6 +3,7 @@ import {
   Bell,
   ChevronDown,
   ChevronRight,
+  Eye,
   FlaskConical,
   History,
   Pencil,
@@ -29,6 +30,7 @@ import {
   scheduleSummary,
   SubscriptionEditorDialog,
 } from './SubscriptionsDialog';
+import { SubscriptionPreviewDialog, type SubscriptionPreviewRequest } from './SubscriptionPreviewDialog';
 
 export interface SubscriptionsManagerProps {
   open: boolean;
@@ -150,6 +152,7 @@ export function SubscriptionsManager({ open, onClose, onError, initialTab }: Sub
   const [editSubscription, setEditSubscription] = useState<DashboardSubscription | null>(null);
   const [editAlert, setEditAlert] = useState<DashboardAlert | null>(null);
   const [historyFor, setHistoryFor] = useState<DashboardSubscription | null>(null);
+  const [preview, setPreview] = useState<SubscriptionPreviewRequest | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<
     { kind: 'subscription'; row: DashboardSubscription } | { kind: 'alert'; row: DashboardAlert } | null
   >(null);
@@ -209,6 +212,7 @@ export function SubscriptionsManager({ open, onClose, onError, initialTab }: Sub
       setGlobalOptOuts(null);
       setScope('mine');
       setTab(initialTab ?? 'subscriptions');
+      setPreview(null);
       return;
     }
     runtime.api
@@ -478,6 +482,20 @@ export function SubscriptionsManager({ open, onClose, onError, initialTab }: Sub
                         onChange={(enabled) => void handleToggleSubscription(subscription, enabled)}
                       />
                       <RcdIconButton
+                        aria-label={`Preview ${subscription.name}`}
+                        title="Preview email"
+                        onClick={() =>
+                          // Saved endpoint with {} — the manager previews the config as saved.
+                          setPreview({
+                            kind: 'saved',
+                            subscriptionId: subscription.id,
+                            format: subscription.format,
+                          })
+                        }
+                      >
+                        <Eye size={14} />
+                      </RcdIconButton>
+                      <RcdIconButton
                         aria-label={`Send ${subscription.name} now`}
                         title="Send now"
                         disabled={showStrip}
@@ -641,6 +659,8 @@ export function SubscriptionsManager({ open, onClose, onError, initialTab }: Sub
         onClose={() => setHistoryFor(null)}
         onError={onError}
       />
+
+      <SubscriptionPreviewDialog request={preview} onClose={() => setPreview(null)} />
 
       <ConfirmDialog
         title={confirmDelete?.kind === 'alert' ? 'Delete alert' : 'Delete subscription'}

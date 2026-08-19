@@ -16,6 +16,7 @@ import {
   emptyChart,
   filterCardIsActive,
   isChartTile,
+  isButtonGroupTile,
   isButtonTile,
   isCollabLiveDashboard,
   isImageTile,
@@ -78,8 +79,11 @@ import {
 import { FilterIndicatorMenu } from './FilterIndicatorMenu';
 import { FiltersPane } from './FiltersPane';
 import { FitPageViewport } from './FitPageViewport';
+import { LiveMenu } from './LiveMenu';
 import { ButtonTile } from './ButtonTile';
 import { ButtonTileDialog } from './ButtonTileDialog';
+import { ButtonGroupTile } from './ButtonGroupTile';
+import { ButtonGroupTileDialog } from './ButtonGroupTileDialog';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
 import { MOBILE_BREAKPOINT, MobileLayoutEditor, MobileStack } from './MobileLayout';
@@ -291,6 +295,8 @@ export function DashboardView({
   const collabEditors = useDashboardState((state) => state.collabEditors);
   /** Wave 2 foreign tile locks (host-fed; own locks never land here). */
   const tileLocks = useDashboardState((state) => state.tileLocks);
+  /** Live menu: cursors toggle — gates the overlay AND the outbound stream. */
+  const collabShowCursors = useDashboardState((state) => state.collabShowCursors);
   const canUndo = useDashboardState((state) => state.canUndo);
   const canRedo = useDashboardState((state) => state.canRedo);
   const saveStatus = useDashboardState((state) => state.saveStatus);
@@ -360,6 +366,7 @@ export function DashboardView({
   const [addSlicerOpen, setAddSlicerOpen] = useState(false);
   const [addImageOpen, setAddImageOpen] = useState(false);
   const [addButtonOpen, setAddButtonOpen] = useState(false);
+  const [addButtonGroupOpen, setAddButtonGroupOpen] = useState(false);
   const [printConfigOpen, setPrintConfigOpen] = useState(false);
   /** Non-null while the print preview overlay is mounted. */
   const [printOptions, setPrintOptions] = useState<PrintOptions | null>(null);
@@ -429,18 +436,43 @@ export function DashboardView({
       // 'edit' state a fresh create() had just set — the remount's open() then
       // re-fetched the dashboard into view mode. View-mode sessions still close
       // so a later visit re-fetches fresh data.
-      if (runtime.dashboards.store.getState().mode !== 'edit') runtime.dashboards.close();
+      if (runtime.dashboards.store.getState().mode !== 'edit') void runtime.dashboards.close();
     };
   }, [runtime, openDashboard]);
 
-  // Collab wave 1: remote-op application suspends while the print preview is
-  // mounted — the exact companion of the auto-refresh printOptions guards
-  // below (a mid-print doc change would re-render the pages being captured).
-  // Suspended ops queue in the store and land in order on resume/unmount.
+  // Live-visibility quiesce: remote application (ops AND all four ephemeral
+  // channels) pauses while the print preview is mounted — the companion of
+  // the auto-refresh printOptions guards below (a mid-print doc change would
+  // re-render the pages being captured). Quiesced events are DROPPED; closing
+  // the preview resyncs from the server (store resume-edge doctrine). The
+  // print CONFIG dialog and the image-export dialog hold their own sources.
   useEffect(() => {
-    runtime.dashboards.setRemoteOpsSuspended(printOptions !== null);
-    return () => runtime.dashboards.setRemoteOpsSuspended(false);
+    if (printOptions === null) return;
+    runtime.dashboards.setCollabQuiesce('printPreview', true);
+    return () => runtime.dashboards.setCollabQuiesce('printPreview', false);
   }, [runtime, printOptions]);
+
+  // C3 (library-side unload safety): a live session's authored-but-unsent ops
+  // flush on pagehide with fetch keepalive (best effort — the send outlives
+  // the page), and beforeunload prompts while any op is unsent/in flight so
+  // an accidental tab close cannot silently drop the last keystrokes.
+  useEffect(() => {
+    const onPageHide = () => {
+      void runtime.dashboards.flushPendingOps({ keepalive: true });
+    };
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (!runtime.dashboards.hasUnsentOps()) return;
+      event.preventDefault();
+      // Chrome requires returnValue for the prompt (the text is not shown).
+      event.returnValue = '';
+    };
+    window.addEventListener('pagehide', onPageHide);
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => {
+      window.removeEventListener('pagehide', onPageHide);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+    };
+  }, [runtime]);
 
   const modelId = current?.id === dashboardId ? current.modelId : null;
 
@@ -1137,7 +1169,9 @@ export function DashboardView({
   );
 
   const gridItems = useMemo<DashboardGridItem[]>(
-    () => tiles.map((tile) => ({ id: tile.id, ...tile.layout })),
+    // `kind` rides along for the grid's per-kind minimum-size floors
+    // (button/buttonGroup tiles must never clip a default button — B4).
+    () => tiles.map((tile) => ({ id: tile.id, kind: tile.kind, ...tile.layout })),
     [tiles],
   );
 
@@ -1736,13 +1770,25 @@ export function DashboardView({
       return <ImageTile tileId={tile.id} spec={tile.image} editable={canEditLayout} />;
     }
 
-    // Navigation buttons: live page-switch in view mode; layout-class edits.
-    // `pages` resolves the target every render (broken-link badge).
+    // Navigation buttons: live page-switch in BOTH modes (B5); layout-class
+    // edits. `pages` resolves the target every render (broken-link badge).
     if (isButtonTile(tile)) {
       return (
         <ButtonTile
           tileId={tile.id}
           spec={tile.button}
+          editable={canEditLayout}
+          pages={pages.map((page) => ({ id: page.id, name: page.name }))}
+        />
+      );
+    }
+
+    // Button groups: same live/edit split and rights class as single buttons.
+    if (isButtonGroupTile(tile)) {
+      return (
+        <ButtonGroupTile
+          tileId={tile.id}
+          spec={tile.buttonGroup}
           editable={canEditLayout}
           pages={pages.map((page) => ({ id: page.id, name: page.name }))}
         />
@@ -1954,6 +2000,7 @@ export function DashboardView({
         onAddText={() => runtime.dashboards.addTextTile()}
         onAddImage={() => setAddImageOpen(true)}
         onAddButton={() => setAddButtonOpen(true)}
+        onAddButtonGroup={() => setAddButtonGroupOpen(true)}
         onAddSlicer={() => setAddSlicerOpen(true)}
         addSlicerDisabled={modelId === null}
         // Session clipboard paste (Add ▾ > Paste chart); gated with the
@@ -1971,6 +2018,9 @@ export function DashboardView({
         liveMode={liveMode}
         // Wave 2 presence strip (live dashboards only; hidden while empty).
         presenceEditors={collabLive ? collabEditors : undefined}
+        // Live menu (cursor/pause toggles + paused/syncing chips): whenever
+        // the dashboard is shared or a live session is active.
+        liveControls={collabLive || liveMode ? <LiveMenu /> : undefined}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={editable ? () => runtime.dashboards.undo() : undefined}
@@ -2254,7 +2304,7 @@ export function DashboardView({
                 // sides use the grid's own content box, so fractions are
                 // zoom- and mode-independent (see DashboardGridProps).
                 onPointerFraction={
-                  collabLive && activePage
+                  collabLive && collabShowCursors && activePage
                     ? (xFrac, yFrac) =>
                         runtime.dashboards.sendCursorThrottled(activePage.id, xFrac, yFrac)
                     : undefined
@@ -2262,8 +2312,12 @@ export function DashboardView({
                 onPointerLeaveGrid={
                   collabLive ? () => runtime.dashboards.cancelCursorSend() : undefined
                 }
+                // The Live menu's cursor toggle hides the overlay outright
+                // (the store also drops inbound frames — belt and braces).
                 overlay={
-                  collabLive ? <RemoteCursorOverlay pageId={activePage?.id ?? null} /> : undefined
+                  collabLive && collabShowCursors ? (
+                    <RemoteCursorOverlay pageId={activePage?.id ?? null} />
+                  ) : undefined
                 }
               />
             </FitPageViewport>
@@ -2567,6 +2621,18 @@ export function DashboardView({
         onSave={(spec) => {
           runtime.dashboards.addButtonTile(spec);
           setAddButtonOpen(false);
+        }}
+      />
+
+      <ButtonGroupTileDialog
+        open={addButtonGroupOpen}
+        title="Add button group"
+        initial={null}
+        pages={pages.map((page) => ({ id: page.id, name: page.name }))}
+        onClose={() => setAddButtonGroupOpen(false)}
+        onSave={(spec) => {
+          runtime.dashboards.addButtonGroupTile(spec);
+          setAddButtonGroupOpen(false);
         }}
       />
 

@@ -19,11 +19,14 @@ import type {
   DashboardShare,
   DashboardSubscription,
   DashboardSummary,
+  DraftSubscriptionPreviewBody,
   RcdUser,
   SaveAlertBody,
   SaveSubscriptionBody,
   SubscriptionDispatch,
   SubscriptionOptOut,
+  SubscriptionPreviewBody,
+  SubscriptionPreviewResult,
 } from '../types/dashboard';
 import type { DashboardOpPayload, DashboardOpTargetKind } from '../types/ops';
 
@@ -71,6 +74,21 @@ export interface SaveDashboardBody {
   layout: DashboardLayoutDoc;
   isShared?: boolean;
   expectedUpdatedAtUtc?: string | null;
+}
+
+/**
+ * Body of PATCH /dashboards/{id}/meta — metadata-only writes that NEVER read
+ * or write LayoutJson and take no expectedUpdatedAtUtc (metadata is not the
+ * doc, so a rename/publish flip can never clobber a collaborator's tiles).
+ * ABSENT fields keep their stored value; `description`/`modelId` accept null
+ * as an explicit clear. Auth mirrors the whole-doc update exactly: name/
+ * description/modelId need owner-or-admin; isShared needs CanManageShared.
+ */
+export interface PatchDashboardMetaBody {
+  name?: string;
+  description?: string | null;
+  modelId?: number | null;
+  isShared?: boolean;
 }
 
 /** One grant of PUT dashboards/{id}/shares (all flags false = view-only). */
@@ -305,6 +323,15 @@ export class DashboardsApi {
     return this.fetcher(this.url(`/dashboards/${id}`), { method: 'PUT', body });
   }
 
+  /**
+   * Metadata-only write (name/description/modelId/isShared) — see
+   * PatchDashboardMetaBody. The rename/publish/model-link store paths use this
+   * in EVERY mode so they can never carry (and clobber with) a whole layout.
+   */
+  patchDashboardMeta(id: number, body: PatchDashboardMetaBody): Promise<DashboardDetail> {
+    return this.fetcher(this.url(`/dashboards/${id}/meta`), { method: 'PATCH', body });
+  }
+
   deleteDashboard(id: number): Promise<void> {
     return this.fetcher(this.url(`/dashboards/${id}`), { method: 'DELETE' });
   }
@@ -323,8 +350,17 @@ export class DashboardsApi {
    * dashboard-{id} group. Well-known failures: 403 (class not granted),
    * 409 rcd.dashboard.stale (baseline too old for the server to accept).
    */
-  sendOp(dashboardId: number, body: SendDashboardOpBody): Promise<SendDashboardOpResult> {
-    return this.fetcher(this.url(`/dashboards/${dashboardId}/ops`), { method: 'POST', body });
+  sendOp(
+    dashboardId: number,
+    body: SendDashboardOpBody,
+    options?: { keepalive?: boolean },
+  ): Promise<SendDashboardOpResult> {
+    return this.fetcher(this.url(`/dashboards/${dashboardId}/ops`), {
+      method: 'POST',
+      body,
+      // pagehide flush only: the send must outlive the page (see RcdRequestInit).
+      ...(options?.keepalive ? { keepalive: true } : {}),
+    });
   }
 
   /**
@@ -487,6 +523,33 @@ export class DashboardsApi {
 
   deleteSubscription(id: number): Promise<void> {
     return this.fetcher(this.url(`/subscriptions/${id}`), { method: 'DELETE' });
+  }
+
+  /**
+   * Renders the email a SAVED subscription would send — no dispatch row, no
+   * email. {} previews the saved config; { content } overrides it for this
+   * render only. Owner or admin; the render runs under the subscription
+   * OWNER's principal, so an admin preview honors the owner's row filters.
+   */
+  previewSubscription(
+    id: number,
+    body: SubscriptionPreviewBody = {},
+    signal?: AbortSignal,
+  ): Promise<SubscriptionPreviewResult> {
+    return this.fetcher(this.url(`/subscriptions/${id}/preview`), { method: 'POST', body, signal });
+  }
+
+  /** Renders an UNSAVED subscription draft against a dashboard (owner = caller). */
+  previewDraftSubscription(
+    dashboardId: number,
+    body: DraftSubscriptionPreviewBody,
+    signal?: AbortSignal,
+  ): Promise<SubscriptionPreviewResult> {
+    return this.fetcher(this.url(`/dashboards/${dashboardId}/subscriptions/preview`), {
+      method: 'POST',
+      body,
+      signal,
+    });
   }
 
   /* -------------------------------------------------------- metric alerts */

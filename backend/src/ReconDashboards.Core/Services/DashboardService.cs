@@ -60,6 +60,22 @@ public sealed record DashboardSaveRequest(
     DateTime? ExpectedUpdatedAtUtc = null);
 
 /// <summary>
+/// Metadata-only patch (PATCH dashboards/{id}/meta). Explicit *Set flags carry
+/// the absent-vs-null distinction JSON binding loses: an ABSENT field keeps
+/// the stored value; Description/ModelId present with null CLEAR it. By
+/// construction this never reads or writes LayoutJson and takes no
+/// expectedUpdatedAtUtc — metadata is not the doc, so a rename/publish flip
+/// can never clobber (or be blocked by) concurrent layout edits.
+/// </summary>
+public sealed record DashboardMetaPatch(
+    string? Name,
+    bool DescriptionSet,
+    string? Description,
+    bool ModelIdSet,
+    int? ModelId,
+    bool? IsShared);
+
+/// <summary>
 /// One named-user grant, decorated with directory display names (the grantee's
 /// and the granter's) plus when it was granted — the Share dialog's
 /// "granted by X on date" line.
@@ -357,6 +373,123 @@ public sealed class DashboardService(
 
         await db.SaveChangesAsync(ct);
         await TrimActivityAsync(id, ct);
+
+        return ServiceResult<DashboardDetail>.Ok(await MaterializeAsync(record, userId, share, ct));
+    }
+
+    /// <summary>
+    /// Metadata-only write (see <see cref="DashboardMetaPatch"/>). Auth mirrors
+    /// <see cref="UpdateAsync"/> field for field: name/description/modelId need
+    /// owner-or-admin (grantee metadata is immutable — share_forbidden_fields),
+    /// flipping IsShared additionally needs CanManageShared. Unlike UpdateAsync
+    /// there is NO stamp precondition: this path cannot touch LayoutJson, so
+    /// there is no doc to protect — but a real change still bumps UpdatedAtUtc,
+    /// keeping the whole-doc stale check honest (a draft PUT racing a rename
+    /// 409s instead of silently reverting it).
+    /// </summary>
+    public async Task<ServiceResult<DashboardDetail>> PatchMetaAsync(
+        int id, DashboardMetaPatch patch, CancellationToken ct)
+    {
+        var userId = currentUser.GetUserId();
+        var record = await db.Dashboards.FirstOrDefaultAsync(d => d.Id == id && !d.IsDeleted, ct);
+        var share = record is null ? null : await FindShareAsync(id, userId, ct);
+
+        if (record is null || !IsVisibleTo(record, userId, share))
+        {
+            return NotFound<DashboardDetail>(id);
+        }
+
+        if (IsSystem(record))
+        {
+            return SystemReadOnly<DashboardDetail>();
+        }
+
+        var isOwner = record.OwnerUserId == userId;
+        if (!isOwner && !currentUser.CanManageShared)
+        {
+            return ServiceResult<DashboardDetail>.Fail(
+                ServiceErrorKind.Forbidden, "rcd.dashboard.share_forbidden_fields",
+                "Shared access does not allow changing this dashboard's name, description, linked model, or publish state.");
+        }
+
+        // Validate EVERYTHING before assigning anything — a half-valid body
+        // must change nothing.
+        string? newName = null;
+        if (patch.Name is not null)
+        {
+            if (string.IsNullOrWhiteSpace(patch.Name))
+            {
+                return ServiceResult<DashboardDetail>.Fail(
+                    ServiceErrorKind.BadRequest, "rcd.dashboard.name_required", "Dashboard name is required.");
+            }
+
+            newName = patch.Name.Trim();
+            if (newName.Length > MaxNameLength)
+            {
+                return ServiceResult<DashboardDetail>.Fail(
+                    ServiceErrorKind.BadRequest, "rcd.dashboard.name_too_long",
+                    $"Dashboard names are limited to {MaxNameLength} characters.");
+            }
+
+            if (!string.Equals(record.Name, newName, StringComparison.Ordinal)
+                && await NameTakenAsync(record.OwnerUserId, newName, excludeId: id, ct))
+            {
+                return NameConflict(newName, ownerIsCaller: isOwner);
+            }
+        }
+
+        if (patch.DescriptionSet && patch.Description is { Length: > MaxDescriptionLength })
+        {
+            return ServiceResult<DashboardDetail>.Fail(
+                ServiceErrorKind.BadRequest, "rcd.dashboard.description_too_long",
+                $"Dashboard descriptions are limited to {MaxDescriptionLength} characters.");
+        }
+
+        if (patch.IsShared is { } isShared && isShared != record.IsShared && !currentUser.CanManageShared)
+        {
+            return SharingForbidden();
+        }
+
+        var now = timeProvider.GetUtcNow().UtcDateTime;
+        var renamed = newName is not null && !string.Equals(record.Name, newName, StringComparison.Ordinal);
+        var otherChanged =
+            (patch.DescriptionSet && record.Description != patch.Description)
+            || (patch.ModelIdSet && record.ModelId != patch.ModelId)
+            || (patch.IsShared is { } flag && record.IsShared != flag);
+
+        if (renamed)
+        {
+            AddActivity(id, userId, "renamed",
+                JsonSerializer.Serialize(new { from = record.Name, to = newName }, ActivityJson), now);
+            record.Name = newName!;
+        }
+
+        if (patch.DescriptionSet)
+        {
+            record.Description = patch.Description;
+        }
+
+        if (patch.ModelIdSet)
+        {
+            record.ModelId = patch.ModelId;
+        }
+
+        if (patch.IsShared is { } nextShared)
+        {
+            record.IsShared = nextShared;
+        }
+
+        if (renamed || otherChanged)
+        {
+            if (otherChanged)
+            {
+                AddActivity(id, userId, "saved", detailJson: null, now);
+            }
+
+            record.UpdatedAtUtc = now;
+            await db.SaveChangesAsync(ct);
+            await TrimActivityAsync(id, ct);
+        }
 
         return ServiceResult<DashboardDetail>.Ok(await MaterializeAsync(record, userId, share, ct));
     }

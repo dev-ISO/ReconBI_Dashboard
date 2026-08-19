@@ -545,19 +545,21 @@ export const mergePendingPayloads = (
 };
 
 /**
- * Pending-buffer slot key: ops that supersede each other share a slot. All
- * tile-content ops on one tile share theirs (upsert/remove/geometry supersede
- * per the merge above); page prop families stay separate (a rename must not
- * clobber a pending recolor); doc elements share per element; docSettingSet
- * slots per SCALAR KEY (one wire op per key — a defaultViewFit write must
- * never swallow a pending refreshSeconds op); pageReorder holds one doc-wide
- * slot (latest full order wins).
+ * Pending-buffer slot key: ops that supersede each other share a slot. Tile
+ * upsert/geometry share theirs (geometry folds INTO a pending upsert per the
+ * merge above) but tileRemove holds its OWN slot — a remove must never
+ * coalesce with an upsert: LWW-replacing a buffered content upsert with a
+ * bare remove (or vice versa) silently drops the half that never reached the
+ * wire, while separate slots send both in authored order (upsert-then-remove
+ * and remove-then-re-add both replay exactly). Page prop families stay
+ * separate (a rename must not clobber a pending recolor); doc elements share
+ * per element; docSettingSet slots per SCALAR KEY (one wire op per key — a
+ * defaultViewFit write must never swallow a pending refreshSeconds op);
+ * pageReorder holds one doc-wide slot (latest full order wins).
  */
 export const pendingSlotKey = (op: DashboardLocalOp): string => {
   const family =
-    op.payload.kind === 'tileUpsert' ||
-    op.payload.kind === 'tileRemove' ||
-    op.payload.kind === 'tileGeometry'
+    op.payload.kind === 'tileUpsert' || op.payload.kind === 'tileGeometry'
       ? 'tile'
       : op.payload.kind === 'docSettingSet'
         ? `docSettingSet:${op.payload.key}`

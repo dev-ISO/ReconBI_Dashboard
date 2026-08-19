@@ -99,8 +99,8 @@ interface RendererPointHandlers {
   onTablePageChange?: (page: number) => void;
   /** Total row count over the full filtered result; null = unknown. */
   tableTotalRows?: number | null;
-  /** Totals row aligned to measure columns; null = none. */
-  totalsRow?: (number | null)[] | null;
+  /** Totals row aligned to measure columns (dates ride as ISO strings); null = none. */
+  totalsRow?: (CellValue | null)[] | null;
   /** Column drag/resize report (persist or keep transient — caller's call). */
   onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
   /** Active per-column header filters + change hook (format.table.filterable). */
@@ -169,8 +169,9 @@ export interface ChartTileProps {
    * companion count query); null = unknown -> the pager degrades to "Page X".
    */
   tableTotalRows?: number | null;
-  /** Totals row aligned to measure columns (companion no-dimension query). */
-  totalsRow?: (number | null)[] | null;
+  /** Totals row aligned to measure columns (companion no-dimension query;
+   *  CellValue so date totals survive to the cell formatter). */
+  totalsRow?: (CellValue | null)[] | null;
   /** Column width/order drag report (persist or transient — caller's call). */
   onTableLayoutChange?: (patch: ChartTableLayoutPatch) => void;
   /** Per-column header filter state + change hook (interactive tables). */
@@ -361,9 +362,15 @@ export function ChartTile({
   }
 
   if (entry.status === 'error') {
-    // Actionable text keyed on the server's rcd.query.* error code (falls back
-    // to the raw message — server messages are contract-specified and precise).
-    const friendly = queryErrorTextFor(entry.errorCode, entry.error ?? 'The chart query failed.');
+    // Field-level server issue when the response carried one: its message is
+    // the most precise thing we have, and the wire path names the exact field
+    // (dimensions[1].column, measures[0].aggregation, …). Otherwise the
+    // actionable text keyed on the server's rcd.query.* error code (falling
+    // back to the raw message — server messages are contract-specified).
+    const issue = entry.issues?.[0];
+    const friendly = issue
+      ? { message: issue.message, hint: issue.path ? `At ${issue.path}` : undefined }
+      : queryErrorTextFor(entry.errorCode, entry.error ?? 'The chart query failed.');
     return (
       <State icon={<AlertTriangle size={20} className="text-rcd-muted" />}>
         <span className="max-w-full break-words text-xs text-rcd-text-2">{friendly.message}</span>

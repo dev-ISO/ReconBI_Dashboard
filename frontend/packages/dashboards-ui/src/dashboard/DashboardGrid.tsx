@@ -14,7 +14,70 @@ export interface DashboardGridItem {
   h: number;
   minW?: number;
   minH?: number;
+  /**
+   * Tile kind, for the per-kind minimum-size floors (see withKindMinima).
+   * Optional — items without one (or with a kind that has no floor) keep
+   * their stored constraints untouched.
+   */
+  kind?: string;
 }
+
+/* ------------------------------------------------------ grid drag tracker
+ * BUTTON-TILES B5: navigation buttons follow a left-click in BOTH modes, and
+ * in edit mode the whole button doubles as a drag handle — so the synthetic
+ * click the browser fires after a drag's mouseup must NOT navigate. RGL only
+ * begins a drag once the pointer actually moves, so plain clicks never mark
+ * this state; the tracker is module-scoped (one pointer per document) and the
+ * "just ended" window covers the mouseup→click gap.
+ */
+
+let gridDragActive = false;
+let gridDragEndedAt = 0;
+
+/** A grid move/resize gesture began (also exported for tests). */
+export const markGridDragStart = (): void => {
+  gridDragActive = true;
+};
+
+/** The gesture ended — the click that follows its mouseup is still a drag's. */
+export const markGridDragEnd = (): void => {
+  gridDragActive = false;
+  gridDragEndedAt = Date.now();
+};
+
+/**
+ * True while a grid drag is in progress or one ended within the last few
+ * hundred ms — button click handlers consult this and swallow the click that
+ * concludes a drag instead of navigating.
+ */
+export const clickFollowsGridDrag = (): boolean =>
+  gridDragActive || Date.now() - gridDragEndedAt < 300;
+
+/* -------------------------------------------------------- per-kind minima
+ * BUTTON-TILES B4: react-grid-layout supports per-item minW/minH; these
+ * floors guarantee a default button/group is never clipped by an undersized
+ * tile. Applied in the layout-item mapping on EVERY render (never a doc
+ * migration): existing undersized tiles render at the floor, and the raised
+ * geometry only persists if the author later rearranges the page.
+ */
+const KIND_MIN_SIZES: Record<string, { minW: number; minH: number }> = {
+  button: { minW: 3, minH: 2 },
+  buttonGroup: { minW: 4, minH: 2 },
+};
+
+/** Floors an item's constraints AND geometry to its kind's minimum (exported
+ *  for tests; identity for kinds without a floor). */
+export const withKindMinima = (item: DashboardGridItem): DashboardGridItem => {
+  const min = item.kind !== undefined ? KIND_MIN_SIZES[item.kind] : undefined;
+  if (!min) return item;
+  return {
+    ...item,
+    minW: Math.max(item.minW ?? 1, min.minW),
+    minH: Math.max(item.minH ?? 1, min.minH),
+    w: Math.max(item.w, min.minW),
+    h: Math.max(item.h, min.minH),
+  };
+};
 
 export interface DashboardGridProps {
   items: DashboardGridItem[];
@@ -96,7 +159,7 @@ export function DashboardGrid({
 }: DashboardGridProps) {
   const layout: Layout[] = useMemo(
     () =>
-      items.map((item) => ({
+      items.map(withKindMinima).map((item) => ({
         i: item.id,
         x: item.x,
         y: item.y,
@@ -171,11 +234,24 @@ export function DashboardGrid({
           draggableHandle={draggableHandle}
           // Move AND resize both report as drag start/stop — either gesture
           // rewrites the tile's geometry (the soft-lock consumer treats them
-          // identically).
-          onDragStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
-          onDragStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
-          onResizeStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
-          onResizeStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
+          // identically). The module tracker additionally records the gesture
+          // so button tiles can tell a plain click from a drag's closing click.
+          onDragStart={(_layout: Layout[], oldItem: Layout) => {
+            markGridDragStart();
+            onItemDragStart?.(oldItem.i);
+          }}
+          onDragStop={(_layout: Layout[], oldItem: Layout) => {
+            markGridDragEnd();
+            onItemDragStop?.(oldItem.i);
+          }}
+          onResizeStart={(_layout: Layout[], oldItem: Layout) => {
+            markGridDragStart();
+            onItemDragStart?.(oldItem.i);
+          }}
+          onResizeStop={(_layout: Layout[], oldItem: Layout) => {
+            markGridDragEnd();
+            onItemDragStop?.(oldItem.i);
+          }}
           onLayoutChange={(next: Layout[]) =>
             onLayoutChange?.(
               next.map((l) => ({

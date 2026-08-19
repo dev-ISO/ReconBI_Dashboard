@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { ChevronLeft, ChevronRight, Printer } from 'lucide-react';
 import { RcdButton, RcdDialog, RcdSelect } from '../primitives';
+import { useRuntime } from '../provider/DashboardsProvider';
 import { PrintSheets } from './DashboardPrintView';
 import { computePrintJob, isUncommonPaper, printBrowserChecklist } from './printLayout';
 import { usePrintSections } from './usePrintSections';
@@ -162,12 +163,23 @@ export interface PrintConfigDialogProps {
  * workbook jobs that span several dashboard pages.
  */
 export function PrintConfigDialog({ open, onClose, onConfirm }: PrintConfigDialogProps) {
+  const runtime = useRuntime();
   const [draft, setDraft] = useState<PrintOptions>(() => ({ ...sessionOptions }));
 
   // Re-seed from the session memory each time the dialog opens.
   useEffect(() => {
     if (open) setDraft({ ...sessionOptions });
   }, [open]);
+
+  // The live thumbnail below renders store state — while the dialog is open,
+  // remote application quiesces exactly like the full print preview (a
+  // collaborator's op re-rendering the sheet mid-inspection was the one
+  // unprotected surface). Resume triggers the store's refetch.
+  useEffect(() => {
+    if (!open) return;
+    runtime.dashboards.setCollabQuiesce('printConfig', true);
+    return () => runtime.dashboards.setCollabQuiesce('printConfig', false);
+  }, [open, runtime]);
 
   // The thumbnail mirrors what DashboardPrintView will print: the SAME hook
   // resolves the included pages, per-section headers and per-tile filters.

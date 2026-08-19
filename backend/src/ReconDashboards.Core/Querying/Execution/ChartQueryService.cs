@@ -70,7 +70,7 @@ public sealed class ChartQueryService(
         catch (QueryCompilationException ex)
         {
             return ServiceResult<QueryOutcome>.Fail(
-                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message, ToValidation(ex));
         }
         catch (RowFilterDeniedException ex)
         {
@@ -150,7 +150,7 @@ public sealed class ChartQueryService(
         catch (QueryCompilationException ex)
         {
             return ServiceResult<ExportOutcome>.Fail(
-                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message, ToValidation(ex));
         }
         catch (RowFilterDeniedException ex)
         {
@@ -219,7 +219,7 @@ public sealed class ChartQueryService(
         catch (QueryCompilationException ex)
         {
             return ServiceResult<(QueryOutcome, string)>.Fail(
-                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message, ToValidation(ex));
         }
         catch (RowFilterDeniedException ex)
         {
@@ -259,7 +259,7 @@ public sealed class ChartQueryService(
         catch (QueryCompilationException ex)
         {
             return ServiceResult<DistinctValuesResult>.Fail(
-                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message);
+                ServiceErrorKind.BadRequest, ToErrorCode(ex.Code), ex.Message, ToValidation(ex));
         }
         catch (RowFilterDeniedException ex)
         {
@@ -475,6 +475,26 @@ public sealed class ChartQueryService(
             // Auditing must never break queries.
             logger.LogWarning(ex, "Failed to write query audit row");
         }
+    }
+
+    /// <summary>
+    /// Lifts a compilation failure's field path into the SAME structured
+    /// channel the model editor's MDL checks use (ServiceError.Validation →
+    /// ProblemDetails "issues" → RcdApiError.issues), so the chart builder can
+    /// badge the well that owns the mistake instead of only printing the
+    /// sentence. Null when the compiler did not attribute the fault to a
+    /// field — the response is then exactly what it has always been.
+    /// </summary>
+    private static ValidationResult? ToValidation(QueryCompilationException ex)
+    {
+        if (ex.Path is null)
+        {
+            return null;
+        }
+
+        var validation = new ValidationResult();
+        validation.AddError(ToErrorCode(ex.Code), ex.Message, ex.Path);
+        return validation;
     }
 
     /// <summary>QRY_DISCONNECTED → rcd.query.disconnected etc.</summary>

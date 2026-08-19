@@ -6,6 +6,7 @@ import {
   type ImageExportMode,
 } from '../chart/chartImage';
 import { RcdButton, RcdDialog, RcdSelect } from '../primitives';
+import { useRuntime } from '../provider/DashboardsProvider';
 
 /**
  * Per-chart PNG export configuration ("Export image…" on the view-mode chart
@@ -45,6 +46,7 @@ export function ExportImageDialog({
   resolveTileRoot: (tileId: string) => HTMLElement | null;
   onClose: () => void;
 }) {
+  const runtime = useRuntime();
   const [choices, setChoices] = useState<ExportChoices>(sessionChoices);
   const [busy, setBusy] = useState<ImageExportMode | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -57,6 +59,9 @@ export function ExportImageDialog({
     sessionChoices = { ...choices, area };
     setBusy(mode);
     setError(null);
+    // Quiesce remote application for the rasterization's duration: a
+    // collaborator's op re-rendering the tile mid-capture yields a torn PNG.
+    runtime.dashboards.setCollabQuiesce('imageExport', true);
     try {
       const ok = await exportChartImage(
         resolveTileRoot(request.tileId),
@@ -73,6 +78,7 @@ export function ExportImageDialog({
     } catch {
       setError('Image export failed — try again, or use Download instead of Copy.');
     } finally {
+      runtime.dashboards.setCollabQuiesce('imageExport', false);
       setBusy(null);
     }
   };

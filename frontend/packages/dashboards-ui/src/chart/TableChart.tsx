@@ -1,6 +1,7 @@
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -16,8 +17,10 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronsDownUp,
   ChevronsLeft,
   ChevronsRight,
+  ChevronsUpDown,
   Filter as FilterIcon,
   Loader2,
 } from 'lucide-react';
@@ -33,6 +36,13 @@ import {
 } from '@recon/dashboards-core';
 import { conditionalColor, matchRuleColor } from './analytics';
 import { legacyMeasureColumnLabels } from './chartData';
+import {
+  buildTableTree,
+  collectGroupKeys,
+  flattenTableTree,
+  measureFoldKinds,
+  type VisibleTableRow,
+} from './tableTree';
 import { textStyleToCss } from './textStyle';
 import type { ChartDatumClickInfo, ChartDatumFacet, ChartSelection } from './ChartRenderer';
 
@@ -194,8 +204,9 @@ export interface TableChartProps {
   /**
    * Full-data totals, aligned to the MEASURE columns in RESULT order (index i
    * = i-th measure column). Renders a bold pinned bottom "Total" row.
+   * CellValue-wide: date totals ride as ISO strings and format per column.
    */
-  totalsRow?: (number | null)[] | null;
+  totalsRow?: (CellValue | null)[] | null;
   /** Column resize (drag the header edge, min 60px) / header drag-to-reorder. */
   onTableLayoutChange?: (patch: TableLayoutPatch) => void;
   /**
@@ -219,6 +230,9 @@ export interface TableChartProps {
 
 /** Row cap when the tile is NOT paging (pageSize unset): render-cost guard. */
 const TABLE_ROW_CAP = 500;
+
+/** Shared empty expanded-keys set (matrix groups default COLLAPSED). */
+const NO_EXPANDED: ReadonlySet<string> = new Set();
 
 /** Columns can't be dragged narrower than this (px). */
 const MIN_COLUMN_WIDTH = 60;
@@ -903,10 +917,73 @@ export function TableChart({
   const format = spec.format;
   const table = format.table ?? {};
   const headerStyle = textStyleToCss(format.legendStyle);
-  const paged = table.pageSize != null && table.pageSize > 0;
+
+  // ---- matrix (row hierarchy) ----------------------------------------------
+  // Active when the spec carries extra Rows fields (drillLevels) as wire
+  // dimensions AND the result actually holds them — a stale result fetched
+  // before a matrix toggle must never fold over the wrong columns.
+  const hierarchyDepth = 1 + (spec.query.drillLevels?.length ?? 0);
+  const matrixActive =
+    spec.query.axis != null &&
+    hierarchyDepth > 1 &&
+    table.matrix !== false &&
+    result.columns.filter((c) => c.role === 'dimension').length >= hierarchyDepth;
+  // Matrix is single-page by contract (the tile forces pageSize null; server
+  // paging and client grouping don't compose) — guard locally too so a stale
+  // paged prop can never split groups across pages.
+  const paged = !matrixActive && table.pageSize != null && table.pageSize > 0;
   // Paged results are already one page (ChartQuerySpec.offset/limit); the cap
   // only guards the single-page path.
   const rows = paged ? result.rows : result.rows.slice(0, TABLE_ROW_CAP);
+
+  /**
+   * Expand/collapse state for matrix group rows: EPHEMERAL view state, never
+   * persisted, default COLLAPSED. Keys are value paths, so they survive a
+   * refetch of the same data; stale keys after a data change are ignored.
+   */
+  const [expandedKeys, setExpandedKeys] = useState<ReadonlySet<string>>(NO_EXPANDED);
+  const toggleNode = (key: string) =>
+    setExpandedKeys((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
+  /** Tree + fold metadata, rebuilt only when the data/spec identity changes. */
+  const matrix = useMemo(() => {
+    if (!matrixActive) return null;
+    const capped = result.rows.slice(0, TABLE_ROW_CAP);
+    const measureCols = result.columns.filter((c) => c.role === 'measure');
+    const kinds = measureFoldKinds(spec, measureCols, spec.format.table?.dateAggregation);
+    const tree = buildTableTree(capped, result.columns, hierarchyDepth, kinds);
+    return {
+      tree,
+      /** cellIndex per hierarchy level (the group row's own column). */
+      hierarchyCells: result.columns
+        .filter((c) => c.role === 'dimension')
+        .slice(0, hierarchyDepth)
+        .map((c) => result.columns.indexOf(c)),
+      /** cellIndexes of NON-ADDITIVE measure columns (group rows show an em-dash). */
+      blankCells: new Set<number>(
+        measureCols.filter((_, i) => kinds[i] === 'blank').map((c) => result.columns.indexOf(c)),
+      ),
+      groupKeys: collectGroupKeys(tree),
+    };
+  }, [matrixActive, result, spec, hierarchyDepth]);
+
+  const anyExpanded = expandedKeys.size > 0;
+  const toggleAllNodes = () =>
+    setExpandedKeys(anyExpanded ? NO_EXPANDED : new Set(matrix?.groupKeys ?? []));
+
+  /**
+   * What the tbody actually walks: the flattened matrix tree (group roll-up
+   * rows + the leaf rows under expanded groups), or the plain result rows
+   * wrapped in the same shape so the row map below stays single-path.
+   */
+  const bodyRows: VisibleTableRow[] = matrix
+    ? flattenTableTree(matrix.tree, expandedKeys)
+    : rows.map((row, i): VisibleTableRow => ({ kind: 'leaf', key: String(i), depth: 0, row }));
   const measureColumns = result.columns.filter((c) => c.role === 'measure');
   // Pre-Wave-21 label form per measure column (undefined = identical) — the
   // legacy fallback key for seriesLabels / conditionalFormats saved before
@@ -1353,11 +1430,13 @@ export function TableChart({
   const canNext =
     Boolean(onTablePageChange) && (tablePageCount == null ? true : tablePage < tablePageCount - 1);
   // Page-size picker (viewer-facing): rides the layout-patch channel, so it
-  // needs a layout consumer. 0 = "All" (unpaged).
+  // needs a layout consumer. 0 = "All" (unpaged). Hidden while the matrix is
+  // active — paging and row grouping don't compose.
   const sizeOptions = (table.pageSizeOptions ?? []).filter(
     (n) => Number.isFinite(n) && n > 0 && Number.isInteger(n),
   );
-  const sizePickerEnabled = sizeOptions.length > 0 && Boolean(onTableLayoutChange);
+  const sizePickerEnabled =
+    !matrixActive && sizeOptions.length > 0 && Boolean(onTableLayoutChange);
   const currentSize = paged ? (table.pageSize as number) : 0;
   const sizeChoices = sizeOptions.includes(currentSize)
     ? [0, ...sizeOptions]
@@ -1504,6 +1583,25 @@ export function TableChart({
                             : 'justify-start'
                       }`}
                     >
+                      {matrix !== null && l.cellIndex === matrix.hierarchyCells[0] && (
+                        // Expand-all / collapse-all for the matrix hierarchy,
+                        // in the first hierarchy column's header. Never part
+                        // of the sort click or the reorder drag.
+                        <button
+                          type="button"
+                          aria-label={anyExpanded ? 'Collapse all rows' : 'Expand all rows'}
+                          title={anyExpanded ? 'Collapse all' : 'Expand all'}
+                          draggable={false}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            toggleAllNodes();
+                          }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+                        >
+                          {anyExpanded ? <ChevronsDownUp size={12} /> : <ChevronsUpDown size={12} />}
+                        </button>
+                      )}
                       <span className={wrapText ? 'whitespace-normal break-words' : 'truncate'}>
                         {headerLabel(column)}
                       </span>
@@ -1578,19 +1676,25 @@ export function TableChart({
             </tr>
           </thead>
           <tbody style={table.fontSize !== undefined ? { fontSize: table.fontSize } : undefined}>
-            {rows.map((row, rowIndex) => {
+            {bodyRows.map((entry, rowIndex) => {
+              const row = entry.row;
+              // Matrix GROUP rows are synthetic aggregates: clicking anywhere
+              // on one toggles its expansion; cross-filter/hover/context-menu
+              // interactions belong to LEAF rows only (an aggregate row's
+              // blank dim cells are not filterable identities).
+              const isGroup = entry.kind === 'group';
               const striped = Boolean(table.stripes) && rowIndex % 2 === 1;
               // Hover highlight: NON-matching rows dim; the matching row keeps
               // full strength plus a subtle tint so it reads as the focus.
               const rowMatchesHighlight =
-                highlightCategory !== null && clickColumn !== null
+                !isGroup && highlightCategory !== null && clickColumn !== null
                   ? rowLabel(row) === highlightCategory.label
                   : null;
               // This row's value is (one of) the active cross-filter value(s).
               // Two paths: the legacy first-column match, and the
               // column-qualified cell match that follows a 'cell'/'row' click.
               const selectedCells = new Set<number>();
-              if (selectionCells.length > 0) {
+              if (!isGroup && selectionCells.length > 0) {
                 layout.forEach((l, i) => {
                   if (cellSelected(row, l.column)) selectedCells.add(i);
                 });
@@ -1598,15 +1702,16 @@ export function TableChart({
                 // matching just one of several AND-ed fields loses its cells.
                 if (!rowSelectedByCells(selectedCells)) selectedCells.clear();
               }
-              const selected = selectedCells.size > 0 || rowSelected(row);
+              const selected = !isGroup && (selectedCells.size > 0 || rowSelected(row));
               return (
                 <tr
-                  key={rowIndex}
+                  key={entry.key}
                   // Global attribute, so it is valid on a plain table row: it
                   // announces WHICH row the page is filtered by.
                   aria-current={selected ? true : undefined}
+                  onClick={isGroup ? () => toggleNode(entry.key) : undefined}
                   onContextMenu={
-                    rowEvent && onPointContextMenu
+                    !isGroup && rowEvent && onPointContextMenu
                       ? (e) => {
                           e.preventDefault();
                           onPointContextMenu(rowEvent(row, e));
@@ -1614,10 +1719,12 @@ export function TableChart({
                       : undefined
                   }
                   onMouseEnter={
-                    rowEvent && onPointHover ? (e) => onPointHover(rowEvent(row, e)) : undefined
+                    !isGroup && rowEvent && onPointHover
+                      ? (e) => onPointHover(rowEvent(row, e))
+                      : undefined
                   }
                   className={`${
-                    clickable ? 'cursor-pointer ' : ''
+                    clickable || isGroup ? 'cursor-pointer ' : ''
                   }hover:bg-black/5 dark:hover:bg-white/10 ${
                     // Selection outranks the hover dim: a row the page is
                     // filtered by never fades because someone hovered elsewhere.
@@ -1632,8 +1739,11 @@ export function TableChart({
                     // cellBackground / cellText rules key the measure's
                     // DEFAULT label; first matching spec (then rule) wins.
                     // They survive reorder/pinning/paging because they only
-                    // depend on the column + cell value.
-                    const cellBackground = isMeasure
+                    // depend on the column + cell value. GROUP rows skip them
+                    // (and the data bars): the rules were authored against
+                    // leaf-level values, and the bars are scaled to the leaf
+                    // max — an aggregate would recolor/overflow misleadingly.
+                    const cellBackground = isMeasure && !isGroup
                       ? conditionalColor(
                           format.conditionalFormats,
                           'cellBackground',
@@ -1642,7 +1752,7 @@ export function TableChart({
                           legacyLabelByName.get(column.name),
                         )
                       : undefined;
-                    const cellText = isMeasure
+                    const cellText = isMeasure && !isGroup
                       ? conditionalColor(
                           format.conditionalFormats,
                           'cellText',
@@ -1651,9 +1761,42 @@ export function TableChart({
                           legacyLabelByName.get(column.name),
                         )
                       : undefined;
-                    const dataBar = isMeasure ? dataBars.get(column.name) : undefined;
+                    const dataBar = isMeasure && !isGroup ? dataBars.get(column.name) : undefined;
                     const text = formatCellValue(raw, column);
                     let content: ReactNode = text;
+                    if (isGroup && matrix !== null) {
+                      if (l.cellIndex === matrix.hierarchyCells[entry.depth]) {
+                        // The group's OWN column: rotating chevron + label.
+                        // (The whole row also toggles; stopPropagation keeps
+                        // the button from double-firing through the tr.)
+                        content = (
+                          <span className="flex items-center gap-1">
+                            <button
+                              type="button"
+                              aria-expanded={entry.expanded}
+                              aria-label={`${entry.expanded ? 'Collapse' : 'Expand'} ${entry.node.label}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleNode(entry.key);
+                              }}
+                              className="shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+                            >
+                              <ChevronRight
+                                size={12}
+                                className={`transition-transform ${entry.expanded ? 'rotate-90' : ''}`}
+                              />
+                            </button>
+                            <span className="min-w-0 truncate">{entry.node.label}</span>
+                          </span>
+                        );
+                      } else if (isMeasure && matrix.blankCells.has(l.cellIndex)) {
+                        // Non-additive roll-up (avg/countDistinct/model/calc
+                        // measures): an em-dash beats a wrong number.
+                        content = '—';
+                      } else if (!isMeasure) {
+                        content = ''; // other dim cells stay blank on a group row
+                      }
+                    }
                     if (dataBar && typeof raw === 'number') {
                       // Proportional bar behind the value, scaled to the
                       // column's max |value|. With negatives, zero sits at
@@ -1707,7 +1850,7 @@ export function TableChart({
                       <td
                         key={column.name}
                         onClick={
-                          handleCellClick || (rowEvent && onPointClick)
+                          !isGroup && (handleCellClick || (rowEvent && onPointClick))
                             ? (e) => {
                                 handleCellClick?.(row, column);
                                 if (rowEvent && onPointClick) onPointClick(rowEvent(row, e));
@@ -1732,11 +1875,15 @@ export function TableChart({
                         className={`px-3 py-1 text-rcd-text ${
                           pinned ? 'sticky z-[1]' : ''
                         } ${isMeasure ? 'tabular-nums' : ''} ${
+                          // Group roll-up rows read a step heavier, like the
+                          // totals row, so aggregates never pass for leaves.
+                          isGroup ? 'font-medium' : ''
+                        } ${
                           // Cell-level click target: tint the hovered cell (an
                           // inset wash that layers over its own background).
                           // Skipped on the cell already wearing the accent bar,
                           // whose inline box-shadow would win anyway.
-                          cellHoverAffordance && !isMeasure && !barHere
+                          cellHoverAffordance && !isGroup && !isMeasure && !barHere
                             ? 'hover:shadow-[inset_0_0_0_9999px_rgba(127,127,127,0.10)]'
                             : ''
                         }`}

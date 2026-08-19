@@ -410,3 +410,21 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819212113_SubscriptionEmailContent') THEN
+    ALTER TABLE rcd_subscriptions ADD "ContentJson" jsonb;
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260819212113_SubscriptionEmailContent') THEN
+    INSERT INTO "__RcdMigrationsHistory" ("MigrationId", "ProductVersion")
+    VALUES ('20260819212113_SubscriptionEmailContent', '10.0.8');
+    END IF;
+END $EF$;
+COMMIT;
+

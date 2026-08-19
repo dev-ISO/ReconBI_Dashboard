@@ -33,8 +33,25 @@ public sealed class FileEmailSink(string folder, TimeProvider? timeProvider = nu
         foreach (var attachment in message.Attachments)
         {
             builder.AppendLine();
-            builder.AppendLine($"--- attachment: {attachment.FileName} ({attachment.ContentType}) ---");
-            builder.AppendLine(attachment.Content);
+            if (attachment.Bytes is { } bytes)
+            {
+                // Binary attachments (inline chart PNGs) go to sibling files —
+                // named by ContentId when present so a cid in the HTML body can
+                // be matched to its image on disk.
+                var suffix = Sanitize(attachment.ContentId ?? attachment.FileName);
+                var binaryPath = Path.Combine(
+                    Folder,
+                    $"{now:yyyyMMdd-HHmmss-fff}-{safeSubject}-{suffix}{Path.GetExtension(attachment.FileName)}");
+                await File.WriteAllBytesAsync(binaryPath, bytes, cancellationToken);
+                var inlineNote = attachment.Inline ? $"; inline cid:{attachment.ContentId}" : "";
+                builder.AppendLine(
+                    $"--- attachment: {attachment.FileName} ({attachment.ContentType}{inlineNote}) -> {Path.GetFileName(binaryPath)} ---");
+            }
+            else
+            {
+                builder.AppendLine($"--- attachment: {attachment.FileName} ({attachment.ContentType}) ---");
+                builder.AppendLine(attachment.Content);
+            }
         }
 
         await File.WriteAllTextAsync(path, builder.ToString(), Encoding.UTF8, cancellationToken);

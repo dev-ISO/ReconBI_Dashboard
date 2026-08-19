@@ -39,7 +39,9 @@ namespace ReconDashboards.Core.Services;
 ///                                              other key ⇒ op_invalid (whole-page
 ///                                              writes must not ride this op — they
 ///                                              would stomp concurrent tile edits).
-///   pageRemove       page       page id        —              (missing page: no-op)
+///   pageRemove       page       page id        —              (missing page: no-op;
+///                                              the LAST page: op_target_missing —
+///                                              pages[] never reaches 0)
 ///   pageReorder      doc        null           pageIds: string[] — surviving pages
 ///                                              follow this order; pages the list
 ///                                              does not know (concurrent adds)
@@ -437,6 +439,16 @@ internal static class DashboardOpApplier
     {
         if (root["pages"] is JsonArray pages && FindPage(pages, targetId) is { } found)
         {
+            // Mirror the client guard: a doc never drops its LAST page —
+            // renderers and the open-time pages migration assume pages ≥ 1,
+            // and two concurrent "remove the other page" ops would otherwise
+            // race the doc down to zero. TargetMissing sends the loser to
+            // refetch, where the surviving page is the truth.
+            if (pages.Count <= 1)
+            {
+                return TargetMissing("The last page cannot be removed.");
+            }
+
             pages.RemoveAt(found.Index);
         }
 

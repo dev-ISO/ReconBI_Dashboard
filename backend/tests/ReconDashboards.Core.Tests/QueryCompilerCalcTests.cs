@@ -240,7 +240,7 @@ LIMIT @p1
 
         var lag = "LAG(\"__rcd_base\".\"meas0\", CAST(@p0 AS integer)) OVER (ORDER BY \"__rcd_axis\".\"dim0\" ASC NULLS LAST)";
         Assert.Contains(
-            $"(CAST((\"__rcd_base\".\"meas0\" - {lag}) AS decimal) / NULLIF({lag}, 0)) AS \"meas0\"",
+            $"ROUND(CAST((\"__rcd_base\".\"meas0\" - {lag}) AS decimal) / NULLIF({lag}, 0), 12) AS \"meas0\"",
             compiled.Sql, StringComparison.Ordinal);
 
         var measureColumn = compiled.Columns[1];
@@ -384,7 +384,7 @@ LIMIT @p1
             model);
 
         Assert.Contains(
-            "(CAST(SUM(\"t0\".\"order_total\") AS decimal) / NULLIF(COUNT(*), 0)) AS \"meas0\"",
+            "ROUND(CAST(SUM(\"t0\".\"order_total\") AS decimal) / NULLIF(COUNT(*), 0), 12) AS \"meas0\"",
             compiled.Sql, StringComparison.Ordinal);
         Assert.Contains(
             "SUM(\"meas0\") OVER (ORDER BY \"dim0\" ASC NULLS LAST ROWS UNBOUNDED PRECEDING) AS \"meas0\"",

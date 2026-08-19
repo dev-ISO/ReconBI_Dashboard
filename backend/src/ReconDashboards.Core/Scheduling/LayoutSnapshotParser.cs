@@ -5,7 +5,34 @@ using ReconDashboards.Core.Querying.Spec;
 namespace ReconDashboards.Core.Scheduling;
 
 /// <summary>One runnable chart tile extracted from a dashboard layout doc.</summary>
-public sealed record SnapshotTile(string TileId, string Title, string ChartType, ChartQuerySpec Spec);
+public sealed record SnapshotTile(
+    string TileId, string Title, string ChartType, ChartQuerySpec Spec, ChartFormatDoc? Format = null);
+
+/// <summary>
+/// The chart.format fields the server-side chart renderer consumes (v1).
+/// Persisted in LayoutJson by the GUI; parsed tolerantly — a wrong-typed field
+/// degrades to null/unset, never fails the tile. dateFormat/dateFormatPattern
+/// ride along because date-axis tick text is shaped by them (chart.ts:410-414).
+/// EXCLUDED v1 (not parsed, not drawn): referenceLines, trendlines,
+/// conditionalFormats.
+/// </summary>
+public sealed record ChartFormatDoc(
+    string? Theme = null,
+    IReadOnlyDictionary<string, string>? ColorOverrides = null,
+    bool? ShowLegend = null,
+    string? LegendPosition = null,
+    bool? ShowDataLabels = null,
+    string? DataLabelContent = null,
+    string? ValueFormat = null,
+    string? XAxisLabel = null,
+    string? YAxisLabel = null,
+    IReadOnlyDictionary<string, string>? SeriesLabels = null,
+    IReadOnlyList<string>? CategoryOrder = null,
+    IReadOnlyList<string>? SeriesOrder = null,
+    bool? GridX = null,
+    bool? GridY = null,
+    string? DateFormat = null,
+    string? DateFormatPattern = null);
 
 /// <summary>One dashboard page with its runnable chart tiles, in document order.</summary>
 public sealed record SnapshotPage(string Name, IReadOnlyList<SnapshotTile> Tiles);
@@ -110,7 +137,82 @@ public static class LayoutSnapshotParser
             modelId, dimensions, measures, filters, query.Sort ?? [], TopN: null, query.Limit);
 
         return new SnapshotTile(
-            tile.Id ?? "", tile.Chart.Title ?? "Chart", tile.Chart.Type ?? "column", spec);
+            tile.Id ?? "", tile.Chart.Title ?? "Chart", tile.Chart.Type ?? "column", spec,
+            ReadFormat(tile.Chart.Format));
+    }
+
+    /// <summary>
+    /// Extracts the consumed chart.format fields by hand: the GUI persists many
+    /// more fields with evolving shapes, and one stray type must degrade to
+    /// "unset" instead of failing the tile (or, worse, the whole document —
+    /// which a typed DTO mismatch inside Deserialize would).
+    /// </summary>
+    private static ChartFormatDoc? ReadFormat(JsonElement? format)
+    {
+        if (format is not { ValueKind: JsonValueKind.Object } doc)
+        {
+            return null;
+        }
+
+        return new ChartFormatDoc(
+            Theme: ReadString(doc, "theme"),
+            ColorOverrides: ReadStringMap(doc, "colorOverrides"),
+            ShowLegend: ReadBool(doc, "showLegend"),
+            LegendPosition: ReadString(doc, "legendPosition"),
+            ShowDataLabels: ReadBool(doc, "showDataLabels"),
+            DataLabelContent: ReadString(doc, "dataLabelContent"),
+            ValueFormat: ReadString(doc, "valueFormat"),
+            XAxisLabel: ReadString(doc, "xAxisLabel"),
+            YAxisLabel: ReadString(doc, "yAxisLabel"),
+            SeriesLabels: ReadStringMap(doc, "seriesLabels"),
+            CategoryOrder: ReadStringList(doc, "categoryOrder"),
+            SeriesOrder: ReadStringList(doc, "seriesOrder"),
+            GridX: ReadBool(doc, "gridX"),
+            GridY: ReadBool(doc, "gridY"),
+            DateFormat: ReadString(doc, "dateFormat"),
+            DateFormatPattern: ReadString(doc, "dateFormatPattern"));
+    }
+
+    private static string? ReadString(JsonElement doc, string name) =>
+        doc.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.String
+            ? value.GetString()
+            : null;
+
+    private static bool? ReadBool(JsonElement doc, string name) =>
+        doc.TryGetProperty(name, out var value) && value.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? value.GetBoolean()
+            : null;
+
+    private static IReadOnlyList<string>? ReadStringList(JsonElement doc, string name)
+    {
+        if (!doc.TryGetProperty(name, out var value) || value.ValueKind is not JsonValueKind.Array)
+        {
+            return null;
+        }
+
+        return value.EnumerateArray()
+            .Where(item => item.ValueKind is JsonValueKind.String)
+            .Select(item => item.GetString()!)
+            .ToArray();
+    }
+
+    private static IReadOnlyDictionary<string, string>? ReadStringMap(JsonElement doc, string name)
+    {
+        if (!doc.TryGetProperty(name, out var value) || value.ValueKind is not JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        var map = new Dictionary<string, string>();
+        foreach (var property in value.EnumerateObject())
+        {
+            if (property.Value.ValueKind is JsonValueKind.String)
+            {
+                map[property.Name] = property.Value.GetString()!;
+            }
+        }
+
+        return map;
     }
 
     /// <summary>Mirrors the GUI's filtersForTile card scoping (minus view-mode overrides).</summary>
@@ -197,7 +299,7 @@ public static class LayoutSnapshotParser
         List<SortSpec>? Sort,
         int? Limit);
 
-    private sealed record ChartDoc(string? Type, string? Title, ChartQueryDoc? Query);
+    private sealed record ChartDoc(string? Type, string? Title, ChartQueryDoc? Query, JsonElement? Format);
 
     private sealed record TileDoc(string? Id, string? Kind, ChartDoc? Chart);
 

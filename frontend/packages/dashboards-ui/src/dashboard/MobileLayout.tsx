@@ -148,6 +148,7 @@ export function MobileLayoutEditor({ tiles, layout, onChange, renderTile }: Mobi
     if (tile.kind === 'image') return 'Image';
     // Plain-text of the rich button label; generic fallback for empty labels.
     if (tile.kind === 'button' && tile.button) return buttonLabelText(tile.button) || 'Button';
+    if (tile.kind === 'buttonGroup') return 'Button group';
     return tile.id;
   };
 

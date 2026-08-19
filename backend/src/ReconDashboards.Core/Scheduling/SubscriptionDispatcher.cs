@@ -73,7 +73,11 @@ public sealed class SubscriptionDispatcher(
     /// <summary>
     /// Everything a retry needs WITHOUT re-rendering: the fully personalized
     /// message is cached in memory for the (at most ~8 minute) retry window,
-    /// so a retried email is byte-identical to the failed attempt.
+    /// so a retried email is byte-identical to the failed attempt. In charts
+    /// mode the message now carries inline PNG attachments (~15-40 KB per
+    /// visual tile, +33% base64 on API-style transports) — hundreds of KB per
+    /// failed recipient worst case, held only for that window. Accepted
+    /// (EMAIL-CONTENT-DESIGN).
     /// </summary>
     private sealed record RetryItem(
         long DispatchId,
@@ -348,44 +352,31 @@ public sealed class SubscriptionDispatcher(
         }
 
         // ---- render ONCE under the owner's identity ------------------------
+        // The parse → impersonate → run → render pipeline lives in
+        // SnapshotComposer, shared verbatim with the preview endpoints.
         string subject;
         string baseBody;
         IReadOnlyList<RcdEmailAttachment> attachments;
         try
         {
-            var pages = LayoutSnapshotParser.Parse(dashboard.LayoutJson, modelId);
-            var queryService = ImpersonatedQuery.Create(services, subscription.OwnerUserId);
-            var principal = ImpersonatedQuery.PrincipalFor(subscription.OwnerUserId);
-
-            var rendered = new List<RenderedPage>();
-            foreach (var page in pages)
-            {
-                var tiles = new List<RenderedTile>();
-                foreach (var tile in page.Tiles)
-                {
-                    var outcome = await queryService.RunAsync(tile.Spec, principal, ct);
-                    tiles.Add(outcome.Succeeded
-                        ? new RenderedTile(tile, outcome.Value!.Compiled.Columns, outcome.Value.Rows, Error: null)
-                        : new RenderedTile(tile, [], [], outcome.Error!.Message));
-                }
-
-                rendered.Add(new RenderedPage(page.Name, tiles));
-            }
-
-            subject = $"{dashboard.Name} — dashboard snapshot";
-            baseBody = SnapshotRenderer.RenderHtml(
-                dashboard.Name, nowUtc, rendered, _scheduleZone, options.ScheduleTimeZoneLabel);
+            var composer = services.GetRequiredService<SnapshotComposer>();
+            var composed = await composer.ComposeAsync(
+                dashboard, modelId, subscription.OwnerUserId, subscription.Format,
+                SubscriptionContentConfig.FromJson(subscription.ContentJson),
+                SnapshotMode.EmailDelivery, ct);
+            subject = composed.Subject;
+            baseBody = composed.Html;
             var stampLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, _scheduleZone);
-            attachments = subscription.Format == SubscriptionFormat.Csv
+            attachments = composed.Csv is { } csv
                 ?
                 [
                     new RcdEmailAttachment(
                         $"{SafeFileName(dashboard.Name)}-snapshot-{stampLocal:yyyyMMdd-HHmm}.csv",
                         "text/csv",
-                        SnapshotRenderer.RenderCsv(
-                            dashboard.Name, nowUtc, rendered, _scheduleZone, options.ScheduleTimeZoneLabel)),
+                        csv),
+                    .. composed.InlineImages,
                 ]
-                : [];
+                : composed.InlineImages;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {

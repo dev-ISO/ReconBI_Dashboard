@@ -1,12 +1,18 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Pencil, Trash2, Unlink } from 'lucide-react';
-import { sanitizeRichHtml, type ButtonTileSpec } from '@recon/dashboards-core';
+import { type ButtonTileSpec } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog } from '../primitives';
 import { ButtonTileDialog } from './ButtonTileDialog';
+import { ButtonVisual, buttonLabelText } from './ButtonVisual';
 import { TileBackgroundSwatches } from './TileBackgroundSwatches';
 import { TileFrame } from './TileFrame';
+
+// The shared button rendering was extracted to ButtonVisual.tsx for the
+// button-group wave; re-exported so existing imports (MobileLayout's row
+// labels) keep working unchanged.
+export { ButtonVisual, buttonLabelText, type ButtonVisualSpec } from './ButtonVisual';
 
 export interface ButtonTileProps {
   tileId: string;
@@ -17,62 +23,22 @@ export interface ButtonTileProps {
   pages: { id: string; name: string }[];
 }
 
-/** Plain text of the rich label (tags stripped), for frame titles/aria. */
-export const buttonLabelText = (spec: ButtonTileSpec): string =>
-  spec.html
-    .replace(/<[^>]*>/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-/** Element styling for the sanitized label subset (paragraph margins collapse
- *  so short labels center cleanly inside the button chrome). */
-const LABEL_CLASSES =
-  'text-sm leading-snug [overflow-wrap:anywhere] [&_p]:my-0 ' +
-  '[&_h1]:my-0 [&_h1]:text-xl [&_h1]:font-semibold ' +
-  '[&_h2]:my-0 [&_h2]:text-lg [&_h2]:font-semibold ' +
-  '[&_h3]:my-0 [&_h3]:text-base [&_h3]:font-semibold';
-
-/**
- * Presentational button body shared by both modes. Rendering a real <button>
- * keeps focus/keyboard semantics; the rich LABEL rides inside it (sanitized
- * again as the usual second belt — this is a static render, never a live
- * contentEditable, so dangerouslySetInnerHTML is fine here).
- */
+/** Single-tile body: the shared visual centered in the tile (or filling it). */
 function ButtonTileContent({
   spec,
   onActivate,
   disabled,
 }: {
   spec: ButtonTileSpec;
-  /** View-mode navigation; absent in edit mode (clicks select the tile). */
   onActivate?: () => void;
-  /** Broken target in view mode: inert, no pointer affordance. */
   disabled?: boolean;
 }) {
-  const html = useMemo(() => sanitizeRichHtml(spec.html), [spec.html]);
   const fullSize = spec.fullSize === true;
   return (
-    <div className={`flex h-full items-center justify-center ${fullSize ? '' : 'p-1'}`}>
-      <button
-        type="button"
-        // Edit mode renders the chrome but the CLICK belongs to tile selection —
-        // tabIndex -1 keeps the preview out of the tab order there.
-        tabIndex={onActivate ? 0 : -1}
-        aria-label={buttonLabelText(spec) || 'Button'}
-        disabled={disabled}
-        onClick={onActivate}
-        style={{
-          borderRadius: spec.radius ?? 8,
-          ...(spec.background ? { backgroundColor: spec.background } : null),
-        }}
-        className={`${fullSize ? 'h-full w-full' : 'max-h-full max-w-full px-4 py-1.5'} ${
-          spec.background
-            ? 'border border-transparent text-rcd-text'
-            : 'border border-rcd-border bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)]'
-        } ${disabled ? 'cursor-default opacity-60' : onActivate ? 'transition-[filter] hover:brightness-95 active:brightness-90' : 'cursor-default'} overflow-hidden`}
-      >
-        <span className={LABEL_CLASSES} dangerouslySetInnerHTML={{ __html: html || '<p>Button</p>' }} />
-      </button>
+    <div
+      className={`flex h-full items-center justify-center overflow-hidden ${fullSize ? '' : 'p-1'}`}
+    >
+      <ButtonVisual spec={spec} fullSize={fullSize} onActivate={onActivate} disabled={disabled} />
     </div>
   );
 }
@@ -80,9 +46,11 @@ function ButtonTileContent({
 /**
  * Navigation-button tile. View mode: frameless live button — click switches to
  * the target page via setActivePage (which no-ops on dead ids, so a stale
- * target is inert). Edit mode: standard TileFrame (title-bar dragging), a
- * non-navigating preview with a "broken link" badge when the target page no
- * longer exists (resolved against `pages` every render), and the kebab /
+ * target is inert). Edit mode: standard TileFrame (title-bar dragging), the
+ * SAME live button (B5 — left-click navigates in both modes; the button body
+ * is additionally a grid drag handle, and the drag's closing click is
+ * swallowed inside ButtonVisual), a "broken link" badge when the target page
+ * no longer exists (resolved against `pages` every render), and the kebab /
  * right-click config card (edit dialog, background, remove).
  */
 export function ButtonTile({ tileId, spec, editable, pages }: ButtonTileProps) {
@@ -91,17 +59,12 @@ export function ButtonTile({ tileId, spec, editable, pages }: ButtonTileProps) {
   const [editOpen, setEditOpen] = useState(false);
 
   const targetExists = pages.some((page) => page.id === spec.targetPageId);
+  const activate = targetExists
+    ? () => runtime.dashboards.setActivePage(spec.targetPageId)
+    : undefined;
 
   if (!editable) {
-    return (
-      <ButtonTileContent
-        spec={spec}
-        disabled={!targetExists}
-        onActivate={
-          targetExists ? () => runtime.dashboards.setActivePage(spec.targetPageId) : undefined
-        }
-      />
-    );
+    return <ButtonTileContent spec={spec} disabled={!targetExists} onActivate={activate} />;
   }
 
   return (
@@ -117,7 +80,13 @@ export function ButtonTile({ tileId, spec, editable, pages }: ButtonTileProps) {
       }}
     >
       <div className="relative h-full">
-        <ButtonTileContent spec={spec} />
+        {/* B5: the whole content doubles as an RGL drag handle in edit mode so
+            click-and-drag MOVES the tile from anywhere on the button, while a
+            plain left-click still navigates (ButtonVisual swallows the click
+            that concludes a drag). */}
+        <div className="rcd-tile-drag-handle h-full">
+          <ButtonTileContent spec={spec} disabled={!targetExists} onActivate={activate} />
+        </div>
         {!targetExists && (
           <span
             className="absolute left-1 top-1 z-10 inline-flex items-center gap-1 rounded-md border border-[var(--rcd-status-warn)] bg-rcd-surface px-1.5 py-0.5 text-[10px] font-medium text-[var(--rcd-status-warn)]"
@@ -245,6 +214,10 @@ function ButtonTileConfigMenu({
           <Pencil size={14} />
           Edit button…
         </button>
+        {/* B5 discoverability: edit-mode clicks follow the link. */}
+        <p className="px-3 pb-1 pt-0.5 text-[11px] leading-snug text-rcd-muted">
+          Click follows the button - right-click to edit.
+        </p>
 
         <Divider />
         <SectionLabel>Background</SectionLabel>

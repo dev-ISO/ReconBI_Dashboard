@@ -17,6 +17,7 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import {
+  AlertTriangle,
   Check,
   ChevronDown,
   ChevronRight,
@@ -32,6 +33,7 @@ import {
   reconcileOrder,
   type Aggregation,
   type Catalog,
+  type ChartIssue,
   type ChartQuery,
   type ChartType,
   type DateBucket,
@@ -75,7 +77,31 @@ export interface WellsProps {
    * the lists from the cached preview result — no extra fetch.
    */
   ordering?: ManualOrderInputs;
+  /**
+   * Well-tagged validation issues to badge: client issues from
+   * validateChartSpec plus server RcdApiError.issues mapped through
+   * pathToWell. The offending well gets a red ring and a tooltip listing its
+   * messages; the flat summary list stays with ChartBuilder.
+   */
+  issues?: ChartIssue[];
 }
+
+/**
+ * The messages that badge one well. 'drill' issues land on the table's
+ * multi-field Rows well (its levels render INSIDE the axis well there);
+ * cartesians route them to the DrillSection under the axis instead.
+ */
+export const issueMessagesFor = (
+  def: Pick<WellDef, 'id' | 'capacity'>,
+  issues: readonly ChartIssue[] | undefined,
+): string[] =>
+  (issues ?? [])
+    .filter(
+      (issue) =>
+        issue.well === def.id ||
+        (def.id === 'axis' && def.capacity === 'many' && issue.well === 'drill'),
+    )
+    .map((issue) => issue.message);
 
 /** What the manual-order UI needs to know about the CURRENTLY rendered chart. */
 export interface ManualOrderInputs {
@@ -228,6 +254,7 @@ export function Wells({
   onChange,
   onEditFilter,
   ordering,
+  issues,
 }: WellsProps) {
   const removeMeasure = (index: number) =>
     onChange({ ...query, measures: query.measures.filter((_, i) => i !== index) });
@@ -275,13 +302,14 @@ export function Wells({
   const firstValuesKey = wellsFor(chartType).find((w) => w.id === 'values')?.key;
 
   const renderWell = (def: WellDef) => {
+    const wellIssues = issueMessagesFor(def, issues);
     if (def.id === 'values') {
       // A measure-parameter binding replaces the measure display; removing the
       // binding chip restores the (untouched) measures underneath.
       if (measuresBinding != null) {
         if (def.key !== firstValuesKey) return null;
         return (
-          <Well key={def.key} def={def} empty={false}>
+          <Well key={def.key} def={def} empty={false} issues={wellIssues}>
             <ParamBindingChip
               name={parameterName(measuresBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'measures'))}
@@ -312,6 +340,7 @@ export function Wells({
             key={def.key}
             def={def}
             empty={measure === undefined}
+            issues={wellIssues}
             footer={
               typeHint !== null ? (
                 <p className="pt-1 text-[11px] leading-snug text-[var(--rcd-status-warn)]">
@@ -325,7 +354,7 @@ export function Wells({
         );
       }
       return (
-        <Well key={def.key} def={def} empty={query.measures.length === 0}>
+        <Well key={def.key} def={def} empty={query.measures.length === 0} issues={wellIssues}>
           {query.measures.map(valueChip)}
         </Well>
       );
@@ -336,7 +365,7 @@ export function Wells({
       // drill-levels UI); removing it clears only the binding, not the axis.
       if (axisBinding != null) {
         return (
-          <Well key={def.key} def={def} empty={false}>
+          <Well key={def.key} def={def} empty={false} issues={wellIssues}>
             <ParamBindingChip
               name={parameterName(axisBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'axis'))}
@@ -348,7 +377,7 @@ export function Wells({
         // Table "Rows": ordered multi-field list (row 1, 2, 3, …) — stored as
         // [axis, ...drillLevels] on the wire, no drill framing in the UI.
         return (
-          <Well key={def.key} def={def} empty={!query.axis}>
+          <Well key={def.key} def={def} empty={!query.axis} issues={wellIssues}>
             {query.axis && (
               <OrderedDimensionList
                 idPrefix="row"
@@ -374,9 +403,18 @@ export function Wells({
           key={def.key}
           def={def}
           empty={!query.axis}
+          issues={wellIssues}
           footer={
             hasDrillSubArea(chartType) ? (
-              <DrillSection query={query} model={model} catalog={catalog} onChange={onChange} />
+              <DrillSection
+                query={query}
+                model={model}
+                catalog={catalog}
+                onChange={onChange}
+                issues={(issues ?? [])
+                  .filter((issue) => issue.well === 'drill')
+                  .map((issue) => issue.message)}
+              />
             ) : undefined
           }
         >
@@ -401,7 +439,7 @@ export function Wells({
       );
 
     return (
-      <Well key={def.key} def={def} empty={!dimension}>
+      <Well key={def.key} def={def} empty={!dimension} issues={wellIssues}>
         {dimension && (
           <DimensionChip
             dimension={dimension}
@@ -420,7 +458,11 @@ export function Wells({
     <div className="flex flex-col gap-3">
       {wellsFor(chartType).map(renderWell)}
 
-      <Well def={FILTERS_WELL} empty={query.filters.length === 0}>
+      <Well
+        def={FILTERS_WELL}
+        empty={query.filters.length === 0}
+        issues={issueMessagesFor(FILTERS_WELL, issues)}
+      >
         {query.filters.map((clause, index) => (
           <FilterChip
             key={`${clause.table}.${clause.column}.${clause.operator}-${index}`}
@@ -432,7 +474,15 @@ export function Wells({
         ))}
       </Well>
 
-      <SortLimitSection query={query} model={model} ordering={ordering} onChange={onChange} />
+      <SortLimitSection
+        query={query}
+        model={model}
+        ordering={ordering}
+        onChange={onChange}
+        issues={(issues ?? [])
+          .filter((issue) => issue.well === 'sort')
+          .map((issue) => issue.message)}
+      />
     </div>
   );
 }
@@ -442,12 +492,15 @@ function Well({
   empty,
   children,
   footer,
+  issues = [],
 }: {
   def: WellDef;
   empty: boolean;
   children: React.ReactNode;
   /** Rendered under the drop box, inside the well group (drill sub-area). */
   footer?: React.ReactNode;
+  /** Validation messages badging THIS well: red ring + tooltip + label icon. */
+  issues?: string[];
 }) {
   const { setNodeRef, isOver, active } = useDroppable({
     id: `well-${def.key}`,
@@ -456,6 +509,7 @@ function Well({
 
   const dragData = (active?.data.current as FieldDragData | undefined) ?? null;
   const validTarget = dragData ? canAccept(def.id, dragData) : null;
+  const flagged = issues.length > 0;
 
   const borderClass =
     validTarget === false
@@ -472,6 +526,13 @@ function Well({
     <div>
       <div className="flex items-baseline gap-1.5 pb-0.5">
         <span className="text-xs font-medium text-rcd-text">{def.label}</span>
+        {flagged && (
+          <AlertTriangle
+            size={11}
+            aria-label={`${def.label} has issues`}
+            className="shrink-0 self-center text-[var(--rcd-status-critical)]"
+          />
+        )}
         {def.required && empty && (
           <span className="text-[10px] font-medium text-[var(--rcd-status-warn)]">Required</span>
         )}
@@ -479,9 +540,14 @@ function Well({
       <div className="pb-1.5 text-[11px] leading-snug text-rcd-muted">{def.caption}</div>
       <div
         ref={setNodeRef}
+        title={flagged ? issues.join('\n') : undefined}
         className={`flex min-h-[2.75rem] flex-col justify-center gap-1 rounded-lg border ${
           empty ? 'border-dashed' : ''
-        } p-1.5 transition-colors ${borderClass}`}
+        } p-1.5 transition-colors ${borderClass} ${
+          // The offending well wears a red ring while a drag is not restyling
+          // it; the tooltip above carries the message list.
+          flagged && validTarget === null ? 'ring-1 ring-[var(--rcd-status-critical)]' : ''
+        }`}
       >
         {empty ? (
           <span className="px-1 text-xs text-rcd-muted">{def.placeholder}</span>
@@ -509,14 +575,18 @@ function DrillSection({
   model,
   catalog,
   onChange,
+  issues = [],
 }: {
   query: ChartQuery;
   model: ModelDefinition;
   catalog: Catalog | null;
   onChange: (query: ChartQuery) => void;
+  /** Validation messages badging the drill levels (red ring + tooltip). */
+  issues?: string[];
 }) {
   const levels = query.drillLevels ?? [];
   const [open, setOpen] = useState(levels.length > 0);
+  const flagged = issues.length > 0;
 
   // Auto-expand when a drop adds the first level while collapsed (never
   // fights a manual collapse — only fires when the count GROWS).
@@ -544,7 +614,12 @@ function DrillSection({
     onChange({ ...query, drillLevels: next.length > 0 ? next : undefined });
 
   return (
-    <div className="mt-1.5 border-l-2 border-rcd-border pl-2">
+    <div
+      className={`mt-1.5 border-l-2 pl-2 ${
+        flagged ? 'border-[var(--rcd-status-critical)]' : 'border-rcd-border'
+      }`}
+      title={flagged ? issues.join('\n') : undefined}
+    >
       {open ? (
         <>
           <button
@@ -555,6 +630,13 @@ function DrillSection({
           >
             <ChevronDown size={12} className="shrink-0 text-rcd-muted" />
             Drill-down levels
+            {flagged && (
+              <AlertTriangle
+                size={11}
+                aria-label="Drill levels have issues"
+                className="shrink-0 text-[var(--rcd-status-critical)]"
+              />
+            )}
             {levels.length > 0 && (
               <span className="rounded bg-black/10 px-1 text-[10px] font-semibold leading-4 text-rcd-text-2 dark:bg-white/10">
                 {levels.length}
@@ -781,11 +863,14 @@ function SortLimitSection({
   model,
   ordering,
   onChange,
+  issues = [],
 }: {
   query: ChartQuery;
   model: ModelDefinition;
   ordering?: ManualOrderInputs;
   onChange: (query: ChartQuery) => void;
+  /** Sort/limit validation messages, rendered inline under the heading. */
+  issues?: string[];
 }) {
   // The first wire dimension is what sorting "by category" orders: the axis,
   // or (pie/donut) the slice dimension.
@@ -830,6 +915,21 @@ function SortLimitSection({
 
   return (
     <div className="flex flex-col gap-2 border-t border-rcd-border pt-2.5">
+      {issues.length > 0 && (
+        // Sort/Top-N faults have no drop box to ring, so they read inline
+        // above the controls that produce them.
+        <div className="flex flex-col gap-0.5">
+          {issues.map((message, index) => (
+            <p
+              key={index}
+              className="flex items-start gap-1.5 text-[11px] leading-snug text-[var(--rcd-status-critical)]"
+            >
+              <AlertTriangle size={11} aria-label="Sort issue" className="mt-[2px] shrink-0" />
+              <span className="min-w-0 break-words">{message}</span>
+            </p>
+          ))}
+        </div>
+      )}
       <label className="flex flex-col gap-1">
         <span className="text-xs font-medium text-rcd-text">Sort</span>
         <RcdSelect value={choice} onChange={(event) => apply(event.target.value as SortChoice)}>

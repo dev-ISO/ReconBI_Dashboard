@@ -19,7 +19,11 @@ public sealed record SubscriptionSaveRequest(
     int? DayOfWeekUtc,
     string Recipients,
     SubscriptionFormat Format,
-    bool Enabled = true);
+    bool Enabled = true,
+    // Null = the caller didn't speak content (pre-0.14 client): an update
+    // PRESERVES the stored config rather than silently resetting chart emails
+    // to tables; a create stays legacy NULL. Current clients always send it.
+    SubscriptionContentConfig? Content = null);
 
 /// <summary>Latest-dispatch roll-up for the list rows' "Last delivery" badge.</summary>
 public sealed record DispatchSummary(
@@ -50,7 +54,11 @@ public sealed record SubscriptionDetail(
     DateTime CreatedUtc,
     string OwnerUserId,
     string? OwnerDisplayName,
-    DispatchSummary? LastDispatch);
+    DispatchSummary? LastDispatch,
+    SubscriptionContentConfig? Content);
+
+/// <summary>What a preview endpoint returns — the composed email, nothing sent or stored.</summary>
+public sealed record SubscriptionPreview(string Subject, string Html);
 
 public sealed record DispatchRecipientDetail(
     long Id,
@@ -102,7 +110,8 @@ public sealed class SubscriptionService(
     TimeProvider timeProvider,
     ReconDashboardsOptions options,
     SubscriptionDispatcher dispatcher,
-    IUserDirectory userDirectory)
+    IUserDirectory userDirectory,
+    SnapshotComposer composer)
 {
     /// <summary>Minimum minutes between interval runs.</summary>
     public const int MinIntervalMinutes = 5;
@@ -319,6 +328,82 @@ public sealed class SubscriptionService(
         }
 
         return await dispatcher.StartManualAsync(id, userId, ct);
+    }
+
+    /// <summary>
+    /// Renders the email a SAVED subscription would send — through the SAME
+    /// SnapshotComposer the dispatcher uses, in Preview mode (PNGs as data:
+    /// URIs, nothing attached, nothing stored, no dispatch row). Access
+    /// mirrors editing: owner or admin. The render runs under the
+    /// subscription OWNER's impersonated principal so an admin preview honors
+    /// the owner's row filters instead of lying.
+    /// </summary>
+    public async Task<ServiceResult<SubscriptionPreview>> PreviewAsync(
+        int id, SubscriptionContentConfig? contentOverride, CancellationToken ct)
+    {
+        var userId = currentUser.GetUserId();
+        var record = await db.Subscriptions.AsNoTracking().FirstOrDefaultAsync(s => s.Id == id, ct);
+        if (record is null || (record.OwnerUserId != userId && !currentUser.CanManageShared))
+        {
+            return NotFound<SubscriptionPreview>(id);
+        }
+
+        if (ValidateContent(contentOverride) is { } error)
+        {
+            return ServiceResult<SubscriptionPreview>.Fail(error);
+        }
+
+        var content = contentOverride ?? SubscriptionContentConfig.FromJson(record.ContentJson);
+        return await ComposePreviewAsync(record.DashboardId, record.OwnerUserId, record.Format, content, ct);
+    }
+
+    /// <summary>
+    /// Renders an UNSAVED subscription draft against a dashboard; the caller
+    /// is the owner-to-be, so the render runs as them. Dashboard access =
+    /// exactly the visibility check subscription save applies.
+    /// </summary>
+    public async Task<ServiceResult<SubscriptionPreview>> PreviewDraftAsync(
+        int dashboardId, SubscriptionFormat format, SubscriptionContentConfig? content, CancellationToken ct)
+    {
+        if (!Enum.IsDefined(format))
+        {
+            return ServiceResult<SubscriptionPreview>.Fail(
+                ServiceErrorKind.BadRequest, "rcd.subscription.bad_format", "Format must be 'html' or 'csv'.");
+        }
+
+        if (ValidateContent(content) is { } error)
+        {
+            return ServiceResult<SubscriptionPreview>.Fail(error);
+        }
+
+        return await ComposePreviewAsync(dashboardId, currentUser.GetUserId(), format, content, ct);
+    }
+
+    private async Task<ServiceResult<SubscriptionPreview>> ComposePreviewAsync(
+        int dashboardId, string ownerUserId, SubscriptionFormat format,
+        SubscriptionContentConfig? content, CancellationToken ct)
+    {
+        // Same precondition ladder as the dispatcher's first pass, answered
+        // with errors instead of a 'skipped' dispatch row.
+        var dashboard = await db.Dashboards.AsNoTracking()
+            .FirstOrDefaultAsync(d => d.Id == dashboardId && !d.IsDeleted, ct);
+        if (dashboard is null || (dashboard.OwnerUserId != ownerUserId && !dashboard.IsShared))
+        {
+            return ServiceResult<SubscriptionPreview>.Fail(
+                ServiceErrorKind.NotFound, "rcd.dashboard.not_found",
+                $"Dashboard {dashboardId} does not exist or is not visible to you.");
+        }
+
+        if (dashboard.ModelId is not { } modelId)
+        {
+            return ServiceResult<SubscriptionPreview>.Fail(
+                ServiceErrorKind.BadRequest, "rcd.subscription.preview_unavailable",
+                "The dashboard has no data model, so there is nothing to render.");
+        }
+
+        var composed = await composer.ComposeAsync(
+            dashboard, modelId, ownerUserId, format, content, SnapshotMode.Preview, ct);
+        return ServiceResult<SubscriptionPreview>.Ok(new SubscriptionPreview(composed.Subject, composed.Html));
     }
 
     /// <summary>Dispatch history (newest first) with per-recipient rows; owner-or-admin.</summary>
@@ -542,6 +627,12 @@ public sealed class SubscriptionService(
         record.Recipients = request.Recipients.Trim();
         record.Format = request.Format;
         record.Enabled = request.Enabled;
+        if (request.Content is { } content)
+        {
+            // Absent content preserves the stored config (see the request
+            // record's remark); explicit configs are stored normalized.
+            record.ContentJson = content.ToJson();
+        }
     }
 
     private static ServiceError? Validate(SubscriptionSaveRequest request)
@@ -590,7 +681,52 @@ public sealed class SubscriptionService(
                 "At least one recipient email address is required (semicolon-separated).");
         }
 
+        return ValidateContent(request.Content);
+    }
+
+    /// <summary>Content-config rules (spec §7); shared by save and both preview endpoints.</summary>
+    private static ServiceError? ValidateContent(SubscriptionContentConfig? content)
+    {
+        if (content is null)
+        {
+            return null;
+        }
+
+        if (!Enum.IsDefined(content.Body))
+        {
+            return BadContent("content.body must be 'tables', 'charts', or 'both'.");
+        }
+
+        if (!SubscriptionContentConfig.AllowedImageWidths.Contains(content.ImageWidth))
+        {
+            return BadContent(
+                $"content.imageWidth must be one of {string.Join(", ", SubscriptionContentConfig.AllowedImageWidths)}.");
+        }
+
+        if (content.MaxTableRows is < SubscriptionContentConfig.MinTableRows
+            or > SubscriptionContentConfig.MaxTableRowsCeiling)
+        {
+            return BadContent(
+                $"content.maxTableRows must be between {SubscriptionContentConfig.MinTableRows} and {SubscriptionContentConfig.MaxTableRowsCeiling}.");
+        }
+
+        if (content.ExcludedTileIds.Count > SubscriptionContentConfig.MaxExcludedTiles)
+        {
+            return BadContent(
+                $"content.excludedTileIds can hold at most {SubscriptionContentConfig.MaxExcludedTiles} tile ids.");
+        }
+
+        if (content.ExcludedTileIds.Any(
+                id => id is null || id.Length > SubscriptionContentConfig.MaxTileIdLength))
+        {
+            return BadContent(
+                $"content.excludedTileIds entries must be tile ids of at most {SubscriptionContentConfig.MaxTileIdLength} characters.");
+        }
+
         return null;
+
+        static ServiceError BadContent(string message) =>
+            new(ServiceErrorKind.BadRequest, "rcd.subscription.bad_content", message);
     }
 
     private async Task<bool> DashboardVisibleToAsync(int dashboardId, string userId, CancellationToken ct) =>
@@ -602,7 +738,8 @@ public sealed class SubscriptionService(
         new(record.Id, record.DashboardId, record.Name, record.ScheduleKind, record.IntervalMinutes,
             record.TimeOfDayMinutesUtc, record.DayOfWeekUtc, record.Recipients, record.Format,
             record.Enabled, record.OwnerUserId == userId, record.LastRunUtc, record.CreatedUtc,
-            record.OwnerUserId, ownerDisplayName, lastDispatch);
+            record.OwnerUserId, ownerDisplayName, lastDispatch,
+            SubscriptionContentConfig.FromJson(record.ContentJson));
 
     private static ServiceResult<T> AdminRequired<T>() =>
         ServiceResult<T>.Fail(

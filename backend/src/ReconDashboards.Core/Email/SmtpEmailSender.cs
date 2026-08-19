@@ -38,9 +38,28 @@ public sealed class SmtpEmailSender(RcdEmailOptions options) : IRcdEmailSender
             throw new InvalidOperationException("Rcd:Email:From is not configured; cannot send via SMTP.");
         }
 
-        using var mail = new MailMessage
+        using var mail = BuildMailMessage(options.From, message);
+        using var client = new SmtpClient(options.Host, options.Port)
         {
-            From = new MailAddress(options.From),
+            EnableSsl = options.UseSsl,
+            Credentials = string.IsNullOrEmpty(options.User)
+                ? null
+                : new NetworkCredential(options.User, options.Password),
+        };
+
+        await client.SendMailAsync(mail, cancellationToken);
+    }
+
+    /// <summary>
+    /// Message construction, separated from transport so the attachment
+    /// contract (bytes resolution, Content-ID, inline disposition) is testable
+    /// without an SMTP server. Caller owns disposal.
+    /// </summary>
+    public static MailMessage BuildMailMessage(string from, RcdEmailMessage message)
+    {
+        var mail = new MailMessage
+        {
+            From = new MailAddress(from),
             Subject = message.Subject,
             Body = message.HtmlBody,
             IsBodyHtml = true,
@@ -51,20 +70,25 @@ public sealed class SmtpEmailSender(RcdEmailOptions options) : IRcdEmailSender
             mail.To.Add(new MailAddress(recipient));
         }
 
-        foreach (var attachment in message.Attachments)
+        foreach (var item in message.Attachments)
         {
-            var stream = new MemoryStream(Encoding.UTF8.GetBytes(attachment.Content));
-            mail.Attachments.Add(new Attachment(stream, attachment.FileName, attachment.ContentType));
+            var bytes = item.Bytes ?? Encoding.UTF8.GetBytes(item.Content ?? "");
+            var attachment = new Attachment(new MemoryStream(bytes), item.FileName, item.ContentType);
+            if (item.ContentId is not null)
+            {
+                attachment.ContentId = item.ContentId;
+            }
+
+            if (item.Inline)
+            {
+                // cid-referenced body image: mail clients render it in place
+                // instead of listing it as a downloadable file.
+                attachment.ContentDisposition!.Inline = true;
+            }
+
+            mail.Attachments.Add(attachment);
         }
 
-        using var client = new SmtpClient(options.Host, options.Port)
-        {
-            EnableSsl = options.UseSsl,
-            Credentials = string.IsNullOrEmpty(options.User)
-                ? null
-                : new NetworkCredential(options.User, options.Password),
-        };
-
-        await client.SendMailAsync(mail, cancellationToken);
+        return mail;
     }
 }

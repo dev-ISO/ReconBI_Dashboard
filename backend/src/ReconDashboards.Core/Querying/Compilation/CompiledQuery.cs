@@ -52,10 +52,22 @@ public sealed record CompiledQuery(
 /// QRY_AMBIGUOUS_PATH, QRY_UNKNOWN_TABLE, QRY_UNKNOWN_COLUMN, QRY_BAD_FILTER,
 /// QRY_BAD_VALUE, QRY_BAD_BUCKET, QRY_NO_MEASURES, QRY_TOO_MANY_JOINS, ...).
 /// Messages are user-facing; they never contain SQL.
+///
+/// <paramref name="path"/> names the offending part of the WIRE spec in the
+/// same JSON-pointer-ish grammar the model editor's
+/// <see cref="Modeling.ValidationIssue.Path"/> uses — "measures[0].column",
+/// "dimensions[1].dateBucket", "filters[3]", "sort[0]", "limit",
+/// "query.table" — so the chart builder can badge the well that owns the
+/// mistake instead of showing a bare sentence. Indexes are WIRE indexes (the
+/// order the client sent), never model indexes. Null where a fault belongs to
+/// the query as a whole.
 /// </summary>
-public sealed class QueryCompilationException(string code, string message) : Exception(message)
+public sealed class QueryCompilationException(string code, string message, string? path = null)
+    : Exception(message)
 {
     public string Code { get; } = code;
+
+    public string? Path { get; } = path;
 }
 
 /// <summary>Raised when a row-filter contributor denies access or fails (fail closed).</summary>

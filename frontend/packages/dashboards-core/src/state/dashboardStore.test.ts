@@ -43,6 +43,7 @@ interface ApiStub {
   api: DashboardsApi;
   getDashboard: ReturnType<typeof vi.fn>;
   updateDashboard: ReturnType<typeof vi.fn>;
+  patchDashboardMeta: ReturnType<typeof vi.fn>;
 }
 
 const apiStub = (detail: DashboardDetail): ApiStub => {
@@ -57,11 +58,20 @@ const apiStub = (detail: DashboardDetail): ApiStub => {
       updatedAtUtc: 'stamp-2',
     }),
   );
+  const patchDashboardMeta = vi.fn(async (id: number, body: Record<string, unknown>) =>
+    structuredClone({ ...detail, id, ...body, updatedAtUtc: 'stamp-2' }),
+  );
   const listDashboards = vi.fn(async () => []);
   return {
-    api: { getDashboard, updateDashboard, listDashboards } as unknown as DashboardsApi,
+    api: {
+      getDashboard,
+      updateDashboard,
+      patchDashboardMeta,
+      listDashboards,
+    } as unknown as DashboardsApi,
     getDashboard,
     updateDashboard,
+    patchDashboardMeta,
   };
 };
 
@@ -301,54 +311,50 @@ describe('copyChartToDashboard', () => {
   });
 });
 
-describe('renameDashboard (0.11.1)', () => {
-  it('open dashboard: PUTs the in-memory layout with the new name and adopts the fresh stamp', async () => {
-    const { store, getDashboard, updateDashboard } = await openStore();
+describe('renameDashboard (metadata PATCH since the collab fix wave)', () => {
+  it('open dashboard: PATCHes name+description (never a layout) and adopts the fresh stamp', async () => {
+    const { store, getDashboard, updateDashboard, patchDashboardMeta } = await openStore();
     getDashboard.mockClear();
 
     const ok = await store.renameDashboard(1, 'Renamed', 'new desc');
 
     expect(ok).toBe(true);
-    expect(getDashboard).not.toHaveBeenCalled(); // no refetch — the open session's layout is the truth
-    const [id, body] = updateDashboard.mock.calls[0]! as [number, SaveDashboardBody];
-    expect(id).toBe(1);
-    expect(body.name).toBe('Renamed');
-    expect(body.description).toBe('new desc');
-    expect(body.expectedUpdatedAtUtc).toBe('stamp-1');
-    expect(body.layout.pages).toHaveLength(1);
+    expect(getDashboard).not.toHaveBeenCalled();
+    expect(updateDashboard).not.toHaveBeenCalled(); // C5: a rename carries no doc
+    expect(patchDashboardMeta).toHaveBeenCalledWith(1, { name: 'Renamed', description: 'new desc' });
     const state = store.store.getState();
     expect(state.current!.name).toBe('Renamed');
     expect(state.current!.expectedUpdatedAtUtc).toBe('stamp-2');
   });
 
-  it('open dashboard: omitting description keeps the existing one', async () => {
-    const { store, updateDashboard } = await openStore(detailFor(1, { description: 'keep me' }));
+  it('open dashboard: omitting description keeps the existing one (field absent in the PATCH)', async () => {
+    const { store, patchDashboardMeta } = await openStore(detailFor(1, { description: 'keep me' }));
 
     await store.renameDashboard(1, 'Renamed');
 
-    const body = updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
-    expect(body.description).toBe('keep me');
+    expect(patchDashboardMeta).toHaveBeenCalledWith(1, { name: 'Renamed' });
+    expect(store.store.getState().current!.description).toBe('keep me');
   });
 
-  it('non-open row: fetch-then-PUT with the fetched layout, fields and stamp', async () => {
-    const { store, getDashboard, updateDashboard } = await openStore();
+  it('non-open row: PATCHes by id without ever fetching (nothing to clobber)', async () => {
+    const { store, getDashboard, updateDashboard, patchDashboardMeta } = await openStore();
     getDashboard.mockClear();
 
     const ok = await store.renameDashboard(2, 'Other renamed');
 
     expect(ok).toBe(true);
-    expect(getDashboard).toHaveBeenCalledWith(2);
-    const [id, body] = updateDashboard.mock.calls[0]! as [number, SaveDashboardBody];
-    expect(id).toBe(2);
-    expect(body.name).toBe('Other renamed');
-    expect(body.expectedUpdatedAtUtc).toBe('stamp-1'); // the FETCHED stamp
+    expect(getDashboard).not.toHaveBeenCalled();
+    expect(updateDashboard).not.toHaveBeenCalled();
+    expect(patchDashboardMeta).toHaveBeenCalledWith(2, { name: 'Other renamed' });
     // The open dashboard is untouched.
     expect(store.store.getState().current!.name).toBe('Dash 1');
   });
 
   it('surfaces failures via store error and returns false', async () => {
-    const { store, updateDashboard } = await openStore();
-    updateDashboard.mockRejectedValueOnce(new RcdApiError('409 conflict', 409, 'rcd.dashboard.name_conflict'));
+    const { store, patchDashboardMeta } = await openStore();
+    patchDashboardMeta.mockRejectedValueOnce(
+      new RcdApiError('409 conflict', 409, 'rcd.dashboard.name_conflict'),
+    );
 
     const ok = await store.renameDashboard(1, 'Taken');
 

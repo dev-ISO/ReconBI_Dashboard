@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using ReconDashboards.Core.Persistence;
+using ReconDashboards.Core.Scheduling;
 using ReconDashboards.Core.Services;
 
 namespace ReconDashboards.AspNetCore.Http;
@@ -13,6 +14,17 @@ namespace ReconDashboards.AspNetCore.Http;
 // hence timeOfDayLocal/dayOfWeek on the wire, even though the storage columns
 // keep their historical *Utc names.
 
+/// <summary>
+/// Wire "content" object (EMAIL-CONTENT-DESIGN pinned shape). Missing
+/// sub-fields take the documented defaults so a partial object from an older
+/// client is usable; explicit bad values are still rejected by validation.
+/// </summary>
+public sealed record SubscriptionContentRequest(
+    SubscriptionContentBody Body,
+    IReadOnlyList<string>? ExcludedTileIds,
+    int? ImageWidth,
+    int? MaxTableRows);
+
 public sealed record SaveSubscriptionRequest(
     int DashboardId,
     string Name,
@@ -22,7 +34,8 @@ public sealed record SaveSubscriptionRequest(
     int? DayOfWeek,
     string Recipients,
     SubscriptionFormat Format,
-    bool Enabled = true);
+    bool Enabled = true,
+    SubscriptionContentRequest? Content = null);
 
 public sealed record DispatchSummaryResponse(
     long DispatchId,
@@ -47,12 +60,24 @@ public sealed record SubscriptionResponse(
     string Recipients,
     SubscriptionFormat Format,
     bool Enabled,
+    // Object for configured rows; null mirrors a legacy NULL ContentJson.
+    SubscriptionContentConfig? Content,
     bool OwnerIsMe,
     DateTime? LastRunUtc,
     DateTime CreatedUtc,
     string OwnerUserId,
     string? OwnerDisplayName,
     DispatchSummaryResponse? LastDispatch);
+
+/// <summary>POST subscriptions/{id}/preview body: {} previews the saved config, content overrides it.</summary>
+public sealed record SubscriptionPreviewRequest(SubscriptionContentRequest? Content = null);
+
+/// <summary>POST dashboards/{id}/subscriptions/preview body (unsaved draft; format defaults to html).</summary>
+public sealed record DraftSubscriptionPreviewRequest(
+    SubscriptionFormat? Format = null,
+    SubscriptionContentRequest? Content = null);
+
+public sealed record SubscriptionPreviewResponse(string Subject, string Html);
 
 public sealed record DispatchRecipientResponse(
     long Id,
@@ -147,13 +172,23 @@ public static class SchedulingDtoMapping
     public static SubscriptionSaveRequest ToSaveRequest(SaveSubscriptionRequest request) =>
         new(request.DashboardId, request.Name ?? "", request.ScheduleKind, request.IntervalMinutes,
             ParseTimeOfDay(request.TimeOfDayLocal), request.DayOfWeek, request.Recipients ?? "",
-            request.Format, request.Enabled);
+            request.Format, request.Enabled, ToContentConfig(request.Content));
+
+    /// <summary>Wire content → normalized config; missing sub-fields take the documented defaults.</summary>
+    public static SubscriptionContentConfig? ToContentConfig(SubscriptionContentRequest? content) =>
+        content is null
+            ? null
+            : new SubscriptionContentConfig(
+                content.Body,
+                content.ExcludedTileIds ?? [],
+                content.ImageWidth ?? SubscriptionContentConfig.DefaultImageWidth,
+                content.MaxTableRows ?? SubscriptionContentConfig.DefaultMaxTableRows);
 
     public static SubscriptionResponse ToResponse(SubscriptionDetail detail) =>
         new(detail.Id, detail.DashboardId, detail.Name, detail.ScheduleKind, detail.IntervalMinutes,
             FormatTimeOfDay(detail.TimeOfDayMinutesUtc), detail.DayOfWeekUtc, detail.Recipients,
-            detail.Format, detail.Enabled, detail.OwnerIsMe, detail.LastRunUtc, detail.CreatedUtc,
-            detail.OwnerUserId, detail.OwnerDisplayName, ToResponse(detail.LastDispatch));
+            detail.Format, detail.Enabled, detail.Content, detail.OwnerIsMe, detail.LastRunUtc,
+            detail.CreatedUtc, detail.OwnerUserId, detail.OwnerDisplayName, ToResponse(detail.LastDispatch));
 
     public static DispatchSummaryResponse? ToResponse(DispatchSummary? summary) =>
         summary is null

@@ -199,19 +199,74 @@ export interface ButtonTileSpec {
   html: string;
   /** Page this button navigates to (by id — page renames never break it). */
   targetPageId: string;
-  /** Fixed-palette hex persisted verbatim; null/absent = default button look. */
+  /**
+   * Custom button fill — any hex, picked in the edit dialog (native picker +
+   * hex field + recents) or the config card's fixed swatches; persisted
+   * verbatim. null/absent = the default (preset) button look. A custom color
+   * always overrides the preset chrome.
+   */
   background?: string | null;
+  /** Custom label text color (whole-button); rich spans inside the label can
+   *  still override per-run. null/absent = theme text color. */
+  textColor?: string | null;
   /** Corner radius in px; absent = 8. */
   radius?: number;
   /** True: the button fills the whole tile; false/absent: auto-sized, centered. */
   fullSize?: boolean;
+  /**
+   * Advanced free-form CSS declarations applied to the BUTTON element itself,
+   * sanitized through util/buttonStyle's allowlist (visual properties only —
+   * url()/var()/positioning/margins never survive) on EVERY store write and
+   * again at render. ''/absent = none.
+   */
+  customCss?: string;
+}
+
+/** One button of a buttonGroup tile — the single-button fields sans tile-level
+ *  concerns (fullSize is meaningless inside a flexed group; `align: 'stretch'`
+ *  is the group's fill). Rendered by the SAME ButtonVisual as a single tile. */
+export interface ButtonGroupButton {
+  id: string;
+  /** Rich label — same sanitize-on-every-write doctrine as ButtonTileSpec.html. */
+  html: string;
+  /** Page this button navigates to. */
+  targetPageId: string;
+  /** Custom fill; null/absent = default button look. */
+  background?: string | null;
+  /** Custom label text color; null/absent = theme text color. */
+  textColor?: string | null;
+  /** Corner radius in px; absent = 8. */
+  radius?: number;
+  /** Advanced CSS override — sanitized like ButtonTileSpec.customCss. */
+  customCss?: string;
+}
+
+/**
+ * Button-group tile: a flex container of navigation buttons with authored
+ * packing (the single-button tile spaced buttons by grid geometry alone —
+ * "minimum distance" between buttons was a full grid cell). Buttons render
+ * identically to single button tiles; the container never scrolls — undersize
+ * clips WHOLE buttons (never slices).
+ */
+export interface ButtonGroupTileSpec {
+  buttons: ButtonGroupButton[];
+  /** Main axis of the flex container. */
+  direction: 'row' | 'column';
+  /** Wrap onto additional rows/columns instead of clipping the main axis. */
+  wrap: boolean;
+  /** Gap between buttons in px (default 8 — tight). */
+  gap: number;
+  /** Cross-axis alignment; 'stretch' fills buttons across the cross axis. */
+  align: 'start' | 'center' | 'end' | 'stretch';
+  /** Container fill behind the buttons; null/absent = transparent. */
+  background?: string | null;
 }
 
 export interface DashboardTile {
   id: string;
   layout: TileLayout;
   /** Tile discriminator; absent = 'chart' (legacy docs). */
-  kind?: 'chart' | 'slicer' | 'text' | 'image' | 'button';
+  kind?: 'chart' | 'slicer' | 'text' | 'image' | 'button' | 'buttonGroup';
   /** Present iff this is a chart tile (kind absent or 'chart'). */
   chart?: ChartSpec;
   /** Present iff this is a slicer tile (kind 'slicer'). */
@@ -222,6 +277,8 @@ export interface DashboardTile {
   image?: ImageTileSpec;
   /** Present iff this is a navigation-button tile (kind 'button'). */
   button?: ButtonTileSpec;
+  /** Present iff this is a button-group tile (kind 'buttonGroup'). */
+  buttonGroup?: ButtonGroupTileSpec;
 }
 
 /** Legacy (pre-tile) slicer definition; migrated into slicer tiles on open. */
@@ -501,6 +558,11 @@ export const isButtonTile = (
   tile: DashboardTile,
 ): tile is DashboardTile & { kind: 'button'; button: ButtonTileSpec } =>
   tile.kind === 'button' && tile.button !== undefined;
+
+export const isButtonGroupTile = (
+  tile: DashboardTile,
+): tile is DashboardTile & { kind: 'buttonGroup'; buttonGroup: ButtonGroupTileSpec } =>
+  tile.kind === 'buttonGroup' && tile.buttonGroup !== undefined;
 
 /* ------------------------------------------------------- sharing (0.8.0)
  * Real per-user shares + activity log. Every field here is ADDITIVE on the
@@ -814,6 +876,26 @@ export const mergedSlicerFilters = (values: SlicerValues): FilterClause[] =>
 
 export type SubscriptionScheduleKind = 'interval' | 'daily' | 'weekly';
 
+/** What each visual tile contributes to the email body. */
+export type SubscriptionContentBody = 'tables' | 'charts' | 'both';
+
+/** Logical chart-image width in px (480 Compact / 600 Standard / 900 Wide). */
+export type SubscriptionImageWidth = 480 | 600 | 900;
+
+/**
+ * Email content composition — wire mirror of the backend's ContentJson
+ * (camelCase, exactly this shape). null/absent on a response = legacy
+ * behavior (tables only, 50-row cap); saves always send the explicit object.
+ */
+export interface SubscriptionContentConfig {
+  body: SubscriptionContentBody;
+  /** Tile ids omitted from the email entirely (≤200 entries server-side). */
+  excludedTileIds: string[];
+  imageWidth: SubscriptionImageWidth;
+  /** Per-tile table row cap, 5..500 (replaces the old hard 50 cap). */
+  maxTableRows: number;
+}
+
 export interface DashboardSubscription {
   id: number;
   dashboardId: number;
@@ -831,6 +913,9 @@ export interface DashboardSubscription {
   recipients: string;
   format: 'html' | 'csv';
   enabled: boolean;
+  /** Email content composition; null (or absent from a pre-0.14 server) =
+   * legacy tables behavior. Saves always emit the explicit object. */
+  content?: SubscriptionContentConfig | null;
   /* --- response-only fields (server-assigned) --- */
   ownerIsMe: boolean;
   /** ISO instant of the last send; null = never sent. */
@@ -855,6 +940,29 @@ export type SaveSubscriptionBody = Omit<
   | 'ownerDisplayName'
   | 'lastDispatch'
 >;
+
+/**
+ * Body of POST subscriptions/{id}/preview. An empty {} previews the SAVED
+ * config; `content` overrides it for this render only (never persisted).
+ */
+export interface SubscriptionPreviewBody {
+  content?: SubscriptionContentConfig | null;
+}
+
+/**
+ * Body of POST dashboards/{dashboardId}/subscriptions/preview — an UNSAVED
+ * draft rendered under the caller's own principal (format defaults to html).
+ */
+export interface DraftSubscriptionPreviewBody {
+  format?: 'html' | 'csv';
+  content: SubscriptionContentConfig | null;
+}
+
+/** The composed email both preview endpoints return — nothing is sent. */
+export interface SubscriptionPreviewResult {
+  subject: string;
+  html: string;
+}
 
 /* --------------------------------------------------- dispatches (delivery)
  * Wire mirrors of subscriptions/{id}/dispatches and the live-progress event

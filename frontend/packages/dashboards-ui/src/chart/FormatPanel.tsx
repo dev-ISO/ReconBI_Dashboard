@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { ChevronDown, ChevronUp, PenLine, Trash2, X } from 'lucide-react';
 import {
   CATEGORICAL_SLOTS,
   CHART_THEMES,
   formatDatePattern,
   formatNumberPattern,
+  isMatrixChart,
   newId,
   sanitizeRichHtml,
   type AxisLabelFit,
@@ -31,6 +32,8 @@ import {
 } from '@recon/dashboards-core';
 import { supportsSmallMultiples } from '../chart-builder/wellConfig';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
+import { RichTextEditingSurface } from '../richtext/RichTextEditingSurface';
+import { RICH_TEXT_CLASSES } from '../richtext/richTextClasses';
 
 export interface FormatPanelProps {
   spec: ChartSpec;
@@ -1274,15 +1277,16 @@ function ConditionalFormatCard({
 }
 
 /**
- * Minimal self-contained rich-text editor dialog, shared by the tile's inner
- * title and the rich axis titles: contentEditable plus a B/I/U/size/color
- * toolbar driven by the legacy execCommand API (deprecated but universally
- * shipped; every call is wrapped in try/catch so an engine without it degrades
- * to plain-text editing). styleWithCSS is requested first so output prefers
- * span/style over <font> tags. The live preview and the applied value both run
- * through the core sanitizeRichHtml allowlist, so nothing outside it ever
- * reaches the spec. Applying an empty editor emits undefined (clears the
- * target field).
+ * Rich-text editor dialog, shared by the tile's inner title and the rich axis
+ * titles (x/y/y2). The editing itself is the shared RichTextEditingSurface —
+ * full toolbar, right-click format menu, Tab/list handling — seeded
+ * imperatively ONCE per open (the dialog is conditionally mounted per open,
+ * so each open re-seeds from the then-current value; React 19 re-applies
+ * dangerouslySetInnerHTML on EVERY re-render, which is why a live-rendered
+ * seed stomped typing — pinned in test/contentEditable.test.tsx). The live
+ * preview and the applied value both run through the core sanitizeRichHtml
+ * allowlist, so nothing outside it ever reaches the spec. Applying an empty
+ * editor emits undefined (clears the target field).
  */
 export function RichTextDialog({
   title,
@@ -1296,46 +1300,10 @@ export function RichTextDialog({
   onApply: (html: string | undefined) => void;
   onCancel: () => void;
 }) {
-  const editorRef = useRef<HTMLDivElement>(null);
   const [html, setHtml] = useState(initialHtml);
-
-  // Seed the editor's DOM exactly ONCE, imperatively. It used to be seeded via
-  // dangerouslySetInnerHTML on the element itself, but React 19 re-applies
-  // that HTML on EVERY re-render (proven in test/contentEditable.test.tsx) —
-  // and this component re-renders on each keystroke (onInput -> setHtml), so
-  // typing was overwritten by the original seed mid-word, leaving stray
-  // "remnant" fragments. After this one-time seed the browser owns the
-  // contentEditable's DOM entirely; React renders the element childless and
-  // never touches its contents again. (The dialog is conditionally mounted
-  // per open, so each open re-seeds from the then-current value.)
-  useLayoutEffect(() => {
-    if (editorRef.current) editorRef.current.innerHTML = initialHtml;
-    // Mount-only by design — see above; a changing seed must NOT re-stomp.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   const sanitized = sanitizeRichHtml(html);
   const isEmpty = sanitized.replace(/<[^>]*>/g, '').trim() === '';
-
-  const exec = (command: string, value?: string) => {
-    const editor = editorRef.current;
-    if (!editor) return;
-    editor.focus();
-    try {
-      document.execCommand('styleWithCSS', false, 'true');
-    } catch {
-      /* optional — <font> fallback output is normalized by the sanitizer */
-    }
-    try {
-      document.execCommand(command, false, value);
-    } catch {
-      /* execCommand unavailable — formatting off, text editing still works */
-    }
-    setHtml(editor.innerHTML);
-  };
-
-  const toolButton =
-    'flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-rcd-border text-xs text-rcd-text-2 transition-colors hover:bg-black/5 dark:hover:bg-white/10';
 
   return (
     <RcdDialog
@@ -1355,69 +1323,22 @@ export function RichTextDialog({
       }
     >
       <div className="flex flex-col gap-3">
-        <div className="flex items-center gap-1.5">
-          <button
-            type="button"
-            aria-label="Bold"
-            className={`${toolButton} font-bold`}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => exec('bold')}
-          >
-            B
-          </button>
-          <button
-            type="button"
-            aria-label="Italic"
-            className={`${toolButton} italic`}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => exec('italic')}
-          >
-            I
-          </button>
-          <button
-            type="button"
-            aria-label="Underline"
-            className={`${toolButton} underline`}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => exec('underline')}
-          >
-            U
-          </button>
-          <RcdSelect
-            aria-label="Font size"
-            value=""
-            onChange={(event) => {
-              if (event.target.value !== '') exec('fontSize', event.target.value);
-            }}
-          >
-            <option value="">Size</option>
-            <option value="2">Small</option>
-            <option value="3">Normal</option>
-            <option value="5">Large</option>
-            <option value="6">Huge</option>
-          </RcdSelect>
-          <input
-            type="color"
-            aria-label="Text color"
-            defaultValue="#1f2937"
-            className={COLOR_INPUT_CLASS}
-            onInput={(event) => exec('foreColor', event.currentTarget.value)}
-          />
-        </div>
-        <div
-          ref={editorRef}
-          contentEditable
-          role="textbox"
-          aria-multiline="true"
-          aria-label={`${title} rich text`}
-          className="min-h-[5rem] rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 text-sm text-rcd-text outline-none focus:border-rcd-accent"
-          onInput={(event) => setHtml(event.currentTarget.innerHTML)}
+        <RichTextEditingSurface
+          seedHtml={initialHtml}
+          onChange={setHtml}
+          inDialog
+          ariaLabel={`${title} rich text`}
+          className={`${RICH_TEXT_CLASSES} min-h-[5rem] rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 outline-none focus:border-rcd-accent`}
         />
         <div className="flex flex-col gap-1">
           <span className="text-xs font-medium uppercase tracking-wide text-rcd-muted">
             Preview
           </span>
-          <div className="min-h-[2.5rem] rounded-md border border-dashed border-rcd-border px-2.5 py-1.5 text-sm text-rcd-text">
+          {/* RICH_TEXT_CLASSES here too: a list styled in the editor must
+              show its markers in the preview, not collapse to bare lines. */}
+          <div
+            className={`${RICH_TEXT_CLASSES} min-h-[2.5rem] rounded-md border border-dashed border-rcd-border px-2.5 py-1.5`}
+          >
             {isEmpty ? (
               <span className="text-xs text-rcd-muted">
                 Empty — applying clears this title.
@@ -1640,6 +1561,12 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     if (merged.clickFilter !== undefined && merged.clickFilter !== 'cell') {
       next.clickFilter = merged.clickFilter;
     }
+    // Matrix defaults ON (absent) — only the explicit opt-out persists.
+    if (merged.matrix === false) next.matrix = false;
+    // Only 'latest' entries persist ('earliest' is the default).
+    if (merged.dateAggregation && Object.keys(merged.dateAggregation).length > 0) {
+      next.dateAggregation = merged.dateAggregation;
+    }
     patch({ table: Object.keys(next).length > 0 ? next : undefined });
   };
 
@@ -1658,6 +1585,19 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
     else delete next[key];
     setTable({ columnVerticalAlign: next });
   };
+
+  /** 'earliest' (the default) removes the key; the map drops via setTable's prune. */
+  const setDateAggregation = (key: string, mode: 'earliest' | 'latest') => {
+    const next = { ...format.table?.dateAggregation };
+    if (mode === 'latest') next[key] = mode;
+    else delete next[key];
+    setTable({ dateAggregation: next });
+  };
+
+  /** The table renders its extra Rows fields as a matrix hierarchy. */
+  const matrixEligible =
+    spec.type === 'table' && spec.query.axis != null && (spec.query.drillLevels?.length ?? 0) > 0;
+  const matrixOn = matrixEligible && format.table?.matrix !== false;
 
   /**
    * Viewer page-size choices: free-typed comma list, committed live as parsed
@@ -1704,14 +1644,19 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   };
 
   // Table result columns for the per-column alignment editor. columnAlign is
-  // keyed by result column NAME, and toWireSpec emits names positionally:
-  // dimensions [axis, legend, smallMultiples] -> dim0..dimN, then measures ->
-  // meas0..measN — the same names TableChart keys columnWidths/columnAlign by.
+  // keyed by result column NAME, and the engine names them positionally from
+  // the WIRE order: dimensions -> dim0..dimN, then measures -> meas0..measN —
+  // the same names TableChart keys columnWidths/columnAlign/dateAggregation
+  // by. Matrix tables splice the row hierarchy into that order
+  // ([axis, drill…, legend]); everything else stays
+  // [axis, legend, smallMultiples]. Mirrors toWireSpec exactly.
   const tableColumns: { key: string; label: string }[] = [];
   if (spec.type === 'table') {
-    const dims = [spec.query.axis, spec.query.legend, spec.query.smallMultiples].filter(
-      (dim): dim is NonNullable<typeof dim> => dim != null,
-    );
+    const dims = (
+      isMatrixChart(spec)
+        ? [spec.query.axis, ...(spec.query.drillLevels ?? []), spec.query.legend]
+        : [spec.query.axis, spec.query.legend, spec.query.smallMultiples]
+    ).filter((dim): dim is NonNullable<typeof dim> => dim != null);
     dims.forEach((dim, index) => {
       tableColumns.push({
         key: `dim${index}`,
@@ -1729,6 +1674,20 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
       tableColumns.push({ key: `meas${index}`, label: format.seriesLabels?.[base] ?? base });
     });
   }
+
+  // Date roll-up candidates: INLINE Min/Max measures — the only measure shape
+  // whose grand-total / matrix roll-up the client can rewrite between
+  // earliest and latest (TableOptions.dateAggregation).
+  const dateAggregationColumns = tableColumns.filter(({ key }) => {
+    if (!key.startsWith('meas')) return false;
+    const measure = spec.query.measures[Number(key.slice(4))];
+    return (
+      measure !== undefined &&
+      measure.measureId == null &&
+      measure.calc == null &&
+      (measure.aggregation === 'min' || measure.aggregation === 'max')
+    );
+  });
 
   /** Merge + prune: drops every default-valued field, then the object itself. */
   const setContainer = (partial: Partial<ContainerStyle>) => {
@@ -3157,11 +3116,51 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
           )}
 
           <h4 className={SUBHEAD_CLASS}>Behavior</h4>
+          {matrixEligible && (
+            <>
+              <CheckboxRow
+                label="Row hierarchy (matrix)"
+                checked={format.table?.matrix ?? true}
+                onChange={(checked) => setTable({ matrix: checked ? undefined : false })}
+              />
+              <p className="text-xs text-rcd-muted">
+                Extra Rows fields group as expandable parent rows with rolled-up values. Off:
+                they become drill-down levels instead (the drill controls return).
+              </p>
+            </>
+          )}
           <CheckboxRow
             label="Totals row"
             checked={format.table?.totals ?? false}
             onChange={(checked) => setTable({ totals: checked || undefined })}
           />
+          {dateAggregationColumns.length > 0 && (
+            <>
+              {dateAggregationColumns.map(({ key, label }) => (
+                <SegmentedRow
+                  key={key}
+                  label={`${label} rolls up as`}
+                  options={[
+                    { value: 'earliest', label: 'Earliest' },
+                    { value: 'latest', label: 'Latest' },
+                  ]}
+                  value={format.table?.dateAggregation?.[key] ?? 'earliest'}
+                  onChange={(next) => setDateAggregation(key, next)}
+                />
+              ))}
+              <p className="text-xs text-rcd-muted">
+                How Min/Max date columns total — in the totals row and in matrix parent rows:
+                earliest keeps the Min across all rows, latest the Max.
+              </p>
+            </>
+          )}
+          {matrixOn ? (
+            <p className="text-xs text-rcd-muted">
+              Paging is unavailable while the row hierarchy is on — grouped rows can’t split
+              across pages. Long tables cap at 500 rows.
+            </p>
+          ) : (
+          <>
           <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
             Page size
             <RcdSelect
@@ -3227,6 +3226,8 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               default.
             </p>
           </div>
+          </>
+          )}
           <CheckboxRow
             label="Stripes"
             checked={format.table?.stripes ?? false}

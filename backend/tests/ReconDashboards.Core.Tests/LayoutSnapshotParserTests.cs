@@ -219,4 +219,154 @@ public class LayoutSnapshotParserTests
         var json = JsonSerializer.Serialize(tile.Spec, new JsonSerializerOptions(JsonSerializerDefaults.Web));
         Assert.Contains("\"runningTotal\"", json, StringComparison.Ordinal);
     }
+
+    // ------------------------------------------------------------ chart.format
+    // The server-side chart renderer draws from chart.format, so the parser has
+    // to carry it through. It is read FIELD BY FIELD on purpose: the GUI
+    // persists many more keys with evolving shapes, and one stray type must
+    // degrade to "unset" rather than fail the tile — or the whole document.
+
+    private static string LayoutWithFormat(string formatJson) => $$"""
+        {
+          "version": 1, "tiles": [], "slicers": [],
+          "pages": [{ "id": "p1", "name": "One", "tiles": [
+            { "id": "t1", "kind": "chart", "chart": { "id": "c1", "type": "column", "title": "A",
+              "query": { "axis": { "table": "public.customers", "column": "region" },
+                         "measures": [{ "table": "public.orders", "column": "order_total", "aggregation": "sum" }],
+                         "filters": [] },
+              "format": {{formatJson}} } }
+          ]}]
+        }
+        """;
+
+    private static ChartFormatDoc? ParseFormat(string formatJson) =>
+        Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(LayoutWithFormat(formatJson), ModelId)).Tiles).Format;
+
+    [Fact]
+    public void EveryConsumedFormatFieldSurvivesParsing()
+    {
+        var format = ParseFormat("""
+            {
+              "theme": "ocean",
+              "colorOverrides": { "West": "#123456", "East": "#654321" },
+              "showLegend": false,
+              "legendPosition": "right",
+              "showDataLabels": true,
+              "dataLabelContent": "both",
+              "valueFormat": "$#,##0",
+              "xAxisLabel": "Territory",
+              "yAxisLabel": "Revenue",
+              "seriesLabels": { "Total": "Revenue" },
+              "categoryOrder": ["East", "West"],
+              "seriesOrder": ["Target", "Total"],
+              "gridX": true,
+              "gridY": false,
+              "dateFormat": "monthShort",
+              "dateFormatPattern": "yyyy-MM"
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.Equal("ocean", format.Theme);
+        Assert.Equal("#123456", format.ColorOverrides!["West"]);
+        Assert.Equal("#654321", format.ColorOverrides["East"]);
+        Assert.False(format.ShowLegend);
+        Assert.Equal("right", format.LegendPosition);
+        Assert.True(format.ShowDataLabels);
+        Assert.Equal("both", format.DataLabelContent);
+        Assert.Equal("$#,##0", format.ValueFormat);
+        Assert.Equal("Territory", format.XAxisLabel);
+        Assert.Equal("Revenue", format.YAxisLabel);
+        Assert.Equal("Revenue", format.SeriesLabels!["Total"]);
+        Assert.Equal(["East", "West"], format.CategoryOrder);
+        Assert.Equal(["Target", "Total"], format.SeriesOrder);
+        Assert.True(format.GridX);
+        Assert.False(format.GridY);
+        Assert.Equal("monthShort", format.DateFormat);
+        Assert.Equal("yyyy-MM", format.DateFormatPattern);
+    }
+
+    [Fact]
+    public void AMissingOrNonObjectFormatIsSimplyUnset()
+    {
+        Assert.Null(ParseFormat("null"));
+        Assert.Null(ParseFormat("\"nonsense\""));
+        Assert.Null(ParseFormat("[]"));
+
+        // An empty object parses to an all-unset doc — every renderer default applies.
+        var empty = ParseFormat("{}");
+        Assert.NotNull(empty);
+        Assert.Null(empty.Theme);
+        Assert.Null(empty.ShowLegend);
+        Assert.Null(empty.CategoryOrder);
+
+        // ...and a tile with no "format" key at all is Format = null.
+        const string noFormat = """
+            {
+              "version": 1, "tiles": [], "slicers": [],
+              "pages": [{ "id": "p1", "name": "One", "tiles": [
+                { "id": "t1", "chart": { "id": "c1", "type": "column", "title": "A", "query": {
+                  "measures": [{ "table": "public.orders", "aggregation": "count" }], "filters": [] } } }
+              ]}]
+            }
+            """;
+        Assert.Null(Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(noFormat, ModelId)).Tiles).Format);
+    }
+
+    [Fact]
+    public void WrongTypedFormatFieldsDegradeToUnsetInsteadOfFailingTheTile()
+    {
+        var format = ParseFormat("""
+            {
+              "theme": 42,
+              "showLegend": "yes",
+              "gridY": 0,
+              "colorOverrides": "not-a-map",
+              "categoryOrder": "not-a-list",
+              "valueFormat": "$#,##0"
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.Null(format.Theme);
+        Assert.Null(format.ShowLegend);
+        Assert.Null(format.GridY);
+        Assert.Null(format.ColorOverrides);
+        Assert.Null(format.CategoryOrder);
+        // The well-typed neighbours still come through — one bad key is not fatal.
+        Assert.Equal("$#,##0", format.ValueFormat);
+    }
+
+    [Fact]
+    public void NonStringEntriesInsideMapsAndListsAreSkipped()
+    {
+        var format = ParseFormat("""
+            {
+              "colorOverrides": { "West": "#123456", "East": 7, "North": null },
+              "categoryOrder": ["East", 5, null, "West"]
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.Equal(["West"], format.ColorOverrides!.Keys);
+        Assert.Equal(["East", "West"], format.CategoryOrder);
+    }
+
+    [Fact]
+    public void FormatKeysExcludedInV1AreCarriedNowhereAndBreakNothing()
+    {
+        // referenceLines / trendlines / conditionalFormats are NOT drawn server
+        // side yet; their presence must be inert, not an error.
+        var format = ParseFormat("""
+            {
+              "theme": "forest",
+              "referenceLines": [{ "value": 100, "label": "Target" }],
+              "trendlines": [{ "series": "Total", "kind": "linear" }],
+              "conditionalFormats": [{ "when": "gt", "value": 5, "color": "#f00" }]
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.Equal("forest", format.Theme);
+    }
 }

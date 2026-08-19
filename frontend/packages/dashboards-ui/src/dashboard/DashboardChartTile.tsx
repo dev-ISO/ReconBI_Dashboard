@@ -8,6 +8,8 @@ import {
 } from 'react';
 import { ArrowDown, ArrowUp, ChevronsDown, CornerUpLeft } from 'lucide-react';
 import {
+  isMatrixChart,
+  isTemporalType,
   stableStringify,
   toWireSpec,
   type CellValue,
@@ -17,6 +19,7 @@ import {
   type DimensionRef,
   type FilterClause,
   type FilterValue,
+  type MeasureRef,
   type QueryColumn,
   type QueryResult,
   type SortSpec,
@@ -111,13 +114,66 @@ const mergeTablePatch = (
     : null),
 });
 
-/** A chart's dimensions in wire order [axis, legend, smallMultiples] (mirrors toWireSpec). */
+/**
+ * A chart's dimensions in wire order (mirrors toWireSpec): matrix tables emit
+ * [axis, drills..., legend], everything else [axis, legend, smallMultiples].
+ */
 const wireDimensionsOf = (chart: ChartSpec): DimensionRef[] => {
   const dims: DimensionRef[] = [];
   if (chart.query.axis) dims.push(chart.query.axis);
+  if (isMatrixChart(chart)) dims.push(...(chart.query.drillLevels ?? []));
   if (chart.query.legend) dims.push(chart.query.legend);
   if (chart.query.smallMultiples) dims.push(chart.query.smallMultiples);
   return dims;
+};
+
+/** Positional meta of a result's MEASURE columns (name + temporal-ness). */
+interface TotalsMeasureColumn {
+  name: string;
+  temporal: boolean;
+}
+
+/** Extracts the measure columns' totals-relevant meta, in result order. */
+export const totalsMeasureColumnsOf = (columns: QueryColumn[]): TotalsMeasureColumn[] =>
+  columns
+    .filter((column) => column.role === 'measure')
+    .map((column) => ({ name: column.name, temporal: isTemporalType(column.type) }));
+
+/**
+ * Measures for the totals companion query: TEMPORAL measure columns total as
+ * MIN ('earliest', the default) or MAX ('latest') per table.dateAggregation —
+ * the same per-column rule matrix parent rows fold by, so the Total row and
+ * the roll-ups always agree. Only INLINE measures can be rewritten (a model
+ * measure's aggregation lives server-side behind its id); those keep their
+ * own aggregation. Column meta is positional: measure i -> i-th measure
+ * column (wire order); null meta (no result yet) leaves everything untouched.
+ */
+export const totalsMeasuresFor = (
+  measures: MeasureRef[],
+  measureColumns: readonly TotalsMeasureColumn[] | null,
+  dateAggregation: Record<string, 'earliest' | 'latest'> | undefined,
+): MeasureRef[] =>
+  measures.map((measure, i) => {
+    const column = measureColumns?.[i];
+    if (!column?.temporal || measure.measureId != null || measure.column == null) return measure;
+    const aggregation =
+      (dateAggregation?.[column.name] ?? 'earliest') === 'latest' ? 'max' : 'min';
+    return measure.aggregation === aggregation ? measure : { ...measure, aggregation };
+  });
+
+/**
+ * Reduces the companion result's single row to the measure-aligned totals
+ * array. Cells pass through AS-IS — date totals arrive as ISO strings and must
+ * survive to formatCellValue (the old `typeof value === 'number'` reducer
+ * silently nulled them); only a genuinely missing cell becomes null.
+ */
+export const totalsRowFromResult = (result: QueryResult): (CellValue | null)[] | null => {
+  const row = result.rows[0];
+  if (!row) return null;
+  return result.columns
+    .map((column, i) => ({ column, i }))
+    .filter(({ column }) => column.role === 'measure')
+    .map(({ i }) => row[i] ?? null);
 };
 
 type HavingOperator = ChartHavingClause['operator'];
@@ -416,7 +472,11 @@ export function DashboardChartTile({
   }, [queryKey]);
 
   const drillLevels = chart.query.drillLevels ?? [];
-  const hasHierarchy = drillLevels.length > 0 && chart.query.axis != null;
+  // Matrix tables consume drillLevels as WIRE dimensions (row hierarchy), so
+  // the drill affordances hide and the drill runtime stays at the root —
+  // drill and matrix are mutually exclusive readings of the same array.
+  const matrixActive = isMatrixChart(chart);
+  const hasHierarchy = !matrixActive && drillLevels.length > 0 && chart.query.axis != null;
   const maxLevel = hasHierarchy ? drillLevels.length : 0;
   // Defensive clamp: a mid-edit spec swap can briefly outpace the reset effect.
   const level = Math.min(drill.level, maxLevel);
@@ -521,8 +581,13 @@ export function DashboardChartTile({
   // the existing offset/limit mechanism without touching the doc.
   const pageSizePick = tableLayoutOverride?.pageSize;
   const effectivePageSize = pageSizePick ?? tableOptions?.pageSize ?? null;
+  // Matrix forces single-page: server paging and client row-grouping don't
+  // compose (a page boundary would split groups and lie in the roll-ups) —
+  // the TABLE_ROW_CAP render guard takes over.
   const pageSize =
-    isTable && effectivePageSize != null && effectivePageSize > 0 ? effectivePageSize : null;
+    isTable && !matrixActive && effectivePageSize != null && effectivePageSize > 0
+      ? effectivePageSize
+      : null;
 
   // Sort/page/column-filter reset whenever the EFFECTIVE query identity
   // changes — drill level/path, drillthrough/slicer/cross-filter clauses,
@@ -539,8 +604,24 @@ export function DashboardChartTile({
 
   /** Freshest rendered result (ref assignment from ChartTile — no re-renders). */
   const lastResultRef = useRef<QueryResult | null>(null);
+  /**
+   * Measure-column meta (name + temporal-ness) from the freshest result. The
+   * totals companion's temporal rewrite needs it inside a memo, and memos
+   * can't read a bare ref reliably — so it lives in state, CONTENT-guarded so
+   * a re-render only happens when the measure columns actually change (in
+   * practice once per query shape, not per refetch).
+   */
+  const [measureColumnMeta, setMeasureColumnMeta] = useState<TotalsMeasureColumn[] | null>(null);
   const handleResult = useCallback((result: QueryResult) => {
     lastResultRef.current = result;
+    const meta = totalsMeasureColumnsOf(result.columns);
+    setMeasureColumnMeta((prev) =>
+      prev !== null &&
+      prev.length === meta.length &&
+      prev.every((m, i) => m.name === meta[i]!.name && m.temporal === meta[i]!.temporal)
+        ? prev
+        : meta,
+    );
   }, []);
 
   /** Maps a result column NAME onto the effective spec's dimension/measure index. */
@@ -805,6 +886,16 @@ export function DashboardChartTile({
           axis: null,
           legend: null,
           smallMultiples: null,
+          // A matrix chart's drillLevels are wire dimensions — the companion
+          // must stay a NO-dimension query, so they are stripped here too.
+          drillLevels: undefined,
+          // Temporal measure columns total as MIN/MAX per table.dateAggregation
+          // (earliest by default); numeric measures pass through untouched.
+          measures: totalsMeasuresFor(
+            drilledChart.query.measures,
+            measureColumnMeta,
+            tableOptions?.dateAggregation,
+          ),
           sort: [],
           limit: null,
         },
@@ -812,7 +903,15 @@ export function DashboardChartTile({
       modelId,
       mergedFilters,
     );
-  }, [isTable, tableOptions?.totals, modelId, drilledChart, mergedFilters]);
+  }, [
+    isTable,
+    tableOptions?.totals,
+    tableOptions?.dateAggregation,
+    modelId,
+    drilledChart,
+    mergedFilters,
+    measureColumnMeta,
+  ]);
 
   const totalsKey = totalsSpec ? runtime.queries.keyFor(totalsSpec) : null;
   const totalsEntry = useQueryCacheState((state) =>
@@ -830,18 +929,9 @@ export function DashboardChartTile({
     });
   }, [runtime, totalsKey, refreshKey]);
 
-  const totalsRow = useMemo<(number | null)[] | null>(() => {
+  const totalsRow = useMemo<(CellValue | null)[] | null>(() => {
     if (!totalsSpec || totalsEntry?.status !== 'ok' || !totalsEntry.data) return null;
-    const result = totalsEntry.data;
-    const row = result.rows[0];
-    if (!row) return null;
-    return result.columns
-      .map((column, i) => ({ column, i }))
-      .filter(({ column }) => column.role === 'measure')
-      .map(({ i }) => {
-        const value = row[i];
-        return typeof value === 'number' ? value : null;
-      });
+    return totalsRowFromResult(totalsEntry.data);
   }, [totalsSpec, totalsEntry]);
 
   /* -------------------------------------------------------- table row count */

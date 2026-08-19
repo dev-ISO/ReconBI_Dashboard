@@ -204,7 +204,9 @@ export const WELL_CONFIG: Record<ChartType, readonly WellDef[]> = {
     def('axis', 'axis', 'Rows', 'many', 'Fields that define the rows, in this order', {
       required: true,
     }),
-    def('legend', 'legend', 'Columns', 'one', 'Optional: pivot — one column per value'),
+    // Honest caption: the legend lands as one flat extra dimension column
+    // whose values repeat per row — nothing pivots into per-value columns.
+    def('legend', 'legend', 'Columns', 'one', 'Optional: one extra grouping column on every row'),
     def('values', 'values', 'Values', 'many', 'Measure columns', { required: true }),
   ],
 };

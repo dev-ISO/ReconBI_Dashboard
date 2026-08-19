@@ -69,7 +69,7 @@ public class QueryCompilerExpressionMeasureTests
         var compiled = Compile(SpecFor(ratio), ModelWith(ratio));
 
         AssertSql("""
-SELECT (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
+SELECT ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -85,7 +85,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(ratio), ModelWith(ratio));
 
         AssertSql("""
-SELECT (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
+SELECT ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -99,7 +99,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(ratio), ModelWith(ratio));
 
         AssertSql("""
-SELECT (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0)) AS "meas0"
+SELECT ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 LIMIT @p0
@@ -127,7 +127,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(skew), ModelWith(skew));
 
         AssertSql("""
-SELECT (CAST(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "t0"."order_total") AS decimal) / NULLIF(AVG("t0"."order_total"), 0)) AS "meas0"
+SELECT ROUND(CAST(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY "t0"."order_total") AS decimal) / NULLIF(AVG("t0"."order_total"), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);
@@ -164,7 +164,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(ratio), model);
 
         AssertSql("""
-SELECT (CAST(SUM("t0"."order_total") FILTER (WHERE "t0"."status" = @p0) AS decimal) / NULLIF(SUM("t0"."order_total"), 0)) AS "meas0"
+SELECT ROUND(CAST(SUM("t0"."order_total") FILTER (WHERE "t0"."status" = @p0) AS decimal) / NULLIF(SUM("t0"."order_total"), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p1
 """, compiled);
@@ -183,7 +183,7 @@ LIMIT @p1
 
         AssertSql("""
 SELECT "t1"."region" AS "dim0",
-       (CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) AS "meas0"
+       ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) AS "meas0"
 FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 GROUP BY "t1"."region"
@@ -273,7 +273,7 @@ LIMIT @p0
         var compiled = Compile(SpecFor(second), ModelWith(first, second));
 
         AssertSql("""
-SELECT ((CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0)) * 2) AS "meas0"
+SELECT (ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(COUNT(*), 0), 12) * 2) AS "meas0"
 FROM "public"."orders" AS "t0"
 LIMIT @p0
 """, compiled);

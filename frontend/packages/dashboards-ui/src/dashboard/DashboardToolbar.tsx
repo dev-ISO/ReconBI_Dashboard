@@ -28,6 +28,7 @@ import {
   Shrink,
   SlidersHorizontal,
   Smartphone,
+  SquareStack,
   Trash2,
   Type,
   Undo2,
@@ -58,6 +59,7 @@ export interface DashboardToolbarProps {
   onAddText: () => void;
   onAddImage: () => void;
   onAddButton: () => void;
+  onAddButtonGroup: () => void;
   onAddSlicer: () => void;
   /** Disables the Add > Slicer item (no model attached). */
   addSlicerDisabled?: boolean;
@@ -84,6 +86,12 @@ export interface DashboardToolbarProps {
    * never have collaborators to show.
    */
   presenceEditors?: DashboardCollabEditor[];
+  /**
+   * Live-visibility controls (the Live menu + paused/syncing chips), rendered
+   * beside the presence strip. The caller passes it only for shared/live
+   * dashboards — the toolbar itself stays store-agnostic.
+   */
+  liveControls?: ReactNode;
   /** View-mode auto-refresh interval (persisted with the layout); null = off. */
   refreshSeconds?: number | null;
   /** Edit-mode change of the auto-refresh interval. */
@@ -194,6 +202,7 @@ export function DashboardToolbar({
   onAddText,
   onAddImage,
   onAddButton,
+  onAddButtonGroup,
   onAddSlicer,
   addSlicerDisabled,
   onPasteChart,
@@ -202,6 +211,7 @@ export function DashboardToolbar({
   onDiscard,
   liveMode = false,
   presenceEditors,
+  liveControls,
   refreshSeconds = null,
   onChangeRefreshSeconds,
   onRefresh,
@@ -340,6 +350,9 @@ export function DashboardToolbar({
 
       {/* Wave 2: "editing now" avatar strip (renders nothing while empty). */}
       {presenceEditors !== undefined && <PresenceStrip editors={presenceEditors} />}
+
+      {/* Live-visibility controls (Live menu + paused/syncing chips). */}
+      {liveControls}
 
       {/* Flexible middle: the DEFAULT home of the active-filter chips. Its
           width comes from the flex line (flex-1 + basis 0), never from its
@@ -513,6 +526,7 @@ export function DashboardToolbar({
                   onAddText={onAddText}
                   onAddImage={onAddImage}
                   onAddButton={onAddButton}
+                  onAddButtonGroup={onAddButtonGroup}
                   onAddSlicer={onAddSlicer}
                   addSlicerDisabled={addSlicerDisabled ?? false}
                   onPasteChart={onPasteChart}
@@ -1144,6 +1158,7 @@ function AddTileMenu({
   onAddText,
   onAddImage,
   onAddButton,
+  onAddButtonGroup,
   onAddSlicer,
   addSlicerDisabled,
   onPasteChart,
@@ -1156,6 +1171,7 @@ function AddTileMenu({
   onAddText: () => void;
   onAddImage: () => void;
   onAddButton: () => void;
+  onAddButtonGroup: () => void;
   onAddSlicer: () => void;
   addSlicerDisabled: boolean;
   onPasteChart?: () => void;
@@ -1226,6 +1242,10 @@ function AddTileMenu({
               <AddMenuItem onClick={() => pick(onAddButton)}>
                 <MousePointerClick size={14} />
                 Button
+              </AddMenuItem>
+              <AddMenuItem onClick={() => pick(onAddButtonGroup)}>
+                <SquareStack size={14} />
+                Button group
               </AddMenuItem>
               <AddMenuItem
                 onClick={() => pick(onAddSlicer)}

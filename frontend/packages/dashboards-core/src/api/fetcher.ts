@@ -3,7 +3,7 @@
 // wrapper. The library never touches tokens or storage.
 
 export interface RcdRequestInit {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
   /**
@@ -13,6 +13,12 @@ export interface RcdRequestInit {
    * pre-date this flag simply need to return the Response untouched when set.
    */
   raw?: boolean;
+  /**
+   * Forward as fetch's keepalive so the request survives page teardown — the
+   * pagehide op-buffer flush rides this. BEST EFFORT: host-adapted fetchers
+   * that pre-date the flag ignore it and the flush degrades to a normal send.
+   */
+  keepalive?: boolean;
 }
 
 export type RcdFetcher = <T>(path: string, init?: RcdRequestInit) => Promise<T>;
@@ -81,6 +87,7 @@ export const createFetchFetcher =
       headers,
       body: init?.body !== undefined ? JSON.stringify(init.body) : undefined,
       signal: init?.signal ?? null,
+      ...(init?.keepalive ? { keepalive: true } : {}),
     });
 
     if (!response.ok) {

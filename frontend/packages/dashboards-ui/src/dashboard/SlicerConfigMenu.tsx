@@ -381,9 +381,9 @@ export function SlicerConfigMenu({
                   <span className="min-w-0 flex-1">
                     Shared with viewers (live)
                     <span className="block text-[11px] leading-tight text-rcd-muted">
-                      On shared dashboards, picking a value updates this slicer for
-                      everyone viewing right now (never saved). Off: selections stay
-                      personal.
+                      On shared dashboards, picking a value updates this slicer live for
+                      co-editors and viewers who have it open (never saved). Off:
+                      selections stay personal.
                     </span>
                   </span>
                 </label>

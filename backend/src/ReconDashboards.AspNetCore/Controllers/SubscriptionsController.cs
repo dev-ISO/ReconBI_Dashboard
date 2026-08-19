@@ -80,6 +80,25 @@ public sealed class SubscriptionsController(SubscriptionService subscriptions) :
             : FromError(result.Error!);
     }
 
+    /// <summary>
+    /// Renders the email this subscription would send, without sending it:
+    /// 200 { subject, html } with chart images inlined as data: URIs. Body {}
+    /// previews the SAVED config; { content } overrides it for this render
+    /// only. Owner or admin (same rule as editing); the service renders under
+    /// the subscription OWNER's impersonated principal. No state change, no
+    /// dispatch row, no email.
+    /// </summary>
+    [HttpPost("{id:int}/preview")]
+    public async Task<IActionResult> Preview(
+        int id, [FromBody] SubscriptionPreviewRequest request, CancellationToken ct)
+    {
+        var result = await subscriptions.PreviewAsync(
+            id, SchedulingDtoMapping.ToContentConfig(request.Content), ct);
+        return result.Succeeded
+            ? Ok(new SubscriptionPreviewResponse(result.Value!.Subject, result.Value.Html))
+            : FromError(result.Error!);
+    }
+
     /// <summary>Dispatch history with per-recipient status/attempts/errors/opens; owner or admin.</summary>
     [HttpGet("{id:int}/dispatches")]
     public async Task<IActionResult> ListDispatches(int id, [FromQuery] int limit = 20, CancellationToken ct = default)

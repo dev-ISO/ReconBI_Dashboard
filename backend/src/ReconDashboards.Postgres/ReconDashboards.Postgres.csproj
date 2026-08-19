@@ -19,4 +19,10 @@
     <ProjectReference Include="..\ReconDashboards.Core\ReconDashboards.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- The executor's row-reading guard is unit-tested with a stub DbDataReader:
+         its container-backed companion needs Docker, which not every dev box has. -->
+    <InternalsVisibleTo Include="ReconDashboards.Postgres.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -49,6 +49,29 @@ public sealed class DashboardsController(
         return result.Succeeded ? Ok(ToResponse(result.Value!)) : FromError(result.Error!);
     }
 
+    /// <summary>
+    /// Metadata-only write: { name?, description?, modelId?, isShared? } — absent
+    /// fields keep their stored value; description/modelId accept null as a clear.
+    /// Never reads or writes the layout and takes no expectedUpdatedAtUtc (metadata
+    /// is not the doc). Bound as a raw JsonElement because record binding cannot
+    /// tell an absent field from an explicit null, and this endpoint's whole
+    /// contract IS that distinction.
+    /// </summary>
+    [HttpPatch("{id:int}/meta")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> PatchMeta(int id, [FromBody] JsonElement body, CancellationToken ct)
+    {
+        if (ToMetaPatch(body) is not { } patch)
+        {
+            return FromError(new ServiceError(
+                ServiceErrorKind.BadRequest, "rcd.dashboard.invalid_meta",
+                "PATCH meta takes a JSON object with optional fields: name (string), description (string or null), modelId (number or null), isShared (boolean)."));
+        }
+
+        var result = await dashboards.PatchMetaAsync(id, patch, ct);
+        return result.Succeeded ? Ok(ToResponse(result.Value!)) : FromError(result.Error!);
+    }
+
     /// <summary>Owner/admin: soft delete. Grantee: removes only their share row.</summary>
     [HttpDelete("{id:int}")]
     [RcdPolicySlot(RcdPolicySlot.View)]
@@ -170,6 +193,59 @@ public sealed class DashboardsController(
     private static DashboardSaveRequest ToSaveRequest(SaveDashboardRequest request) =>
         new(request.Name, request.Description, request.ModelId,
             request.Layout.GetRawText(), request.IsShared, request.ExpectedUpdatedAtUtc);
+
+    /// <summary>
+    /// Strict shape-check + absent-vs-null preservation for PATCH meta (null =
+    /// the body is not a usable patch). Unknown fields are rejected, not
+    /// ignored — the same strictness doctrine as op payloads: a typo'd field
+    /// must fail loudly instead of silently changing nothing.
+    /// </summary>
+    private static DashboardMetaPatch? ToMetaPatch(JsonElement body)
+    {
+        if (body.ValueKind is not JsonValueKind.Object)
+        {
+            return null;
+        }
+
+        string? name = null;
+        var descriptionSet = false;
+        string? description = null;
+        var modelIdSet = false;
+        int? modelId = null;
+        bool? isShared = null;
+
+        foreach (var property in body.EnumerateObject())
+        {
+            switch (property.Name)
+            {
+                case "name" when property.Value.ValueKind is JsonValueKind.String:
+                    name = property.Value.GetString();
+                    break;
+                case "description" when property.Value.ValueKind is JsonValueKind.String or JsonValueKind.Null:
+                    descriptionSet = true;
+                    description = property.Value.ValueKind is JsonValueKind.Null
+                        ? null
+                        : property.Value.GetString();
+                    break;
+                case "modelId" when property.Value.ValueKind is JsonValueKind.Null:
+                    modelIdSet = true;
+                    modelId = null;
+                    break;
+                case "modelId" when property.Value.ValueKind is JsonValueKind.Number
+                    && property.Value.TryGetInt32(out var parsedModelId):
+                    modelIdSet = true;
+                    modelId = parsedModelId;
+                    break;
+                case "isShared" when property.Value.ValueKind is JsonValueKind.True or JsonValueKind.False:
+                    isShared = property.Value.GetBoolean();
+                    break;
+                default:
+                    return null;
+            }
+        }
+
+        return new DashboardMetaPatch(name, descriptionSet, description, modelIdSet, modelId, isShared);
+    }
 
     private static DashboardResponse ToResponse(DashboardDetail detail) =>
         new(detail.Id, detail.Name, detail.Description, detail.ModelId, detail.IsShared,

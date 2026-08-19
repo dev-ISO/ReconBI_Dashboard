@@ -324,8 +324,13 @@ export function RcdDialog({
         onCloseRef.current();
       }
       if (event.key === 'Tab' && panelRef.current) {
+        // contenteditable is focusable but matches no form-control selector —
+        // without it the rich-text dialogs' editors sat OUTSIDE the trap:
+        // Tab from the toolbar skipped the editor to Cancel, and the
+        // Shift+Tab wrap jumped past it entirely. (Only the two editable
+        // values count; [contenteditable="false"] is not focusable.)
         const focusables = panelRef.current.querySelectorAll<HTMLElement>(
-          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+          'button, [href], input, select, textarea, [contenteditable=""], [contenteditable="true"], [tabindex]:not([tabindex="-1"])',
         );
         if (focusables.length === 0) return;
         const first = focusables[0]!;

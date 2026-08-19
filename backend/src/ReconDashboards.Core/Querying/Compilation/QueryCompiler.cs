@@ -99,6 +99,39 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     // ---------- Phase 1: resolution ----------
 
+    /// <summary>
+    /// Attributes a compilation failure to the WIRE item being resolved. The
+    /// deep resolution helpers (columns, buckets, expression measures, join
+    /// paths) know what is wrong but not which of the request's dimensions /
+    /// measures / filters asked for it, so the path is stamped here, at the
+    /// only place that knows the index. A failure that already named a more
+    /// specific path keeps it — inner attribution always wins.
+    /// </summary>
+    private static T WithPath<T>(string path, Func<T> resolve)
+    {
+        try
+        {
+            return resolve();
+        }
+        catch (QueryCompilationException ex) when (ex.Path is null)
+        {
+            throw new QueryCompilationException(ex.Code, ex.Message, path);
+        }
+    }
+
+    /// <inheritdoc cref="WithPath{T}(string, Func{T})"/>
+    private static void WithPath(string path, Action validate)
+    {
+        try
+        {
+            validate();
+        }
+        catch (QueryCompilationException ex) when (ex.Path is null)
+        {
+            throw new QueryCompilationException(ex.Code, ex.Message, path);
+        }
+    }
+
     public PreparedQuery Prepare(ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
     {
         if (spec.Measures.Count == 0)
@@ -123,9 +156,19 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         schema = AugmentWithDateTables(model, schema);
 
-        var dimensions = spec.Dimensions.Select(d => ResolveDimension(d, model, schema)).ToArray();
-        var measures = spec.Measures.Select(m => ResolveMeasure(m, model, schema)).ToArray();
-        var filters = spec.Filters.Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)).ToArray();
+        // Resolution failures are attributed to the wire item that caused them
+        // (see WithPath) so the builder can badge the offending well instead of
+        // only printing the sentence.
+        var dimensions = spec.Dimensions
+            .Select((d, i) => WithPath($"dimensions[{i}]", () => ResolveDimension(d, model, schema)))
+            .ToArray();
+        var measures = spec.Measures
+            .Select((m, i) => WithPath($"measures[{i}]", () => ResolveMeasure(m, model, schema)))
+            .ToArray();
+        var filters = spec.Filters
+            .Select((f, i) => WithPath(
+                $"filters[{i}]", () => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)))
+            .ToArray();
 
         for (var i = 0; i < spec.Measures.Count; i++)
         {
@@ -135,10 +178,12 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 {
                     throw new QueryCompilationException(
                         "QRY_PCT_TOTAL_UNSUPPORTED",
-                        $"Measure '{measures[i].Label}': a {calc.Kind} calculation cannot be combined with PERCENTOFTOTAL.");
+                        $"Measure '{measures[i].Label}': a {calc.Kind} calculation cannot be combined with PERCENTOFTOTAL.",
+                        $"measures[{i}]");
                 }
 
-                ValidateCalc(calc, dimensions, measures[i].Label);
+                var index = i;
+                WithPath($"measures[{index}]", () => ValidateCalc(calc, dimensions, measures[index].Label));
                 measures[i] = measures[i] with { Calc = calc };
             }
         }
@@ -449,13 +494,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         {
             throw new QueryCompilationException(
                 "QRY_BAD_TOPN",
-                $"Top N applies to a chart with exactly one dimension; this query has {prepared.Dimensions.Count}.");
+                $"Top N applies to a chart with exactly one dimension; this query has {prepared.Dimensions.Count}.",
+                "limit");
         }
 
         if (topN.ByMeasureIndex < 0 || topN.ByMeasureIndex >= prepared.Measures.Count)
         {
             throw new QueryCompilationException(
-                "QRY_BAD_SORT", $"Top N ranks by measure {topN.ByMeasureIndex}, which does not exist.");
+                "QRY_BAD_SORT", $"Top N ranks by measure {topN.ByMeasureIndex}, which does not exist.", "limit");
         }
 
         if (prepared.Measures[topN.ByMeasureIndex].PercentOfTotal)
@@ -737,7 +783,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             }
             else if (measure.PercentOfTotal)
             {
-                item = $"(CAST({measureRef} AS decimal) / NULLIF({dialect.Aggregate(Aggregation.Sum, measureRef)} OVER (), 0)) AS {MeasAlias(i)}";
+                item = $"{BoundedDivision(measureRef, $"NULLIF({dialect.Aggregate(Aggregation.Sum, measureRef)} OVER (), 0)")} AS {MeasAlias(i)}";
             }
             else
             {
@@ -786,6 +832,30 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     }
 
     /// <summary>
+    /// Fractional digits every GENERATED division is rounded to. Postgres
+    /// numeric division is unbounded, and a result wider than System.Decimal
+    /// makes the reader throw — which used to fail the entire chart rather
+    /// than the one cell (the executor now also degrades such a value to a
+    /// double, so this is defence in depth, not the only guard). 12 digits is
+    /// far finer than any chart renders and matches the digit range the
+    /// measure grammar already accepts for an authored ROUND().
+    /// </summary>
+    private const int DivisionScale = 12;
+
+    private static readonly string DivisionScaleSql =
+        DivisionScale.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// A generated division: the numerator is cast so integer/integer never
+    /// divides integrally (COUNT(*)/COUNT(*) would otherwise be 0 or 1), and
+    /// the result's scale is bounded (see <see cref="DivisionScale"/>).
+    /// Callers pass the denominator ALREADY guarded — normally
+    /// NULLIF(x, 0) — because divide-by-zero handling differs per call site.
+    /// </summary>
+    private static string BoundedDivision(string numeratorSql, string guardedDenominatorSql) =>
+        $"ROUND(CAST({numeratorSql} AS decimal) / {guardedDenominatorSql}, {DivisionScaleSql})";
+
+    /// <summary>
     /// One calc measure's window expression over the grouped base rows.
     /// Running total / YTD are frame-bound running SUMs (YTD additionally
     /// partitions by the axis year); the prior-period family is LAG by
@@ -824,7 +894,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         {
             MeasureCalcKind.PriorPeriod => lag,
             MeasureCalcKind.PeriodChange => $"({measureRef} - {lag})",
-            MeasureCalcKind.PeriodChangePct => $"(CAST(({measureRef} - {lag}) AS decimal) / NULLIF({lag}, 0))",
+            MeasureCalcKind.PeriodChangePct => BoundedDivision($"({measureRef} - {lag})", $"NULLIF({lag}, 0)"),
             _ => throw new InvalidOperationException($"Unknown calc kind {calc.Kind}."),
         };
     }
@@ -1735,7 +1805,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 // integer-divide to 0 or 1 (matches PERCENTOFTOTAL and
                 // periodChangePct, which already cast).
                 return binary.Operator == '/'
-                    ? $"(CAST({left} AS decimal) / NULLIF({right}, 0))"
+                    ? BoundedDivision(left, $"NULLIF({right}, 0)")
                     : $"({left} {binary.Operator} {right})";
 
             case ComparisonNode comparison:
@@ -1778,8 +1848,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 // Same decimal cast as bare '/': integer/integer must not
                 // integer-divide (DIVIDE([Closed], [Total]) was 0-or-1).
                 return divide.Alternate is null
-                    ? $"(CAST({numerator} AS decimal) / NULLIF({denominator}, 0))"
-                    : $"CASE WHEN {denominator} IS NULL OR {denominator} = 0 THEN {Render(divide.Alternate)} ELSE (CAST({numerator} AS decimal) / {denominator}) END";
+                    ? BoundedDivision(numerator, $"NULLIF({denominator}, 0)")
+                    : $"CASE WHEN {denominator} IS NULL OR {denominator} = 0 THEN {Render(divide.Alternate)} ELSE {BoundedDivision(numerator, denominator)} END";
 
             case ScalarCallNode scalar:
                 var arguments = string.Join(", ", scalar.Arguments.Select(Render));
@@ -1920,14 +1990,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var parts = new List<string>();
         var sortedDimensionIndexes = new HashSet<int>();
 
-        foreach (var sort in spec.Sort)
+        for (var sortIndex = 0; sortIndex < spec.Sort.Count; sortIndex++)
         {
+            var sort = spec.Sort[sortIndex];
             var direction = sort.Direction == SortDirection.Desc ? "DESC" : "ASC";
             if (sort.Target.Kind == SortTargetKind.Dimension)
             {
                 if (sort.Target.Index < 0 || sort.Target.Index >= prepared.Dimensions.Count)
                 {
-                    throw new QueryCompilationException("QRY_BAD_SORT", $"Sort references dimension {sort.Target.Index}, which does not exist.");
+                    throw new QueryCompilationException(
+                        "QRY_BAD_SORT",
+                        $"Sort references dimension {sort.Target.Index}, which does not exist.",
+                        $"sort[{sortIndex}]");
                 }
 
                 parts.Add($"{dimensionExprs[sort.Target.Index]} {direction}{dialect.NullsLastSuffix}");
@@ -1937,7 +2011,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             {
                 if (sort.Target.Index < 0 || sort.Target.Index >= prepared.Measures.Count)
                 {
-                    throw new QueryCompilationException("QRY_BAD_SORT", $"Sort references measure {sort.Target.Index}, which does not exist.");
+                    throw new QueryCompilationException(
+                        "QRY_BAD_SORT",
+                        $"Sort references measure {sort.Target.Index}, which does not exist.",
+                        $"sort[{sortIndex}]");
                 }
 
                 var measureRef = dialect.SupportsSelectAliasInOrderBy

@@ -9,6 +9,7 @@ using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
 using ReconDashboards.Core.Querying.Compilation;
+using ReconDashboards.Core.Rendering;
 using ReconDashboards.Core.Scheduling;
 using ReconDashboards.Postgres;
 
@@ -59,6 +60,12 @@ public sealed class SchedulingEvaluatorTests : IDisposable
         // no-op defaults keep these tests focused on delivery semantics.
         services.AddSingleton<IRcdDispatchProgressNotifier, NullRcdDispatchProgressNotifier>();
         services.AddSingleton<IRcdDeliveryFailureNotifier, NullRcdDeliveryFailureNotifier>();
+        // The render path the dispatcher resolves per scope (the library
+        // registers these in AddReconDashboards). These subscriptions carry no
+        // content config, so the composer stays on the legacy tables path and
+        // the painter is never asked for a chart.
+        services.AddSingleton<IChartImageRenderer, SkiaChartImageRenderer>();
+        services.AddScoped<SnapshotComposer>();
         services.AddDbContext<ReconDashboardsDbContext>(o => o.UseSqlite(_connection));
         _services = services.BuildServiceProvider();
 

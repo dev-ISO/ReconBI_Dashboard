@@ -2,7 +2,12 @@ import { describe, expect, it } from 'vitest';
 import type { ChartSpec } from '../types/chart';
 import type { ModelDefinition } from '../types/model';
 import type { Catalog, CatalogColumn, CatalogTable, ColumnType } from '../types/schema';
-import { validateChartSpec, type ChartIssue } from './chartValidation';
+import {
+  pathToWell,
+  validateChartSpec,
+  wireDimensionWells,
+  type ChartIssue,
+} from './chartValidation';
 
 const column = (name: string, type: ColumnType, ordinal = 0): CatalogColumn => ({
   name,
@@ -352,5 +357,213 @@ describe('validateChartSpec', () => {
 
     spec.query.limit = 500;
     expect(codes(validateChartSpec(spec, model, catalog))).not.toContain('high_cardinality');
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * ITEM 6 — wire paths and the well they map back onto.
+ *
+ * The path grammar is PINNED and shared with the backend's
+ * ValidationIssue.Path ("dimensions[i].column", "measures[i].aggregation", …),
+ * so these tests double as the wire contract for the server half: whatever the
+ * compiler tags an issue with must land on the right builder well here.
+ * ------------------------------------------------------------------------- */
+
+/** A table spec with a Rows hierarchy; matrix defaults ON. */
+const matrixSpec = (): ChartSpec => ({
+  id: 'c2',
+  type: 'table',
+  title: 'Rows',
+  query: {
+    axis: { table: 'public.customers', column: 'region' },
+    drillLevels: [
+      { table: 'public.orders', column: 'status' },
+      { table: 'public.orders', column: 'customer_id' },
+    ],
+    legend: { table: 'public.orders', column: 'order_date' },
+    measures: [{ measureId: 'm-total' }],
+    filters: [],
+  },
+  format: {},
+});
+
+describe('wireDimensionWells', () => {
+  it('mirrors toWireSpec for a matrix table: [axis, drill…, legend]', () => {
+    expect(wireDimensionWells(matrixSpec())).toEqual(['axis', 'drill', 'drill', 'legend']);
+  });
+
+  it('drops the levels again when matrix is off', () => {
+    const spec = matrixSpec();
+    spec.format = { table: { matrix: false } };
+    expect(wireDimensionWells(spec)).toEqual(['axis', 'legend']);
+  });
+
+  it('keeps cartesians on [axis, legend, smallMultiples]', () => {
+    const spec = baseSpec();
+    spec.query.drillLevels = [{ table: 'public.orders', column: 'status' }];
+    spec.query.legend = { table: 'public.orders', column: 'status' };
+    spec.query.smallMultiples = { table: 'public.orders', column: 'order_date' };
+    expect(wireDimensionWells(spec)).toEqual(['axis', 'legend', 'smallMultiples']);
+  });
+
+  it('skips absent parts so the array index IS the wire index', () => {
+    const spec = baseSpec();
+    spec.query.axis = null;
+    spec.query.legend = { table: 'public.orders', column: 'status' };
+    expect(wireDimensionWells(spec)).toEqual(['legend']);
+  });
+});
+
+describe('pathToWell', () => {
+  it('resolves dimension indexes against the MATRIX wire order', () => {
+    const spec = matrixSpec();
+    expect(pathToWell('dimensions[0]', spec)).toBe('axis');
+    expect(pathToWell('dimensions[1].column', spec)).toBe('drill');
+    expect(pathToWell('dimensions[2].dateBucket', spec)).toBe('drill');
+    expect(pathToWell('dimensions[3]', spec)).toBe('legend');
+  });
+
+  it('resolves the same index differently for a cartesian chart', () => {
+    const spec = baseSpec();
+    spec.query.legend = { table: 'public.orders', column: 'status' };
+    spec.query.smallMultiples = { table: 'public.orders', column: 'order_date' };
+    expect(pathToWell('dimensions[1]', spec)).toBe('legend');
+    expect(pathToWell('dimensions[2]', spec)).toBe('smallMultiples');
+  });
+
+  it('maps every non-dimension head of the pinned grammar', () => {
+    const spec = matrixSpec();
+    expect(pathToWell('measures[0]', spec)).toBe('values');
+    expect(pathToWell('measures[3].column', spec)).toBe('values');
+    expect(pathToWell('measures[1].aggregation', spec)).toBe('values');
+    expect(pathToWell('measures[1].expression', spec)).toBe('values');
+    expect(pathToWell('filters[0]', spec)).toBe('filters');
+    expect(pathToWell('filters[2].column', spec)).toBe('filters');
+    expect(pathToWell('filters[2].values', spec)).toBe('filters');
+    expect(pathToWell('having[0]', spec)).toBe('filters');
+    expect(pathToWell('sort[1]', spec)).toBe('sort');
+    expect(pathToWell('limit', spec)).toBe('sort');
+  });
+
+  it('returns undefined for paths with no single owning well', () => {
+    const spec = matrixSpec();
+    expect(pathToWell('query.table', spec)).toBeUndefined();
+    expect(pathToWell('dimensions[9]', spec)).toBeUndefined(); // out of range
+    expect(pathToWell('dimensions', spec)).toBeUndefined(); // no index
+    expect(pathToWell('', spec)).toBeUndefined();
+    expect(pathToWell('!!!', spec)).toBeUndefined();
+    expect(pathToWell('somethingElse[0]', spec)).toBeUndefined();
+  });
+});
+
+describe('validateChartSpec wire paths', () => {
+  /** Every issue that carries a path must agree with pathToWell on the well. */
+  const expectRoundTrip = (spec: ChartSpec): ChartIssue[] => {
+    const issues = validateChartSpec(spec, model, catalog);
+    for (const issue of issues) {
+      if (issue.path === undefined) continue;
+      expect({ path: issue.path, well: pathToWell(issue.path, spec) }).toEqual({
+        path: issue.path,
+        well: issue.well,
+      });
+    }
+    return issues;
+  };
+
+  it('addresses a bad axis column at dimensions[0].column', () => {
+    const spec = baseSpec();
+    spec.query.axis = { table: 'public.orders', column: 'nope' };
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'unknown_column', well: 'axis', path: 'dimensions[0].column' },
+    ]);
+  });
+
+  it('addresses a bad bucket at dimensions[i].dateBucket', () => {
+    const spec = baseSpec();
+    spec.query.axis = { table: 'public.orders', column: 'status', dateBucket: 'month' };
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'bad_bucket', well: 'axis', path: 'dimensions[0].dateBucket' },
+    ]);
+  });
+
+  it('addresses an unknown TABLE at the ref itself, not its column', () => {
+    const spec = baseSpec();
+    spec.query.axis = { table: 'public.nope', column: 'x' };
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'unknown_table', well: 'axis', path: 'dimensions[0]' },
+    ]);
+  });
+
+  it('numbers matrix drill levels as REAL wire dimensions', () => {
+    const spec = matrixSpec();
+    spec.query.drillLevels = [
+      { table: 'public.orders', column: 'nope' },
+      { table: 'public.orders', column: 'status' },
+    ];
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'unknown_column', well: 'drill', path: 'dimensions[1].column' },
+    ]);
+  });
+
+  it('gives LEGACY drill levels no path (they never reach the wire)', () => {
+    const spec = matrixSpec();
+    spec.format = { table: { matrix: false } };
+    spec.query.drillLevels = [{ table: 'public.orders', column: 'nope' }];
+    const issues = expectRoundTrip(spec);
+    expect(issues).toMatchObject([{ code: 'unknown_column', well: 'drill' }]);
+    expect(issues[0]!.path).toBeUndefined();
+    // …and the legend behind it keeps ITS wire index at 1, not 2.
+    expect(wireDimensionWells(spec)).toEqual(['axis', 'legend']);
+  });
+
+  it('addresses measures by wire index, aggregation faults at .aggregation', () => {
+    const spec = baseSpec();
+    spec.query.measures = [
+      { measureId: 'm-total' },
+      { table: 'public.orders', column: 'status', aggregation: 'sum' },
+    ];
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'bad_measure', well: 'values', path: 'measures[1].aggregation' },
+    ]);
+  });
+
+  it('addresses a missing measure column at measures[i].column', () => {
+    const spec = baseSpec();
+    spec.query.measures = [{ table: 'public.orders', aggregation: 'sum' }];
+    expect(expectRoundTrip(spec)).toMatchObject([
+      { code: 'bad_measure', well: 'values', path: 'measures[0].column' },
+    ]);
+  });
+
+  it('addresses filters and sort by their own wire index', () => {
+    const spec = baseSpec();
+    spec.query.filters = [
+      { table: 'public.orders', column: 'status', operator: 'eq', values: ['a'] },
+      { table: 'public.orders', column: 'order_total', operator: 'contains', values: ['x'] },
+    ];
+    spec.query.sort = [{ target: { kind: 'measure', index: 9 }, direction: 'asc' }];
+    const issues = expectRoundTrip(spec);
+    expect(issues).toMatchObject([
+      { code: 'bad_filter', well: 'filters', path: 'filters[1]' },
+      { code: 'bad_sort', well: 'sort', path: 'sort[0]' },
+    ]);
+  });
+
+  it('caps the matrix hierarchy at the axis plus three levels', () => {
+    const spec = matrixSpec();
+    spec.query.legend = null;
+    spec.query.drillLevels = ['status', 'customer_id', 'order_total', 'order_date'].map(
+      (column) => ({ table: 'public.orders', column }),
+    );
+    const issues = expectRoundTrip(spec).filter((i) => i.code === 'too_many_dimensions');
+    expect(issues).toMatchObject([{ well: 'drill', path: 'dimensions[4]' }]);
+    expect(issues[0]!.message).toContain('row hierarchy');
+
+    // Exactly at the cap (axis + 3 = 5 wire dims with the legend) is fine —
+    // well under the server's MaxDimensions of 8, so no backend raise needed.
+    spec.query.drillLevels = spec.query.drillLevels!.slice(0, 3);
+    spec.query.legend = { table: 'public.orders', column: 'order_date' };
+    expect(wireDimensionWells(spec)).toHaveLength(5);
+    expect(codes(validateChartSpec(spec, model, catalog))).not.toContain('too_many_dimensions');
   });
 });

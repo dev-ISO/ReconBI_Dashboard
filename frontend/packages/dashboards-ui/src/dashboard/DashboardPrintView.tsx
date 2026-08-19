@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { memo, useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { Printer, X } from 'lucide-react';
 import {
@@ -102,8 +102,15 @@ export interface PrintSheetsProps {
  * Workbook jobs: each section (dashboard page) starts on a fresh sheet, its
  * first sheet carries that page's own header (title/timestamp/filters per the
  * Include options), and physical page numbers run continuously.
+ *
+ * MEMOIZED: sheets re-render only when their own inputs change. The parents
+ * re-render on store slices the sheets never draw (chip state, presence,
+ * baseline stamps), and every such pass re-rendered EVERY ChartTile on paper
+ * — visible as a preview-wide flicker mid-print. The quiesce flag keeps the
+ * inputs themselves still while a preview/dialog/export is up; this keeps
+ * unrelated churn from re-painting the sheets at all.
  */
-export function PrintSheets({
+export const PrintSheets = memo(function PrintSheets({
   sections,
   modelId,
   filtersByTile,
@@ -273,7 +280,7 @@ export function PrintSheets({
       )}
     </div>
   );
-}
+});
 
 /**
  * One pagination block. The OUTER box is in normal flow with the exact scaled

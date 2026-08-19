@@ -151,6 +151,11 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             // Small discriminated strings, readable in psql; never cron.
             entity.Property(e => e.ScheduleKind).HasConversion<string>().HasMaxLength(16);
             entity.Property(e => e.Format).HasConversion<string>().HasMaxLength(8);
+            if (jsonColumnType is not null)
+            {
+                entity.Property(e => e.ContentJson).HasColumnType(jsonColumnType);
+            }
+
             entity.HasOne<DashboardRecord>()
                 .WithMany()
                 .HasForeignKey(e => e.DashboardId)

@@ -137,6 +137,14 @@ public sealed class SubscriptionRecord
     public string Recipients { get; set; } = "";
 
     public SubscriptionFormat Format { get; set; }
+
+    /// <summary>
+    /// Email content composition (Scheduling.SubscriptionContentConfig as
+    /// camelCase JSON; jsonb on Postgres). NULL = legacy behavior: tables
+    /// only, 50-row cap — pre-0.14 rows are never backfilled.
+    /// </summary>
+    public string? ContentJson { get; set; }
+
     public bool Enabled { get; set; } = true;
     public DateTime? LastRunUtc { get; set; }
     public DateTime CreatedUtc { get; set; }

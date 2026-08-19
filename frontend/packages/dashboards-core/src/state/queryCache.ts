@@ -8,6 +8,13 @@ export interface QueryCacheEntry {
   data?: QueryResult;
   error?: string;
   errorCode?: string | null;
+  /**
+   * Structured field-level validation issues off a failed run's RcdApiError
+   * (the server's ValidationIssue list — path speaks the wire-path grammar
+   * chartValidation's pathToWell maps back onto builder wells). Present only
+   * on 'error' entries whose response carried them.
+   */
+  issues?: { code: string; severity: string; message: string; path: string | null }[];
   fetchedAt: number;
 }
 
@@ -116,7 +123,20 @@ export class QueryCache {
             error && typeof error === 'object' && 'errorCode' in error
               ? ((error as { errorCode: string | null }).errorCode ?? null)
               : null;
-          this.setEntry(key, { status: 'error', error: message, errorCode, fetchedAt: Date.now() });
+          // RcdApiError.issues ride along so consumers (builder well badges,
+          // the tile error card) can point at the offending field.
+          const issues =
+            error && typeof error === 'object' && 'issues' in error &&
+            Array.isArray((error as { issues: unknown }).issues)
+              ? (error as { issues: NonNullable<QueryCacheEntry['issues']> }).issues
+              : undefined;
+          this.setEntry(key, {
+            status: 'error',
+            error: message,
+            errorCode,
+            ...(issues !== undefined && issues.length > 0 ? { issues } : {}),
+            fetchedAt: Date.now(),
+          });
         }
         throw error;
       })

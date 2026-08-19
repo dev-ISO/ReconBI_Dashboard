@@ -30,11 +30,28 @@ public static class SnapshotRenderer
     /// "Generated" stamps render in the host-configured schedule zone
     /// (<paramref name="stampZone"/> / <paramref name="stampZoneLabel"/> come
     /// from ReconDashboardsOptions via the evaluator) — the reader schedules
-    /// in plant time, so the email must speak plant time too.
+    /// in plant time, so the email must speak plant time too. The default
+    /// <paramref name="maxTableRows"/> keeps legacy (NULL content) emails
+    /// byte-identical to the pre-content renderer.
     /// </summary>
     public static string RenderHtml(
         string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages,
-        TimeZoneInfo stampZone, string stampZoneLabel)
+        TimeZoneInfo stampZone, string stampZoneLabel, int maxTableRows = HtmlRowsPerTile) =>
+        RenderHtml(
+            dashboardName, generatedUtc, pages, stampZone, stampZoneLabel,
+            (html, tile, _, _) => AppendTileBody(html, tile, maxTableRows));
+
+    /// <summary>
+    /// Shell + custom tile bodies: SnapshotComposer's charts/both modes swap
+    /// in per-tile image/table decisions while header, page structure, and
+    /// footer stay THIS one implementation — the preview can never drift from
+    /// the delivered shell. The delegate receives (builder, tile, pageIndex,
+    /// tileIndex); indices feed the cid naming.
+    /// </summary>
+    public static string RenderHtml(
+        string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages,
+        TimeZoneInfo stampZone, string stampZoneLabel,
+        Action<StringBuilder, RenderedTile, int, int> appendTileBody)
     {
         var html = new StringBuilder();
         html.Append("<div style=\"font-family:Segoe UI,Arial,sans-serif;color:#1f2937;max-width:760px;margin:0 auto;\">");
@@ -45,8 +62,9 @@ public static class SnapshotRenderer
         html.Append("</div>");
 
         var multiplePages = pages.Count > 1;
-        foreach (var page in pages)
+        for (var pageIndex = 0; pageIndex < pages.Count; pageIndex++)
         {
+            var page = pages[pageIndex];
             if (multiplePages)
             {
                 html.Append("<div style=\"font-size:15px;font-weight:600;margin:20px 0 4px;color:#374151;\">")
@@ -59,12 +77,13 @@ public static class SnapshotRenderer
                 continue;
             }
 
-            foreach (var tile in page.Tiles)
+            for (var tileIndex = 0; tileIndex < page.Tiles.Count; tileIndex++)
             {
+                var tile = page.Tiles[tileIndex];
                 html.Append("<div style=\"margin:16px 0;padding:12px 16px;border:1px solid #e5e7eb;border-radius:8px;\">");
                 html.Append("<div style=\"font-size:13px;font-weight:600;margin-bottom:8px;\">")
                     .Append(Encode(tile.Tile.Title)).Append("</div>");
-                AppendTileBody(html, tile);
+                appendTileBody(html, tile, pageIndex, tileIndex);
                 html.Append("</div>");
             }
         }
@@ -76,35 +95,51 @@ public static class SnapshotRenderer
         return html.ToString();
     }
 
-    private static void AppendTileBody(StringBuilder html, RenderedTile tile)
+    /// <summary>The legacy per-tile body: error note, KPI shape, else the table.</summary>
+    public static void AppendTileBody(StringBuilder html, RenderedTile tile, int maxTableRows = HtmlRowsPerTile)
     {
         if (tile.Error is not null)
         {
-            html.Append("<div style=\"font-size:12px;color:#b91c1c;\">").Append(Encode(tile.Error)).Append("</div>");
+            AppendErrorNote(html, tile.Error);
             return;
         }
-
-        var dimensionCount = tile.Columns.Count(c => c.Role == ResultColumnRole.Dimension);
 
         // KPI shape: no dimensions, single row — big numbers, one per measure.
-        if (dimensionCount == 0 && tile.Rows.Count <= 1)
+        if (HasKpiShape(tile))
         {
-            var row = tile.Rows.Count == 1 ? tile.Rows[0] : null;
-            html.Append("<div>");
-            for (var i = 0; i < tile.Columns.Count; i++)
-            {
-                var column = tile.Columns[i];
-                html.Append("<div style=\"display:inline-block;margin-right:28px;\">");
-                html.Append("<div style=\"font-size:26px;font-weight:700;color:#111827;\">")
-                    .Append(Encode(FormatValue(row?[i]))).Append("</div>");
-                html.Append("<div style=\"font-size:11px;color:#6b7280;\">").Append(Encode(column.Label)).Append("</div>");
-                html.Append("</div>");
-            }
-
-            html.Append("</div>");
+            AppendKpiBlock(html, tile);
             return;
         }
 
+        AppendTable(html, tile, maxTableRows);
+    }
+
+    public static void AppendErrorNote(StringBuilder html, string error) =>
+        html.Append("<div style=\"font-size:12px;color:#b91c1c;\">").Append(Encode(error)).Append("</div>");
+
+    /// <summary>The shape-triggered KPI branch's condition: 0 dimensions, at most one row.</summary>
+    public static bool HasKpiShape(RenderedTile tile) =>
+        tile.Columns.Count(c => c.Role == ResultColumnRole.Dimension) == 0 && tile.Rows.Count <= 1;
+
+    public static void AppendKpiBlock(StringBuilder html, RenderedTile tile)
+    {
+        var row = tile.Rows.Count == 1 ? tile.Rows[0] : null;
+        html.Append("<div>");
+        for (var i = 0; i < tile.Columns.Count; i++)
+        {
+            var column = tile.Columns[i];
+            html.Append("<div style=\"display:inline-block;margin-right:28px;\">");
+            html.Append("<div style=\"font-size:26px;font-weight:700;color:#111827;\">")
+                .Append(Encode(FormatValue(row?[i]))).Append("</div>");
+            html.Append("<div style=\"font-size:11px;color:#6b7280;\">").Append(Encode(column.Label)).Append("</div>");
+            html.Append("</div>");
+        }
+
+        html.Append("</div>");
+    }
+
+    public static void AppendTable(StringBuilder html, RenderedTile tile, int maxTableRows)
+    {
         html.Append("<table style=\"border-collapse:collapse;font-size:12px;width:100%;\">");
         html.Append("<tr>");
         foreach (var column in tile.Columns)
@@ -115,7 +150,7 @@ public static class SnapshotRenderer
 
         html.Append("</tr>");
 
-        foreach (var row in tile.Rows.Take(HtmlRowsPerTile))
+        foreach (var row in tile.Rows.Take(maxTableRows))
         {
             html.Append("<tr>");
             for (var i = 0; i < tile.Columns.Count; i++)
@@ -133,10 +168,10 @@ public static class SnapshotRenderer
 
         html.Append("</table>");
 
-        if (tile.Rows.Count > HtmlRowsPerTile)
+        if (tile.Rows.Count > maxTableRows)
         {
             html.Append("<div style=\"font-size:11px;color:#9ca3af;margin-top:4px;\">")
-                .Append(tile.Rows.Count - HtmlRowsPerTile).Append(" more rows not shown.</div>");
+                .Append(tile.Rows.Count - maxTableRows).Append(" more rows not shown.</div>");
         }
     }
 
