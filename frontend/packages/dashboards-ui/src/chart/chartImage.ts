@@ -141,22 +141,54 @@ const safeFilename = (title: string): string => {
 };
 
 /**
- * Export the chart inside `tileRoot` as a PNG. 'download' saves
- * "<title>@<scale>x.png"; 'copy' puts the PNG on the clipboard and falls back
- * to a download when the clipboard refuses (permissions, non-secure context)
- * so the user always ends up holding an image. Resolves false only when there
- * is no SVG to export (caller should have gated the menu item, but a stale
- * tile can race).
+ * Rasterize the WHOLE tile as rendered — header/inner title, legend, axis
+ * titles, data labels, HTML renderers (table, KPI) included — via
+ * html-to-image (bundled): it clones the subtree with computed styles inlined
+ * and paints it through an SVG foreignObject at `pixelRatio`. Chrome-only
+ * caveats don't apply here (tracker runs on Chrome), and tile chrome that
+ * must never appear on an export (kebab, drag strips, drill buttons) is
+ * tagged data-rcd-no-export and filtered out.
+ */
+export async function tileToPngBlob(tileRoot: HTMLElement, scale: number): Promise<Blob> {
+  const { toBlob } = await import('html-to-image');
+  const blob = await toBlob(tileRoot, {
+    pixelRatio: scale,
+    backgroundColor: surfaceColorBehind(tileRoot),
+    filter: (node) =>
+      !(node instanceof HTMLElement && node.hasAttribute('data-rcd-no-export')),
+  });
+  if (!blob) throw new Error('Tile rasterization produced no image.');
+  return blob;
+}
+
+export type ImageExportArea = 'tile' | 'plot';
+export type ImageExportMode = 'copy' | 'download';
+
+/**
+ * Export the chart tile as a PNG. Area 'tile' captures everything the tile
+ * shows (title/inner title, legend, axis titles, labels — works for table and
+ * KPI tiles too); 'plot' re-rasterizes just the chart's SVG (bare plot, SVG
+ * chart types only). 'download' saves "<title>@<scale>x.png"; 'copy' puts the
+ * PNG on the clipboard and falls back to a download when the clipboard
+ * refuses (permissions, focus loss) so the user always ends up holding an
+ * image. Resolves false only when there is nothing to export (stale tile).
  */
 export async function exportChartImage(
   tileRoot: HTMLElement | null,
   title: string,
-  mode: 'copy' | 'download',
+  mode: ImageExportMode,
   scale = 2,
+  area: ImageExportArea = 'tile',
 ): Promise<boolean> {
-  const svg = findChartSvg(tileRoot);
-  if (!svg) return false;
-  const blob = await chartSvgToPngBlob(svg, scale);
+  if (!tileRoot) return false;
+  let blob: Blob;
+  if (area === 'plot') {
+    const svg = findChartSvg(tileRoot);
+    if (!svg) return false;
+    blob = await chartSvgToPngBlob(svg, scale);
+  } else {
+    blob = await tileToPngBlob(tileRoot, scale);
+  }
   if (mode === 'copy') {
     try {
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);

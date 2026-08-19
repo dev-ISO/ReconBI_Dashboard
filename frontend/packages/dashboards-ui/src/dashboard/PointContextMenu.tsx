@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
-import { ArrowDown, ArrowUp, BellPlus, Camera, CopyPlus, CornerUpLeft, FileDown, ImageDown, Pencil, Rows3, Table2, Zap } from 'lucide-react';
+import { ArrowDown, ArrowUp, BellPlus, CopyPlus, CornerUpLeft, FileDown, ImageDown, Pencil, Rows3, Table2, Zap } from 'lucide-react';
 import type { FilterClause } from '@recon/dashboards-core';
 
 /** One candidate drillthrough page for the clicked point. */
@@ -60,12 +60,11 @@ export interface PointContextMenuProps {
    */
   onEdit?: (() => void) | null;
   /**
-   * "Copy as image" / "Download image (2×)" — high-res PNG of the chart's
-   * SVG (chartImage.exportChartImage). Passed only for SVG-rendered chart
-   * types (never table/KPI); hidden when absent.
+   * "Export image…" — opens the PNG-export dialog (area + resolution +
+   * copy/download; ExportImageDialog). Offered for every chart tile: the
+   * entire-tile capture covers HTML renderers (table, KPI) too.
    */
-  onCopyImage?: (() => void) | null;
-  onDownloadImage?: (() => void) | null;
+  onExportImage?: (() => void) | null;
   onExport: (mode: 'summarized' | 'underlying') => void;
   onClose: () => void;
 }
@@ -88,8 +87,7 @@ export function PointContextMenu({
   onSetAlert = null,
   onCopyChart = null,
   onEdit = null,
-  onCopyImage = null,
-  onDownloadImage = null,
+  onExportImage = null,
   onExport,
   onClose,
 }: PointContextMenuProps) {
@@ -278,31 +276,18 @@ export function PointContextMenu({
         </>
       )}
 
-      {(onCopyImage || onDownloadImage) && (
+      {onExportImage && (
         <>
           <div className="my-1 border-t border-rcd-border" />
-          {onCopyImage && (
-            <ActionItem
-              icon={<Camera size={14} />}
-              onClick={() => {
-                onCopyImage();
-                onClose();
-              }}
-            >
-              Copy as image
-            </ActionItem>
-          )}
-          {onDownloadImage && (
-            <ActionItem
-              icon={<ImageDown size={14} />}
-              onClick={() => {
-                onDownloadImage();
-                onClose();
-              }}
-            >
-              Download image (2×)
-            </ActionItem>
-          )}
+          <ActionItem
+            icon={<ImageDown size={14} />}
+            onClick={() => {
+              onExportImage();
+              onClose();
+            }}
+          >
+            Export image…
+          </ActionItem>
         </>
       )}
 

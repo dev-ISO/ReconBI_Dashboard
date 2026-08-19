@@ -154,7 +154,8 @@ export function TileFrame({
   // One kebab instance, rendered either in the header bar or (frameless edit
   // mode) inside the floating top-right hover wrapper.
   const kebab = editable ? (
-    <div className="relative" ref={menuRef}>
+    // data-rcd-no-export: interactive chrome, never part of an image export.
+    <div className="relative" ref={menuRef} data-rcd-no-export>
       <RcdIconButton
         aria-label={`Actions for ${title}`}
         aria-haspopup="menu"
@@ -247,6 +248,7 @@ export function TileFrame({
             <div
               className="rcd-tile-drag-handle absolute inset-x-0 top-0 z-10 flex h-4 cursor-move items-start justify-center"
               title={`Drag to move ${title}`}
+              data-rcd-no-export
             >
               <span className="mt-[3px] flex items-center rounded-full border border-rcd-border bg-rcd-surface px-1.5 py-px opacity-0 shadow-sm transition-opacity group-hover:opacity-90">
                 <GripHorizontal size={10} className="text-rcd-muted" />
@@ -267,6 +269,7 @@ export function TileFrame({
             className={`absolute right-1 top-1 z-40 flex items-center gap-0.5 rounded-md bg-rcd-surface shadow-sm transition-opacity group-hover:opacity-100 ${
               editable ? 'opacity-60' : 'opacity-0'
             }`}
+            data-rcd-no-export
           >
             {headerExtra}
             {kebab}

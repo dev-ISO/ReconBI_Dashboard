@@ -1104,7 +1104,12 @@ export function DashboardChartTile({
     : [];
 
   const drillControls = hasHierarchy ? (
-    <div className="flex min-w-0 shrink-0 items-center gap-1" onClick={(e) => e.stopPropagation()}>
+    // data-rcd-no-export: interactive chrome, never part of an image export.
+    <div
+      className="flex min-w-0 shrink-0 items-center gap-1"
+      onClick={(e) => e.stopPropagation()}
+      data-rcd-no-export
+    >
       {crumbs.length > 0 && (
         <span className="flex max-w-[12rem] items-center gap-0.5 truncate text-[11px] leading-none text-rcd-muted">
           {crumbs.map((crumb, i) => (

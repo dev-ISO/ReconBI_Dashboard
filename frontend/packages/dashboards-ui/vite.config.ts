@@ -4,8 +4,11 @@ import dts from 'vite-plugin-dts';
 
 // Library build: ship only our own code. Every runtime dependency is external so
 // the consuming app (host SPA or portal) resolves and chunks them itself.
-// preserveModules keeps internal React.lazy() boundaries intact for host-side
-// code splitting and tree-shaking.
+// ONE deliberate exception: html-to-image (the tile→PNG rasterizer) is a tiny
+// zero-dependency devDep left OFF the external list so it is BUNDLED into the
+// dist — consumers get the image-export feature without a new dependency of
+// their own. preserveModules keeps internal React.lazy() boundaries intact for
+// host-side code splitting and tree-shaking.
 export default defineConfig({
   plugins: [react(), dts({ rollupTypes: false, tsconfigPath: './tsconfig.json' })],
   build: {
