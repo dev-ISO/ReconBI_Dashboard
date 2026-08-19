@@ -164,6 +164,13 @@ function TextTileEditor({ tileId, spec }: { tileId: string; spec: TextTileSpec }
 
   const html = useMemo(() => sanitizeRichHtml(spec.html), [spec.html]);
 
+  // Unmounting mid-focus (leaving edit mode, page switch) never blurs — make
+  // sure the soft lock is dropped anyway (no-op when it was never acquired).
+  useEffect(
+    () => () => runtime.dashboards.releaseTileLock(tileId),
+    [runtime, tileId],
+  );
+
   const commit = useCallback(() => {
     const root = editorRef.current;
     if (!root) return;
@@ -229,6 +236,12 @@ function TextTileEditor({ tileId, spec }: { tileId: string; spec: TextTileSpec }
     // where the engine supports it (Chromium does).
     exec('styleWithCSS', 'true');
     exec('defaultParagraphSeparator', 'p');
+    // Collab wave 1: claim the tile's soft lock while typing here — remote
+    // ops on this tile hold instead of yanking the text mid-edit, and other
+    // editors' builders see it as taken. Fire-and-forget: a refusal never
+    // blocks typing (soft locks avoid conflicts, they don't enforce; a 409
+    // raises the store's lockNotice chip), and solo sessions no-op inside.
+    void runtime.dashboards.acquireTileLock(tileId);
   };
 
   const handleWrapperBlur = (event: ReactFocusEvent<HTMLDivElement>) => {
@@ -238,6 +251,10 @@ function TextTileEditor({ tileId, spec }: { tileId: string; spec: TextTileSpec }
     }
     setFocused(false);
     commit();
+    // Commit BEFORE release: the blur's updateTextTile lands in the pending
+    // buffer first, so a held remote op stays superseded by our newer write
+    // rather than clobbering the text we just committed.
+    runtime.dashboards.releaseTileLock(tileId);
   };
 
   return (

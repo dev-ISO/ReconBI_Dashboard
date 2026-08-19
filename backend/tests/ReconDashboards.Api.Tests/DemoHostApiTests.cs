@@ -558,7 +558,28 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
         var problem = await ReadJsonAsync(aliceAttempt);
         Assert.Equal("rcd.dashboard.forbidden", problem["errorCode"]!.GetValue<string>());
 
-        var carolAttempt = await carol.PutAsJsonAsync($"{Dashboards}/{id}", updateBody);
+        // The stamp is required for updates (COLLAB wave 1): the authorized
+        // caller without one gets a clear 428 rather than a blind overwrite…
+        var carolNoStamp = await carol.PutAsJsonAsync($"{Dashboards}/{id}", updateBody);
+        Assert.Equal(HttpStatusCode.PreconditionRequired, carolNoStamp.StatusCode);
+        var stampProblem = await ReadJsonAsync(carolNoStamp);
+        Assert.Equal("rcd.dashboard.stamp_required", stampProblem["errorCode"]!.GetValue<string>());
+
+        // …a stale stamp conflicts (the previously untested rcd.dashboard.stale)…
+        var staleBody = SaveDashboardBody(
+            name, isShared: true, description: "updated",
+            expectedUpdatedAtUtc: DateTime.UtcNow.AddDays(-1));
+        var carolStale = await carol.PutAsJsonAsync($"{Dashboards}/{id}", staleBody);
+        Assert.Equal(HttpStatusCode.Conflict, carolStale.StatusCode);
+        var staleProblem = await ReadJsonAsync(carolStale);
+        Assert.Equal("rcd.dashboard.stale", staleProblem["errorCode"]!.GetValue<string>());
+
+        // …and the current stamp saves.
+        var current = await ReadJsonAsync(await carol.GetAsync($"{Dashboards}/{id}"));
+        var freshBody = SaveDashboardBody(
+            name, isShared: true, description: "updated",
+            expectedUpdatedAtUtc: current["updatedAtUtc"]!.GetValue<DateTime>());
+        var carolAttempt = await carol.PutAsJsonAsync($"{Dashboards}/{id}", freshBody);
         Assert.Equal(HttpStatusCode.OK, carolAttempt.StatusCode);
     }
 
@@ -610,13 +631,16 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
         isShared,
     };
 
-    private static object SaveDashboardBody(string name, bool isShared = false, string? description = null) => new
+    private static object SaveDashboardBody(
+        string name, bool isShared = false, string? description = null,
+        DateTime? expectedUpdatedAtUtc = null) => new
     {
         name,
         description,
         modelId = (int?)null,
         layout = new { tiles = Array.Empty<object>() },
         isShared,
+        expectedUpdatedAtUtc,
     };
 
     /// <summary>Customers + orders + the FK relationship + one Sum measure (mirrors the fixture schema).</summary>

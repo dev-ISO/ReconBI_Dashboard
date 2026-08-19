@@ -8,7 +8,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import { AlertTriangle, ArrowLeft, LayoutDashboard, Plus, RefreshCw, X, Zap } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, LayoutDashboard, Lock, Plus, RefreshCw, X, Zap } from 'lucide-react';
 import {
   columnLabelOf,
   crossFilterClauseFor,
@@ -281,6 +281,10 @@ export function DashboardView({
   const current = useDashboardState((state) => state.current);
   const mode = useDashboardState((state) => state.mode);
   const dirty = useDashboardState((state) => state.dirty);
+  /** Collaborative live-editing session (COLLAB-DESIGN wave 1). */
+  const liveMode = useDashboardState((state) => state.liveMode);
+  /** Soft-lock refusal/expiry notice raised by the store. */
+  const lockNotice = useDashboardState((state) => state.lockNotice);
   const canUndo = useDashboardState((state) => state.canUndo);
   const canRedo = useDashboardState((state) => state.canRedo);
   const saveStatus = useDashboardState((state) => state.saveStatus);
@@ -422,6 +426,15 @@ export function DashboardView({
       if (runtime.dashboards.store.getState().mode !== 'edit') runtime.dashboards.close();
     };
   }, [runtime, openDashboard]);
+
+  // Collab wave 1: remote-op application suspends while the print preview is
+  // mounted — the exact companion of the auto-refresh printOptions guards
+  // below (a mid-print doc change would re-render the pages being captured).
+  // Suspended ops queue in the store and land in order on resume/unmount.
+  useEffect(() => {
+    runtime.dashboards.setRemoteOpsSuspended(printOptions !== null);
+    return () => runtime.dashboards.setRemoteOpsSuspended(false);
+  }, [runtime, printOptions]);
 
   const modelId = current?.id === dashboardId ? current.modelId : null;
 
@@ -1583,11 +1596,43 @@ export function DashboardView({
 
   const openAddChart = () => setBuilder({ tileId: null, spec: emptyChart(newId()) });
 
+  /**
+   * Opens the chart builder for an EXISTING tile, claiming its soft lock
+   * first (collab wave 1). A positive "someone else holds it" REFUSES to open
+   * and surfaces the message as the transient notice — the builder's draft
+   * never rebases, so opening over a collaborator's active edit is exactly
+   * the collision soft locks exist to prevent. Lock-service failures never
+   * block, and solo/draft sessions skip the lock entirely (store doctrine),
+   * so this is a plain setBuilder for them. New tiles (openAddChart) have no
+   * id to lock yet.
+   */
+  const openBuilderForTile = (
+    tileId: string,
+    spec: ChartSpec,
+    initialTab?: 'fields' | 'format',
+  ) => {
+    void runtime.dashboards.acquireTileLock(tileId).then((result) => {
+      if (!result.ok) {
+        setNotice(result.message ?? 'This tile is being edited by someone else right now.');
+        return;
+      }
+      setBuilder({ tileId, spec, ...(initialTab ? { initialTab } : {}) });
+    });
+  };
+
+  /** Closes the builder and drops the tile's soft lock (no-op when unheld). */
+  const closeBuilder = () => {
+    if (builder?.tileId != null) runtime.dashboards.releaseTileLock(builder.tileId);
+    setBuilder(null);
+  };
+
   const handleBuilderSave = (spec: ChartSpec) => {
     if (!builder) return;
     if (builder.tileId === null) runtime.dashboards.addTile(spec);
     else runtime.dashboards.updateChart(builder.tileId, spec);
-    setBuilder(null);
+    // Release AFTER the update buffered its op: a remote op held on this tile
+    // stays superseded by our newer write instead of clobbering the save.
+    closeBuilder();
   };
 
   /**
@@ -1603,7 +1648,7 @@ export function DashboardView({
     const tile = tiles.find((t) => t.id === tileId);
     if (!tile || !isChartTile(tile)) return;
     if (mode !== 'edit') runtime.dashboards.enterEdit();
-    setBuilder({ tileId, spec: tile.chart });
+    openBuilderForTile(tileId, tile.chart);
   };
 
   /**
@@ -1705,7 +1750,7 @@ export function DashboardView({
         activeCells={sourceEmphasisByTile.get(tile.id)?.cells ?? null}
         selectedLegendLabel={sourceEmphasisByTile.get(tile.id)?.legend ?? null}
         onSelect={() => runtime.dashboards.selectTile(tile.id)}
-        onEdit={() => setBuilder({ tileId: tile.id, spec: chart })}
+        onEdit={() => openBuilderForTile(tile.id, chart)}
         onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
         // Tile deletion additionally rides the CanDeleteContent right (0.11.1)
         // — withholding the handler hides the affordance for grantees without it.
@@ -1790,7 +1835,7 @@ export function DashboardView({
         // Owner-only chart rename (0.11.1): grantees get a locked Title input.
         canRenameTitle={canRenameCharts}
         onSave={handleBuilderSave}
-        onCancel={() => setBuilder(null)}
+        onCancel={closeBuilder}
         requestCloseRef={builderCloseRef}
       />
     );
@@ -1881,6 +1926,8 @@ export function DashboardView({
         canAddLayoutTiles={canEditLayout}
         onSave={() => void runtime.dashboards.save()}
         onDiscard={() => runtime.dashboards.discardEdits()}
+        // Collaborative session: "Live editing" caption, Save→Done, no Discard.
+        liveMode={liveMode}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={editable ? () => runtime.dashboards.undo() : undefined}
@@ -2055,6 +2102,18 @@ export function DashboardView({
               {notice}
             </TransientChip>
           )}
+          {/* Soft-lock refusals/expiries raised by the STORE (text-editor
+              focus, drag start, heartbeat loss) — the builder-open refusal
+              uses the plain notice above because it carries its own copy. */}
+          {lockNotice && (
+            <TransientChip
+              icon={<Lock size={12} className="text-[var(--rcd-status-warn)]" />}
+              dismissLabel="Dismiss lock notice"
+              onDismiss={() => runtime.dashboards.clearLockNotice()}
+            >
+              {lockNotice}
+            </TransientChip>
+          )}
         </div>
 
         {/* Floating (pill/stack) indicator docked at a corner slot. */}
@@ -2135,6 +2194,12 @@ export function DashboardView({
                 // CanEditLayout; the differ + server reject regardless).
                 locked={!canMoveTiles}
                 onLayoutChange={handleLayoutChange}
+                // Collab wave 1: a move/resize gesture claims the tile's soft
+                // lock for its duration (store no-ops outside live sessions).
+                // A refusal never blocks the drag — soft locks avoid
+                // conflicts, they don't enforce; the notice chip says so.
+                onItemDragStart={(id) => void runtime.dashboards.acquireTileLock(id)}
+                onItemDragStop={(id) => runtime.dashboards.releaseTileLock(id)}
                 renderItem={renderTile}
                 draggableHandle=".rcd-tile-drag-handle"
                 boundaryHeight={editable ? canvasBoundary : null}
@@ -2196,20 +2261,8 @@ export function DashboardView({
             <ChartContextMenu
               title={chartMenuTile.chart.title}
               position={chartMenu.position}
-              onFormat={() =>
-                setBuilder({
-                  tileId: chartMenuTile.id,
-                  spec: chartMenuTile.chart,
-                  initialTab: 'format',
-                })
-              }
-              onEditFields={() =>
-                setBuilder({
-                  tileId: chartMenuTile.id,
-                  spec: chartMenuTile.chart,
-                  initialTab: 'fields',
-                })
-              }
+              onFormat={() => openBuilderForTile(chartMenuTile.id, chartMenuTile.chart, 'format')}
+              onEditFields={() => openBuilderForTile(chartMenuTile.id, chartMenuTile.chart, 'fields')}
               onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
               // Both copy flavors take the AUTHORED tile spec, never the
               // drilled/filtered effective one.
@@ -2382,7 +2435,7 @@ export function DashboardView({
         // setBuilder(null) via their own handlers.
         onClose={() => {
           if (builderCloseRef.current) builderCloseRef.current();
-          else setBuilder(null);
+          else closeBuilder();
         }}
         wide
         draggable

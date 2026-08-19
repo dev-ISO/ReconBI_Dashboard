@@ -122,7 +122,7 @@ public sealed class DashboardService(
     /// <summary>GET activity default page size.</summary>
     public const int DefaultActivityLimit = 100;
 
-    private static readonly JsonSerializerOptions ActivityJson = new(JsonSerializerDefaults.Web);
+    private static readonly JsonSerializerOptions ActivityJson = DashboardActivityLog.Json;
 
     public async Task<IReadOnlyList<DashboardSummary>> ListVisibleAsync(CancellationToken ct)
     {
@@ -255,13 +255,23 @@ public sealed class DashboardService(
 
         if (!fullEditor && share is null)
         {
-            return ServiceResult<DashboardDetail>.Fail(
-                ServiceErrorKind.Forbidden, "rcd.dashboard.forbidden",
-                "Only the owner, an administrator, or a user it was shared with can edit this dashboard.");
+            return ServiceResult<DashboardDetail>.Fail(DashboardAccessRules.EditForbiddenError());
         }
 
-        if (request.ExpectedUpdatedAtUtc is { } expected
-            && Math.Abs((record.UpdatedAtUtc - expected).TotalMilliseconds) > 1)
+        // COLLAB-DESIGN "fixed regardless": an omitted stamp used to mean blind
+        // overwrite — the one save shape that can silently discard someone
+        // else's work. Updates now REQUIRE the stamp; 428 tells the client this
+        // request must be conditional (a clear, dedicated failure rather than a
+        // surprise conflict). Creates and duplicates are unaffected (they write
+        // fresh rows), and the ops endpoint has its own FOR UPDATE discipline.
+        if (request.ExpectedUpdatedAtUtc is not { } expected)
+        {
+            return ServiceResult<DashboardDetail>.Fail(
+                ServiceErrorKind.PreconditionRequired, "rcd.dashboard.stamp_required",
+                "Updating a dashboard requires expectedUpdatedAtUtc (the updatedAtUtc you loaded). Reload the dashboard and retry.");
+        }
+
+        if (Math.Abs((record.UpdatedAtUtc - expected).TotalMilliseconds) > 1)
         {
             return ServiceResult<DashboardDetail>.Fail(
                 ServiceErrorKind.Conflict, "rcd.dashboard.stale",
@@ -333,8 +343,7 @@ public sealed class DashboardService(
             if (missing.Count > 0)
             {
                 return ServiceResult<DashboardDetail>.Fail(
-                    ServiceErrorKind.Forbidden, "rcd.dashboard.permission_denied",
-                    $"Your access does not allow {string.Join(" or ", missing)}.");
+                    DashboardAccessRules.PermissionDeniedError(missing));
             }
 
             record.LayoutJson = request.LayoutJson;
@@ -637,86 +646,26 @@ public sealed class DashboardService(
 
     // ------------------------------- internals -------------------------------
 
+    // Authorization primitives live in DashboardAccessRules so the ops path
+    // (DashboardOpService) enforces the SAME code — these wrappers just bind
+    // the service's identity/options context.
+
     private bool IsSystem(DashboardRecord record) =>
-        !string.IsNullOrEmpty(options.SystemOwnerUserId)
-        && string.Equals(record.OwnerUserId, options.SystemOwnerUserId, StringComparison.Ordinal);
+        DashboardAccessRules.IsSystem(record, options.SystemOwnerUserId);
 
     private static bool IsVisibleTo(DashboardRecord record, string userId, DashboardShareRecord? share) =>
-        record.OwnerUserId == userId || record.IsShared || share is not null;
+        DashboardAccessRules.IsVisibleTo(record, userId, share);
 
     private Task<DashboardShareRecord?> FindShareAsync(int dashboardId, string userId, CancellationToken ct) =>
         db.DashboardShares.FirstOrDefaultAsync(
             s => s.DashboardId == dashboardId && s.UserId == userId, ct);
 
-    /// <summary>THE single place caller access is computed from a record + share row.</summary>
-    private DashboardAccess ComputeAccess(DashboardRecord record, string userId, DashboardShareRecord? share)
-    {
-        var isOwner = record.OwnerUserId == userId;
-        var viaShare = !isOwner && share is not null;
-        var viaPublish = !isOwner && share is null && record.IsShared;
+    private DashboardAccess ComputeAccess(DashboardRecord record, string userId, DashboardShareRecord? share) =>
+        DashboardAccessRules.ComputeAccess(
+            record, userId, currentUser.CanManageShared, options.SystemOwnerUserId, share);
 
-        if (IsSystem(record))
-        {
-            // Built-in content is read-only for everyone, admins included.
-            return new DashboardAccess(isOwner, false, false, false, false, false, false, viaShare, viaPublish);
-        }
-
-        var full = isOwner || currentUser.CanManageShared;
-        var canEditLayout = full || share?.CanEditLayout == true;
-        var canManagePages = full || share?.CanManagePages == true;
-        var canEditCharts = full || share?.CanEditCharts == true;
-        var canMoveTiles = full || share?.CanMoveTiles == true;
-        var canDeleteContent = full || share?.CanDeleteContent == true;
-        return new DashboardAccess(
-            isOwner,
-            full || canEditLayout || canManagePages || canEditCharts || canMoveTiles || canDeleteContent,
-            canEditLayout, canManagePages, canEditCharts, canMoveTiles, canDeleteContent,
-            viaShare, viaPublish);
-    }
-
-    /// <summary>
-    /// Maps raised change classes to the share flags that must cover them.
-    /// Beyond the three class flags: geometry rides CanMoveTiles; tile/page
-    /// REMOVALS additionally require CanDeleteContent (deletion = class flag
-    /// AND delete flag, so the delete right narrows rather than widens); chart
-    /// retitles have NO covering flag — they are owner/admin-only, so any
-    /// rename in a grantee save is always denied here.
-    /// </summary>
-    private static List<string> MissingPermissions(LayoutChangeSummary summary, DashboardShareRecord share)
-    {
-        var missing = new List<string>();
-        if (summary.LayoutChanged && !share.CanEditLayout)
-        {
-            missing.Add("layout changes");
-        }
-
-        if (summary.PagesChanged && !share.CanManagePages)
-        {
-            missing.Add("page changes");
-        }
-
-        if (summary.ChartsChanged && !share.CanEditCharts)
-        {
-            missing.Add("chart changes");
-        }
-
-        if (summary.GeometryChanged && !share.CanMoveTiles)
-        {
-            missing.Add("moving or resizing tiles");
-        }
-
-        if (summary.HasRemovals && !share.CanDeleteContent)
-        {
-            missing.Add("removing tiles or pages");
-        }
-
-        if (summary.ChartsRenamed.Count > 0)
-        {
-            missing.Add("renaming charts (owner only)");
-        }
-
-        return missing;
-    }
+    private static List<string> MissingPermissions(LayoutChangeSummary summary, DashboardShareRecord share) =>
+        DashboardAccessRules.MissingPermissions(summary, share);
 
     private static ServiceError? ValidateGrantTargets(
         IReadOnlyList<DashboardShareGrant> grants, string ownerUserId, string callerUserId)
@@ -779,14 +728,7 @@ public sealed class DashboardService(
     }
 
     private void AddActivity(int dashboardId, string userId, string action, string? detailJson, DateTime atUtc) =>
-        db.DashboardActivity.Add(new DashboardActivityRecord
-        {
-            DashboardId = dashboardId,
-            UserId = userId,
-            Action = action,
-            DetailJson = detailJson,
-            AtUtc = atUtc,
-        });
+        DashboardActivityLog.Add(db, dashboardId, userId, action, detailJson, atUtc);
 
     private void AddShareActivity(int dashboardId, string userId, string action, List<string> targetUserIds, DateTime atUtc)
     {
@@ -798,22 +740,8 @@ public sealed class DashboardService(
     }
 
     /// <summary>Keeps only the newest <see cref="MaxActivityEntriesPerDashboard"/> rows. Call after SaveChanges.</summary>
-    private async Task TrimActivityAsync(int dashboardId, CancellationToken ct)
-    {
-        var threshold = await db.DashboardActivity
-            .Where(a => a.DashboardId == dashboardId)
-            .OrderByDescending(a => a.Id)
-            .Select(a => a.Id)
-            .Skip(MaxActivityEntriesPerDashboard)
-            .FirstOrDefaultAsync(ct);
-
-        if (threshold > 0)
-        {
-            await db.DashboardActivity
-                .Where(a => a.DashboardId == dashboardId && a.Id <= threshold)
-                .ExecuteDeleteAsync(ct);
-        }
-    }
+    private Task TrimActivityAsync(int dashboardId, CancellationToken ct) =>
+        DashboardActivityLog.TrimAsync(db, dashboardId, ct);
 
     /// <summary>Column caps of rcd_dashboards (Name/Description HasMaxLength) — validated here so an
     /// over-long rename fails as a clean 400 instead of a provider truncation error.</summary>
@@ -881,15 +809,11 @@ public sealed class DashboardService(
     }
 
     private static ServiceResult<T> NotFound<T>(int id) =>
-        ServiceResult<T>.Fail(
-            ServiceErrorKind.NotFound, "rcd.dashboard.not_found",
-            $"Dashboard {id} does not exist or is not visible to you.");
+        ServiceResult<T>.Fail(DashboardAccessRules.NotFoundError(id));
 
     private static ServiceResult<T> SystemReadOnly<T>() => ServiceResult<T>.Fail(SystemReadOnlyError());
 
-    private static ServiceError SystemReadOnlyError() =>
-        new(ServiceErrorKind.Forbidden, "rcd.dashboard.system_readonly",
-            "This is a built-in item managed by the application. Make a copy to edit it.");
+    private static ServiceError SystemReadOnlyError() => DashboardAccessRules.SystemReadOnlyError();
 
     private static ServiceResult<DashboardDetail> SharingForbidden() =>
         ServiceResult<DashboardDetail>.Fail(

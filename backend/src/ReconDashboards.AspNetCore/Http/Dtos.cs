@@ -199,6 +199,38 @@ public sealed record ShareGrantRequest(
 /// <summary>PUT dashboards/{id}/shares body: REPLACES the full grant set.</summary>
 public sealed record SaveDashboardSharesRequest(IReadOnlyList<ShareGrantRequest> Shares);
 
+/// <summary>
+/// POST dashboards/{id}/ops body: ONE element-scoped collaborative edit
+/// (COLLAB-DESIGN wave 1). payload.kind selects from the closed op vocabulary
+/// (tileUpsert/tileRemove/tileGeometry, pageAdd/pageRename/pageColor/pageSet/
+/// pageRemove/pageReorder, docElementUpsert/docElementRemove/docSettingSet);
+/// payloads are STRICT — unknown extra fields are rejected, never ignored.
+/// The server classifies by DIFF and gates on the caller's share flags.
+/// baseUpdatedAtUtc is informational — ops are last-writer-wins per element,
+/// never stamp-rejected.
+/// </summary>
+public sealed record DashboardOpRequest(
+    string OpId,
+    string TargetKind,
+    string? TargetId,
+    JsonElement Payload,
+    DateTime? BaseUpdatedAtUtc = null);
+
+/// <summary>The committed op's receipt; updatedAtUtc is the client's new concurrency baseline.
+/// class is "layout|pages|charts|geometry|removal", or "none" for an idempotent no-op replay.</summary>
+public sealed record DashboardOpResponse(
+    string OpId,
+    string Class,
+    DateTime UpdatedAtUtc);
+
+/// <summary>The soft tile lock the caller now holds (acquire and heartbeat share this shape).</summary>
+public sealed record DashboardTileLockResponse(
+    string TileId,
+    string HolderUserId,
+    string? HolderDisplayName,
+    DateTime AcquiredAtUtc,
+    DateTime ExpiresAtUtc);
+
 /// <summary>Detail is the stored DetailJson re-emitted verbatim (camelCase), or null.</summary>
 public sealed record ActivityEntryResponse(
     long Id,

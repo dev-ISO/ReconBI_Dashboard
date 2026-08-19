@@ -75,12 +75,19 @@ public static class AddReconDashboardsExtensions
         // hosts register their SignalR/bell bridges after this call and win.
         services.TryAddSingleton<IRcdDispatchProgressNotifier, NullRcdDispatchProgressNotifier>();
         services.TryAddSingleton<IRcdDeliveryFailureNotifier, NullRcdDeliveryFailureNotifier>();
+        // Collaborative-op broadcast seam (COLLAB-DESIGN wave 1): no-op default,
+        // the host's SignalR bridge registration wins.
+        services.TryAddSingleton<IRcdDashboardOpNotifier, NullRcdDashboardOpNotifier>();
+        // Soft tile locks are process-local state (single-instance constraint is
+        // an accepted design tradeoff) — a plain singleton, not a host seam.
+        services.AddSingleton<DashboardTileLockService>();
         // The dispatcher lives HERE (not in AddReconDashboardsScheduling):
         // send-now must work on hosts that never enable the background
         // scheduler, and its retry queue/manual guard are process state.
         services.TryAddSingleton<SubscriptionDispatcher>();
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
+        services.AddScoped<DashboardOpService>();
         services.AddScoped<ChartQueryService>();
         services.AddScoped<SubscriptionService>();
         services.AddScoped<AlertService>(sp => new AlertService(

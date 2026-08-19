@@ -29,9 +29,42 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
     public DbSet<SubscriptionOptOutRecord> SubscriptionOptOuts => Set<SubscriptionOptOutRecord>();
     public DbSet<GlobalOptOutRecord> GlobalOptOuts => Set<GlobalOptOutRecord>();
 
+    /// <summary>Same provider probe the model build uses (jsonb, index filters, timestamps).</summary>
+    private bool IsNpgsql =>
+        Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true;
+
+    /// <summary>
+    /// Loads ONE dashboard row with an exclusive row lock, to be called inside
+    /// an open transaction by the collaborative-ops path (COLLAB-DESIGN: apply
+    /// ops under SELECT … FOR UPDATE so concurrent ops serialize instead of
+    /// last-write-losing whole documents).
+    ///
+    /// Provider seam, same style as the model build above: on Npgsql the lock
+    /// is a raw FOR UPDATE (EF has no first-class pessimistic-locking API); on
+    /// SQLite — the host test suites' provider — FOR UPDATE does not exist in
+    /// the grammar, and none is needed: SQLite allows a single writer per
+    /// database, so the surrounding write transaction already serializes
+    /// concurrent op applications. The raw SQL is deliberately non-composed
+    /// (no LINQ operators appended) so the executed statement is exactly the
+    /// one documented here; IsDeleted/visibility filtering happens in the
+    /// service after materialization.
+    /// </summary>
+    public async Task<DashboardRecord?> FindDashboardForUpdateAsync(int id, CancellationToken ct)
+    {
+        if (IsNpgsql)
+        {
+            var rows = await Dashboards
+                .FromSqlInterpolated($"""SELECT * FROM rcd_dashboards WHERE "Id" = {id} FOR UPDATE""")
+                .ToListAsync(ct);
+            return rows.FirstOrDefault();
+        }
+
+        return await Dashboards.FirstOrDefaultAsync(d => d.Id == id, ct);
+    }
+
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
-        var isNpgsql = Database.ProviderName?.Contains("Npgsql", StringComparison.OrdinalIgnoreCase) == true;
+        var isNpgsql = IsNpgsql;
         var jsonColumnType = isNpgsql ? "jsonb" : null;
         var notDeletedFilter = isNpgsql ? "\"IsDeleted\" = false" : "\"IsDeleted\" = 0";
 

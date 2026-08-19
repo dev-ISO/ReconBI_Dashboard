@@ -66,6 +66,15 @@ export interface DashboardToolbarProps {
   pasteChartEnabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
+  /**
+   * Collaborative live-editing session (COLLAB-DESIGN wave 1): every change
+   * persists as it happens, so the edit-mode chrome changes shape — the
+   * caption reads "Live editing — changes save as you go", the primary button
+   * becomes "Done" (exit; onSave still handles it — the store's save() is
+   * live-aware), and Discard disappears (scoped undo is the revert
+   * affordance). Draft (solo) sessions are untouched.
+   */
+  liveMode?: boolean;
   /** View-mode auto-refresh interval (persisted with the layout); null = off. */
   refreshSeconds?: number | null;
   /** Edit-mode change of the auto-refresh interval. */
@@ -182,6 +191,7 @@ export function DashboardToolbar({
   pasteChartEnabled = false,
   onSave,
   onDiscard,
+  liveMode = false,
   refreshSeconds = null,
   onChangeRefreshSeconds,
   onRefresh,
@@ -307,9 +317,16 @@ export function DashboardToolbar({
           Everyone
         </span>
       )}
-      {mode === 'edit' && dirty && (
-        <span className="shrink-0 text-xs text-rcd-muted">Unsaved changes</span>
-      )}
+      {mode === 'edit' &&
+        (liveMode ? (
+          // Live sessions autosave per op — say so instead of "Unsaved
+          // changes" (dirty only flickers for the coalescing window).
+          <span className="shrink-0 text-xs text-rcd-muted">
+            Live editing — changes save as you go
+          </span>
+        ) : (
+          dirty && <span className="shrink-0 text-xs text-rcd-muted">Unsaved changes</span>
+        ))}
 
       {/* Flexible middle: the DEFAULT home of the active-filter chips. Its
           width comes from the flex line (flex-1 + basis 0), never from its
@@ -490,11 +507,15 @@ export function DashboardToolbar({
                   onManageParameters={onManageParameters}
                 />
               )}
-              <RcdButton onClick={handleDiscard} disabled={saving}>
-                Discard
-              </RcdButton>
+              {/* Live mode: Discard is replaced by the (scoped) Undo above,
+                  and Save becomes "Done" — ops already persisted everything. */}
+              {!liveMode && (
+                <RcdButton onClick={handleDiscard} disabled={saving}>
+                  Discard
+                </RcdButton>
+              )}
               <RcdButton variant="primary" onClick={onSave} disabled={saving}>
-                {saving ? 'Saving…' : 'Save'}
+                {saving ? 'Saving…' : liveMode ? 'Done' : 'Save'}
               </RcdButton>
             </>
           )}

@@ -23,6 +23,7 @@ public abstract class RcdControllerBase : ControllerBase
             ServiceErrorKind.Validation => StatusCodes.Status422UnprocessableEntity,
             ServiceErrorKind.LimitExceeded => StatusCodes.Status422UnprocessableEntity,
             ServiceErrorKind.TooManyRequests => StatusCodes.Status429TooManyRequests,
+            ServiceErrorKind.PreconditionRequired => StatusCodes.Status428PreconditionRequired,
             ServiceErrorKind.Upstream => StatusCodes.Status502BadGateway,
             _ => StatusCodes.Status500InternalServerError,
         };

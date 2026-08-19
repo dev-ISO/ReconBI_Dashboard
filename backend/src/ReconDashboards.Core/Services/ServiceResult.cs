@@ -14,6 +14,14 @@ public enum ServiceErrorKind
     /// <summary>The caller must wait for an in-flight operation (maps to 429), e.g. a concurrent manual send.</summary>
     TooManyRequests,
 
+    /// <summary>
+    /// The request must be conditional but was not (maps to 428 Precondition
+    /// Required) — e.g. a dashboard update without expectedUpdatedAtUtc.
+    /// Distinct from Conflict (409, the precondition was sent and FAILED) so
+    /// clients can tell "you forgot the stamp" from "your stamp is stale".
+    /// </summary>
+    PreconditionRequired,
+
     /// <summary>The downstream database failed or was unreachable (maps to 502).</summary>
     Upstream,
 }

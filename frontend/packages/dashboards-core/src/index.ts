@@ -5,10 +5,11 @@ export * from './types/model';
 export * from './types/query';
 export * from './types/chart';
 export * from './types/dashboard';
+export * from './types/ops';
 
 export { RcdApiError, createFetchFetcher, rcdErrorMessage } from './api/fetcher';
 export type { RcdFetcher, RcdRequestInit } from './api/fetcher';
-export { DashboardsApi } from './api/DashboardsApi';
+export { DashboardsApi, opResultStampOf } from './api/DashboardsApi';
 export type {
   SaveModelBody,
   ModelExportDocument,
@@ -22,6 +23,9 @@ export type {
   UnderlyingQueryBody,
   UnderlyingQueryResult,
   RcdMeta,
+  SendDashboardOpBody,
+  SendDashboardOpResult,
+  DashboardTileLockResult,
 } from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';
@@ -45,6 +49,7 @@ export type {
   HoverHighlight,
   OpenDashboard,
 } from './state/dashboardStore';
+export { applyOpToDoc, diffLayoutDocs, invertLocalOp } from './state/collabOps';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
 

@@ -25,6 +25,7 @@ import type {
   SubscriptionDispatch,
   SubscriptionOptOut,
 } from '../types/dashboard';
+import type { DashboardOpPayload, DashboardOpTargetKind } from '../types/ops';
 
 /** GET /meta — version, effective limits, and the caller's admin standing. */
 export interface RcdMeta {
@@ -95,6 +96,57 @@ export interface ListActivityOptions {
   limit?: number;
   /** Return entries with id strictly below this ("Load more" cursor). */
   beforeId?: number;
+}
+
+/**
+ * Body of POST /dashboards/{id}/ops — the backend's DashboardOpRequest
+ * verbatim (reconciled contract; the server is authoritative): dashboardId
+ * rides the URL, the actor is resolved from the caller's auth principal, and
+ * there is NO class field — the server classifies every op with the differ's
+ * own rules before the grantee gate, so an op can never bypass permissions.
+ */
+export interface SendDashboardOpBody {
+  /** Client-generated unique id (≤128 chars) — the sender drops its own
+   * broadcast echo by it, and the server dedupes an idempotent replay. */
+  opId: string;
+  targetKind: DashboardOpTargetKind;
+  /** The targeted element's id; null ONLY for pageReorder / docSettingSet. */
+  targetId: string | null;
+  /** The op body as a JSON OBJECT (NOT a serialized string — that shape is
+   * the inbound broadcast's payloadJson only). STRICT server-side: any
+   * top-level property the kind does not declare is rejected (op_invalid). */
+  payload: DashboardOpPayload;
+  /** The sender's concurrency baseline when the op was authored.
+   * INFORMATIONAL — ops are per-element last-writer-wins, never stamp-rejected. */
+  baseUpdatedAtUtc: string;
+}
+
+/** Result of POST /dashboards/{id}/ops (the backend's DashboardOpResponse). */
+export interface SendDashboardOpResult {
+  opId?: string;
+  /** "layout|pages|charts|geometry|removal" as the server classified it, or
+   * "none" for an idempotent no-op replay. */
+  class?: string;
+  /** The dashboard's UpdatedAtUtc AFTER the op — the sender's next baseline. */
+  updatedAtUtc?: string;
+  /** Tolerant-reader alias: builds emitting COLLAB-DESIGN's original record
+   * name still advance the baseline. */
+  resultUpdatedAtUtc?: string;
+}
+
+/** The committed stamp under either wire name (see SendDashboardOpResult). */
+export const opResultStampOf = (result: SendDashboardOpResult): string | null =>
+  result.updatedAtUtc ?? result.resultUpdatedAtUtc ?? null;
+
+/** 200 body of the tile-lock acquire/heartbeat POST (the lock the CALLER now
+ * holds); a lock held by someone else answers 409 rcd.dashboard.tile_locked
+ * with the holder named in the error message. */
+export interface DashboardTileLockResult {
+  tileId: string;
+  holderUserId: string;
+  holderDisplayName: string | null;
+  acquiredAtUtc: string;
+  expiresAtUtc: string;
 }
 
 export interface ValidationOutcome {
@@ -259,6 +311,43 @@ export class DashboardsApi {
 
   duplicateDashboard(id: number): Promise<DashboardDetail> {
     return this.fetcher(this.url(`/dashboards/${id}/duplicate`), { method: 'POST' });
+  }
+
+  /* ------------------------------------------- collaborative editing (ops) */
+
+  /**
+   * Commits ONE live-mode edit op (COLLAB-DESIGN wave 1). The server resolves
+   * the actor, re-classifies the op with the differ's rules, gates it on the
+   * caller's share flags, applies it to LayoutJson inside a FOR UPDATE
+   * transaction, bumps UpdatedAtUtc and broadcasts the committed record to the
+   * dashboard-{id} group. Well-known failures: 403 (class not granted),
+   * 409 rcd.dashboard.stale (baseline too old for the server to accept).
+   */
+  sendOp(dashboardId: number, body: SendDashboardOpBody): Promise<SendDashboardOpResult> {
+    return this.fetcher(this.url(`/dashboards/${dashboardId}/ops`), { method: 'POST', body });
+  }
+
+  /**
+   * Acquires — or, for the current holder, heartbeats — the SOFT lock on one
+   * tile (conflict avoidance, not enforcement; ~30s TTL server-side).
+   * Idempotent for the holder: re-POSTing refreshes the TTL, so acquire and
+   * heartbeat are the same call. 409 rcd.dashboard.tile_locked (naming the
+   * holder in the message) when another user holds it.
+   */
+  acquireTileLock(dashboardId: number, tileId: string): Promise<DashboardTileLockResult> {
+    return this.fetcher(
+      this.url(`/dashboards/${dashboardId}/tiles/${encodeURIComponent(tileId)}/lock`),
+      { method: 'POST' },
+    );
+  }
+
+  /** Releases the caller's soft lock on one tile. Idempotent — releasing an
+   * expired/stolen lock still 204s (disconnect cleanup expires them anyway). */
+  releaseTileLock(dashboardId: number, tileId: string): Promise<void> {
+    return this.fetcher(
+      this.url(`/dashboards/${dashboardId}/tiles/${encodeURIComponent(tileId)}/lock`),
+      { method: 'DELETE' },
+    );
   }
 
   /* ------------------------------------------------- shares/activity/users */

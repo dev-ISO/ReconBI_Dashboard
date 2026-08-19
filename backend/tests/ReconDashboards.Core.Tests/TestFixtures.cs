@@ -218,6 +218,23 @@ public sealed class ServiceTestHarness : IDisposable
     public Services.DashboardService CreateDashboardService() =>
         new(Db, CurrentUser, UserDirectory, Options, TimeProvider.System);
 
+    /// <summary>
+    /// Ops-path service over the same harness state. Clock, lock table and
+    /// notifier are injectable so lock-TTL and broadcast tests can observe
+    /// them; defaults mirror production wiring (no-op notifier).
+    /// </summary>
+    public Services.DashboardOpService CreateDashboardOpService(
+        Services.DashboardTileLockService? tileLocks = null,
+        IRcdDashboardOpNotifier? notifier = null,
+        TimeProvider? clock = null)
+    {
+        var time = clock ?? TimeProvider.System;
+        return new Services.DashboardOpService(
+            Db, CurrentUser, UserDirectory, Options, time,
+            tileLocks ?? new Services.DashboardTileLockService(time),
+            notifier ?? new NullRcdDashboardOpNotifier());
+    }
+
     public void Dispose()
     {
         Db.Dispose();

@@ -68,12 +68,79 @@ public class DashboardServiceTests : IDisposable
 
         var updated = await _service.UpdateAsync(
             created.Value!.Id,
-            Request("Final Board", layoutJson: """{"tiles":[{"kind":"line"},{"kind":"pie"}]}"""),
+            Request("Final Board", layoutJson: """{"tiles":[{"kind":"line"},{"kind":"pie"}]}""",
+                expectedUpdatedAtUtc: created.Value.UpdatedAtUtc),
             CancellationToken.None);
 
         Assert.True(updated.Succeeded);
         Assert.Equal("Final Board", updated.Value!.Name);
         Assert.Equal(2, updated.Value.Layout.GetProperty("tiles").GetArrayLength());
+    }
+
+    // -------------------- optimistic-concurrency stamp (COLLAB wave 1) --------------------
+    // The stamp is REQUIRED for updates now: omitting it used to mean blind
+    // overwrite, the one save shape that silently discards someone else's work.
+
+    [Fact]
+    public async Task UpdateWithoutStamp_IsRejectedAsStampRequired()
+    {
+        var created = await _service.CreateAsync(Request("Stamped Board"), CancellationToken.None);
+        Assert.True(created.Succeeded);
+
+        var updated = await _service.UpdateAsync(
+            created.Value!.Id, Request("Stamped Board v2"), CancellationToken.None);
+
+        Assert.False(updated.Succeeded);
+        Assert.Equal(ServiceErrorKind.PreconditionRequired, updated.Error!.Kind);
+        Assert.Equal("rcd.dashboard.stamp_required", updated.Error.Code);
+    }
+
+    [Fact]
+    public async Task UpdateWithStaleStamp_IsRejectedAsStale()
+    {
+        var created = await _service.CreateAsync(Request("Contended Board"), CancellationToken.None);
+        Assert.True(created.Succeeded);
+        var id = created.Value!.Id;
+
+        // Another session saves first (with the fresh stamp)…
+        var first = await _service.UpdateAsync(
+            id,
+            Request("Contended Board", layoutJson: """{"tiles":[{"kind":"line"}]}""",
+                expectedUpdatedAtUtc: created.Value.UpdatedAtUtc),
+            CancellationToken.None);
+        Assert.True(first.Succeeded, first.Error?.Message);
+
+        // …so a save still carrying the ORIGINAL stamp must conflict, not overwrite.
+        var stale = await _service.UpdateAsync(
+            id,
+            Request("Contended Board", layoutJson: """{"tiles":[{"kind":"pie"}]}""",
+                expectedUpdatedAtUtc: created.Value.UpdatedAtUtc),
+            CancellationToken.None);
+
+        Assert.False(stale.Succeeded);
+        Assert.Equal(ServiceErrorKind.Conflict, stale.Error!.Kind);
+        Assert.Equal("rcd.dashboard.stale", stale.Error.Code);
+
+        // The losing writer's layout never landed.
+        var current = await _service.GetAsync(id, CancellationToken.None);
+        Assert.Equal("line",
+            current.Value!.Layout.GetProperty("tiles")[0].GetProperty("kind").GetString());
+    }
+
+    [Fact]
+    public async Task UpdateWithCurrentStamp_Succeeds_AndAdvancesTheStamp()
+    {
+        var created = await _service.CreateAsync(Request("Fresh Board"), CancellationToken.None);
+        Assert.True(created.Succeeded);
+
+        var updated = await _service.UpdateAsync(
+            created.Value!.Id,
+            Request("Fresh Board", layoutJson: """{"tiles":[{"kind":"kpi"}]}""",
+                expectedUpdatedAtUtc: created.Value.UpdatedAtUtc),
+            CancellationToken.None);
+
+        Assert.True(updated.Succeeded, updated.Error?.Message);
+        Assert.True(updated.Value!.UpdatedAtUtc >= created.Value.UpdatedAtUtc);
     }
 
     [Fact]
@@ -193,7 +260,8 @@ public class DashboardServiceTests : IDisposable
         Assert.True(ok.Succeeded);
         var updated = await _service.UpdateAsync(
             ok.Value!.Id,
-            new DashboardSaveRequest("Board", new string('d', 513), ModelId: null, """{"tiles":[]}"""),
+            new DashboardSaveRequest("Board", new string('d', 513), ModelId: null, """{"tiles":[]}""",
+                ExpectedUpdatedAtUtc: ok.Value.UpdatedAtUtc),
             CancellationToken.None);
         Assert.Equal("rcd.dashboard.description_too_long", updated.Error!.Code);
     }

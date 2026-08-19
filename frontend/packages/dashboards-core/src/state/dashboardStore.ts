@@ -1,10 +1,27 @@
 import { createStore, type StoreApi } from 'zustand/vanilla';
-import type {
-  DashboardsApi,
-  DashboardShareInput,
-  ListActivityOptions,
+import {
+  opResultStampOf,
+  type DashboardsApi,
+  type DashboardShareInput,
+  type ListActivityOptions,
+  type SendDashboardOpBody,
 } from '../api/DashboardsApi';
 import { RcdApiError, rcdErrorMessage } from '../api/fetcher';
+import {
+  applyOpToDoc,
+  diffLayoutDocs,
+  invertLocalOp,
+  mergePendingPayloads,
+  pendingSlotKey,
+} from './collabOps';
+import {
+  opConflictKey,
+  OP_TARGET_MISSING_ERROR,
+  TILE_LOCKED_ERROR,
+  type DashboardLocalOp,
+  type DashboardOpEvent,
+  type DashboardOpPayload,
+} from '../types/ops';
 import type { ChartSpec } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
@@ -174,13 +191,50 @@ export interface DashboardStoreState {
    */
   viewFitOverride: ViewFitMode | null;
   /**
-   * Whether an edit-session undo/redo step is available. The snapshot stacks
-   * themselves live OUTSIDE the reactive state (class fields) — components
-   * only ever need these two booleans, and stacks of deep layout clones have
-   * no business feeding useSyncExternalStore.
+   * Whether an edit-session undo/redo step is available. The stacks themselves
+   * live OUTSIDE the reactive state (class fields) — components only ever need
+   * these two booleans, and stacks of deep layout clones have no business
+   * feeding useSyncExternalStore. Draft sessions stack whole-doc snapshots
+   * (historic behavior, untouched); LIVE sessions stack inverse OPS scoped to
+   * the local user's own changes (COLLAB-DESIGN: a collaborator's concurrent
+   * work can never be reverted by someone else's Ctrl+Z).
    */
   canUndo: boolean;
   canRedo: boolean;
+  /**
+   * COLLAB-DESIGN live mode: true while the edit session on a COLLABORATIVE
+   * dashboard is active — every edit persists immediately as an op (that IS
+   * the autosave), Save becomes "Done" (exit only, no doc PUT), Discard is
+   * replaced by the (locally-scoped) undo. A dashboard is collaborative when
+   * it has ≥1 share grant: a grantee holding edit rights proves one exists;
+   * for the owner/admin the grant count is the honest client-side signal (the
+   * per-grant edit flags are not on the open payload — a dashboard shared
+   * view-only enters live mode too, harmlessly: ops simply autosave with no
+   * other editors possible). Solo dashboards keep the draft/save/discard path
+   * EXACTLY as before; so does an admin editing an unshared dashboard via
+   * CanManageShared (the design's accepted edge). Set on enterEdit, cleared on
+   * exit/close — and cleared mid-session when op delivery fails twice, which
+   * degrades the session to draft semantics (see the ops pipeline).
+   */
+  liveMode: boolean;
+  /**
+   * Remote ops HELD by the merge doctrine (copied from the tracker's
+   * applyRealtimeSystemInput): a remote op targeting an element with local
+   * uncommitted changes is not applied — the concurrency baseline advances,
+   * the local element stays untouched, and the conflict is surfaced honestly
+   * here (keyed by the op's CONFLICT KEY — see opConflictKey; latest per
+   * element) for the UI to badge. A held op is superseded when the local
+   * change commits (our op is newer server-side) and re-applied when the
+   * element becomes clean without a local write (e.g. a chart builder Cancel
+   * releasing the tile lock).
+   */
+  heldRemoteOps: Record<string, DashboardOpEvent>;
+  /**
+   * Transient soft-lock notice ("this tile is being edited by someone else") —
+   * set when a lock acquire/heartbeat is rejected, cleared via
+   * clearLockNotice(). The toolbar area renders it as a dismissible chip.
+   */
+  lockNotice: string | null;
   saveStatus: AsyncStatus;
   error: string | null;
   /**
@@ -490,6 +544,9 @@ const initialState: DashboardStoreState = {
   viewFitOverride: null,
   canUndo: false,
   canRedo: false,
+  liveMode: false,
+  heldRemoteOps: {},
+  lockNotice: null,
   saveStatus: 'idle',
   error: null,
   chartClipboard: null,
@@ -509,6 +566,36 @@ interface HistoryCoalesce {
 
 const HISTORY_CAP = 50;
 
+/** Cap on remembered own-op ids (echo dropping); oldest are evicted. */
+const SENT_OP_CAP = 500;
+
+/**
+ * Soft tile-lock heartbeat cadence. Locks are a GridPresenceTracker clone —
+ * a server-side TTL claim the holder refreshes by re-acquiring; 20s keeps a
+ * lock alive under any plausible TTL (~60s) while staying negligible traffic.
+ */
+const TILE_LOCK_HEARTBEAT_MS = 20_000;
+
+/**
+ * Is this dashboard COLLABORATIVE (live-mode editing) for this caller? True
+ * when ≥1 share grant exists: a grantee holding edit rights IS one; for the
+ * owner/admin, shareCount is the client-side signal (per-grant edit flags are
+ * not on the open payload — see DashboardStoreState.liveMode for why counting
+ * view-only grants is harmless). Built-ins never (read-only anyway); the
+ * legacy publish ("Everyone") flag grants VIEW only, so it does not count.
+ */
+const isLiveCollaborative = (dashboard: OpenDashboard): boolean =>
+  !dashboard.isSystem &&
+  dashboard.myAccess.canEdit &&
+  (dashboard.myAccess.viaShare || dashboard.shareCount > 0);
+
+/** One buffered, not-yet-POSTed local op (see bufferOps). */
+interface PendingOp {
+  op: DashboardLocalOp;
+  /** Earliest instant this op may flush (coalescing window's trailing edge). */
+  flushAt: number;
+}
+
 export class DashboardStore {
   readonly store: StoreApi<DashboardStoreState>;
 
@@ -520,6 +607,32 @@ export class DashboardStore {
   private lastHistoryAt = 0;
   /** >0 while inside groupHistory — inner mutations skip their own push. */
   private historyDepth = 0;
+
+  /* ---- collaborative live-mode session plumbing (COLLAB-DESIGN wave 1).
+   * All non-reactive for the same reason as the snapshot stacks: components
+   * only ever need liveMode / heldRemoteOps / canUndo, which ARE in state. */
+
+  /** LIVE-session history: entries are inverse-op lists scoped to the local
+   * user's own changes (never whole-doc snapshots — see undo()). */
+  private liveUndoStack: DashboardLocalOp[][] = [];
+  private liveRedoStack: DashboardLocalOp[][] = [];
+  /** Open groupHistory accumulator while historyDepth > 0 in live mode. */
+  private liveGroupEntry: DashboardLocalOp[] | null = null;
+  /** Authored-but-unsent ops, keyed by pendingSlotKey (newer edits to the same
+   * element merge in — per-element LWW makes that lossless). Map order is the
+   * send order; page.add naturally precedes tile ops onto the new page. */
+  private pendingOps = new Map<string, PendingOp>();
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serializes drains so two flushOps() calls can never interleave sends. */
+  private flushChain: Promise<void> = Promise.resolve();
+  /** Ids of ops THIS client sent — the broadcast echo is dropped by them. */
+  private sentOpIds = new Set<string>();
+  /** True while remote application is suspended (print preview mounted). */
+  private remoteSuspended = false;
+  /** Ops received while suspended, applied in order on resume. */
+  private suspendedRemoteOps: DashboardOpEvent[] = [];
+  /** Heartbeat timers of soft tile locks THIS client holds, keyed by tile id. */
+  private tileLockHeartbeats = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(private readonly api: DashboardsApi) {
     this.store = createStore<DashboardStoreState>(() => ({ ...initialState }));
@@ -631,6 +744,9 @@ export class DashboardStore {
    * one tile within 800ms) into ONE entry by keeping the first snapshot.
    */
   private pushHistory(coalesce?: HistoryCoalesce): void {
+    // LIVE sessions never snapshot: their history is inverse OPS, recorded by
+    // recordLocalOps at the same seams (locally-scoped undo doctrine).
+    if (this.state.liveMode) return;
     if (this.historyDepth > 0) return;
     const current = this.state.current;
     if (!current || this.state.mode !== 'edit') return;
@@ -654,6 +770,29 @@ export class DashboardStore {
 
   /** Runs several doc mutations as ONE undo step. */
   private groupHistory(fn: () => void): void {
+    if (this.state.liveMode) {
+      // Live sessions group the INVERSE OPS of every inner mutation into one
+      // locally-scoped history entry (recordLocalOps appends while depth > 0).
+      this.historyDepth += 1;
+      this.liveGroupEntry = this.liveGroupEntry ?? [];
+      try {
+        fn();
+      } finally {
+        this.historyDepth -= 1;
+        if (this.historyDepth === 0) {
+          const entry = this.liveGroupEntry;
+          this.liveGroupEntry = null;
+          this.lastHistoryTag = null;
+          if (entry !== null && entry.length > 0) {
+            this.liveRedoStack = [];
+            this.liveUndoStack.push(entry);
+            if (this.liveUndoStack.length > HISTORY_CAP) this.liveUndoStack.shift();
+          }
+          this.syncHistoryFlags();
+        }
+      }
+      return;
+    }
     this.pushHistory();
     this.historyDepth += 1;
     try {
@@ -663,18 +802,47 @@ export class DashboardStore {
     }
   }
 
-  /** Drops both stacks (open/close/enterEdit/discardEdits — NOT save). */
+  /** Drops all stacks — snapshot AND live-op — (open/close/enterEdit/
+   * discardEdits/live-session exit — NOT save). */
   private clearHistory(): void {
     this.undoStack = [];
     this.redoStack = [];
+    this.liveUndoStack = [];
+    this.liveRedoStack = [];
+    this.liveGroupEntry = null;
     this.lastHistoryTag = null;
     if (this.state.canUndo || this.state.canRedo) this.set({ canUndo: false, canRedo: false });
   }
 
-  /** Restores the previous document snapshot (edit mode only). Dirties. */
+  /** Reflects the ACTIVE stacks (live-op vs snapshot) into the two booleans. */
+  private syncHistoryFlags(): void {
+    const live = this.state.liveMode;
+    const canUndo = live ? this.liveUndoStack.length > 0 : this.undoStack.length > 0;
+    const canRedo = live ? this.liveRedoStack.length > 0 : this.redoStack.length > 0;
+    if (this.state.canUndo !== canUndo || this.state.canRedo !== canRedo) {
+      this.set({ canUndo, canRedo });
+    }
+  }
+
+  /**
+   * Undo. DRAFT sessions restore the previous whole-doc snapshot (historic
+   * behavior; dirties). LIVE sessions apply the top entry's inverse ops — a
+   * locally-scoped revert touching ONLY elements this user changed — and emit
+   * them through the same op pipeline so the revert syncs to collaborators.
+   */
   undo(): void {
     const current = this.state.current;
-    if (!current || this.state.mode !== 'edit' || this.undoStack.length === 0) return;
+    if (!current || this.state.mode !== 'edit') return;
+    if (this.state.liveMode) {
+      if (this.liveUndoStack.length === 0) return;
+      const entry = this.liveUndoStack.pop()!;
+      const redoEntry = this.applyLocalOpEntry(entry);
+      if (redoEntry.length > 0) this.liveRedoStack.push(redoEntry);
+      this.lastHistoryTag = null;
+      this.syncHistoryFlags();
+      return;
+    }
+    if (this.undoStack.length === 0) return;
     const snapshot = this.undoStack.pop()!;
     this.redoStack.push(
       structuredClone({ layout: current.layout, activePageId: this.state.activePageId }),
@@ -683,10 +851,23 @@ export class DashboardStore {
     this.applySnapshot(snapshot);
   }
 
-  /** Re-applies the last undone snapshot (edit mode only). Dirties. */
+  /** Re-applies the last undone step (edit mode only) — see undo(). */
   redo(): void {
     const current = this.state.current;
-    if (!current || this.state.mode !== 'edit' || this.redoStack.length === 0) return;
+    if (!current || this.state.mode !== 'edit') return;
+    if (this.state.liveMode) {
+      if (this.liveRedoStack.length === 0) return;
+      const entry = this.liveRedoStack.pop()!;
+      const undoEntry = this.applyLocalOpEntry(entry);
+      if (undoEntry.length > 0) {
+        this.liveUndoStack.push(undoEntry);
+        if (this.liveUndoStack.length > HISTORY_CAP) this.liveUndoStack.shift();
+      }
+      this.lastHistoryTag = null;
+      this.syncHistoryFlags();
+      return;
+    }
+    if (this.redoStack.length === 0) return;
     const snapshot = this.redoStack.pop()!;
     this.undoStack.push(
       structuredClone({ layout: current.layout, activePageId: this.state.activePageId }),
@@ -718,7 +899,13 @@ export class DashboardStore {
     const current = this.state.current;
     if (!current) return;
     this.pushHistory(coalesce);
-    this.set({ current: { ...current, layout: mutate(current.layout) }, dirty: true });
+    const nextLayout = mutate(current.layout);
+    this.set({ current: { ...current, layout: nextLayout }, dirty: true });
+    // THE emission decorator (COLLAB-DESIGN): every doc mutation funnels
+    // through this seam (or addPage/removePage's decorated direct writes), so
+    // diffing before/after here provably covers the whole action catalog.
+    // recordLocalOps no-ops outside live edit sessions.
+    this.recordLocalOps(current.layout, nextLayout, coalesce);
   }
 
   private mutatePages(
@@ -750,6 +937,637 @@ export class DashboardStore {
     return pagesOf(layout).find((page) => page.id === this.state.activePageId)?.tiles ?? [];
   }
 
+  /* ==================================================== collaborative editing
+   * COLLAB-DESIGN wave 1: live-mode op emission, inbound application with the
+   * dirty-hold merge doctrine, locally-scoped undo, soft tile locks, and the
+   * reconnect-refetch resync. The HOST owns all transport: it joins the
+   * dashboard-{id} SignalR group on live edit, forwards each RcdDashboardOp
+   * event into applyRemoteOp, and calls resyncFromServer on reconnect — the
+   * library never touches a socket (the applyDispatchProgress precedent).
+   */
+
+  /**
+   * Emission decorator body: derives the ops one seam-level mutation produced
+   * (structural doc diff — see collabOps), records their INVERSES as the
+   * locally-scoped history entry, and buffers them for sending under the
+   * mutation's own coalescing window (400ms drag storms / 800ms typing — the
+   * exact windows the snapshot history already used). ONLY active during live
+   * edit sessions; draft mode emits nothing (its Save PUT is the persistence).
+   */
+  private recordLocalOps(
+    before: DashboardLayoutDoc,
+    after: DashboardLayoutDoc,
+    coalesce?: HistoryCoalesce,
+  ): void {
+    if (!this.state.liveMode || this.state.mode !== 'edit') return;
+    if (before === after) return;
+    const ops = diffLayoutDocs(before, after);
+    if (ops.length === 0) return;
+
+    const inverses = ops
+      .map((op) => invertLocalOp(before, op))
+      .filter((op): op is DashboardLocalOp => op !== null);
+    if (this.historyDepth > 0) {
+      // Inside groupHistory: PREPEND, so the entry's application order is the
+      // reverse of the mutations' — each inverse lands on the doc state its
+      // mutation started from.
+      this.liveGroupEntry = [...inverses, ...(this.liveGroupEntry ?? [])];
+    } else {
+      const now = Date.now();
+      const merge =
+        coalesce !== undefined &&
+        this.lastHistoryTag === coalesce.tag &&
+        now - this.lastHistoryAt <= coalesce.windowMs &&
+        this.liveUndoStack.length > 0;
+      this.lastHistoryTag = coalesce?.tag ?? null;
+      this.lastHistoryAt = now;
+      this.liveRedoStack = [];
+      // Same-tag bursts keep the FIRST inverse (the pre-burst state), exactly
+      // like snapshot coalescing keeps the first snapshot.
+      if (!merge && inverses.length > 0) {
+        this.liveUndoStack.push(inverses);
+        if (this.liveUndoStack.length > HISTORY_CAP) this.liveUndoStack.shift();
+      }
+      this.syncHistoryFlags();
+    }
+
+    this.bufferOps(ops, coalesce);
+  }
+
+  /**
+   * Queues ops for sending. Newer ops on the same element MERGE into their
+   * pending slot (per-element LWW — the latest payload is the whole truth;
+   * see mergePendingPayloads for the two union cases), which is what turns a
+   * drag/typing storm into ONE op. `dirty` mirrors "has un-persisted changes"
+   * in live mode: raised here, cleared when the buffer drains.
+   */
+  private bufferOps(ops: DashboardLocalOp[], coalesce?: HistoryCoalesce): void {
+    const flushAt = Date.now() + (coalesce?.windowMs ?? 0);
+    for (const op of ops) {
+      const key = pendingSlotKey(op);
+      const existing = this.pendingOps.get(key);
+      // Map.set on an existing key keeps its position — send order is
+      // first-authored order (page.add stays ahead of tiles onto that page).
+      this.pendingOps.set(key, {
+        op: existing ? mergePendingPayloads(existing.op, op) : op,
+        flushAt,
+      });
+    }
+    if (this.state.liveMode && !this.state.dirty) this.set({ dirty: true });
+    this.scheduleFlush();
+  }
+
+  /** (Re)arms the flush timer at the earliest pending deadline. */
+  private scheduleFlush(): void {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    let earliest: number | null = null;
+    for (const pending of this.pendingOps.values()) {
+      if (earliest === null || pending.flushAt < earliest) earliest = pending.flushAt;
+    }
+    if (earliest === null) return;
+    this.flushTimer = setTimeout(
+      () => {
+        this.flushTimer = null;
+        void this.flushOps();
+      },
+      Math.max(0, earliest - Date.now()),
+    );
+  }
+
+  /** Drains the pending buffer (serialized — concurrent calls chain). */
+  private flushOps(): Promise<void> {
+    this.flushChain = this.flushChain.then(() => this.drainPending());
+    return this.flushChain;
+  }
+
+  private async drainPending(): Promise<void> {
+    while (this.pendingOps.size > 0) {
+      const current = this.state.current;
+      if (!current || !this.state.liveMode) {
+        // Session ended / degraded mid-drain — the doc still carries every
+        // change (draft semantics take over); the buffer is moot.
+        this.pendingOps.clear();
+        return;
+      }
+      const first = this.pendingOps.entries().next().value as [string, PendingOp];
+      const [key, pending] = first;
+      // Take BEFORE the await: an edit landing on this element mid-send
+      // becomes a fresh pending entry and goes out on the next iteration
+      // instead of being silently dropped by a post-send delete.
+      this.pendingOps.delete(key);
+      const op = pending.op;
+      const body: SendDashboardOpBody = {
+        opId: newId(),
+        targetKind: op.targetKind,
+        targetId: op.targetId,
+        payload: op.payload,
+        baseUpdatedAtUtc: current.expectedUpdatedAtUtc,
+      };
+      // Remember BEFORE the await: the SignalR echo can beat the HTTP response.
+      this.rememberSentOp(body.opId);
+      try {
+        const result = await this.sendOpWithRetry(current.id, body);
+        const live = this.state.current;
+        if (live && live.id === current.id) {
+          // Our commit is the element's newest server state — any held remote
+          // op for it is superseded (the collaborator's earlier write lost the
+          // per-element race; theirs would arrive again only via a newer op).
+          const conflictKey = opConflictKey(op.targetKind, op.targetId, op.payload);
+          const { [conflictKey]: _superseded, ...held } = this.state.heldRemoteOps;
+          const stamp = opResultStampOf(result) ?? live.expectedUpdatedAtUtc;
+          this.set({
+            current: { ...live, expectedUpdatedAtUtc: stamp },
+            ...(conflictKey in this.state.heldRemoteOps ? { heldRemoteOps: held } : {}),
+          });
+        }
+      } catch (error) {
+        // op_target_missing (409): the op's required target vanished under a
+        // collaborator's concurrent structure change. Per the server contract
+        // this is the resync cue, NOT a delivery failure — drop the op (its
+        // element no longer exists), refetch, and stop this drain: whatever
+        // is still buffered flushes against the fresh baseline afterwards
+        // (resyncFromServer re-arms the flush timer). The session stays live.
+        if (error instanceof RcdApiError && error.errorCode === OP_TARGET_MISSING_ERROR) {
+          void this.resyncFromServer();
+          if (
+            this.pendingOps.size === 0 &&
+            this.state.liveMode &&
+            this.state.mode === 'edit' &&
+            this.state.dirty
+          ) {
+            this.set({ dirty: false });
+          }
+          return;
+        }
+        this.degradeToDraft(error);
+        return;
+      }
+    }
+    // Buffer drained: nothing un-persisted remains.
+    if (this.state.liveMode && this.state.mode === 'edit' && this.state.dirty) {
+      this.set({ dirty: false });
+    }
+  }
+
+  /**
+   * One transparent retry (same opId, so a commit-then-network-drop can be
+   * deduplicated server-side); the second failure escalates to the caller.
+   * Semantic 4xx rejections (op_invalid, forbidden, target_missing,
+   * layout_size…) never retry — a deterministic answer cannot change.
+   */
+  private async sendOpWithRetry(dashboardId: number, body: SendDashboardOpBody) {
+    try {
+      return await this.api.sendOp(dashboardId, body);
+    } catch (error) {
+      const deterministic =
+        error instanceof RcdApiError &&
+        error.status >= 400 &&
+        error.status < 500 &&
+        error.status !== 408 &&
+        error.status !== 429;
+      if (deterministic) throw error;
+      return await this.api.sendOp(dashboardId, body);
+    }
+  }
+
+  private rememberSentOp(opId: string): void {
+    this.sentOpIds.add(opId);
+    if (this.sentOpIds.size > SENT_OP_CAP) {
+      const oldest = this.sentOpIds.values().next().value as string;
+      this.sentOpIds.delete(oldest);
+    }
+  }
+
+  /**
+   * Op delivery failed twice → the session DEGRADES TO DRAFT SEMANTICS
+   * (documented failure doctrine): emission stops (liveMode false gates it),
+   * saveStatus surfaces the error, dirty stays true, and Save/Discard return
+   * to the toolbar. Every change is still in the local doc, so Save PUTs the
+   * whole doc over the last known baseline — a concurrent editor's newer op
+   * still 409s that PUT honestly (rcd.dashboard.stale). Ops committed BEFORE
+   * the failure are already persisted; the baseline reflects them. The live
+   * inverse-op history cannot drive snapshot undo, so history clears.
+   */
+  private degradeToDraft(error: unknown): void {
+    this.pendingOps.clear();
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.liveUndoStack = [];
+    this.liveRedoStack = [];
+    this.liveGroupEntry = null;
+    this.stopAllLockHeartbeats(false);
+    this.set({
+      liveMode: false,
+      dirty: true,
+      saveStatus: 'error',
+      error: `Live sync failed — working offline from here. Save to retry. (${messageOf(error)})`,
+      heldRemoteOps: {},
+      canUndo: false,
+      canRedo: false,
+    });
+  }
+
+  /**
+   * Applies one live-history entry (a list of inverse ops) to the local doc
+   * and EMITS it through the op pipeline, returning the entry that reverses it
+   * (computed step-by-step against the evolving doc — that entry becomes the
+   * redo/undo counterpart). Never touches the history stacks itself.
+   */
+  private applyLocalOpEntry(ops: DashboardLocalOp[]): DashboardLocalOp[] {
+    const current = this.state.current;
+    if (!current) return [];
+    let layout = current.layout;
+    const reversal: DashboardLocalOp[] = [];
+    const applied: DashboardLocalOp[] = [];
+    for (const op of ops) {
+      const inverse = invertLocalOp(layout, op);
+      const next = applyOpToDoc(layout, op.targetId, op.payload);
+      if (next === null) continue;
+      if (inverse !== null) reversal.unshift(inverse);
+      applied.push(op);
+      layout = next;
+    }
+    if (applied.length === 0) return [];
+    this.set({
+      current: { ...current, layout },
+      selectedTileId: null,
+      hoverHighlight: null,
+      ...this.reconcileTransients(layout),
+    });
+    this.bufferOps(applied);
+    return reversal;
+  }
+
+  /**
+   * Inbound remote op — the host's realtime bridge forwards each
+   * RcdDashboardOp hub event here verbatim (the second host→store event path
+   * after applyDispatchProgress). Application reuses the same doc transform as
+   * everything else, WITHOUT pushHistory and WITHOUT dirty. THE MERGE DOCTRINE
+   * (tracker applyRealtimeSystemInput): an op targeting an element with local
+   * uncommitted changes is HELD — the concurrency baseline advances, the local
+   * element stays untouched, and the hold is surfaced in heldRemoteOps for the
+   * UI to badge. Application is suspended while a print preview is mounted
+   * (setRemoteOpsSuspended mirrors the auto-refresh printOptions guard);
+   * suspended ops queue and apply in order on resume.
+   */
+  applyRemoteOp(event: DashboardOpEvent): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    if (this.sentOpIds.has(event.opId)) {
+      // Our own echo: the POST response already applied it; only the baseline
+      // may be newer (another op serialized between response and broadcast).
+      this.advanceBaseline(event.resultUpdatedAtUtc);
+      return;
+    }
+    if (this.remoteSuspended) {
+      this.suspendedRemoteOps.push(event);
+      return;
+    }
+    // Parse BEFORE the hold check: the conflict key of a doc-level op depends
+    // on what it touches (docSettingSet keys per scalar, pageReorder on its
+    // own bucket) — see opConflictKey.
+    let payload: DashboardOpPayload;
+    try {
+      payload = JSON.parse(event.payloadJson) as DashboardOpPayload;
+    } catch {
+      // Malformed frame — never guess; the baseline still advances and a
+      // resync repairs any real divergence.
+      this.advanceBaseline(event.resultUpdatedAtUtc);
+      return;
+    }
+    const conflictKey = opConflictKey(event.targetKind, event.targetId, payload);
+    if (this.isConflictKeyDirty(conflictKey)) {
+      this.advanceBaseline(event.resultUpdatedAtUtc);
+      this.set({
+        heldRemoteOps: { ...this.state.heldRemoteOps, [conflictKey]: event },
+      });
+      return;
+    }
+    this.applyRemotePayload(event, payload, conflictKey);
+  }
+
+  private applyRemotePayload(
+    event: DashboardOpEvent,
+    payload: DashboardOpPayload,
+    conflictKey: string,
+  ): void {
+    const current = this.state.current;
+    if (!current || current.id !== event.dashboardId) return;
+    // Locally-scoped doctrine, second half: once a collaborator has written
+    // this element, our older history entries for it must not revert THEIR
+    // work — purge them (their newer write owns the element now).
+    this.purgeLocalHistoryFor(conflictKey);
+    const next = applyOpToDoc(current.layout, event.targetId, payload);
+    if (next === null) {
+      this.advanceBaseline(event.resultUpdatedAtUtc);
+      return;
+    }
+    this.set({
+      current: { ...current, layout: next, expectedUpdatedAtUtc: event.resultUpdatedAtUtc },
+      ...this.reconcileTransients(next),
+    });
+  }
+
+  /** Adopts a newer concurrency baseline without touching the doc. */
+  private advanceBaseline(resultUpdatedAtUtc: string): void {
+    const current = this.state.current;
+    if (!current) return;
+    this.set({ current: { ...current, expectedUpdatedAtUtc: resultUpdatedAtUtc } });
+  }
+
+  /**
+   * "Locally dirty" for the hold doctrine: the conflict key has an authored-
+   * but-unsent op in the buffer, OR it is a tile this client holds the soft
+   * lock on (an open chart builder / focused text editor whose draft lives
+   * outside the store until commit — the strongest reason locks exist).
+   */
+  private isConflictKeyDirty(conflictKey: string): boolean {
+    if (conflictKey.startsWith('tile:') && this.tileLockHeartbeats.has(conflictKey.slice(5))) {
+      return true;
+    }
+    for (const pending of this.pendingOps.values()) {
+      if (
+        opConflictKey(pending.op.targetKind, pending.op.targetId, pending.op.payload) ===
+        conflictKey
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Strips ops targeting one conflict key from the live history stacks. */
+  private purgeLocalHistoryFor(conflictKey: string): void {
+    if (!this.state.liveMode) return;
+    const strip = (stack: DashboardLocalOp[][]): DashboardLocalOp[][] =>
+      stack
+        .map((entry) =>
+          entry.filter(
+            (op) => opConflictKey(op.targetKind, op.targetId, op.payload) !== conflictKey,
+          ),
+        )
+        .filter((entry) => entry.length > 0);
+    this.liveUndoStack = strip(this.liveUndoStack);
+    this.liveRedoStack = strip(this.liveRedoStack);
+    this.syncHistoryFlags();
+  }
+
+  /** A held remote op lands once its element becomes clean WITHOUT a local
+   * write superseding it (chart-builder Cancel, drag abort). */
+  private applyHeldOpIfClean(conflictKey: string): void {
+    const held = this.state.heldRemoteOps[conflictKey];
+    if (held === undefined || this.isConflictKeyDirty(conflictKey)) return;
+    const { [conflictKey]: _applied, ...rest } = this.state.heldRemoteOps;
+    this.set({ heldRemoteOps: rest });
+    try {
+      const payload = JSON.parse(held.payloadJson) as DashboardOpPayload;
+      this.applyRemotePayload(held, payload, conflictKey);
+    } catch {
+      // Malformed payload — the hold is dropped; resync repairs.
+    }
+  }
+
+  /**
+   * Suspends/resumes inbound op application. The VIEW calls this while its
+   * print preview is mounted (printOptions !== null) — the same guard the
+   * auto-refresh path applies — so tiles never re-render mid-print. Suspended
+   * ops queue and apply in arrival order on resume.
+   */
+  setRemoteOpsSuspended(suspended: boolean): void {
+    if (this.remoteSuspended === suspended) return;
+    this.remoteSuspended = suspended;
+    if (suspended) return;
+    const queued = this.suspendedRemoteOps;
+    this.suspendedRemoteOps = [];
+    for (const event of queued) this.applyRemoteOp(event);
+  }
+
+  /* ------------------------------------------------------ soft tile locks */
+
+  /**
+   * Acquires the soft lock on a tile (chart-builder open / text-editor focus /
+   * drag start) and starts its TTL heartbeat. Resolves `{ok: false}` ONLY on a
+   * positive "someone else holds it" (409) — which also raises lockNotice for
+   * the toolbar chip; lock-SERVICE failures never block editing (soft locks
+   * are conflict avoidance, not enforcement) and solo/draft sessions skip the
+   * traffic entirely (no collaborators exist, and the endpoints may not).
+   */
+  async acquireTileLock(tileId: string): Promise<{ ok: boolean; message?: string }> {
+    const current = this.state.current;
+    if (!current || !this.state.liveMode) return { ok: true };
+    try {
+      await this.api.acquireTileLock(current.id, tileId);
+    } catch (error) {
+      const locked =
+        error instanceof RcdApiError &&
+        (error.errorCode === TILE_LOCKED_ERROR || error.status === 409);
+      if (!locked) return { ok: true };
+      const message = 'This tile is being edited by someone else right now.';
+      this.set({ lockNotice: message });
+      return { ok: false, message };
+    }
+    this.startLockHeartbeat(current.id, tileId);
+    return { ok: true };
+  }
+
+  /**
+   * Releases a held soft lock (builder close / editor blur / drag end). Fire-
+   * and-forget on the wire (disconnect cleanup expires it server-side anyway).
+   * If a remote op was held for this tile and no local write superseded it,
+   * it applies NOW — the collaborator's edit was only deferred, never lost.
+   */
+  releaseTileLock(tileId: string): void {
+    const timer = this.tileLockHeartbeats.get(tileId);
+    if (timer !== undefined) {
+      clearInterval(timer);
+      this.tileLockHeartbeats.delete(tileId);
+    }
+    const current = this.state.current;
+    if (current && this.state.liveMode && timer !== undefined) {
+      void this.api.releaseTileLock(current.id, tileId).catch(() => undefined);
+    }
+    this.applyHeldOpIfClean(`tile:${tileId}`);
+  }
+
+  /** Dismisses the soft-lock toolbar notice. */
+  clearLockNotice(): void {
+    if (this.state.lockNotice !== null) this.set({ lockNotice: null });
+  }
+
+  private startLockHeartbeat(dashboardId: number, tileId: string): void {
+    if (this.tileLockHeartbeats.has(tileId)) return;
+    const timer = setInterval(() => {
+      this.api.acquireTileLock(dashboardId, tileId).catch((error: unknown) => {
+        const lost =
+          error instanceof RcdApiError &&
+          (error.errorCode === TILE_LOCKED_ERROR || error.status === 409);
+        if (!lost) return; // transient service hiccup — keep heartbeating
+        // The lock expired and someone else claimed it (e.g. we were offline
+        // past the TTL). Stop claiming and tell the user; their next commit
+        // still wins the element per LWW, which the notice makes honest.
+        clearInterval(timer);
+        this.tileLockHeartbeats.delete(tileId);
+        this.set({ lockNotice: 'Your lock on a tile expired — someone else is editing it now.' });
+      });
+    }, TILE_LOCK_HEARTBEAT_MS);
+    this.tileLockHeartbeats.set(tileId, timer);
+  }
+
+  /** Stops every heartbeat; optionally releases the locks on the wire. */
+  private stopAllLockHeartbeats(releaseRemote: boolean): void {
+    const current = this.state.current;
+    for (const [tileId, timer] of this.tileLockHeartbeats) {
+      clearInterval(timer);
+      if (releaseRemote && current) {
+        void this.api.releaseTileLock(current.id, tileId).catch(() => undefined);
+      }
+    }
+    this.tileLockHeartbeats.clear();
+  }
+
+  /* ------------------------------------------------------------- resync */
+
+  /**
+   * Reconnect = refetch, never replay (COLLAB-DESIGN): re-GETs the dashboard
+   * and reconciles against the local dirty set. THE HOST WIRES CONNECTIVITY —
+   * it calls this from its realtime reconnect handler (the library owns no
+   * socket); nothing inside the library invokes it.
+   *
+   *  - Live edit session: the fresh doc becomes the base; authored-but-unsent
+   *    pending ops replay onto it (they flush against the new baseline next),
+   *    and tiles this client holds locks on keep their LOCAL version (an open
+   *    builder/editor mid-edit). Held remote ops clear — the fresh doc IS the
+   *    server truth they were part of.
+   *  - Solo DRAFT session with local edits: untouched — never clobber a draft
+   *    or advance its stamp; the save-time 409 is the honest conflict channel.
+   *  - View mode / clean edit: a straight in-place refresh.
+   */
+  async resyncFromServer(): Promise<void> {
+    const current = this.state.current;
+    if (!current) return;
+    if (this.state.mode === 'edit' && !this.state.liveMode && this.state.dirty) return;
+    let detail: Awaited<ReturnType<DashboardsApi['getDashboard']>>;
+    try {
+      detail = await this.api.getDashboard(current.id);
+    } catch (error) {
+      this.set({ error: messageOf(error) });
+      return;
+    }
+    const live = this.state.current;
+    if (!live || live.id !== current.id) return; // navigated away meanwhile
+    const fresh = toOpen(detail);
+    let layout = fresh.layout;
+    if (this.state.liveMode && this.state.mode === 'edit') {
+      for (const pending of this.pendingOps.values()) {
+        layout = applyOpToDoc(layout, pending.op.targetId, pending.op.payload) ?? layout;
+      }
+      for (const tileId of this.tileLockHeartbeats.keys()) {
+        const holder = pagesOf(live.layout).find((p) => p.tiles.some((t) => t.id === tileId));
+        const tile = holder?.tiles.find((t) => t.id === tileId);
+        if (holder && tile) {
+          layout =
+            applyOpToDoc(layout, tileId, { kind: 'tileUpsert', tile, pageId: holder.id }) ??
+            layout;
+        }
+      }
+    }
+    this.set({
+      current: { ...fresh, layout },
+      heldRemoteOps: {},
+      ...this.reconcileTransients(layout),
+    });
+    this.scheduleFlush();
+  }
+
+  /**
+   * Transient-state sweep after a non-user doc change (remote op / live undo /
+   * resync): the same orphan cleanup removeTile/removePage do inline —
+   * selections, slicer values, cross-filter sources, drillthrough pages and
+   * parameter selections must never reference elements the doc no longer has;
+   * NEW remote parameters seed their default selection.
+   */
+  private reconcileTransients(layout: DashboardLayoutDoc): Partial<DashboardStoreState> {
+    const state = this.state;
+    const pages = pagesOf(layout);
+    const tileIds = new Set(pages.flatMap((page) => page.tiles.map((tile) => tile.id)));
+    const pageIds = new Set(pages.map((page) => page.id));
+    const patch: Partial<DashboardStoreState> = {
+      activePageId: resolveActivePageId(layout, state.activePageId),
+    };
+    const slicerKeys = Object.keys(state.slicerValues);
+    if (slicerKeys.some((id) => !tileIds.has(id))) {
+      patch.slicerValues = Object.fromEntries(
+        Object.entries(state.slicerValues).filter(([id]) => tileIds.has(id)),
+      );
+    }
+    if (state.crossFilters.some((f) => !tileIds.has(f.sourceTileId))) {
+      patch.crossFilters = state.crossFilters.filter((f) => tileIds.has(f.sourceTileId));
+    }
+    if (state.hoverHighlight !== null && !tileIds.has(state.hoverHighlight.sourceTileId)) {
+      patch.hoverHighlight = null;
+    }
+    if (
+      state.drillthrough !== null &&
+      (!pageIds.has(state.drillthrough.sourcePageId) ||
+        !pageIds.has(state.drillthrough.targetPageId))
+    ) {
+      patch.drillthrough = null;
+    }
+    if (state.selectedTileId !== null && !tileIds.has(state.selectedTileId)) {
+      patch.selectedTileId = null;
+    }
+    const parameters = layout.parameters ?? [];
+    const next: Record<string, number> = {};
+    let selectionsChanged = Object.keys(state.parameterSelections).some(
+      (id) => !parameters.some((p) => p.id === id),
+    );
+    for (const parameter of parameters) {
+      const existing = state.parameterSelections[parameter.id];
+      const value = clampIndex(
+        existing ?? parameter.defaultIndex ?? 0,
+        parameter.options.length,
+      );
+      next[parameter.id] = value;
+      if (value !== existing) selectionsChanged = true;
+    }
+    if (selectionsChanged) patch.parameterSelections = next;
+    return patch;
+  }
+
+  /**
+   * Fire-and-forget op sends OUTSIDE a live session — the view-mode bookmark
+   * path (see commitBookmarkMutation). Sequential, retry-once each; the last
+   * committed stamp is returned so the caller can advance the baseline.
+   */
+  private async sendOpsDirect(
+    dashboardId: number,
+    ops: DashboardLocalOp[],
+  ): Promise<{ ok: true; stamp: string | null } | { ok: false; message: string }> {
+    let stamp: string | null = null;
+    for (const op of ops) {
+      const body: SendDashboardOpBody = {
+        opId: newId(),
+        targetKind: op.targetKind,
+        targetId: op.targetId,
+        payload: op.payload,
+        baseUpdatedAtUtc: this.state.current?.expectedUpdatedAtUtc ?? '',
+      };
+      this.rememberSentOp(body.opId);
+      try {
+        const result = await this.sendOpWithRetry(dashboardId, body);
+        stamp = opResultStampOf(result) ?? stamp;
+      } catch (error) {
+        return { ok: false, message: messageOf(error) };
+      }
+    }
+    return { ok: true, stamp };
+  }
+
   async loadList(): Promise<void> {
     this.set({ listStatus: 'loading' });
     try {
@@ -764,6 +1582,7 @@ export class DashboardStore {
     const detail = await this.api.getDashboard(id);
     const current = toOpen(detail);
     this.clearHistory();
+    this.resetCollabSession();
     this.set({
       current,
       mode: 'view',
@@ -779,9 +1598,25 @@ export class DashboardStore {
       lastAppliedBookmarkId: null,
       filterCardOverrides: {},
       viewFitOverride: null,
+      liveMode: false,
+      heldRemoteOps: {},
+      lockNotice: null,
       saveStatus: 'idle',
       error: null,
     });
+  }
+
+  /** Drops every non-reactive collab artifact of the previous session. */
+  private resetCollabSession(): void {
+    this.stopAllLockHeartbeats(false);
+    this.pendingOps.clear();
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    this.sentOpIds.clear();
+    this.remoteSuspended = false;
+    this.suspendedRemoteOps = [];
   }
 
   async create(name: string, modelId: number | null): Promise<number | null> {
@@ -807,6 +1642,10 @@ export class DashboardStore {
 
   close(): void {
     this.clearHistory();
+    // Locks die with the session (release remotely so collaborators unblock
+    // before the TTL); pending unsent ops are dropped with the doc they edit.
+    this.stopAllLockHeartbeats(true);
+    this.resetCollabSession();
     this.set({
       ...initialState,
       list: this.state.list,
@@ -821,12 +1660,30 @@ export class DashboardStore {
     const current = this.state.current;
     if (!current) return;
     this.clearHistory();
+    const liveMode = isLiveCollaborative(current);
+    if (liveMode) this.resetCollabSession();
     // View-mode filter tweaks are personal state — edit mode always shows and
     // mutates the authored doc, so overrides reset here.
-    this.set({ mode: 'edit', draftBackup: structuredClone(current), filterCardOverrides: {} });
+    //
+    // LIVE sessions take no draft backup: there is no Discard (ops persist as
+    // they happen; scoped undo is the revert affordance) and a whole-doc
+    // restore could roll back collaborators' concurrent work. The HOST joins
+    // the dashboard-{id} realtime group when it observes liveMode+edit.
+    this.set({
+      mode: 'edit',
+      liveMode,
+      draftBackup: liveMode ? null : structuredClone(current),
+      filterCardOverrides: {},
+      heldRemoteOps: {},
+      lockNotice: null,
+    });
   }
 
   discardEdits(): void {
+    // Live sessions have no Discard (the toolbar replaces it with scoped
+    // undo); guard against stray callers — a whole-doc restore would silently
+    // revert collaborators' work.
+    if (this.state.liveMode) return;
     this.clearHistory();
     const backup = this.state.draftBackup;
     const live = this.state.current;
@@ -859,9 +1716,18 @@ export class DashboardStore {
     });
   }
 
+  /**
+   * Draft mode: PUTs the whole doc (unchanged historic path — always carrying
+   * expectedUpdatedAtUtc, which the backend now REQUIRES for updates). LIVE
+   * mode: the toolbar's "Done" — every edit already persisted as an op, so
+   * this only flushes the coalescing buffer and exits the edit session; no
+   * doc PUT happens (one would pointlessly rewrite what the ops just wrote,
+   * and could clobber a collaborator's newer element).
+   */
   async save(): Promise<boolean> {
     const current = this.state.current;
     if (!current) return false;
+    if (this.state.liveMode) return this.finishLiveSession();
 
     this.set({ saveStatus: 'loading', error: null });
     try {
@@ -889,6 +1755,30 @@ export class DashboardStore {
       this.set({ saveStatus: 'error', error: messageOf(error) });
       return false;
     }
+  }
+
+  /** "Done" (live mode): flush the op buffer, drop the locks, exit edit. */
+  private async finishLiveSession(): Promise<boolean> {
+    this.set({ saveStatus: 'loading', error: null });
+    await this.flushOps();
+    // A degraded flush already flipped to draft semantics with saveStatus
+    // 'error' — stay IN edit mode so the user can Save (PUT) or keep working.
+    if (!this.state.liveMode) return false;
+    this.stopAllLockHeartbeats(true);
+    this.clearHistory();
+    this.set({
+      mode: 'view',
+      liveMode: false,
+      dirty: false,
+      draftBackup: null,
+      selectedTileId: null,
+      heldRemoteOps: {},
+      lockNotice: null,
+      saveStatus: 'ok',
+    });
+    // The list's updatedAt moved with every op; refresh it like a save does.
+    void this.loadList();
+    return true;
   }
 
   addTile(chart: ChartSpec): void {
@@ -1092,11 +1982,17 @@ export class DashboardStore {
     });
   }
 
-  /** Patches a text tile's spec; html always passes through the sanitizer. */
+  /** Patches a text tile's spec; html always passes through the sanitizer.
+   *  Same-tile bursts coalesce like updateChart/updateSlicer — this was the
+   *  one typing path missing its tag (COLLAB-DESIGN fix): the config card's
+   *  Name box writes per keystroke, and in live mode the tag is also what
+   *  folds a typing burst into ONE op instead of one per keystroke. */
   updateTextTile(tileId: string, patch: Partial<TextTileSpec>): void {
     const safe = patch.html === undefined ? patch : { ...patch, html: sanitizeRichHtml(patch.html) };
-    this.mutateActiveTiles((tiles) =>
-      tiles.map((t) => (t.id === tileId && t.text ? { ...t, text: { ...t.text, ...safe } } : t)),
+    this.mutateActiveTiles(
+      (tiles) =>
+        tiles.map((t) => (t.id === tileId && t.text ? { ...t, text: { ...t.text, ...safe } } : t)),
+      { tag: `updateTextTile:${tileId}`, windowMs: 800 },
     );
   }
 
@@ -1143,10 +2039,13 @@ export class DashboardStore {
       name: name?.trim() || nextPageName(pages),
       tiles: [],
     };
-    // Writes `current` directly (not via mutateLayout) — push explicitly.
+    // Writes `current` directly (not via mutateLayout) — push explicitly and
+    // run the op-emission decorator explicitly too (the second direct-write
+    // seam beside removePage).
     this.pushHistory();
+    const nextLayout = { ...current.layout, pages: [...pages, page] };
     this.set({
-      current: { ...current, layout: { ...current.layout, pages: [...pages, page] } },
+      current: { ...current, layout: nextLayout },
       dirty: true,
       activePageId: page.id,
       selectedTileId: null,
@@ -1154,6 +2053,7 @@ export class DashboardStore {
       // ones survive (same doctrine as setActivePage).
       ...(this.scopeOf() === 'page' ? { crossFilters: [] } : {}),
     });
+    this.recordLocalOps(current.layout, nextLayout);
   }
 
   /** Effective cross-filter scope of the open dashboard (default 'page'). */
@@ -1206,16 +2106,18 @@ export class DashboardStore {
         !(c.scope === 'page' && c.pageId === pageId) &&
         !(c.scope === 'visual' && c.targetTileId != null && removedIds.has(c.targetTileId)),
     );
-    // Writes `current` directly (not via mutateLayout) — push explicitly.
+    // Writes `current` directly (not via mutateLayout) — push explicitly and
+    // run the op-emission decorator explicitly (see addPage).
     this.pushHistory();
+    const nextLayout = {
+      ...current.layout,
+      pages: nextPages,
+      ...(nextCards.length !== cards.length ? { filterCards: nextCards } : {}),
+    };
     this.set({
       current: {
         ...current,
-        layout: {
-          ...current.layout,
-          pages: nextPages,
-          ...(nextCards.length !== cards.length ? { filterCards: nextCards } : {}),
-        },
+        layout: nextLayout,
       },
       dirty: true,
       activePageId:
@@ -1233,6 +2135,7 @@ export class DashboardStore {
           : this.state.drillthrough,
       selectedTileId: selected !== null && removedIds.has(selected) ? null : selected,
     });
+    this.recordLocalOps(current.layout, nextLayout);
   }
 
   /**
@@ -1733,9 +2636,16 @@ export class DashboardStore {
   /**
    * Finding 7: bookmark edits made in VIEW mode auto-persist — view mode has
    * no Save affordance, so a merely-dirty doc would silently lose the change
-   * on close. Runs the doc mutation, then immediately save(); a failed save
-   * surfaces the store error (save() sets it) and REVERTS the doc mutation.
-   * Edit mode runs the mutation alone — it saves with the draft as before.
+   * on close. Runs the doc mutation, then persists it immediately; a failure
+   * surfaces the store error and REVERTS the doc mutation. Edit mode runs the
+   * mutation alone — it saves with the draft (or, live, emits as ops) as any
+   * other edit.
+   *
+   * HOW it persists is the COLLAB-DESIGN "fixed regardless" item: on a
+   * COLLABORATIVE dashboard the mutation travels as ops (bookmarks are
+   * id-keyed doc elements) instead of the historic whole-doc PUT — a viewer's
+   * bookmark write can no longer clobber an editor's concurrent changes. Solo
+   * dashboards keep the whole-doc save exactly as before (draft-mode path).
    */
   private commitBookmarkMutation(mutate: () => void): void {
     const current = this.state.current;
@@ -1747,6 +2657,31 @@ export class DashboardStore {
     const layoutBefore = current.layout;
     const dirtyBefore = this.state.dirty;
     mutate();
+    if (isLiveCollaborative(current)) {
+      const after = this.state.current;
+      if (!after || after.id !== current.id) return;
+      const ops = diffLayoutDocs(layoutBefore, after.layout);
+      void this.sendOpsDirect(current.id, ops).then((result) => {
+        const live = this.state.current;
+        if (!live || live.id !== current.id) return;
+        if (result.ok) {
+          this.set({
+            current: result.stamp !== null ? { ...live, expectedUpdatedAtUtc: result.stamp } : live,
+            dirty: dirtyBefore,
+            saveStatus: 'ok',
+          });
+          return;
+        }
+        this.set({
+          current: { ...live, layout: layoutBefore },
+          dirty: dirtyBefore,
+          saveStatus: 'error',
+          error: result.message,
+          lastAppliedBookmarkId: null,
+        });
+      });
+      return;
+    }
     void this.save().then((saved) => {
       if (saved) return;
       const live = this.state.current;
@@ -2053,6 +2988,41 @@ export class DashboardStore {
   setModelId(modelId: number | null): void {
     const current = this.state.current;
     if (!current || current.modelId === modelId) return;
+    if (this.state.liveMode && this.state.mode === 'edit') {
+      // modelId is deliberately NOT an op (COLLAB-DESIGN: the server 403s
+      // grantees on it), and live mode has no Save PUT to carry it — so it
+      // persists immediately via the setPublish-precedent PUT. The op buffer
+      // flushes FIRST so the PUT's layout matches what the ops already wrote;
+      // an op committed by someone else in the gap 409s the PUT honestly.
+      const prior = current.modelId;
+      this.set({ current: { ...current, modelId } });
+      void this.flushOps().then(async () => {
+        const live = this.state.current;
+        if (!live || live.id !== current.id) return;
+        try {
+          const saved = await this.api.updateDashboard(live.id, {
+            name: live.name,
+            description: live.description,
+            modelId,
+            layout: live.layout,
+            isShared: live.isShared,
+            expectedUpdatedAtUtc: live.expectedUpdatedAtUtc,
+          });
+          const now = this.state.current;
+          if (now && now.id === live.id) {
+            this.set({
+              current: { ...now, modelId: saved.modelId, expectedUpdatedAtUtc: saved.updatedAtUtc },
+            });
+          }
+        } catch (error) {
+          const now = this.state.current;
+          if (now && now.id === live.id) {
+            this.set({ current: { ...now, modelId: prior }, error: messageOf(error) });
+          }
+        }
+      });
+      return;
+    }
     this.set({ current: { ...current, modelId }, dirty: true });
   }
 

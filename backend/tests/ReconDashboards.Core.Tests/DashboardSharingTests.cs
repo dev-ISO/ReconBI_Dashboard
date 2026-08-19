@@ -73,6 +73,20 @@ public class DashboardSharingTests : IDisposable
         string? layout = null, bool isShared = false) =>
         new(name, description, modelId, layout ?? TwoTileLayout, isShared);
 
+    /// <summary>
+    /// Update with the dashboard's CURRENT stamp attached: updates REQUIRE
+    /// expectedUpdatedAtUtc since COLLAB wave 1, and this suite exercises the
+    /// permission gates, not concurrency (which has its own tests).
+    /// </summary>
+    private async Task<ServiceResult<DashboardDetail>> UpdateStampedAsync(int id, DashboardSaveRequest request)
+    {
+        var stamp = await _harness.Db.Dashboards.AsNoTracking()
+            .Where(d => d.Id == id)
+            .Select(d => d.UpdatedAtUtc)
+            .SingleAsync();
+        return await _service.UpdateAsync(id, request with { ExpectedUpdatedAtUtc = stamp }, CancellationToken.None);
+    }
+
     private static string MoveTile(string layout) => layout.Replace("\"x\":0", "\"x\":6");
 
     private static string EditChart(string layout) => layout.Replace("\"type\":\"column\"", "\"type\":\"line\"");
@@ -130,7 +144,7 @@ public class DashboardSharingTests : IDisposable
         var id = await CreateOwnedDashboardAsync();
         await ShareWithAsync(id, Grantee, layout: true);
         ActAs(Owner, admin: true);
-        var shared = await _service.UpdateAsync(id, SaveRequest(isShared: true), CancellationToken.None);
+        var shared = await UpdateStampedAsync(id, SaveRequest(isShared: true));
         Assert.True(shared.Succeeded);
 
         ActAs(Owner);
@@ -179,16 +193,16 @@ public class DashboardSharingTests : IDisposable
         ActAs(Grantee);
 
         // 0.11.1: pure move/resize rides CanMoveTiles, NOT CanEditLayout.
-        var moveResult = await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
+        var moveResult = await UpdateStampedAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)));
         Assert.Equal(move, moveResult.Succeeded);
 
-        var textResult = await _service.UpdateAsync(id, SaveRequest(layout: EditText(TwoTileLayout)), CancellationToken.None);
+        var textResult = await UpdateStampedAsync(id, SaveRequest(layout: EditText(TwoTileLayout)));
         Assert.Equal(layout, textResult.Succeeded);
 
-        var pageResult = await _service.UpdateAsync(id, SaveRequest(layout: RenamePage(TwoTileLayout)), CancellationToken.None);
+        var pageResult = await UpdateStampedAsync(id, SaveRequest(layout: RenamePage(TwoTileLayout)));
         Assert.Equal(pages, pageResult.Succeeded);
 
-        var chartResult = await _service.UpdateAsync(id, SaveRequest(layout: EditChart(TwoTileLayout)), CancellationToken.None);
+        var chartResult = await UpdateStampedAsync(id, SaveRequest(layout: EditChart(TwoTileLayout)));
         Assert.Equal(charts, chartResult.Succeeded);
 
         var denied = new[] { moveResult, textResult, pageResult, chartResult }.First(r => !r.Succeeded);
@@ -204,7 +218,7 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, delete: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
+        var result = await UpdateStampedAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)));
 
         Assert.Equal("rcd.dashboard.permission_denied", result.Error!.Code);
         Assert.Contains("moving or resizing tiles", result.Error.Message);
@@ -218,7 +232,7 @@ public class DashboardSharingTests : IDisposable
         // Charts alone: the removal is charts-class but the delete gate is missing.
         await ShareWithAsync(id, Grantee, charts: true);
         ActAs(Grantee);
-        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        var withoutDelete = await UpdateStampedAsync(id, SaveRequest(layout: TextTileOnlyLayout));
         Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
         Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
 
@@ -226,7 +240,7 @@ public class DashboardSharingTests : IDisposable
         ActAs(Owner);
         await ShareWithAsync(id, Grantee, delete: true);
         ActAs(Grantee);
-        var withoutCharts = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        var withoutCharts = await UpdateStampedAsync(id, SaveRequest(layout: TextTileOnlyLayout));
         Assert.Equal("rcd.dashboard.permission_denied", withoutCharts.Error!.Code);
         Assert.Contains("chart changes", withoutCharts.Error.Message);
 
@@ -234,7 +248,7 @@ public class DashboardSharingTests : IDisposable
         ActAs(Owner);
         await ShareWithAsync(id, Grantee, charts: true, delete: true);
         ActAs(Grantee);
-        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: TextTileOnlyLayout), CancellationToken.None);
+        var withBoth = await UpdateStampedAsync(id, SaveRequest(layout: TextTileOnlyLayout));
         Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
     }
 
@@ -245,14 +259,14 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true);
         ActAs(Grantee);
 
-        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: ChartTileOnlyLayout), CancellationToken.None);
+        var withoutDelete = await UpdateStampedAsync(id, SaveRequest(layout: ChartTileOnlyLayout));
         Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
         Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
 
         ActAs(Owner);
         await ShareWithAsync(id, Grantee, layout: true, delete: true);
         ActAs(Grantee);
-        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: ChartTileOnlyLayout), CancellationToken.None);
+        var withBoth = await UpdateStampedAsync(id, SaveRequest(layout: ChartTileOnlyLayout));
         Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
     }
 
@@ -263,14 +277,14 @@ public class DashboardSharingTests : IDisposable
 
         await ShareWithAsync(id, Grantee, pages: true);
         ActAs(Grantee);
-        var withoutDelete = await _service.UpdateAsync(id, SaveRequest(layout: TwoTileLayout), CancellationToken.None);
+        var withoutDelete = await UpdateStampedAsync(id, SaveRequest(layout: TwoTileLayout));
         Assert.Equal("rcd.dashboard.permission_denied", withoutDelete.Error!.Code);
         Assert.Contains("removing tiles or pages", withoutDelete.Error.Message);
 
         ActAs(Owner);
         await ShareWithAsync(id, Grantee, pages: true, delete: true);
         ActAs(Grantee);
-        var withBoth = await _service.UpdateAsync(id, SaveRequest(layout: TwoTileLayout), CancellationToken.None);
+        var withBoth = await UpdateStampedAsync(id, SaveRequest(layout: TwoTileLayout));
         Assert.True(withBoth.Succeeded, withBoth.Error?.Message);
     }
 
@@ -281,7 +295,7 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, move: true, delete: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)), CancellationToken.None);
+        var result = await UpdateStampedAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)));
 
         Assert.Equal("rcd.dashboard.permission_denied", result.Error!.Code);
         Assert.Contains("renaming charts", result.Error.Message);
@@ -292,7 +306,7 @@ public class DashboardSharingTests : IDisposable
     {
         var id = await CreateOwnedDashboardAsync();
 
-        var renamed = await _service.UpdateAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)), CancellationToken.None);
+        var renamed = await UpdateStampedAsync(id, SaveRequest(layout: RenameChart(TwoTileLayout)));
         Assert.True(renamed.Succeeded, renamed.Error?.Message);
 
         var access = renamed.Value!.MyAccess;
@@ -306,7 +320,7 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(id, SaveRequest(layout: RenamePage(TwoTileLayout)), CancellationToken.None);
+        var result = await UpdateStampedAsync(id, SaveRequest(layout: RenamePage(TwoTileLayout)));
 
         Assert.False(result.Succeeded);
         Assert.Equal("rcd.dashboard.permission_denied", result.Error!.Code);
@@ -323,8 +337,8 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(
-            id, SaveRequest(name, description, modelId), CancellationToken.None);
+        var result = await UpdateStampedAsync(
+            id, SaveRequest(name, description, modelId));
 
         Assert.False(result.Succeeded);
         Assert.Equal("rcd.dashboard.share_forbidden_fields", result.Error!.Code);
@@ -337,7 +351,7 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(id, SaveRequest(isShared: true), CancellationToken.None);
+        var result = await UpdateStampedAsync(id, SaveRequest(isShared: true));
 
         Assert.Equal("rcd.dashboard.share_forbidden_fields", result.Error!.Code);
     }
@@ -349,8 +363,8 @@ public class DashboardSharingTests : IDisposable
         await ShareWithAsync(id, Grantee, layout: true, pages: true, charts: true, move: true, delete: true);
         ActAs(Grantee);
 
-        var result = await _service.UpdateAsync(
-            id, SaveRequest(layout: EditChart(MoveTile(RenamePage(TwoTileLayout)))), CancellationToken.None);
+        var result = await UpdateStampedAsync(
+            id, SaveRequest(layout: EditChart(MoveTile(RenamePage(TwoTileLayout)))));
 
         Assert.True(result.Succeeded, result.Error?.Message);
     }
@@ -639,8 +653,8 @@ public class DashboardSharingTests : IDisposable
     public async Task LifecycleWritesActivity_CreatedSavedRenamedDeleted()
     {
         var id = await CreateOwnedDashboardAsync();
-        await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
-        await _service.UpdateAsync(id, SaveRequest("Board v2", layout: MoveTile(TwoTileLayout)), CancellationToken.None);
+        await UpdateStampedAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)));
+        await UpdateStampedAsync(id, SaveRequest("Board v2", layout: MoveTile(TwoTileLayout)));
         await _service.DeleteAsync(id, CancellationToken.None);
 
         var actions = _harness.Db.DashboardActivity
@@ -705,7 +719,7 @@ public class DashboardSharingTests : IDisposable
         for (var i = 0; i < 5; i++)
         {
             var layout = TwoTileLayout.Replace("\"x\":0", $"\"x\":{i + 1}");
-            Assert.True((await _service.UpdateAsync(id, SaveRequest(layout: layout), CancellationToken.None)).Succeeded);
+            Assert.True((await UpdateStampedAsync(id, SaveRequest(layout: layout))).Succeeded);
         }
 
         var firstPage = (await _service.ListActivityAsync(id, 3, null, CancellationToken.None)).Value!;
@@ -734,7 +748,7 @@ public class DashboardSharingTests : IDisposable
         await _harness.Db.SaveChangesAsync();
 
         // Any activity-writing action triggers the trim.
-        var update = await _service.UpdateAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)), CancellationToken.None);
+        var update = await UpdateStampedAsync(id, SaveRequest(layout: MoveTile(TwoTileLayout)));
         Assert.True(update.Succeeded);
 
         var remaining = await _harness.Db.DashboardActivity

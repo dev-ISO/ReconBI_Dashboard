@@ -26,6 +26,13 @@ export interface DashboardGridProps {
    */
   locked?: boolean;
   onLayoutChange?: (items: DashboardGridItem[]) => void;
+  /**
+   * A tile's move/resize gesture began/ended (collab wave 1: the view uses
+   * these to acquire/release the tile's soft lock for the drag's duration).
+   * Resize counts as a drag — both gestures rewrite the tile's geometry.
+   */
+  onItemDragStart?: (id: string) => void;
+  onItemDragStop?: (id: string) => void;
   renderItem: (id: string) => ReactNode;
   /** CSS selector for the per-tile drag handle; the whole tile drags when omitted. */
   draggableHandle?: string;
@@ -55,6 +62,8 @@ export function DashboardGrid({
   editable = false,
   locked = false,
   onLayoutChange,
+  onItemDragStart,
+  onItemDragStop,
   renderItem,
   draggableHandle,
   minRows = 24,
@@ -112,6 +121,13 @@ export function DashboardGrid({
         isDraggable={editable && !locked}
         isResizable={editable && !locked}
         draggableHandle={draggableHandle}
+        // Move AND resize both report as drag start/stop — either gesture
+        // rewrites the tile's geometry (the soft-lock consumer treats them
+        // identically).
+        onDragStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
+        onDragStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
+        onResizeStart={(_layout: Layout[], oldItem: Layout) => onItemDragStart?.(oldItem.i)}
+        onResizeStop={(_layout: Layout[], oldItem: Layout) => onItemDragStop?.(oldItem.i)}
         onLayoutChange={(next: Layout[]) =>
           onLayoutChange?.(
             next.map((l) => ({

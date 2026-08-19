@@ -10,7 +10,9 @@ namespace ReconDashboards.AspNetCore.Controllers;
 // enforces the real per-dashboard rights (a grantee with edit permission may
 // lack the host's Author capability). Create/duplicate stay Author.
 [Route("dashboards")]
-public sealed class DashboardsController(DashboardService dashboards) : RcdControllerBase
+public sealed class DashboardsController(
+    DashboardService dashboards,
+    DashboardOpService dashboardOps) : RcdControllerBase
 {
     [HttpGet]
     [RcdPolicySlot(RcdPolicySlot.View)]
@@ -103,6 +105,57 @@ public sealed class DashboardsController(DashboardService dashboards) : RcdContr
         return result.Succeeded ? NoContent() : FromError(result.Error!);
     }
 
+    // ---------------- collaborative editing (COLLAB-DESIGN wave 1) ----------------
+    // View slot like Update: the service enforces the real per-dashboard rights
+    // (a grantee with edit permission may lack the host's Author capability).
+
+    /// <summary>
+    /// Applies ONE element-scoped edit op inside a row-locked transaction,
+    /// classified with the differ's rules and gated on the caller's share
+    /// flags; the committed op is broadcast to collaborators by the host's
+    /// IRcdDashboardOpNotifier bridge.
+    /// </summary>
+    [HttpPost("{id:int}/ops")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> ApplyOp(int id, [FromBody] DashboardOpRequest request, CancellationToken ct)
+    {
+        // A body without "payload" binds as JsonValueKind.Undefined, where
+        // GetRawText() throws — map it to the empty string so the service
+        // answers with its clean op_invalid instead of a 500.
+        var payloadJson = request.Payload.ValueKind is JsonValueKind.Undefined
+            ? ""
+            : request.Payload.GetRawText();
+        var result = await dashboardOps.ApplyAsync(
+            id,
+            new DashboardOpSubmission(
+                request.OpId, request.TargetKind, request.TargetId,
+                payloadJson, request.BaseUpdatedAtUtc),
+            ct);
+        return result.Succeeded
+            ? Ok(new DashboardOpResponse(result.Value!.OpId, result.Value.Class, result.Value.UpdatedAtUtc))
+            : FromError(result.Error!);
+    }
+
+    /// <summary>Acquire or heartbeat a soft tile lock (30 s TTL). 409 rcd.dashboard.tile_locked names the current holder.</summary>
+    [HttpPost("{id:int}/tiles/{tileId}/lock")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> AcquireTileLock(int id, string tileId, CancellationToken ct)
+    {
+        var result = await dashboardOps.AcquireTileLockAsync(id, tileId, ct);
+        return result.Succeeded
+            ? Ok(ToLockResponse(result.Value!))
+            : FromError(result.Error!);
+    }
+
+    /// <summary>Release the caller's soft tile lock. Idempotent — releasing an expired/stolen lock still 204s.</summary>
+    [HttpDelete("{id:int}/tiles/{tileId}/lock")]
+    [RcdPolicySlot(RcdPolicySlot.View)]
+    public async Task<IActionResult> ReleaseTileLock(int id, string tileId, CancellationToken ct)
+    {
+        var result = await dashboardOps.ReleaseTileLockAsync(id, tileId, ct);
+        return result.Succeeded ? NoContent() : FromError(result.Error!);
+    }
+
     [HttpGet("{id:int}/activity")]
     [RcdPolicySlot(RcdPolicySlot.View)]
     public async Task<IActionResult> Activity(
@@ -128,6 +181,9 @@ public sealed class DashboardsController(DashboardService dashboards) : RcdContr
         new(access.IsOwner, access.CanEdit, access.CanEditLayout, access.CanManagePages,
             access.CanEditCharts, access.CanMoveTiles, access.CanDeleteContent,
             access.ViaShare, access.ViaPublish);
+
+    private static DashboardTileLockResponse ToLockResponse(DashboardTileLockInfo info) =>
+        new(info.TileId, info.HolderUserId, info.HolderDisplayName, info.AcquiredAtUtc, info.ExpiresAtUtc);
 
     private static DashboardShareResponse ToShareResponse(DashboardShareInfo share) =>
         new(share.UserId, share.DisplayName, share.CanEditLayout, share.CanManagePages,
