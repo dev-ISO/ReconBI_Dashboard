@@ -711,30 +711,47 @@ export const mergedSlicerFilters = (values: SlicerValues): FilterClause[] =>
 /* ------------------------------------------------------ subscriptions/alerts
  * Wire mirrors of api/rcd/v1/subscriptions and api/rcd/v1/alerts (email
  * subscriptions + threshold alerts; the backend evaluates them server-side).
+ *
+ * The subscription shape is FLAT — scheduleKind plus nullable per-kind fields
+ * — exactly mirroring the backend's SaveSubscriptionRequest/
+ * SubscriptionResponse records. An earlier nested `schedule` object here
+ * never matched the server (System.Text.Json 400'd every save on the
+ * recipients array alone), so these types ARE the wire contract; UI
+ * ergonomics (draft objects, recipient arrays) live inside the dialogs and
+ * map at the fetch boundary.
  */
 
-export interface SubscriptionSchedule {
-  kind: 'interval' | 'daily' | 'weekly';
-  /** kind 'interval': minutes between sends. */
-  everyMinutes?: number | null;
-  /** kind 'daily'/'weekly': send time "HH:mm" (UTC). */
-  timeUtc?: string | null;
-  /** kind 'weekly': 0 (Sunday) … 6 (Saturday). */
-  dayOfWeek?: number | null;
-}
+export type SubscriptionScheduleKind = 'interval' | 'daily' | 'weekly';
 
 export interface DashboardSubscription {
   id: number;
   dashboardId: number;
   name: string;
-  schedule: SubscriptionSchedule;
-  recipients: string[];
+  scheduleKind: SubscriptionScheduleKind;
+  /** kind 'interval': minutes between sends; null for other kinds. */
+  intervalMinutes: number | null;
+  /** kind 'daily'/'weekly': "HH:mm" wall time in the host's schedule zone
+   * (DashboardsProvider scheduleTimeZoneId / backend ScheduleTimeZoneId). */
+  timeOfDayLocal: string | null;
+  /** kind 'weekly': 0 (Sunday) … 6 (Saturday) on the schedule zone's calendar. */
+  dayOfWeek: number | null;
+  /** ';'-joined email addresses — the backend splits on ';' ONLY (a ','
+   * would validate as one address and then fail at SMTP). */
+  recipients: string;
   format: 'html' | 'csv';
   enabled: boolean;
+  /* --- response-only fields (server-assigned) --- */
+  ownerIsMe: boolean;
+  /** ISO instant of the last send; null = never sent. */
+  lastRunUtc: string | null;
+  createdUtc: string;
 }
 
-/** Create/update body (id is server-assigned). */
-export type SaveSubscriptionBody = Omit<DashboardSubscription, 'id'>;
+/** Create/update body (id + read-only response fields are server-assigned). */
+export type SaveSubscriptionBody = Omit<
+  DashboardSubscription,
+  'id' | 'ownerIsMe' | 'lastRunUtc' | 'createdUtc'
+>;
 
 export type AlertOperator = 'gt' | 'gte' | 'lt' | 'lte' | 'eq';
 
@@ -746,16 +763,26 @@ export interface DashboardAlert {
   spec: ChartQuerySpec;
   operator: AlertOperator;
   threshold: number;
-  recipients: string[];
+  /** ';'-joined email addresses — same wire rule as subscriptions. */
+  recipients: string;
   /** Evaluation cadence in minutes. */
   everyMinutes: number;
   /** Minimum minutes between consecutive firings. */
   cooldownMinutes: number;
   enabled: boolean;
+  /* --- response-only fields (server-assigned; absent from save bodies) --- */
+  ownerIsMe?: boolean;
+  lastEvaluatedUtc?: string | null;
+  lastFiredUtc?: string | null;
+  lastValue?: number | null;
+  createdUtc?: string;
 }
 
-/** Create/update body (id is server-assigned). */
-export type SaveAlertBody = Omit<DashboardAlert, 'id'>;
+/** Create/update body (id + read-only response fields are server-assigned). */
+export type SaveAlertBody = Omit<
+  DashboardAlert,
+  'id' | 'ownerIsMe' | 'lastEvaluatedUtc' | 'lastFiredUtc' | 'lastValue' | 'createdUtc'
+>;
 
 /** POST alerts/{id}/test → the current value and whether it would fire. */
 export interface AlertTestResult {

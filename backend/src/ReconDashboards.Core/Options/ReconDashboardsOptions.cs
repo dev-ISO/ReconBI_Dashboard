@@ -50,6 +50,29 @@ public sealed class ReconDashboardsOptions
     public bool EnableQueryAudit { get; set; }
 
     /// <summary>
+    /// Time zone id (IANA or Windows; resolved via
+    /// TimeZoneInfo.FindSystemTimeZoneById) in which daily/weekly subscription
+    /// send times are interpreted — "plant local time". Default "UTC"
+    /// preserves the original pure-UTC behavior for hosts that never set it.
+    /// NOTE the storage columns keep their historical *Utc names
+    /// (rcd_subscriptions.TimeOfDayMinutesUtc / DayOfWeekUtc): the VALUES are
+    /// minutes past LOCAL midnight / local weekday in THIS zone. Renaming the
+    /// columns would force a hand-applied schema migration on every host for
+    /// zero user value, so the honesty lives here and on the wire
+    /// (timeOfDayLocal / dayOfWeek) instead.
+    /// </summary>
+    public string ScheduleTimeZoneId { get; set; } = "UTC";
+
+    /// <summary>
+    /// Short display label for <see cref="ScheduleTimeZoneId"/> ("CT", "UTC"),
+    /// stamped into snapshot/alert emails and surfaced to frontends next to
+    /// schedule times. A separate option because .NET has no portable
+    /// short-abbreviation API for time zones — the host knows what its plant
+    /// calls the zone better than any generated string would.
+    /// </summary>
+    public string ScheduleTimeZoneLabel { get; set; } = "UTC";
+
+    /// <summary>
     /// In Development only: echo generated SQL in query responses' debug field.
     /// Never honored outside Development.
     /// </summary>

@@ -90,7 +90,7 @@ public sealed class SchedulingApiTests : IClassFixture<DemoApiFactory>
 
         var id = (await ReadJsonAsync(await bob.PostAsJsonAsync(Subscriptions, SubscriptionBody(dashboardId))))["id"]!.GetValue<int>();
 
-        var update = SubscriptionBody(dashboardId, name: "Renamed", scheduleKind: "daily", timeOfDayUtc: "09:30");
+        var update = SubscriptionBody(dashboardId, name: "Renamed", scheduleKind: "daily", timeOfDayLocal: "09:30");
 
         // Another non-admin user: invisible (404).
         Assert.Equal(HttpStatusCode.NotFound, (await alice.PutAsJsonAsync($"{Subscriptions}/{id}", update)).StatusCode);
@@ -101,7 +101,7 @@ public sealed class SchedulingApiTests : IClassFixture<DemoApiFactory>
         Assert.Equal(HttpStatusCode.OK, adminUpdate.StatusCode);
         var updated = await ReadJsonAsync(adminUpdate);
         Assert.Equal("daily", updated["scheduleKind"]!.GetValue<string>());
-        Assert.Equal("09:30", updated["timeOfDayUtc"]!.GetValue<string>());
+        Assert.Equal("09:30", updated["timeOfDayLocal"]!.GetValue<string>());
         Assert.False(updated["ownerIsMe"]!.GetValue<bool>()); // still bob's
 
         // Owner deletes.
@@ -117,7 +117,7 @@ public sealed class SchedulingApiTests : IClassFixture<DemoApiFactory>
     [InlineData("weekly", null, "09:00", null)] // weekly without a day
     [InlineData("weekly", null, "09:00", 9)] // day out of range
     public async Task InvalidSchedules_Return400(
-        string kind, int? intervalMinutes, string? timeOfDayUtc, int? dayOfWeekUtc)
+        string kind, int? intervalMinutes, string? timeOfDayLocal, int? dayOfWeek)
     {
         var carol = _factory.AsUser("carol");
         var dashboardId = await CreateDashboardAsync(carol, isShared: true);
@@ -128,8 +128,8 @@ public sealed class SchedulingApiTests : IClassFixture<DemoApiFactory>
             name = UniqueName("Bad schedule"),
             scheduleKind = kind,
             intervalMinutes,
-            timeOfDayUtc,
-            dayOfWeekUtc,
+            timeOfDayLocal,
+            dayOfWeek,
             recipients = "ops@example.com",
             format = "html",
         });
@@ -379,15 +379,15 @@ public sealed class SchedulingApiTests : IClassFixture<DemoApiFactory>
         int dashboardId,
         string? name = null,
         string scheduleKind = "interval",
-        string? timeOfDayUtc = null,
+        string? timeOfDayLocal = null,
         string recipients = "ops@example.com") => new
         {
             dashboardId,
             name = name ?? UniqueName("Snapshot"),
             scheduleKind,
             intervalMinutes = scheduleKind == "interval" ? 30 : (int?)null,
-            timeOfDayUtc,
-            dayOfWeekUtc = (int?)null,
+            timeOfDayLocal,
+            dayOfWeek = (int?)null,
             recipients,
             format = "html",
             enabled = true,

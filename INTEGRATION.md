@@ -107,6 +107,31 @@ Host-implemented seams:
   not just dimension tables: the contributor only applies to tables actually
   referenced by a query.
 
+### Scheduling + email delivery (subscriptions & alerts)
+
+Opt-in: `builder.Services.AddReconDashboardsScheduling()` after
+`AddReconDashboards` registers the 1-minute background evaluator for
+subscription snapshots and data alerts.
+
+- **Email transport** — register your own `IRcdEmailSender` (an adapter over
+  the host's existing mail pipeline) and call `AddReconDashboardsScheduling()`
+  with NO arguments: the library then registers no sender of its own.
+  Alternatively pass `builder.Configuration` and configure `Rcd:Email`
+  (Host/Port/From/User/Password/UseSsl) for the built-in `SmtpEmailSender`;
+  with no `Rcd:Email:Host` that path falls back to a `FileEmailSink` .eml drop
+  folder — fine for the demo host, never intended for production.
+- **Plant-local schedules** — `rcd.ScheduleTimeZoneId` (IANA/Windows id,
+  default `"UTC"`) is the zone daily/weekly send times are interpreted in;
+  `rcd.ScheduleTimeZoneLabel` (default `"UTC"`, e.g. `"CT"`) is stamped into
+  emails. Mirror both on the frontend via the provider:
+  `<DashboardsProvider scheduleTimeZoneId="America/Chicago"
+  scheduleTimeLabel="CT" …>` so the Subscribe dialog labels match reality.
+  DST edges are defined: a spring-forward gap time advances by the gap; a
+  fall-back ambiguous time maps to standard time (one send per day).
+- Wire fields are `timeOfDayLocal` ("HH:mm" in that zone) and `dayOfWeek`
+  (0 = Sunday); recipients travel as ONE `';'`-joined string. The storage
+  columns keep their historical `*Utc` names — no schema change on upgrade.
+
 ### Dashboard permissions (0.8.0+)
 
 Three distinct verbs (see SHARING-DESIGN.md for the full contract):

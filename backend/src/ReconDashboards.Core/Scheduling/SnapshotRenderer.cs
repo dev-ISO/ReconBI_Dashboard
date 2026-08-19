@@ -26,14 +26,22 @@ public static class SnapshotRenderer
     /// <summary>Rows shown per tile in the HTML body; the CSV carries everything.</summary>
     public const int HtmlRowsPerTile = 50;
 
-    public static string RenderHtml(string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages)
+    /// <summary>
+    /// "Generated" stamps render in the host-configured schedule zone
+    /// (<paramref name="stampZone"/> / <paramref name="stampZoneLabel"/> come
+    /// from ReconDashboardsOptions via the evaluator) — the reader schedules
+    /// in plant time, so the email must speak plant time too.
+    /// </summary>
+    public static string RenderHtml(
+        string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages,
+        TimeZoneInfo stampZone, string stampZoneLabel)
     {
         var html = new StringBuilder();
         html.Append("<div style=\"font-family:Segoe UI,Arial,sans-serif;color:#1f2937;max-width:760px;margin:0 auto;\">");
         html.Append("<div style=\"padding:16px 0;border-bottom:2px solid #e5e7eb;\">");
         html.Append("<div style=\"font-size:20px;font-weight:600;\">").Append(Encode(dashboardName)).Append("</div>");
         html.Append("<div style=\"font-size:12px;color:#6b7280;margin-top:2px;\">Snapshot generated ")
-            .Append(generatedUtc.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)).Append(" UTC</div>");
+            .Append(Encode(Stamp(generatedUtc, stampZone, stampZoneLabel))).Append("</div>");
         html.Append("</div>");
 
         var multiplePages = pages.Count > 1;
@@ -132,12 +140,15 @@ public static class SnapshotRenderer
         }
     }
 
-    /// <summary>One merged CSV: a comment-style section header per tile, then header + data rows.</summary>
-    public static string RenderCsv(string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages)
+    /// <summary>One merged CSV: a comment-style section header per tile, then header + data rows.
+    /// The header stamp uses the same schedule-zone rendering as the HTML body.</summary>
+    public static string RenderCsv(
+        string dashboardName, DateTime generatedUtc, IReadOnlyList<RenderedPage> pages,
+        TimeZoneInfo stampZone, string stampZoneLabel)
     {
         var csv = new StringBuilder();
         csv.Append("# ").Append(dashboardName).Append(" — snapshot ")
-            .Append(generatedUtc.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)).AppendLine(" UTC");
+            .AppendLine(Stamp(generatedUtc, stampZone, stampZoneLabel));
 
         foreach (var page in pages)
         {
@@ -161,6 +172,11 @@ public static class SnapshotRenderer
 
         return csv.ToString();
     }
+
+    /// <summary>"2026-08-18 07:00 CT" — a UTC instant rendered as schedule-zone wall time.</summary>
+    private static string Stamp(DateTime generatedUtc, TimeZoneInfo stampZone, string stampZoneLabel) =>
+        TimeZoneInfo.ConvertTimeFromUtc(generatedUtc, stampZone)
+            .ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) + " " + stampZoneLabel;
 
     private static string Encode(string value) => WebUtility.HtmlEncode(value);
 

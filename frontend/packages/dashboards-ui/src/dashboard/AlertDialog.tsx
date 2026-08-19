@@ -130,7 +130,9 @@ export function AlertDialog({ open, dashboardId, modelId, source, onClose, onErr
       spec: alertSpec,
       operator,
       threshold: thresholdNumber,
-      recipients,
+      // Wire rule: ONE ';'-joined string, never an array — the server binds a
+      // string (an array 400s the whole save) and splits on ';' only.
+      recipients: recipients.join(';'),
       everyMinutes,
       cooldownMinutes,
       enabled,

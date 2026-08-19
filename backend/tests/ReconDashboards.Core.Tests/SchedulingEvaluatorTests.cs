@@ -94,6 +94,7 @@ public sealed class SchedulingEvaluatorTests : IDisposable
         _evaluator = new SchedulingEvaluator(
             _services.GetRequiredService<IServiceScopeFactory>(),
             _services.GetRequiredService<TimeProvider>(),
+            options, // defaults: ScheduleTimeZoneId/Label "UTC" — legacy pure-UTC behavior
             NullLogger<SchedulingEvaluator>.Instance);
     }
 

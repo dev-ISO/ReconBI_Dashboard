@@ -5,6 +5,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using ReconDashboards.Core.Abstractions;
+using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
 using ReconDashboards.Core.Querying.Spec;
 
@@ -16,13 +17,37 @@ namespace ReconDashboards.Core.Scheduling;
 /// minute; each record is processed in its own DI scope under the OWNER's
 /// impersonated identity so row filters apply exactly as if the owner ran the
 /// queries interactively. Per-record failures are logged and never propagate.
+/// Daily/weekly due math and email timestamps use the host-configured
+/// schedule zone (<see cref="ReconDashboardsOptions.ScheduleTimeZoneId"/>),
+/// resolved once here — an unknown id logs an error and falls back to UTC
+/// rather than silently killing the scheduler.
 /// </summary>
 public sealed class SchedulingEvaluator(
     IServiceScopeFactory scopeFactory,
     TimeProvider timeProvider,
+    ReconDashboardsOptions options,
     ILogger<SchedulingEvaluator> logger)
 {
     private static readonly JsonSerializerOptions SpecJsonOptions = new(JsonSerializerDefaults.Web);
+
+    private readonly TimeZoneInfo _scheduleZone = ResolveScheduleZone(options.ScheduleTimeZoneId, logger);
+    private readonly string _scheduleZoneLabel = options.ScheduleTimeZoneLabel;
+
+    private static TimeZoneInfo ResolveScheduleZone(string zoneId, ILogger logger)
+    {
+        try
+        {
+            return TimeZoneInfo.FindSystemTimeZoneById(zoneId);
+        }
+        catch (Exception ex) when (ex is TimeZoneNotFoundException or InvalidTimeZoneException)
+        {
+            logger.LogError(
+                ex,
+                "ScheduleTimeZoneId '{ZoneId}' is not a known time zone; subscription schedules fall back to UTC",
+                zoneId);
+            return TimeZoneInfo.Utc;
+        }
+    }
 
     public async Task RunOnceAsync(CancellationToken ct)
     {
@@ -70,7 +95,7 @@ public sealed class SchedulingEvaluator(
         var candidates = await db.Subscriptions.AsNoTracking()
             .Where(s => s.Enabled)
             .ToListAsync(ct);
-        return candidates.Where(s => ScheduleDue.IsDue(s, nowUtc)).Select(s => s.Id).ToArray();
+        return candidates.Where(s => ScheduleDue.IsDue(s, nowUtc, _scheduleZone)).Select(s => s.Id).ToArray();
     }
 
     private async Task ProcessSubscriptionAsync(int subscriptionId, DateTime nowUtc, CancellationToken ct)
@@ -80,7 +105,7 @@ public sealed class SchedulingEvaluator(
         var db = services.GetRequiredService<ReconDashboardsDbContext>();
 
         var subscription = await db.Subscriptions.FirstOrDefaultAsync(s => s.Id == subscriptionId, ct);
-        if (subscription is null || !ScheduleDue.IsDue(subscription, nowUtc))
+        if (subscription is null || !ScheduleDue.IsDue(subscription, nowUtc, _scheduleZone))
         {
             return; // deleted or already handled by a concurrent instance
         }
@@ -142,14 +167,17 @@ public sealed class SchedulingEvaluator(
             }
 
             var subject = $"{dashboard.Name} — dashboard snapshot";
-            var body = SnapshotRenderer.RenderHtml(dashboard.Name, nowUtc, rendered);
+            var body = SnapshotRenderer.RenderHtml(dashboard.Name, nowUtc, rendered, _scheduleZone, _scheduleZoneLabel);
+            // Filename stamp matches the body stamps: plant-local, so a
+            // recipient's saved files sort the way the emails read.
+            var stampLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, _scheduleZone);
             IReadOnlyList<RcdEmailAttachment> attachments = subscription.Format == SubscriptionFormat.Csv
                 ?
                 [
                     new RcdEmailAttachment(
-                        $"{SafeFileName(dashboard.Name)}-snapshot-{nowUtc:yyyyMMdd-HHmm}.csv",
+                        $"{SafeFileName(dashboard.Name)}-snapshot-{stampLocal:yyyyMMdd-HHmm}.csv",
                         "text/csv",
-                        SnapshotRenderer.RenderCsv(dashboard.Name, nowUtc, rendered)),
+                        SnapshotRenderer.RenderCsv(dashboard.Name, nowUtc, rendered, _scheduleZone, _scheduleZoneLabel)),
                 ]
                 : [];
 
@@ -219,7 +247,8 @@ public sealed class SchedulingEvaluator(
                 try
                 {
                     var sender = services.GetRequiredService<IRcdEmailSender>();
-                    await sender.SendAsync(BuildAlertEmail(alert, evaluated, nowUtc, recipients), ct);
+                    await sender.SendAsync(
+                        BuildAlertEmail(alert, evaluated, nowUtc, recipients, _scheduleZone, _scheduleZoneLabel), ct);
                     alert.LastFiredUtc = nowUtc;
                     logger.LogInformation("Alert {AlertId} ({Name}) fired: value {Value}", alert.Id, alert.Name, evaluated);
                 }
@@ -293,20 +322,24 @@ public sealed class SchedulingEvaluator(
     }
 
     private static RcdEmailMessage BuildAlertEmail(
-        AlertRecord alert, decimal value, DateTime nowUtc, IReadOnlyList<string> recipients)
+        AlertRecord alert, decimal value, DateTime nowUtc, IReadOnlyList<string> recipients,
+        TimeZoneInfo stampZone, string stampZoneLabel)
     {
         var symbol = ScheduleDue.OperatorSymbol(alert.Operator);
         var valueText = SnapshotRenderer.FormatValue(value);
         var thresholdText = SnapshotRenderer.FormatValue(alert.Threshold);
         var subject = $"Alert {alert.Name}: value {valueText} crossed {symbol} {thresholdText}";
 
+        // Same plant-local stamp as snapshot emails (SnapshotRenderer) —
+        // recipients should never have to translate a UTC timestamp.
+        var stampLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, stampZone);
         var body =
             "<div style=\"font-family:Segoe UI,Arial,sans-serif;color:#1f2937;max-width:560px;margin:0 auto;\">" +
             $"<div style=\"padding:16px 0;border-bottom:2px solid #e5e7eb;font-size:18px;font-weight:600;\">{WebUtility.HtmlEncode(alert.Name)}</div>" +
             "<div style=\"margin:16px 0;\">" +
             $"<div style=\"font-size:30px;font-weight:700;color:#b91c1c;\">{WebUtility.HtmlEncode(valueText)}</div>" +
             $"<div style=\"font-size:13px;color:#374151;margin-top:4px;\">crossed the threshold {WebUtility.HtmlEncode(symbol)} {WebUtility.HtmlEncode(thresholdText)}</div>" +
-            $"<div style=\"font-size:11px;color:#6b7280;margin-top:8px;\">Evaluated {nowUtc.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)} UTC</div>" +
+            $"<div style=\"font-size:11px;color:#6b7280;margin-top:8px;\">Evaluated {stampLocal.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)} {WebUtility.HtmlEncode(stampZoneLabel)}</div>" +
             "</div>" +
             "<div style=\"font-size:11px;color:#9ca3af;padding:12px 0;border-top:1px solid #e5e7eb;\">Sent by ReconDashboards data alerts.</div>" +
             "</div>";

@@ -8,15 +8,18 @@ namespace ReconDashboards.AspNetCore.Http;
 // Wire DTOs for subscriptions and alerts. Enum values use the camelCase
 // converters attached to the enum types ("interval"/"daily"/"weekly",
 // "html"/"csv", "gt".."eq"), so the wire format is stable regardless of the
-// host's MVC JSON configuration. Times of day travel as "HH:mm" UTC strings.
+// host's MVC JSON configuration. Times of day travel as "HH:mm" strings in
+// the HOST'S schedule zone (ReconDashboardsOptions.ScheduleTimeZoneId) —
+// hence timeOfDayLocal/dayOfWeek on the wire, even though the storage columns
+// keep their historical *Utc names.
 
 public sealed record SaveSubscriptionRequest(
     int DashboardId,
     string Name,
     SubscriptionScheduleKind ScheduleKind,
     int? IntervalMinutes,
-    string? TimeOfDayUtc,
-    int? DayOfWeekUtc,
+    string? TimeOfDayLocal,
+    int? DayOfWeek,
     string Recipients,
     SubscriptionFormat Format,
     bool Enabled = true);
@@ -27,8 +30,8 @@ public sealed record SubscriptionResponse(
     string Name,
     SubscriptionScheduleKind ScheduleKind,
     int? IntervalMinutes,
-    string? TimeOfDayUtc,
-    int? DayOfWeekUtc,
+    string? TimeOfDayLocal,
+    int? DayOfWeek,
     string Recipients,
     SubscriptionFormat Format,
     bool Enabled,
@@ -77,7 +80,7 @@ public sealed record AlertFiringResponse(
 
 public static class SchedulingDtoMapping
 {
-    /// <summary>"HH:mm" (UTC) -> minutes past midnight; null/blank -> null; invalid -> -1 (rejected downstream).</summary>
+    /// <summary>"HH:mm" (schedule-zone wall time) -> minutes past local midnight; null/blank -> null; invalid -> -1 (rejected downstream).</summary>
     public static int? ParseTimeOfDay(string? text)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -97,7 +100,7 @@ public static class SchedulingDtoMapping
 
     public static SubscriptionSaveRequest ToSaveRequest(SaveSubscriptionRequest request) =>
         new(request.DashboardId, request.Name ?? "", request.ScheduleKind, request.IntervalMinutes,
-            ParseTimeOfDay(request.TimeOfDayUtc), request.DayOfWeekUtc, request.Recipients ?? "",
+            ParseTimeOfDay(request.TimeOfDayLocal), request.DayOfWeek, request.Recipients ?? "",
             request.Format, request.Enabled);
 
     public static SubscriptionResponse ToResponse(SubscriptionDetail detail) =>

@@ -3,7 +3,7 @@ import { Mail, Pencil, Plus, Trash2 } from 'lucide-react';
 import type {
   DashboardSubscription,
   SaveSubscriptionBody,
-  SubscriptionSchedule,
+  SubscriptionScheduleKind,
 } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
@@ -34,12 +34,14 @@ export const looksLikeEmail = (email: string): boolean => /^[^\s@]+@[^\s@]+\.[^\
 
 const INTERVAL_OPTIONS = [15, 30, 60, 240, 480, 1440];
 
+/** Editing-friendly shape; the wire shape is built by draftToWire on save. */
 interface SubscriptionDraft {
   id: number | null;
   name: string;
-  kind: SubscriptionSchedule['kind'];
+  kind: SubscriptionScheduleKind;
   everyMinutes: number;
-  timeUtc: string;
+  /** "HH:mm" wall time in the host's schedule zone. */
+  timeLocal: string;
   dayOfWeek: number;
   recipientsText: string;
   format: 'html' | 'csv';
@@ -51,31 +53,86 @@ const emptyDraft = (): SubscriptionDraft => ({
   name: '',
   kind: 'daily',
   everyMinutes: 60,
-  timeUtc: '08:00',
+  timeLocal: '08:00',
   dayOfWeek: 1,
   recipientsText: '',
   format: 'html',
   enabled: true,
 });
 
+/** The wire's ';'-joined recipients string as an array (for counting/editing). */
+const recipientList = (recipients: string): string[] =>
+  recipients.split(';').map((email) => email.trim()).filter((email) => email !== '');
+
 const draftFrom = (subscription: DashboardSubscription): SubscriptionDraft => ({
   id: subscription.id,
   name: subscription.name,
-  kind: subscription.schedule.kind,
-  everyMinutes: subscription.schedule.everyMinutes ?? 60,
-  timeUtc: subscription.schedule.timeUtc ?? '08:00',
-  dayOfWeek: subscription.schedule.dayOfWeek ?? 1,
-  recipientsText: subscription.recipients.join(', '),
+  kind: subscription.scheduleKind,
+  everyMinutes: subscription.intervalMinutes ?? 60,
+  timeLocal: subscription.timeOfDayLocal ?? '08:00',
+  dayOfWeek: subscription.dayOfWeek ?? 1,
+  recipientsText: recipientList(subscription.recipients).join(', '),
   format: subscription.format,
   enabled: subscription.enabled,
 });
 
+/**
+ * Draft -> FLAT wire body. This mapping IS the save contract — it must mirror
+ * the backend's SaveSubscriptionRequest exactly (see the wire-shape test):
+ * per-kind fields are nulled rather than omitted, and recipients are joined
+ * with ';' because the backend splits on ';' ONLY — a ',' would validate as
+ * one address and then fail at SMTP. Exported for the wire-shape test.
+ */
+export const draftToWire = (draft: SubscriptionDraft, dashboardId: number): SaveSubscriptionBody => ({
+  dashboardId,
+  name: draft.name.trim(),
+  scheduleKind: draft.kind,
+  intervalMinutes: draft.kind === 'interval' ? draft.everyMinutes : null,
+  timeOfDayLocal: draft.kind === 'interval' ? null : draft.timeLocal,
+  dayOfWeek: draft.kind === 'weekly' ? draft.dayOfWeek : null,
+  recipients: parseRecipients(draft.recipientsText).join(';'),
+  format: draft.format,
+  enabled: draft.enabled,
+});
+
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-const scheduleSummary = (schedule: SubscriptionSchedule): string => {
-  if (schedule.kind === 'interval') return `Every ${schedule.everyMinutes ?? '?'} min`;
-  if (schedule.kind === 'daily') return `Daily at ${schedule.timeUtc ?? '?'} UTC`;
-  return `${DAYS[schedule.dayOfWeek ?? 0] ?? '?'} at ${schedule.timeUtc ?? '?'} UTC`;
+const scheduleSummary = (subscription: DashboardSubscription, zoneLabel: string): string => {
+  if (subscription.scheduleKind === 'interval') return `Every ${subscription.intervalMinutes ?? '?'} min`;
+  if (subscription.scheduleKind === 'daily')
+    return `Daily at ${subscription.timeOfDayLocal ?? '?'} ${zoneLabel}`;
+  return `${DAYS[subscription.dayOfWeek ?? 0] ?? '?'} at ${subscription.timeOfDayLocal ?? '?'} ${zoneLabel}`;
+};
+
+/**
+ * "Last sent 2026-08-18 07:00 CT" / "Never sent". The UTC instant is rendered
+ * in the schedule zone via Intl (browsers ship the IANA database); an id the
+ * browser doesn't know falls back to the raw UTC reading rather than lying
+ * with the wrong offset.
+ */
+export const lastSentText = (lastRunUtc: string | null, zoneId: string, zoneLabel: string): string => {
+  if (!lastRunUtc) return 'Never sent';
+  // Backend DateTimes serialize with a trailing Z; tolerate a missing one so
+  // an offsetless string is still read as UTC instead of browser-local.
+  const instant = new Date(/(?:[zZ]|[+-]\d\d:\d\d)$/.test(lastRunUtc) ? lastRunUtc : `${lastRunUtc}Z`);
+  if (Number.isNaN(instant.getTime())) return 'Never sent';
+  try {
+    // en-CA renders "2026-08-18, 07:00" — the ISO-like ordering we want.
+    const stamp = new Intl.DateTimeFormat('en-CA', {
+      timeZone: zoneId,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    })
+      .format(instant)
+      .replace(',', '');
+    return `Last sent ${stamp} ${zoneLabel}`;
+  } catch {
+    return `Last sent ${instant.toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+  }
 };
 
 /**
@@ -86,6 +143,7 @@ const scheduleSummary = (schedule: SubscriptionSchedule): string => {
  */
 export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: SubscriptionsDialogProps) {
   const runtime = useRuntime();
+  const { scheduleTimeZoneId, scheduleTimeLabel } = runtime.options;
   const [subscriptions, setSubscriptions] = useState<DashboardSubscription[] | null>(null);
   const [draft, setDraft] = useState<SubscriptionDraft | null>(null);
   const [saving, setSaving] = useState(false);
@@ -118,20 +176,7 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
 
   const handleSave = async () => {
     if (!draft || !canSave || saving) return;
-    const schedule: SubscriptionSchedule =
-      draft.kind === 'interval'
-        ? { kind: 'interval', everyMinutes: draft.everyMinutes }
-        : draft.kind === 'daily'
-          ? { kind: 'daily', timeUtc: draft.timeUtc }
-          : { kind: 'weekly', timeUtc: draft.timeUtc, dayOfWeek: draft.dayOfWeek };
-    const body: SaveSubscriptionBody = {
-      dashboardId,
-      name: draft.name.trim(),
-      schedule,
-      recipients,
-      format: draft.format,
-      enabled: draft.enabled,
-    };
+    const body = draftToWire(draft, dashboardId);
     setSaving(true);
     try {
       if (draft.id === null) await runtime.api.createSubscription(body);
@@ -185,7 +230,9 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
               No subscriptions yet. Subscribe to get this dashboard emailed on a schedule.
             </p>
           ) : (
-            subscriptions.map((subscription) => (
+            subscriptions.map((subscription) => {
+              const recipientCount = recipientList(subscription.recipients).length;
+              return (
               <div
                 key={subscription.id}
                 className="flex items-center gap-2 rounded-md border border-rcd-border px-3 py-2"
@@ -199,9 +246,10 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
                     )}
                   </p>
                   <p className="truncate text-xs text-rcd-muted">
-                    {scheduleSummary(subscription.schedule)} · {subscription.format.toUpperCase()} ·{' '}
-                    {subscription.recipients.length} recipient
-                    {subscription.recipients.length === 1 ? '' : 's'}
+                    {scheduleSummary(subscription, scheduleTimeLabel)} · {subscription.format.toUpperCase()} ·{' '}
+                    {recipientCount} recipient
+                    {recipientCount === 1 ? '' : 's'} ·{' '}
+                    {lastSentText(subscription.lastRunUtc, scheduleTimeZoneId, scheduleTimeLabel)}
                   </p>
                 </div>
                 <RcdIconButton
@@ -219,7 +267,8 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
                   <Trash2 size={14} />
                 </RcdIconButton>
               </div>
-            ))
+              );
+            })
           )}
           <div>
             <RcdButton onClick={() => setDraft(emptyDraft())}>
@@ -246,7 +295,7 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
                 aria-label="Schedule kind"
                 value={draft.kind}
                 onChange={(event) =>
-                  setDraft({ ...draft, kind: event.target.value as SubscriptionSchedule['kind'] })
+                  setDraft({ ...draft, kind: event.target.value as SubscriptionScheduleKind })
                 }
               >
                 <option value="interval">Every N minutes</option>
@@ -282,11 +331,11 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
                   )}
                   <RcdInput
                     type="time"
-                    aria-label="Send time (UTC)"
-                    value={draft.timeUtc}
-                    onChange={(event) => setDraft({ ...draft, timeUtc: event.target.value })}
+                    aria-label={`Send time (${scheduleTimeLabel})`}
+                    value={draft.timeLocal}
+                    onChange={(event) => setDraft({ ...draft, timeLocal: event.target.value })}
                   />
-                  <span className="text-xs text-rcd-muted">UTC</span>
+                  <span className="text-xs text-rcd-muted">{scheduleTimeLabel}</span>
                 </>
               )}
             </div>

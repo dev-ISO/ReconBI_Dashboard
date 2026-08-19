@@ -83,10 +83,10 @@ public enum SubscriptionScheduleKind
     /// <summary>Every <see cref="SubscriptionRecord.IntervalMinutes"/> minutes.</summary>
     Interval = 0,
 
-    /// <summary>Once a day at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (UTC).</summary>
+    /// <summary>Once a day at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (schedule-zone wall time).</summary>
     Daily = 1,
 
-    /// <summary>Once a week on <see cref="SubscriptionRecord.DayOfWeekUtc"/> at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (UTC).</summary>
+    /// <summary>Once a week on <see cref="SubscriptionRecord.DayOfWeekUtc"/> at <see cref="SubscriptionRecord.TimeOfDayMinutesUtc"/> (schedule-zone wall time).</summary>
     Weekly = 2,
 }
 
@@ -101,7 +101,11 @@ public enum SubscriptionFormat
 /// <summary>
 /// rcd_subscriptions — scheduled email snapshots of a dashboard, rendered and
 /// row-filtered under the OWNER's identity. Recipients is a semicolon list.
-/// All times are UTC (DST-agnostic by construction).
+/// Daily/weekly send times are wall-clock values in the host's configured
+/// schedule zone (ReconDashboardsOptions.ScheduleTimeZoneId; default UTC) —
+/// the *Utc column names below are historical and kept because rcd_ tables
+/// are applied by hand via rcd_schema.sql (renaming = migration pain on every
+/// host for zero user value).
 /// </summary>
 public sealed class SubscriptionRecord
 {
@@ -114,10 +118,12 @@ public sealed class SubscriptionRecord
     /// <summary>Interval kind: minutes between runs (&gt;= 5).</summary>
     public int? IntervalMinutes { get; set; }
 
-    /// <summary>Daily/Weekly kinds: minutes past UTC midnight (0..1439).</summary>
+    /// <summary>Daily/Weekly kinds: minutes past LOCAL midnight (0..1439) in the
+    /// host's schedule zone. Historical column name — see the class remarks.</summary>
     public int? TimeOfDayMinutesUtc { get; set; }
 
-    /// <summary>Weekly kind: 0 = Sunday .. 6 = Saturday (matches <see cref="DayOfWeek"/>).</summary>
+    /// <summary>Weekly kind: 0 = Sunday .. 6 = Saturday (matches <see cref="DayOfWeek"/>),
+    /// resolved on the schedule zone's calendar. Historical column name.</summary>
     public int? DayOfWeekUtc { get; set; }
 
     /// <summary>Semicolon-separated email addresses.</summary>

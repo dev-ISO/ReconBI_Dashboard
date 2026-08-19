@@ -4,6 +4,10 @@ using ReconDashboards.Core.Persistence;
 
 namespace ReconDashboards.Core.Services;
 
+// The *Utc member names below are HISTORICAL (they mirror the entity/storage
+// columns): TimeOfDayMinutesUtc is minutes past LOCAL midnight and DayOfWeekUtc
+// the LOCAL weekday in the host's ReconDashboardsOptions.ScheduleTimeZoneId
+// zone. The wire layer already speaks timeOfDayLocal/dayOfWeek.
 public sealed record SubscriptionSaveRequest(
     int DashboardId,
     string Name,
@@ -175,12 +179,12 @@ public sealed class SubscriptionService(
                 when request.TimeOfDayMinutesUtc is not { } minutes || minutes is < 0 or > 1439:
                 return new ServiceError(
                     ServiceErrorKind.BadRequest, "rcd.subscription.bad_schedule",
-                    "Daily and weekly schedules need a UTC time of day (00:00..23:59).");
+                    "Daily and weekly schedules need a time of day (00:00..23:59).");
             case SubscriptionScheduleKind.Weekly
                 when request.DayOfWeekUtc is not { } day || day is < 0 or > 6:
                 return new ServiceError(
                     ServiceErrorKind.BadRequest, "rcd.subscription.bad_schedule",
-                    "Weekly schedules need dayOfWeekUtc between 0 (Sunday) and 6 (Saturday).");
+                    "Weekly schedules need dayOfWeek between 0 (Sunday) and 6 (Saturday).");
         }
 
         if (Scheduling.SchedulingEvaluator.SplitRecipients(request.Recipients).Count == 0)

@@ -23,6 +23,15 @@ export interface DashboardsProviderProps {
    * a fresh literal per render would rebuild the whole runtime.
    */
   queryOptions?: QueryCacheOptions;
+  /**
+   * Zone in which subscription send times are entered and shown — MUST match
+   * the host backend's ReconDashboardsOptions.ScheduleTimeZoneId (e.g.
+   * "America/Chicago") or the dialog's labels lie about when emails go out.
+   * Default 'UTC' mirrors the backend default.
+   */
+  scheduleTimeZoneId?: string;
+  /** Short display label for scheduleTimeZoneId ("CT"). Default 'UTC'. */
+  scheduleTimeLabel?: string;
   children: ReactNode;
 }
 
@@ -34,11 +43,13 @@ export function DashboardsProvider({
   baseUrl,
   fetcher,
   queryOptions,
+  scheduleTimeZoneId,
+  scheduleTimeLabel,
   children,
 }: DashboardsProviderProps) {
   const runtime = useMemo(
-    () => createDashboardsRuntime(baseUrl, fetcher, queryOptions ? { queryOptions } : undefined),
-    [baseUrl, fetcher, queryOptions],
+    () => createDashboardsRuntime(baseUrl, fetcher, { queryOptions, scheduleTimeZoneId, scheduleTimeLabel }),
+    [baseUrl, fetcher, queryOptions, scheduleTimeZoneId, scheduleTimeLabel],
   );
   return (
     <RuntimeContext.Provider value={runtime}>
