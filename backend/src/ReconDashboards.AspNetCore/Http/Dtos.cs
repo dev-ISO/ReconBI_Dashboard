@@ -22,7 +22,8 @@ public sealed record MetaResponse(
     int MaxFilters,
     int MaxDistinctValues,
     int MaxModelDefinitionBytes,
-    int MaxDashboardLayoutBytes);
+    int MaxDashboardLayoutBytes,
+    bool CanManageShared);
 
 public sealed record ConnectionResponse(string Name, string? Description, string Provider);
 

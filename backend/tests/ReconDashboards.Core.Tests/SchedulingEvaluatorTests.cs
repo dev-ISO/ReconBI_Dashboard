@@ -55,6 +55,10 @@ public sealed class SchedulingEvaluatorTests : IDisposable
         services.AddSingleton<SemanticModelValidator>();
         services.AddSingleton<IRcdEmailSender>(_emails);
         services.AddSingleton<IRowFilterContributor, TestRowFilterContributor>();
+        // The dispatcher resolves the notifier seams per scope; the library's
+        // no-op defaults keep these tests focused on delivery semantics.
+        services.AddSingleton<IRcdDispatchProgressNotifier, NullRcdDispatchProgressNotifier>();
+        services.AddSingleton<IRcdDeliveryFailureNotifier, NullRcdDeliveryFailureNotifier>();
         services.AddDbContext<ReconDashboardsDbContext>(o => o.UseSqlite(_connection));
         _services = services.BuildServiceProvider();
 
@@ -91,10 +95,16 @@ public sealed class SchedulingEvaluatorTests : IDisposable
             _dashboardId = dashboard.Id;
         }
 
+        var dispatcher = new SubscriptionDispatcher(
+            _services.GetRequiredService<IServiceScopeFactory>(),
+            _services.GetRequiredService<TimeProvider>(),
+            options,
+            NullLogger<SubscriptionDispatcher>.Instance);
         _evaluator = new SchedulingEvaluator(
             _services.GetRequiredService<IServiceScopeFactory>(),
             _services.GetRequiredService<TimeProvider>(),
             options, // defaults: ScheduleTimeZoneId/Label "UTC" — legacy pure-UTC behavior
+            dispatcher,
             NullLogger<SchedulingEvaluator>.Instance);
     }
 
@@ -175,32 +185,70 @@ public sealed class SchedulingEvaluatorTests : IDisposable
     // ------------------------------------------------------------ subscriptions
 
     [Fact]
-    public async Task DueSubscriptionSendsHtmlSnapshotAndAdvancesLastRun()
+    public async Task DueSubscriptionSendsPerRecipientAndRecordsTheDispatch()
     {
         var id = AddSubscription();
         _executor.Rows = [["West", 120m], ["East", 45m]];
 
         await _evaluator.RunOnceAsync(CancellationToken.None);
 
-        var message = Assert.Single(_emails.Sent);
-        Assert.Equal(["ops@example.com", "boss@example.com"], message.Recipients);
-        Assert.Equal("Ops Dashboard — dashboard snapshot", message.Subject);
-        Assert.Contains("Ops Dashboard", message.HtmlBody, StringComparison.Ordinal);
-        Assert.Contains("Sales by region", message.HtmlBody, StringComparison.Ordinal);
-        Assert.Contains("West", message.HtmlBody, StringComparison.Ordinal);
-        Assert.Empty(message.Attachments);
+        // Per-recipient sends (the 0.11.0 pipeline): ONE message per address,
+        // identical rendered body — never the old single multi-recipient email.
+        Assert.Equal(2, _emails.Sent.Count);
+        Assert.Equal(
+            ["boss@example.com", "ops@example.com"],
+            _emails.Sent.SelectMany(m => m.Recipients).OrderBy(r => r).ToArray());
+        foreach (var message in _emails.Sent)
+        {
+            Assert.Single(message.Recipients);
+            Assert.Equal("Ops Dashboard — dashboard snapshot", message.Subject);
+            Assert.Contains("Ops Dashboard", message.HtmlBody, StringComparison.Ordinal);
+            Assert.Contains("Sales by region", message.HtmlBody, StringComparison.Ordinal);
+            Assert.Contains("West", message.HtmlBody, StringComparison.Ordinal);
+            Assert.Empty(message.Attachments);
+        }
 
         Assert.Equal(Now, Reload<SubscriptionRecord>(id).LastRunUtc);
 
+        // The audit truth: one dispatch row, closed 'sent', one recipient row
+        // per address with SentUtc stamped and a single attempt.
+        using (var scope = _services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<ReconDashboardsDbContext>();
+            var dispatch = Assert.Single(db.SubscriptionDispatches.ToList());
+            Assert.Equal(id, dispatch.SubscriptionId);
+            Assert.Equal("Morning snapshot", dispatch.SubscriptionName);
+            Assert.Equal("alice", dispatch.OwnerUserId);
+            Assert.Equal(DispatchTrigger.Schedule, dispatch.Trigger);
+            Assert.Equal(DispatchStatus.Sent, dispatch.Status);
+            Assert.NotNull(dispatch.FinishedUtc);
+            Assert.Null(dispatch.Error);
+
+            var recipients = db.SubscriptionDispatchRecipients.OrderBy(r => r.Id).ToList();
+            Assert.Equal(2, recipients.Count);
+            Assert.All(recipients, r =>
+            {
+                Assert.Equal(dispatch.Id, r.DispatchId);
+                Assert.Equal(DispatchRecipientStatus.Sent, r.Status);
+                Assert.Equal(1, r.Attempts);
+                Assert.NotNull(r.SentUtc);
+                Assert.Null(r.Error);
+            });
+        }
+
         // Running again at the same instant: no longer due, nothing new sent.
         await _evaluator.RunOnceAsync(CancellationToken.None);
-        Assert.Single(_emails.Sent);
+        Assert.Equal(2, _emails.Sent.Count);
     }
 
     [Fact]
     public async Task CsvSubscriptionAttachesMergedCsv()
     {
-        AddSubscription(s => s.Format = SubscriptionFormat.Csv);
+        AddSubscription(s =>
+        {
+            s.Format = SubscriptionFormat.Csv;
+            s.Recipients = "ops@example.com";
+        });
         _executor.Rows = [["West", 120m]];
 
         await _evaluator.RunOnceAsync(CancellationToken.None);
@@ -238,6 +286,14 @@ public sealed class SchedulingEvaluatorTests : IDisposable
         Assert.Empty(_emails.Sent);
         Assert.Equal(0, _executor.Count);
         Assert.Equal(Now, Reload<SubscriptionRecord>(id).LastRunUtc); // recorded, not retried every tick
+
+        // The occurrence is history too: a 'skipped' dispatch row with the reason.
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ReconDashboardsDbContext>();
+        var dispatch = Assert.Single(db.SubscriptionDispatches.ToList());
+        Assert.Equal(DispatchStatus.Skipped, dispatch.Status);
+        Assert.Contains("no longer visible", dispatch.Error, StringComparison.Ordinal);
+        Assert.Empty(db.SubscriptionDispatchRecipients.ToList());
     }
 
     [Fact]

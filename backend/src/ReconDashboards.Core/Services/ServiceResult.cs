@@ -11,6 +11,9 @@ public enum ServiceErrorKind
     Validation,
     LimitExceeded,
 
+    /// <summary>The caller must wait for an in-flight operation (maps to 429), e.g. a concurrent manual send.</summary>
+    TooManyRequests,
+
     /// <summary>The downstream database failed or was unreachable (maps to 502).</summary>
     Upstream,
 }

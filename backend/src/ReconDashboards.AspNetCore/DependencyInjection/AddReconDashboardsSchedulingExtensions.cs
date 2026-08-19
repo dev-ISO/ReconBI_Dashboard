@@ -55,10 +55,14 @@ public static class AddReconDashboardsSchedulingExtensions
 /// <summary>
 /// Minute ticker for <see cref="SchedulingEvaluator"/>. The loop is strictly
 /// sequential and additionally guarded, so a slow evaluation can never overlap
-/// the next tick; failures are logged and never crash the host.
+/// the next tick; failures are logged and never crash the host. Each tick
+/// first runs dispatch housekeeping (drain due in-memory retries, close
+/// dispatches orphaned by a restart, daily 90-day history prune) so delivery
+/// state converges even when nothing new is due.
 /// </summary>
 internal sealed class RcdSchedulerService(
     SchedulingEvaluator evaluator,
+    SubscriptionDispatcher dispatcher,
     ILogger<RcdSchedulerService> logger) : BackgroundService
 {
     private int _running;
@@ -78,6 +82,8 @@ internal sealed class RcdSchedulerService(
 
                 try
                 {
+                    await dispatcher.ProcessDueRetriesAsync(stoppingToken);
+                    await dispatcher.RunMaintenanceAsync(stoppingToken);
                     await evaluator.RunOnceAsync(stoppingToken);
                 }
                 catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)

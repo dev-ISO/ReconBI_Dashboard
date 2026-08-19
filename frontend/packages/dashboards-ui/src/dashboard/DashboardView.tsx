@@ -92,6 +92,7 @@ import { relativePresetClause } from './relativeDate';
 import { SeeDataDialog, type SeeDataRequest } from './SeeDataDialog';
 import { SlicerTile } from './SlicerTile';
 import { SubscriptionsDialog } from './SubscriptionsDialog';
+import { SubscriptionsManager } from './SubscriptionsManager';
 import { TextTile } from './TextTile';
 
 /**
@@ -354,6 +355,7 @@ export function DashboardView({
   const [paramsOpen, setParamsOpen] = useState(false);
   /** Subscriptions dialog (view mode, ⋯ > Subscribe…). */
   const [subscribeOpen, setSubscribeOpen] = useState(false);
+  const [managerOpen, setManagerOpen] = useState(false);
   /** Share dialog (toolbar Share button; owner/admin). */
   const [shareOpen, setShareOpen] = useState(false);
   const closeShareDialog = useCallback(() => setShareOpen(false), []);
@@ -2357,6 +2359,16 @@ export function DashboardView({
         open={subscribeOpen}
         dashboardId={dashboardId}
         onClose={() => setSubscribeOpen(false)}
+        onError={setNotice}
+        onManageAll={() => {
+          setSubscribeOpen(false);
+          setManagerOpen(true);
+        }}
+      />
+
+      <SubscriptionsManager
+        open={managerOpen}
+        onClose={() => setManagerOpen(false)}
         onError={setNotice}
       />
 

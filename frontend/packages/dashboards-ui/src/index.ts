@@ -58,5 +58,7 @@ export { ModelListPanel } from './model-list/ModelListPanel';
 export type { ModelListPanelProps } from './model-list/ModelListPanel';
 export { ShareDialog } from './dashboard/ShareDialog';
 export type { ShareDialogProps } from './dashboard/ShareDialog';
+export { SubscriptionsManager } from './dashboard/SubscriptionsManager';
+export type { SubscriptionsManagerProps } from './dashboard/SubscriptionsManager';
 export { ActivityPanel } from './dashboard/ActivityPanel';
 export type { ActivityPanelProps } from './dashboard/ActivityPanel';

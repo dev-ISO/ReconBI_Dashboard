@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Mail, Pencil, Plus, Trash2 } from 'lucide-react';
+import { Mail, Pencil, Plus, Settings2, Trash2 } from 'lucide-react';
 import type {
   DashboardSubscription,
   SaveSubscriptionBody,
@@ -7,6 +7,7 @@ import type {
 } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+import { DeliveryBadge, EnabledToggle } from './deliveryBadge';
 
 export interface SubscriptionsDialogProps {
   open: boolean;
@@ -14,6 +15,12 @@ export interface SubscriptionsDialogProps {
   onClose: () => void;
   /** Failures surface through the dashboard's transient notice chip. */
   onError: (message: string) => void;
+  /**
+   * Renders a "Manage all…" link that closes this dialog and opens the
+   * Subscriptions & alerts manager. Optional: hosts/pages that never mount
+   * the manager simply omit it.
+   */
+  onManageAll?: () => void;
 }
 
 /** Splits a recipients textarea into trimmed, de-duplicated addresses. */
@@ -35,7 +42,7 @@ export const looksLikeEmail = (email: string): boolean => /^[^\s@]+@[^\s@]+\.[^\
 const INTERVAL_OPTIONS = [15, 30, 60, 240, 480, 1440];
 
 /** Editing-friendly shape; the wire shape is built by draftToWire on save. */
-interface SubscriptionDraft {
+export interface SubscriptionDraft {
   id: number | null;
   name: string;
   kind: SubscriptionScheduleKind;
@@ -64,7 +71,7 @@ const emptyDraft = (): SubscriptionDraft => ({
 const recipientList = (recipients: string): string[] =>
   recipients.split(';').map((email) => email.trim()).filter((email) => email !== '');
 
-const draftFrom = (subscription: DashboardSubscription): SubscriptionDraft => ({
+export const draftFrom = (subscription: DashboardSubscription): SubscriptionDraft => ({
   id: subscription.id,
   name: subscription.name,
   kind: subscription.scheduleKind,
@@ -97,7 +104,7 @@ export const draftToWire = (draft: SubscriptionDraft, dashboardId: number): Save
 
 const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-const scheduleSummary = (subscription: DashboardSubscription, zoneLabel: string): string => {
+export const scheduleSummary = (subscription: DashboardSubscription, zoneLabel: string): string => {
   if (subscription.scheduleKind === 'interval') return `Every ${subscription.intervalMinutes ?? '?'} min`;
   if (subscription.scheduleKind === 'daily')
     return `Daily at ${subscription.timeOfDayLocal ?? '?'} ${zoneLabel}`;
@@ -141,13 +148,20 @@ export const lastSentText = (lastRunUtc: string | null, zoneId: string, zoneLabe
  * with lite email validation, format, enabled). All I/O goes through the
  * typed DashboardsApi client; failures surface via the notice chip.
  */
-export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: SubscriptionsDialogProps) {
+export function SubscriptionsDialog({
+  open,
+  dashboardId,
+  onClose,
+  onError,
+  onManageAll,
+}: SubscriptionsDialogProps) {
   const runtime = useRuntime();
   const { scheduleTimeZoneId, scheduleTimeLabel } = runtime.options;
   const [subscriptions, setSubscriptions] = useState<DashboardSubscription[] | null>(null);
   const [draft, setDraft] = useState<SubscriptionDraft | null>(null);
   const [saving, setSaving] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<DashboardSubscription | null>(null);
+  const [togglingId, setTogglingId] = useState<number | null>(null);
 
   const load = useCallback(() => {
     runtime.api
@@ -196,6 +210,23 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
       load();
     } catch (error) {
       onError(`Could not delete the subscription: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  /** Backend-first toggle: flip, then re-render from the reload — the switch never lies. */
+  const handleToggle = async (subscription: DashboardSubscription, enabled: boolean) => {
+    setTogglingId(subscription.id);
+    try {
+      await runtime.api.setSubscriptionEnabled(subscription.id, enabled);
+      load();
+    } catch (error) {
+      onError(
+        `Could not ${enabled ? 'enable' : 'pause'} the subscription: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    } finally {
+      setTogglingId(null);
     }
   };
 
@@ -251,7 +282,20 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
                     {recipientCount === 1 ? '' : 's'} ·{' '}
                     {lastSentText(subscription.lastRunUtc, scheduleTimeZoneId, scheduleTimeLabel)}
                   </p>
+                  <p className="mt-0.5 truncate">
+                    <DeliveryBadge
+                      summary={subscription.lastDispatch}
+                      zoneId={scheduleTimeZoneId}
+                      zoneLabel={scheduleTimeLabel}
+                    />
+                  </p>
                 </div>
+                <EnabledToggle
+                  enabled={subscription.enabled}
+                  busy={togglingId === subscription.id}
+                  label={`${subscription.enabled ? 'Pause' : 'Enable'} subscription ${subscription.name}`}
+                  onChange={(enabled) => void handleToggle(subscription, enabled)}
+                />
                 <RcdIconButton
                   aria-label={`Edit subscription ${subscription.name}`}
                   title="Edit"
@@ -270,131 +314,25 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
               );
             })
           )}
-          <div>
+          <div className="flex items-center justify-between gap-2">
             <RcdButton onClick={() => setDraft(emptyDraft())}>
               <Plus size={14} />
               New subscription
             </RcdButton>
+            {onManageAll && (
+              <button
+                type="button"
+                className="inline-flex cursor-pointer items-center gap-1 text-xs text-rcd-text-2 underline-offset-2 hover:underline"
+                onClick={onManageAll}
+              >
+                <Settings2 size={12} />
+                Manage all…
+              </button>
+            )}
           </div>
         </div>
       ) : (
-        <div className="flex flex-col gap-3">
-          <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
-            Name
-            <RcdInput
-              value={draft.name}
-              onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-              placeholder="e.g. Monday morning report"
-            />
-          </label>
-
-          <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
-            Schedule
-            <div className="flex flex-wrap items-center gap-1.5">
-              <RcdSelect
-                aria-label="Schedule kind"
-                value={draft.kind}
-                onChange={(event) =>
-                  setDraft({ ...draft, kind: event.target.value as SubscriptionScheduleKind })
-                }
-              >
-                <option value="interval">Every N minutes</option>
-                <option value="daily">Daily</option>
-                <option value="weekly">Weekly</option>
-              </RcdSelect>
-              {draft.kind === 'interval' ? (
-                <RcdSelect
-                  aria-label="Interval minutes"
-                  value={String(draft.everyMinutes)}
-                  onChange={(event) => setDraft({ ...draft, everyMinutes: Number(event.target.value) })}
-                >
-                  {INTERVAL_OPTIONS.map((minutes) => (
-                    <option key={minutes} value={String(minutes)}>
-                      Every {minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`}
-                    </option>
-                  ))}
-                </RcdSelect>
-              ) : (
-                <>
-                  {draft.kind === 'weekly' && (
-                    <RcdSelect
-                      aria-label="Day of week"
-                      value={String(draft.dayOfWeek)}
-                      onChange={(event) => setDraft({ ...draft, dayOfWeek: Number(event.target.value) })}
-                    >
-                      {DAYS.map((day, index) => (
-                        <option key={day} value={String(index)}>
-                          {day}
-                        </option>
-                      ))}
-                    </RcdSelect>
-                  )}
-                  <RcdInput
-                    type="time"
-                    aria-label={`Send time (${scheduleTimeLabel})`}
-                    value={draft.timeLocal}
-                    onChange={(event) => setDraft({ ...draft, timeLocal: event.target.value })}
-                  />
-                  <span className="text-xs text-rcd-muted">{scheduleTimeLabel}</span>
-                </>
-              )}
-            </div>
-          </div>
-
-          <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
-            Recipients
-            <textarea
-              value={draft.recipientsText}
-              onChange={(event) => setDraft({ ...draft, recipientsText: event.target.value })}
-              placeholder="one@example.com, two@example.com"
-              rows={3}
-              className="rounded-lg border border-rcd-border bg-rcd-surface px-3 py-1.5 text-sm text-rcd-text shadow-[var(--rcd-shadow-1)] outline-none transition-[border-color,box-shadow] placeholder:text-rcd-muted focus:border-[var(--rcd-accent-interactive)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent-interactive)_20%,transparent)]"
-            />
-            {recipients.length > 0 && (
-              <span className="flex flex-wrap gap-1">
-                {recipients.map((email) => (
-                  <span
-                    key={email}
-                    className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium ${
-                      looksLikeEmail(email)
-                        ? 'border-rcd-border text-rcd-text-2'
-                        : 'border-[var(--rcd-status-critical)] text-[var(--rcd-status-critical)]'
-                    }`}
-                  >
-                    {email}
-                  </span>
-                ))}
-              </span>
-            )}
-            {invalidRecipients.length > 0 && (
-              <span className="text-xs text-[var(--rcd-status-critical)]">
-                These don&apos;t look like email addresses: {invalidRecipients.join(', ')}
-              </span>
-            )}
-          </label>
-
-          <div className="flex items-center gap-4">
-            <label className="flex items-center gap-1.5 text-sm text-rcd-text-2">
-              Format
-              <RcdSelect
-                value={draft.format}
-                onChange={(event) => setDraft({ ...draft, format: event.target.value as 'html' | 'csv' })}
-              >
-                <option value="html">HTML</option>
-                <option value="csv">CSV</option>
-              </RcdSelect>
-            </label>
-            <label className="flex cursor-pointer items-center gap-1.5 text-sm text-rcd-text">
-              <input
-                type="checkbox"
-                className="accent-[var(--rcd-accent)]"
-                checked={draft.enabled}
-                onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
-              />
-              Enabled
-            </label>
-          </div>
-        </div>
+        <SubscriptionForm draft={draft} setDraft={setDraft} scheduleTimeLabel={scheduleTimeLabel} />
       )}
 
       <ConfirmDialog
@@ -409,6 +347,215 @@ export function SubscriptionsDialog({ open, dashboardId, onClose, onError }: Sub
         }}
         onCancel={() => setConfirmDelete(null)}
       />
+    </RcdDialog>
+  );
+}
+
+/**
+ * The subscription create/edit form, extracted so the Subscriptions & alerts
+ * manager can edit any subscription through the EXACT same fields and
+ * validation as the per-dashboard dialog (spec: "Edit opens the existing
+ * dialog prefilled").
+ */
+export function SubscriptionForm({
+  draft,
+  setDraft,
+  scheduleTimeLabel,
+}: {
+  draft: SubscriptionDraft;
+  setDraft: (draft: SubscriptionDraft) => void;
+  scheduleTimeLabel: string;
+}) {
+  const recipients = parseRecipients(draft.recipientsText);
+  const invalidRecipients = recipients.filter((email) => !looksLikeEmail(email));
+  return (
+    <div className="flex flex-col gap-3">
+      <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+        Name
+        <RcdInput
+          value={draft.name}
+          onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+          placeholder="e.g. Monday morning report"
+        />
+      </label>
+
+      <div className="flex flex-col gap-1 text-sm text-rcd-text-2">
+        Schedule
+        <div className="flex flex-wrap items-center gap-1.5">
+          <RcdSelect
+            aria-label="Schedule kind"
+            value={draft.kind}
+            onChange={(event) =>
+              setDraft({ ...draft, kind: event.target.value as SubscriptionScheduleKind })
+            }
+          >
+            <option value="interval">Every N minutes</option>
+            <option value="daily">Daily</option>
+            <option value="weekly">Weekly</option>
+          </RcdSelect>
+          {draft.kind === 'interval' ? (
+            <RcdSelect
+              aria-label="Interval minutes"
+              value={String(draft.everyMinutes)}
+              onChange={(event) => setDraft({ ...draft, everyMinutes: Number(event.target.value) })}
+            >
+              {INTERVAL_OPTIONS.map((minutes) => (
+                <option key={minutes} value={String(minutes)}>
+                  Every {minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`}
+                </option>
+              ))}
+            </RcdSelect>
+          ) : (
+            <>
+              {draft.kind === 'weekly' && (
+                <RcdSelect
+                  aria-label="Day of week"
+                  value={String(draft.dayOfWeek)}
+                  onChange={(event) => setDraft({ ...draft, dayOfWeek: Number(event.target.value) })}
+                >
+                  {DAYS.map((day, index) => (
+                    <option key={day} value={String(index)}>
+                      {day}
+                    </option>
+                  ))}
+                </RcdSelect>
+              )}
+              <RcdInput
+                type="time"
+                aria-label={`Send time (${scheduleTimeLabel})`}
+                value={draft.timeLocal}
+                onChange={(event) => setDraft({ ...draft, timeLocal: event.target.value })}
+              />
+              <span className="text-xs text-rcd-muted">{scheduleTimeLabel}</span>
+            </>
+          )}
+        </div>
+      </div>
+
+      <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
+        Recipients
+        <textarea
+          value={draft.recipientsText}
+          onChange={(event) => setDraft({ ...draft, recipientsText: event.target.value })}
+          placeholder="one@example.com, two@example.com"
+          rows={3}
+          className="rounded-lg border border-rcd-border bg-rcd-surface px-3 py-1.5 text-sm text-rcd-text shadow-[var(--rcd-shadow-1)] outline-none transition-[border-color,box-shadow] placeholder:text-rcd-muted focus:border-[var(--rcd-accent-interactive)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent-interactive)_20%,transparent)]"
+        />
+        {recipients.length > 0 && (
+          <span className="flex flex-wrap gap-1">
+            {recipients.map((email) => (
+              <span
+                key={email}
+                className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium ${
+                  looksLikeEmail(email)
+                    ? 'border-rcd-border text-rcd-text-2'
+                    : 'border-[var(--rcd-status-critical)] text-[var(--rcd-status-critical)]'
+                }`}
+              >
+                {email}
+              </span>
+            ))}
+          </span>
+        )}
+        {invalidRecipients.length > 0 && (
+          <span className="text-xs text-[var(--rcd-status-critical)]">
+            These don&apos;t look like email addresses: {invalidRecipients.join(', ')}
+          </span>
+        )}
+      </label>
+
+      <div className="flex items-center gap-4">
+        <label className="flex items-center gap-1.5 text-sm text-rcd-text-2">
+          Format
+          <RcdSelect
+            value={draft.format}
+            onChange={(event) => setDraft({ ...draft, format: event.target.value as 'html' | 'csv' })}
+          >
+            <option value="html">HTML</option>
+            <option value="csv">CSV</option>
+          </RcdSelect>
+        </label>
+        <label className="flex cursor-pointer items-center gap-1.5 text-sm text-rcd-text">
+          <input
+            type="checkbox"
+            className="accent-[var(--rcd-accent)]"
+            checked={draft.enabled}
+            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+          />
+          Enabled
+        </label>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Standalone editor dialog for ONE subscription — the manager's Edit action.
+ * Same form, same draftToWire save contract as the per-dashboard dialog; the
+ * dashboardId comes from the subscription row (the manager spans dashboards).
+ */
+export function SubscriptionEditorDialog({
+  open,
+  subscription,
+  onClose,
+  onSaved,
+  onError,
+}: {
+  open: boolean;
+  subscription: DashboardSubscription | null;
+  onClose: () => void;
+  /** Called after a successful save so the manager can refresh its table. */
+  onSaved: () => void;
+  onError: (message: string) => void;
+}) {
+  const runtime = useRuntime();
+  const { scheduleTimeLabel } = runtime.options;
+  const [draft, setDraft] = useState<SubscriptionDraft | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setDraft(open && subscription ? draftFrom(subscription) : null);
+    setSaving(false);
+  }, [open, subscription]);
+
+  const recipients = draft ? parseRecipients(draft.recipientsText) : [];
+  const invalidRecipients = recipients.filter((email) => !looksLikeEmail(email));
+  const canSave =
+    draft !== null && draft.name.trim() !== '' && recipients.length > 0 && invalidRecipients.length === 0;
+
+  const handleSave = async () => {
+    if (!draft || draft.id === null || !subscription || !canSave || saving) return;
+    setSaving(true);
+    try {
+      await runtime.api.updateSubscription(draft.id, draftToWire(draft, subscription.dashboardId));
+      onSaved();
+      onClose();
+    } catch (error) {
+      onError(`Could not save the subscription: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <RcdDialog
+      title="Edit subscription"
+      open={open}
+      onClose={onClose}
+      footer={
+        <>
+          <RcdButton onClick={onClose} disabled={saving}>
+            Cancel
+          </RcdButton>
+          <RcdButton variant="primary" disabled={!canSave || saving} onClick={() => void handleSave()}>
+            {saving ? 'Saving…' : 'Save subscription'}
+          </RcdButton>
+        </>
+      }
+    >
+      {draft !== null && (
+        <SubscriptionForm draft={draft} setDraft={setDraft} scheduleTimeLabel={scheduleTimeLabel} />
+      )}
     </RcdDialog>
   );
 }

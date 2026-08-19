@@ -22,7 +22,24 @@ import type {
   RcdUser,
   SaveAlertBody,
   SaveSubscriptionBody,
+  SubscriptionDispatch,
+  SubscriptionOptOut,
 } from '../types/dashboard';
+
+/** GET /meta — version, effective limits, and the caller's admin standing. */
+export interface RcdMeta {
+  version: string;
+  maxRows: number;
+  maxJoins: number;
+  maxDimensions: number;
+  maxMeasures: number;
+  maxFilters: number;
+  maxDistinctValues: number;
+  maxModelDefinitionBytes: number;
+  maxDashboardLayoutBytes: number;
+  /** True when the caller may manage shared resources (admin scope switch). */
+  canManageShared: boolean;
+}
 
 export interface SaveModelBody {
   name: string;
@@ -297,12 +314,74 @@ export class DashboardsApi {
     return this.fetcher(this.url(`/users${suffix}`), { signal });
   }
 
+  /**
+   * Library version, effective limits, and the caller's manage-shared
+   * standing (drives the subscription manager's Mine/All admin switch).
+   */
+  getMeta(signal?: AbortSignal): Promise<RcdMeta> {
+    return this.fetcher(this.url('/meta'), { signal });
+  }
+
   /* --------------------------------------------------- email subscriptions */
 
   /** My subscriptions, optionally scoped to one dashboard. */
   listSubscriptions(dashboardId?: number, signal?: AbortSignal): Promise<DashboardSubscription[]> {
     const suffix = dashboardId === undefined ? '' : `?dashboardId=${dashboardId}`;
     return this.fetcher(this.url(`/subscriptions${suffix}`), { signal });
+  }
+
+  /** EVERY user's subscriptions — admin (manage-shared) only; 403 otherwise. */
+  listAllSubscriptions(signal?: AbortSignal): Promise<DashboardSubscription[]> {
+    return this.fetcher(this.url('/subscriptions?scope=all'), { signal });
+  }
+
+  /** One-click pause/resume; owner or admin. */
+  setSubscriptionEnabled(id: number, enabled: boolean): Promise<DashboardSubscription> {
+    return this.fetcher(this.url(`/subscriptions/${id}/enabled`), {
+      method: 'POST',
+      body: { enabled },
+    });
+  }
+
+  /**
+   * Starts a manual dispatch through the same pipeline as scheduled sends.
+   * 429 (rcd.subscription.send_in_progress) while one is already running.
+   */
+  sendSubscriptionNow(id: number): Promise<{ dispatchId: number }> {
+    return this.fetcher(this.url(`/subscriptions/${id}/send-now`), { method: 'POST' });
+  }
+
+  /** Delivery history, newest first, with per-recipient rows; owner or admin. */
+  listSubscriptionDispatches(
+    id: number,
+    limit = 20,
+    signal?: AbortSignal,
+  ): Promise<SubscriptionDispatch[]> {
+    return this.fetcher(this.url(`/subscriptions/${id}/dispatches?limit=${limit}`), { signal });
+  }
+
+  /** Per-subscription opt-outs; owner or admin. */
+  listSubscriptionOptOuts(id: number, signal?: AbortSignal): Promise<SubscriptionOptOut[]> {
+    return this.fetcher(this.url(`/subscriptions/${id}/optouts`), { signal });
+  }
+
+  /** Clears one opt-out so the address receives this subscription again. */
+  clearSubscriptionOptOut(id: number, email: string): Promise<void> {
+    return this.fetcher(this.url(`/subscriptions/${id}/optouts/${encodeURIComponent(email)}`), {
+      method: 'DELETE',
+    });
+  }
+
+  /** Global suppressions (every subscription email); admin only. */
+  listGlobalOptOuts(signal?: AbortSignal): Promise<SubscriptionOptOut[]> {
+    return this.fetcher(this.url('/subscriptions/optouts/global'), { signal });
+  }
+
+  /** Clears one global suppression; admin only. */
+  clearGlobalOptOut(email: string): Promise<void> {
+    return this.fetcher(this.url(`/subscriptions/optouts/global/${encodeURIComponent(email)}`), {
+      method: 'DELETE',
+    });
   }
 
   createSubscription(body: SaveSubscriptionBody): Promise<DashboardSubscription> {
@@ -323,6 +402,16 @@ export class DashboardsApi {
   listAlerts(dashboardId?: number, signal?: AbortSignal): Promise<DashboardAlert[]> {
     const suffix = dashboardId === undefined ? '' : `?dashboardId=${dashboardId}`;
     return this.fetcher(this.url(`/alerts${suffix}`), { signal });
+  }
+
+  /** EVERY user's alerts — admin (manage-shared) only; 403 otherwise. */
+  listAllAlerts(signal?: AbortSignal): Promise<DashboardAlert[]> {
+    return this.fetcher(this.url('/alerts?scope=all'), { signal });
+  }
+
+  /** One-click pause/resume; owner or admin. */
+  setAlertEnabled(id: number, enabled: boolean): Promise<DashboardAlert> {
+    return this.fetcher(this.url(`/alerts/${id}/enabled`), { method: 'POST', body: { enabled } });
   }
 
   createAlert(body: SaveAlertBody): Promise<DashboardAlert> {

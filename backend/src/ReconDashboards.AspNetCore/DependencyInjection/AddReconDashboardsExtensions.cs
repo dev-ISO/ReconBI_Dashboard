@@ -13,6 +13,7 @@ using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
 using ReconDashboards.Core.Querying.Execution;
+using ReconDashboards.Core.Scheduling;
 using ReconDashboards.Core.Services;
 
 namespace ReconDashboards.AspNetCore.DependencyInjection;
@@ -70,6 +71,14 @@ public static class AddReconDashboardsExtensions
         services.TryAddSingleton(TimeProvider.System);
         // Host-overridable: a later AddScoped/AddSingleton<IUserDirectory> wins.
         services.TryAddSingleton<IUserDirectory, NullUserDirectory>();
+        // Same seam pattern for the dispatch notifiers: no-op defaults here,
+        // hosts register their SignalR/bell bridges after this call and win.
+        services.TryAddSingleton<IRcdDispatchProgressNotifier, NullRcdDispatchProgressNotifier>();
+        services.TryAddSingleton<IRcdDeliveryFailureNotifier, NullRcdDeliveryFailureNotifier>();
+        // The dispatcher lives HERE (not in AddReconDashboardsScheduling):
+        // send-now must work on hosts that never enable the background
+        // scheduler, and its retry queue/manual guard are process state.
+        services.TryAddSingleton<SubscriptionDispatcher>();
         services.AddScoped<DataModelService>();
         services.AddScoped<DashboardService>();
         services.AddScoped<ChartQueryService>();
@@ -79,7 +88,8 @@ public static class AddReconDashboardsExtensions
             sp.GetRequiredService<ICurrentUserProvider>(),
             sp.GetRequiredService<DataModelService>(),
             sp,
-            sp.GetRequiredService<TimeProvider>()));
+            sp.GetRequiredService<TimeProvider>(),
+            sp.GetRequiredService<IUserDirectory>()));
 
         // Per-user token bucket for query endpoints. Takes effect when the host
         // pipeline calls UseRateLimiter() (both production hosts already do).

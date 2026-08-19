@@ -180,6 +180,150 @@ public sealed class AlertRecord
     public DateTime CreatedUtc { get; set; }
 }
 
+/// <summary>What started a dispatch. Wire names: "schedule", "manual".</summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<DispatchTrigger>))]
+public enum DispatchTrigger
+{
+    /// <summary>The minute scheduler found the subscription due.</summary>
+    Schedule = 0,
+
+    /// <summary>A user clicked Send now (RequestedBy records who).</summary>
+    Manual = 1,
+}
+
+/// <summary>
+/// Occurrence-level outcome of a dispatch. Wire names: "running", "sent",
+/// "partial", "failed", "skipped".
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<DispatchStatus>))]
+public enum DispatchStatus
+{
+    /// <summary>Recipients still pending (first pass or in-process retries).</summary>
+    Running = 0,
+
+    /// <summary>Every attempted recipient was delivered (opt-outs do not count against this).</summary>
+    Sent = 1,
+
+    /// <summary>Some recipients delivered, some exhausted their retries.</summary>
+    Partial = 2,
+
+    /// <summary>No recipient could be delivered, or the occurrence-level render failed.</summary>
+    Failed = 3,
+
+    /// <summary>Nothing was attempted (dashboard gone/not visible to owner, no model, no recipients) — reason in Error.</summary>
+    Skipped = 4,
+}
+
+/// <summary>
+/// Per-recipient outcome inside one dispatch. Wire names: "pending", "sent",
+/// "failed", "optedOut". Pending exists beyond the design sketch because the
+/// open-tracking pixel signs the RECIPIENT ROW id — the row must exist before
+/// the email is built — and because the manager UI polls recipient rows while
+/// a send is still running/retrying.
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<DispatchRecipientStatus>))]
+public enum DispatchRecipientStatus
+{
+    /// <summary>Send in flight or awaiting an in-process retry.</summary>
+    Pending = 0,
+
+    Sent = 1,
+
+    /// <summary>All (up to 3) attempts failed; Error holds the last failure.</summary>
+    Failed = 2,
+
+    /// <summary>Matched an opt-out row (per-subscription or global); never attempted.</summary>
+    OptedOut = 3,
+}
+
+/// <summary>
+/// rcd_subscription_dispatches — one row per delivery occurrence (scheduled or
+/// manual send-now) per subscription; the audit truth for "did it send".
+/// Deliberately NO foreign key to rcd_subscriptions: history must survive
+/// subscription deletion, so SubscriptionName is snapshotted (same pattern as
+/// the tracker's NotificationDelivery copying Title). LastRunUtc on the
+/// subscription stays the scheduler's due-math cache only.
+/// </summary>
+public sealed class SubscriptionDispatchRecord
+{
+    public long Id { get; set; }
+    public int SubscriptionId { get; set; }
+
+    /// <summary>Snapshot of the subscription's name at dispatch time.</summary>
+    public string SubscriptionName { get; set; } = "";
+
+    /// <summary>
+    /// Snapshot of the subscription's owner. Not in the design sketch, but the
+    /// close-time notifier seams target the OWNER and history must remain
+    /// readable (and attributable) after the subscription row is deleted —
+    /// the same reason SubscriptionName is snapshotted.
+    /// </summary>
+    public string OwnerUserId { get; set; } = "";
+
+    public int DashboardId { get; set; }
+    public DispatchTrigger Trigger { get; set; }
+
+    /// <summary>Opaque user id for manual sends; null for scheduled runs.</summary>
+    public string? RequestedBy { get; set; }
+
+    public DateTime StartedUtc { get; set; }
+    public DateTime? FinishedUtc { get; set; }
+    public DispatchStatus Status { get; set; }
+
+    /// <summary>Occurrence-level error (render failure, skip reason); per-recipient errors live on the recipient rows.</summary>
+    public string? Error { get; set; }
+}
+
+/// <summary>
+/// rcd_subscription_dispatch_recipients — one row per recipient per dispatch.
+/// OpenedUtc/OpenCount come from the tracking pixel and are inherently
+/// approximate (image proxies, blocked images, Cloudflare Access in front of
+/// the app) — surfaced as "Opened (approximate)", never as a read receipt.
+/// </summary>
+public sealed class SubscriptionDispatchRecipientRecord
+{
+    public long Id { get; set; }
+    public long DispatchId { get; set; }
+    public string Email { get; set; } = "";
+    public DispatchRecipientStatus Status { get; set; }
+
+    /// <summary>Send attempts so far (0 for opted-out recipients; max 3).</summary>
+    public int Attempts { get; set; }
+
+    /// <summary>Last attempt's failure message; null once sent.</summary>
+    public string? Error { get; set; }
+
+    public DateTime? SentUtc { get; set; }
+
+    /// <summary>First pixel hit; later hits only increment OpenCount.</summary>
+    public DateTime? OpenedUtc { get; set; }
+
+    public int OpenCount { get; set; }
+}
+
+/// <summary>
+/// rcd_subscription_optouts — per-subscription recipient opt-outs (the
+/// unsubscribe target). Composite key: one row per (SubscriptionId, Email).
+/// Emails are stored lower-cased so matching is case-insensitive.
+/// </summary>
+public sealed class SubscriptionOptOutRecord
+{
+    public int SubscriptionId { get; set; }
+    public string Email { get; set; } = "";
+    public DateTime OptedOutUtc { get; set; }
+}
+
+/// <summary>
+/// rcd_global_optouts — suppresses an address from EVERY dashboard
+/// subscription email (checked before the per-subscription table). Clearing
+/// is admin-only. Emails are stored lower-cased.
+/// </summary>
+public sealed class GlobalOptOutRecord
+{
+    public string Email { get; set; } = "";
+    public DateTime OptedOutUtc { get; set; }
+}
+
 /// <summary>rcd_query_audit — written only when EnableQueryAudit; retention is host-driven.</summary>
 public sealed class QueryAuditRecord
 {

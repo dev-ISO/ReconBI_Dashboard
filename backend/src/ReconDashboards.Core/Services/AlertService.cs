@@ -33,7 +33,9 @@ public sealed record AlertDetail(
     DateTime? LastEvaluatedUtc,
     DateTime? LastFiredUtc,
     decimal? LastValue,
-    DateTime CreatedUtc);
+    DateTime CreatedUtc,
+    string OwnerUserId,
+    string? OwnerDisplayName);
 
 public sealed record AlertTestResult(decimal? Value, bool WouldFire);
 
@@ -59,24 +61,72 @@ public sealed class AlertService(
     ICurrentUserProvider currentUser,
     DataModelService models,
     IServiceProvider scopeServices,
-    TimeProvider timeProvider)
+    TimeProvider timeProvider,
+    IUserDirectory userDirectory)
 {
     /// <summary>Minimum evaluation cadence in minutes.</summary>
     public const int MinEveryMinutes = 5;
 
     private static readonly JsonSerializerOptions SpecJsonOptions = new(JsonSerializerDefaults.Web);
 
-    public async Task<IReadOnlyList<AlertDetail>> ListMineAsync(int? dashboardId, CancellationToken ct)
+    /// <summary>
+    /// scope=mine (default): the caller's alerts. scope=all: every alert,
+    /// admin-only (CanManageShared), with owner display names via
+    /// IUserDirectory — the same shape SubscriptionService.ListAsync has.
+    /// </summary>
+    public async Task<ServiceResult<IReadOnlyList<AlertDetail>>> ListAsync(
+        bool allScope, int? dashboardId, CancellationToken ct)
     {
         var userId = currentUser.GetUserId();
-        var query = db.Alerts.AsNoTracking().Where(a => a.OwnerUserId == userId);
+        if (allScope && !currentUser.CanManageShared)
+        {
+            return ServiceResult<IReadOnlyList<AlertDetail>>.Fail(
+                ServiceErrorKind.Forbidden, "rcd.alert.admin_required",
+                "Viewing all users' alerts requires manage-shared rights.");
+        }
+
+        var query = db.Alerts.AsNoTracking();
+        if (!allScope)
+        {
+            query = query.Where(a => a.OwnerUserId == userId);
+        }
+
         if (dashboardId is { } id)
         {
             query = query.Where(a => a.DashboardId == id);
         }
 
         var records = await query.OrderBy(a => a.Name).ToListAsync(ct);
-        return records.Select(r => Materialize(r, userId)).ToArray();
+        var owners = allScope
+            ? await userDirectory.ResolveAsync(records.Select(r => r.OwnerUserId).Distinct(), ct)
+            : null;
+        return ServiceResult<IReadOnlyList<AlertDetail>>.Ok(records
+            .Select(r => Materialize(
+                r, userId,
+                owners is not null && owners.TryGetValue(r.OwnerUserId, out var info) ? info.DisplayName : null))
+            .ToArray());
+    }
+
+    /// <summary>Kept for the per-dashboard alert list (mine-only, never fails).</summary>
+    public async Task<IReadOnlyList<AlertDetail>> ListMineAsync(int? dashboardId, CancellationToken ct)
+    {
+        var result = await ListAsync(allScope: false, dashboardId, ct);
+        return result.Value!;
+    }
+
+    /// <summary>One-click pause/resume, owner-or-admin — same contract as subscriptions.</summary>
+    public async Task<ServiceResult<AlertDetail>> SetEnabledAsync(int id, bool enabled, CancellationToken ct)
+    {
+        var userId = currentUser.GetUserId();
+        var record = await db.Alerts.FirstOrDefaultAsync(a => a.Id == id, ct);
+        if (record is null || (record.OwnerUserId != userId && !currentUser.CanManageShared))
+        {
+            return NotFound<AlertDetail>(id);
+        }
+
+        record.Enabled = enabled;
+        await db.SaveChangesAsync(ct);
+        return ServiceResult<AlertDetail>.Ok(Materialize(record, userId));
     }
 
     public async Task<ServiceResult<AlertDetail>> CreateAsync(AlertSaveRequest request, CancellationToken ct)
@@ -282,14 +332,14 @@ public sealed class AlertService(
         return null;
     }
 
-    private static AlertDetail Materialize(AlertRecord record, string userId)
+    private static AlertDetail Materialize(AlertRecord record, string userId, string? ownerDisplayName = null)
     {
         using var doc = JsonDocument.Parse(record.SpecJson);
         return new AlertDetail(
             record.Id, record.Name, record.DashboardId, doc.RootElement.Clone(), record.Operator,
             record.Threshold, record.Recipients, record.EveryMinutes, record.CooldownMinutes,
             record.Enabled, record.OwnerUserId == userId, record.LastEvaluatedUtc, record.LastFiredUtc,
-            record.LastValue, record.CreatedUtc);
+            record.LastValue, record.CreatedUtc, record.OwnerUserId, ownerDisplayName);
     }
 
     private static ServiceResult<T> NotFound<T>(int id) =>

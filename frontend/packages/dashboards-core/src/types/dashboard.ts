@@ -745,13 +745,134 @@ export interface DashboardSubscription {
   /** ISO instant of the last send; null = never sent. */
   lastRunUtc: string | null;
   createdUtc: string;
+  /** Opaque host user id of the owner. */
+  ownerUserId: string;
+  /** Owner display name via the host's IUserDirectory; only populated on scope=all listings. */
+  ownerDisplayName?: string | null;
+  /** Latest dispatch roll-up for the "Last delivery" badge; null = never dispatched. */
+  lastDispatch?: SubscriptionDispatchSummary | null;
 }
 
 /** Create/update body (id + read-only response fields are server-assigned). */
 export type SaveSubscriptionBody = Omit<
   DashboardSubscription,
-  'id' | 'ownerIsMe' | 'lastRunUtc' | 'createdUtc'
+  | 'id'
+  | 'ownerIsMe'
+  | 'lastRunUtc'
+  | 'createdUtc'
+  | 'ownerUserId'
+  | 'ownerDisplayName'
+  | 'lastDispatch'
 >;
+
+/* --------------------------------------------------- dispatches (delivery)
+ * Wire mirrors of subscriptions/{id}/dispatches and the live-progress event
+ * the host may forward over its own socket (runtime.dashboards.
+ * applyDispatchProgress). Every send — scheduled or send-now — writes one
+ * dispatch row plus a row per recipient; open tracking is pixel-based and
+ * inherently APPROXIMATE (mail clients proxy/block images), which is why the
+ * UI labels it "Opened (approximate)".
+ */
+
+export type DispatchTrigger = 'schedule' | 'manual';
+
+export type DispatchStatus = 'running' | 'sent' | 'partial' | 'failed' | 'skipped';
+
+/** 'pending' = in flight or awaiting an in-process retry (max 3 attempts). */
+export type DispatchRecipientStatus = 'pending' | 'sent' | 'failed' | 'optedOut';
+
+export interface SubscriptionDispatchSummary {
+  dispatchId: number;
+  status: DispatchStatus;
+  trigger: DispatchTrigger;
+  startedUtc: string;
+  finishedUtc: string | null;
+  /** Occurrence-level error (render failure / skip reason). */
+  error: string | null;
+  sentCount: number;
+  failedCount: number;
+  optedOutCount: number;
+  pendingCount: number;
+}
+
+export interface SubscriptionDispatchRecipient {
+  id: number;
+  email: string;
+  status: DispatchRecipientStatus;
+  attempts: number;
+  error: string | null;
+  sentUtc: string | null;
+  /** First open-pixel hit; approximate by nature. */
+  openedUtc: string | null;
+  openCount: number;
+}
+
+export interface SubscriptionDispatch {
+  id: number;
+  subscriptionId: number;
+  /** Name snapshot — survives subscription deletion. */
+  subscriptionName: string;
+  dashboardId: number;
+  trigger: DispatchTrigger;
+  /** User id for manual sends; null for scheduled runs. */
+  requestedBy: string | null;
+  startedUtc: string;
+  finishedUtc: string | null;
+  status: DispatchStatus;
+  error: string | null;
+  recipients: SubscriptionDispatchRecipient[];
+}
+
+/** One opt-out row (per-subscription or global; emails stored lower-cased). */
+export interface SubscriptionOptOut {
+  email: string;
+  optedOutUtc: string;
+}
+
+/* ------------------------------------------------ live dispatch progress
+ * The payload contract for the host's realtime bridge. The library never
+ * owns a socket: hosts receive IRcdDispatchProgressNotifier calls on the
+ * backend, forward ONE event stream to the owner's browser, and call
+ * runtime.dashboards.applyDispatchProgress(event) with these shapes. UIs
+ * that never receive events fall back to polling the dispatches endpoint.
+ */
+
+export interface DispatchProgressStarted {
+  kind: 'started';
+  dispatchId: number;
+  subscriptionId: number;
+  subscriptionName: string;
+  trigger: DispatchTrigger;
+  recipientCount: number;
+  startedUtc: string;
+}
+
+export interface DispatchProgressRecipient {
+  kind: 'recipient';
+  dispatchId: number;
+  subscriptionId: number;
+  email: string;
+  status: DispatchRecipientStatus;
+  attempts: number;
+  error: string | null;
+}
+
+export interface DispatchProgressFinished {
+  kind: 'finished';
+  dispatchId: number;
+  subscriptionId: number;
+  status: DispatchStatus;
+  sentCount: number;
+  failedCount: number;
+  optedOutCount: number;
+  error: string | null;
+  finishedUtc: string;
+}
+
+export type DispatchProgressEvent =
+  | DispatchProgressStarted
+  | DispatchProgressRecipient
+  | DispatchProgressFinished;
 
 export type AlertOperator = 'gt' | 'gte' | 'lt' | 'lte' | 'eq';
 
@@ -776,12 +897,23 @@ export interface DashboardAlert {
   lastFiredUtc?: string | null;
   lastValue?: number | null;
   createdUtc?: string;
+  /** Opaque host user id of the owner. */
+  ownerUserId?: string;
+  /** Owner display name; only populated on scope=all listings. */
+  ownerDisplayName?: string | null;
 }
 
 /** Create/update body (id + read-only response fields are server-assigned). */
 export type SaveAlertBody = Omit<
   DashboardAlert,
-  'id' | 'ownerIsMe' | 'lastEvaluatedUtc' | 'lastFiredUtc' | 'lastValue' | 'createdUtc'
+  | 'id'
+  | 'ownerIsMe'
+  | 'lastEvaluatedUtc'
+  | 'lastFiredUtc'
+  | 'lastValue'
+  | 'createdUtc'
+  | 'ownerUserId'
+  | 'ownerDisplayName'
 >;
 
 /** POST alerts/{id}/test → the current value and whether it would fire. */
@@ -790,12 +922,15 @@ export interface AlertTestResult {
   wouldFire: boolean;
 }
 
-/** One row of GET alerts/recent-firings. */
+/** One row of GET alerts/recent-firings. Field names mirror the backend's
+ * AlertFiringResponse exactly — the previous `alertName` never existed on the
+ * wire (the toolbar rendered undefined for every firing). */
 export interface AlertFiring {
   alertId: number;
-  alertName: string;
+  name: string;
   dashboardId?: number | null;
   firedAtUtc: string;
   value: number | null;
+  operator: AlertOperator;
   threshold: number;
 }

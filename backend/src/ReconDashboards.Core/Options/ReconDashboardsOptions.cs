@@ -79,6 +79,29 @@ public sealed class ReconDashboardsOptions
     public bool IncludeSqlInResponse { get; set; }
 
     /// <summary>
+    /// Server-side secret for the HMAC-SHA256 unsubscribe and open-tracking
+    /// tokens (any long random string; hosts thread it from an env var such as
+    /// RCD_UNSUBSCRIBE_SECRET). The tokens are self-authenticating — no login
+    /// identity — so this secret is the only thing standing between a URL and
+    /// an opt-out/open write. When this OR <see cref="PublicBaseUrl"/> is
+    /// unset, subscription emails simply omit the unsubscribe footer and the
+    /// tracking pixel; nothing else degrades and no broken links are ever
+    /// emitted. The anonymous endpoints also refuse all tokens (404 page /
+    /// blind pixel) so a missing secret can never be probed.
+    /// </summary>
+    public string? UnsubscribeSecret { get; set; }
+
+    /// <summary>
+    /// Absolute public origin the app is reachable at from a mail client
+    /// (e.g. the Cloudflare tunnel URL, no trailing slash needed). Used ONLY
+    /// to build unsubscribe links and open-pixel URLs in outbound email —
+    /// the API itself never redirects to it. When this OR
+    /// <see cref="UnsubscribeSecret"/> is unset, emails omit the footer and
+    /// pixel gracefully (see UnsubscribeSecret).
+    /// </summary>
+    public string? PublicBaseUrl { get; set; }
+
+    /// <summary>
     /// Configures the library-owned storage context (rcd_ tables). The host
     /// decides provider and connection, e.g. o => o.UseNpgsql(conn,
     /// n => n.MigrationsAssembly("ReconDashboards.Postgres")).

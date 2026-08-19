@@ -23,6 +23,11 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
     public DbSet<QueryAuditRecord> QueryAudit => Set<QueryAuditRecord>();
     public DbSet<SubscriptionRecord> Subscriptions => Set<SubscriptionRecord>();
     public DbSet<AlertRecord> Alerts => Set<AlertRecord>();
+    public DbSet<SubscriptionDispatchRecord> SubscriptionDispatches => Set<SubscriptionDispatchRecord>();
+    public DbSet<SubscriptionDispatchRecipientRecord> SubscriptionDispatchRecipients =>
+        Set<SubscriptionDispatchRecipientRecord>();
+    public DbSet<SubscriptionOptOutRecord> SubscriptionOptOuts => Set<SubscriptionOptOutRecord>();
+    public DbSet<GlobalOptOutRecord> GlobalOptOuts => Set<GlobalOptOutRecord>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -138,6 +143,53 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             entity.HasIndex(e => e.DashboardId);
             entity.HasIndex(e => new { e.Enabled, e.LastEvaluatedUtc });
             entity.HasIndex(e => e.LastFiredUtc);
+        });
+
+        modelBuilder.Entity<SubscriptionDispatchRecord>(entity =>
+        {
+            entity.ToTable("rcd_subscription_dispatches");
+            // Deliberately NO FK to rcd_subscriptions: history must survive
+            // subscription deletion (SubscriptionName is the snapshot).
+            entity.Property(e => e.SubscriptionName).HasMaxLength(200);
+            entity.Property(e => e.OwnerUserId).HasMaxLength(128);
+            entity.Property(e => e.RequestedBy).HasMaxLength(64);
+            entity.Property(e => e.Error).HasMaxLength(1000);
+            // Small discriminated strings, readable in psql — same convention
+            // as ScheduleKind/Format ("Schedule"/"Manual", "Running".."Skipped").
+            entity.Property(e => e.Trigger).HasConversion<string>().HasMaxLength(10);
+            entity.Property(e => e.Status).HasConversion<string>().HasMaxLength(12);
+            entity.HasIndex(e => new { e.SubscriptionId, e.StartedUtc }).IsDescending(false, true);
+            // The retention sweep and abandoned-dispatch close both scan by these.
+            entity.HasIndex(e => new { e.Status, e.StartedUtc });
+        });
+
+        modelBuilder.Entity<SubscriptionDispatchRecipientRecord>(entity =>
+        {
+            entity.ToTable("rcd_subscription_dispatch_recipients");
+            entity.Property(e => e.Email).HasMaxLength(320);
+            entity.Property(e => e.Error).HasMaxLength(1000);
+            entity.Property(e => e.Status).HasConversion<string>().HasMaxLength(12);
+            entity.Property(e => e.Attempts).HasDefaultValue(0);
+            entity.Property(e => e.OpenCount).HasDefaultValue(0);
+            entity.HasOne<SubscriptionDispatchRecord>()
+                .WithMany()
+                .HasForeignKey(e => e.DispatchId)
+                .OnDelete(DeleteBehavior.Cascade);
+            entity.HasIndex(e => e.DispatchId);
+        });
+
+        modelBuilder.Entity<SubscriptionOptOutRecord>(entity =>
+        {
+            entity.ToTable("rcd_subscription_optouts");
+            entity.HasKey(e => new { e.SubscriptionId, e.Email });
+            entity.Property(e => e.Email).HasMaxLength(320);
+        });
+
+        modelBuilder.Entity<GlobalOptOutRecord>(entity =>
+        {
+            entity.ToTable("rcd_global_optouts");
+            entity.HasKey(e => e.Email);
+            entity.Property(e => e.Email).HasMaxLength(320);
         });
 
         modelBuilder.Entity<QueryAuditRecord>(entity =>

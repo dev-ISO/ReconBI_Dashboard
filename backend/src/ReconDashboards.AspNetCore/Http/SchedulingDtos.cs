@@ -24,6 +24,18 @@ public sealed record SaveSubscriptionRequest(
     SubscriptionFormat Format,
     bool Enabled = true);
 
+public sealed record DispatchSummaryResponse(
+    long DispatchId,
+    DispatchStatus Status,
+    DispatchTrigger Trigger,
+    DateTime StartedUtc,
+    DateTime? FinishedUtc,
+    string? Error,
+    int SentCount,
+    int FailedCount,
+    int OptedOutCount,
+    int PendingCount);
+
 public sealed record SubscriptionResponse(
     int Id,
     int DashboardId,
@@ -37,7 +49,39 @@ public sealed record SubscriptionResponse(
     bool Enabled,
     bool OwnerIsMe,
     DateTime? LastRunUtc,
-    DateTime CreatedUtc);
+    DateTime CreatedUtc,
+    string OwnerUserId,
+    string? OwnerDisplayName,
+    DispatchSummaryResponse? LastDispatch);
+
+public sealed record DispatchRecipientResponse(
+    long Id,
+    string Email,
+    DispatchRecipientStatus Status,
+    int Attempts,
+    string? Error,
+    DateTime? SentUtc,
+    DateTime? OpenedUtc,
+    int OpenCount);
+
+public sealed record DispatchResponse(
+    long Id,
+    int SubscriptionId,
+    string SubscriptionName,
+    int DashboardId,
+    DispatchTrigger Trigger,
+    string? RequestedBy,
+    DateTime StartedUtc,
+    DateTime? FinishedUtc,
+    DispatchStatus Status,
+    string? Error,
+    IReadOnlyList<DispatchRecipientResponse> Recipients);
+
+public sealed record OptOutResponse(string Email, DateTime OptedOutUtc);
+
+public sealed record SetEnabledRequest(bool Enabled);
+
+public sealed record SendNowResponse(long DispatchId);
 
 public sealed record SaveAlertRequest(
     string Name,
@@ -65,7 +109,9 @@ public sealed record AlertResponse(
     DateTime? LastEvaluatedUtc,
     DateTime? LastFiredUtc,
     decimal? LastValue,
-    DateTime CreatedUtc);
+    DateTime CreatedUtc,
+    string OwnerUserId,
+    string? OwnerDisplayName);
 
 public sealed record AlertTestResponse(decimal? Value, bool WouldFire);
 
@@ -106,7 +152,27 @@ public static class SchedulingDtoMapping
     public static SubscriptionResponse ToResponse(SubscriptionDetail detail) =>
         new(detail.Id, detail.DashboardId, detail.Name, detail.ScheduleKind, detail.IntervalMinutes,
             FormatTimeOfDay(detail.TimeOfDayMinutesUtc), detail.DayOfWeekUtc, detail.Recipients,
-            detail.Format, detail.Enabled, detail.OwnerIsMe, detail.LastRunUtc, detail.CreatedUtc);
+            detail.Format, detail.Enabled, detail.OwnerIsMe, detail.LastRunUtc, detail.CreatedUtc,
+            detail.OwnerUserId, detail.OwnerDisplayName, ToResponse(detail.LastDispatch));
+
+    public static DispatchSummaryResponse? ToResponse(DispatchSummary? summary) =>
+        summary is null
+            ? null
+            : new DispatchSummaryResponse(
+                summary.DispatchId, summary.Status, summary.Trigger, summary.StartedUtc, summary.FinishedUtc,
+                summary.Error, summary.SentCount, summary.FailedCount, summary.OptedOutCount,
+                summary.PendingCount);
+
+    public static DispatchResponse ToResponse(DispatchDetail detail) =>
+        new(detail.Id, detail.SubscriptionId, detail.SubscriptionName, detail.DashboardId, detail.Trigger,
+            detail.RequestedBy, detail.StartedUtc, detail.FinishedUtc, detail.Status, detail.Error,
+            detail.Recipients
+                .Select(r => new DispatchRecipientResponse(
+                    r.Id, r.Email, r.Status, r.Attempts, r.Error, r.SentUtc, r.OpenedUtc, r.OpenCount))
+                .ToArray());
+
+    public static OptOutResponse ToResponse(OptOutDetail detail) =>
+        new(detail.Email, detail.OptedOutUtc);
 
     public static AlertSaveRequest ToSaveRequest(SaveAlertRequest request) =>
         new(request.Name ?? "", request.DashboardId,
@@ -119,7 +185,7 @@ public static class SchedulingDtoMapping
         new(detail.Id, detail.Name, detail.DashboardId, detail.Spec, detail.Operator, detail.Threshold,
             detail.Recipients, detail.EveryMinutes, detail.CooldownMinutes, detail.Enabled,
             detail.OwnerIsMe, detail.LastEvaluatedUtc, detail.LastFiredUtc, detail.LastValue,
-            detail.CreatedUtc);
+            detail.CreatedUtc, detail.OwnerUserId, detail.OwnerDisplayName);
 
     public static AlertFiringResponse ToResponse(AlertFiring firing) =>
         new(firing.AlertId, firing.Name, firing.DashboardId, firing.FiredAtUtc, firing.Value,

@@ -610,8 +610,8 @@ function AlertsBell({ firings }: { firings: AlertFiring[] }) {
             firings.map((firing, index) => (
               <div key={`${firing.alertId}-${firing.firedAtUtc}-${index}`} className="px-3 py-1.5">
                 <div className="flex items-baseline justify-between gap-2">
-                  <span className="min-w-0 truncate text-sm text-rcd-text" title={firing.alertName}>
-                    {firing.alertName}
+                  <span className="min-w-0 truncate text-sm text-rcd-text" title={firing.name}>
+                    {firing.name}
                   </span>
                   <span className="shrink-0 text-[11px] text-rcd-muted">
                     {formatFiredAt(firing.firedAtUtc)}

@@ -26,6 +26,7 @@ public sealed class SchedulingEvaluator(
     IServiceScopeFactory scopeFactory,
     TimeProvider timeProvider,
     ReconDashboardsOptions options,
+    SubscriptionDispatcher dispatcher,
     ILogger<SchedulingEvaluator> logger)
 {
     private static readonly JsonSerializerOptions SpecJsonOptions = new(JsonSerializerDefaults.Web);
@@ -57,7 +58,10 @@ public sealed class SchedulingEvaluator(
         {
             try
             {
-                await ProcessSubscriptionAsync(id, nowUtc, ct);
+                // The full per-recipient pipeline (dispatch rows, opt-outs,
+                // retries, notifier seams) lives in SubscriptionDispatcher —
+                // identical for scheduled and send-now triggers by design.
+                await dispatcher.ExecuteScheduledAsync(id, nowUtc, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -96,112 +100,6 @@ public sealed class SchedulingEvaluator(
             .Where(s => s.Enabled)
             .ToListAsync(ct);
         return candidates.Where(s => ScheduleDue.IsDue(s, nowUtc, _scheduleZone)).Select(s => s.Id).ToArray();
-    }
-
-    private async Task ProcessSubscriptionAsync(int subscriptionId, DateTime nowUtc, CancellationToken ct)
-    {
-        using var scope = scopeFactory.CreateScope();
-        var services = scope.ServiceProvider;
-        var db = services.GetRequiredService<ReconDashboardsDbContext>();
-
-        var subscription = await db.Subscriptions.FirstOrDefaultAsync(s => s.Id == subscriptionId, ct);
-        if (subscription is null || !ScheduleDue.IsDue(subscription, nowUtc, _scheduleZone))
-        {
-            return; // deleted or already handled by a concurrent instance
-        }
-
-        // The snapshot is only worth sending when the dashboard is still
-        // readable by the subscription's owner (owner or shared, not deleted).
-        var dashboard = await db.Dashboards.AsNoTracking()
-            .FirstOrDefaultAsync(d => d.Id == subscription.DashboardId && !d.IsDeleted, ct);
-        if (dashboard is null
-            || (dashboard.OwnerUserId != subscription.OwnerUserId && !dashboard.IsShared))
-        {
-            logger.LogWarning(
-                "Subscription {SubscriptionId}: dashboard {DashboardId} is gone or no longer visible to owner {Owner}; skipping",
-                subscription.Id, subscription.DashboardId, subscription.OwnerUserId);
-            subscription.LastRunUtc = nowUtc;
-            await db.SaveChangesAsync(ct);
-            return;
-        }
-
-        try
-        {
-            if (dashboard.ModelId is not { } modelId)
-            {
-                logger.LogWarning(
-                    "Subscription {SubscriptionId}: dashboard {DashboardId} has no model; skipping",
-                    subscription.Id, dashboard.Id);
-                subscription.LastRunUtc = nowUtc;
-                await db.SaveChangesAsync(ct);
-                return;
-            }
-
-            var pages = LayoutSnapshotParser.Parse(dashboard.LayoutJson, modelId);
-            var queryService = ImpersonatedQuery.Create(services, subscription.OwnerUserId);
-            var principal = ImpersonatedQuery.PrincipalFor(subscription.OwnerUserId);
-
-            var rendered = new List<RenderedPage>();
-            foreach (var page in pages)
-            {
-                var tiles = new List<RenderedTile>();
-                foreach (var tile in page.Tiles)
-                {
-                    var outcome = await queryService.RunAsync(tile.Spec, principal, ct);
-                    tiles.Add(outcome.Succeeded
-                        ? new RenderedTile(
-                            tile, outcome.Value!.Compiled.Columns, outcome.Value.Rows, Error: null)
-                        : new RenderedTile(tile, [], [], outcome.Error!.Message));
-                }
-
-                rendered.Add(new RenderedPage(page.Name, tiles));
-            }
-
-            var recipients = SplitRecipients(subscription.Recipients);
-            if (recipients.Count == 0)
-            {
-                logger.LogWarning("Subscription {SubscriptionId} has no recipients; skipping send", subscription.Id);
-                subscription.LastRunUtc = nowUtc;
-                await db.SaveChangesAsync(ct);
-                return;
-            }
-
-            var subject = $"{dashboard.Name} — dashboard snapshot";
-            var body = SnapshotRenderer.RenderHtml(dashboard.Name, nowUtc, rendered, _scheduleZone, _scheduleZoneLabel);
-            // Filename stamp matches the body stamps: plant-local, so a
-            // recipient's saved files sort the way the emails read.
-            var stampLocal = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, _scheduleZone);
-            IReadOnlyList<RcdEmailAttachment> attachments = subscription.Format == SubscriptionFormat.Csv
-                ?
-                [
-                    new RcdEmailAttachment(
-                        $"{SafeFileName(dashboard.Name)}-snapshot-{stampLocal:yyyyMMdd-HHmm}.csv",
-                        "text/csv",
-                        SnapshotRenderer.RenderCsv(dashboard.Name, nowUtc, rendered, _scheduleZone, _scheduleZoneLabel)),
-                ]
-                : [];
-
-            var sender = services.GetRequiredService<IRcdEmailSender>();
-            await sender.SendAsync(new RcdEmailMessage(recipients, subject, body, attachments), ct);
-
-            logger.LogInformation(
-                "Subscription {SubscriptionId} ({Name}) sent to {RecipientCount} recipient(s)",
-                subscription.Id, subscription.Name, recipients.Count);
-        }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // Failures are recorded as a completed run (LastRunUtc advances in
-            // the finally-style update below) so a broken SMTP or model never
-            // hammers every minute; the next scheduled occurrence retries.
-            logger.LogError(ex, "Subscription {SubscriptionId} snapshot failed", subscription.Id);
-        }
-
-        subscription.LastRunUtc = nowUtc;
-        await db.SaveChangesAsync(ct);
     }
 
     // ------------------------------------------------------------------- alerts
@@ -353,11 +251,4 @@ public sealed class SchedulingEvaluator(
         recipients
             .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
             .ToArray();
-
-    private static string SafeFileName(string name)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        var safe = new string(name.Select(c => invalid.Contains(c) || c == ' ' ? '-' : c).ToArray());
-        return string.IsNullOrEmpty(safe) ? "dashboard" : safe;
-    }
 }

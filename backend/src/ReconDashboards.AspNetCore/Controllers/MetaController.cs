@@ -7,9 +7,16 @@ using ReconDashboards.Core.Options;
 namespace ReconDashboards.AspNetCore.Controllers;
 
 [RcdPolicySlot(RcdPolicySlot.View)]
-public sealed class MetaController(ReconDashboardsOptions options) : RcdControllerBase
+public sealed class MetaController(
+    ReconDashboardsOptions options,
+    Core.Abstractions.ICurrentUserProvider currentUser) : RcdControllerBase
 {
-    /// <summary>Library version + effective limits so clients can cap their UX up front.</summary>
+    /// <summary>
+    /// Library version + effective limits so clients can cap their UX up
+    /// front, plus the caller's manage-shared standing — the subscriptions
+    /// manager shows its Mine/All admin scope switch from this, instead of
+    /// probing scope=all and eating a 403.
+    /// </summary>
     [HttpGet("meta")]
     public MetaResponse Get()
     {
@@ -28,6 +35,7 @@ public sealed class MetaController(ReconDashboardsOptions options) : RcdControll
             limits.MaxFilters,
             limits.MaxDistinctValues,
             limits.MaxModelDefinitionBytes,
-            limits.MaxDashboardLayoutBytes);
+            limits.MaxDashboardLayoutBytes,
+            currentUser.CanManageShared);
     }
 }

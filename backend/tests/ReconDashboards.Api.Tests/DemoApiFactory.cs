@@ -31,17 +31,18 @@ public sealed class DemoApiFactory : WebApplicationFactory<Program>
     /// <summary>Never a real secret — used to prove connection strings never leak to clients.</summary>
     public const string SentinelConnectionString = "Host=secret-host;Username=chart_reader;Password=hunter2";
 
-    private readonly SqliteConnection _connection;
-
-    public DemoApiFactory()
-    {
-        _connection = new SqliteConnection("DataSource=:memory:");
-        _connection.Open();
-    }
+    // File-backed SQLite, NOT one shared ":memory:" connection: send-now runs
+    // its dispatch on a detached background task, and a single SqliteConnection
+    // instance is not safe when that task and request threads use it at once.
+    // Pooled connections over a per-factory temp file are.
+    private readonly string _dbPath = Path.Combine(
+        Path.GetTempPath(), $"rcd-api-tests-{Guid.NewGuid():N}.db");
 
     public RecordingQueryExecutor Executor { get; } = new();
 
     public SwitchableRowFilterContributor RowFilters { get; } = new();
+
+    public GatedEmailSink Emails { get; } = new();
 
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -54,7 +55,7 @@ public sealed class DemoApiFactory : WebApplicationFactory<Program>
                 d.ServiceType == typeof(DbContextOptions<ReconDashboardsDbContext>)
                 || d.ServiceType == typeof(DbContextOptions)
                 || d.ServiceType == typeof(IDbContextOptionsConfiguration<ReconDashboardsDbContext>));
-            services.AddDbContext<ReconDashboardsDbContext>(o => o.UseSqlite(_connection));
+            services.AddDbContext<ReconDashboardsDbContext>(o => o.UseSqlite($"DataSource={_dbPath}"));
 
             // 2) Replace the Postgres-backed "demo" data source with the fixture source.
             RemoveAll(services, d => d.ServiceType == typeof(IDataSourceRegistry));
@@ -74,6 +75,12 @@ public sealed class DemoApiFactory : WebApplicationFactory<Program>
             // 3) Replace the demo host's row filter contributor with the switchable fake.
             RemoveAll(services, d => d.ServiceType == typeof(IRowFilterContributor));
             services.AddSingleton<IRowFilterContributor>(RowFilters);
+
+            // 4) Replace the FileEmailSink with a recording/gated fake so
+            //    send-now tests can observe deliveries and hold a dispatch
+            //    open to prove the one-manual-send-per-subscription guard.
+            RemoveAll(services, d => d.ServiceType == typeof(IRcdEmailSender));
+            services.AddSingleton<IRcdEmailSender>(Emails);
         });
     }
 
@@ -104,7 +111,16 @@ public sealed class DemoApiFactory : WebApplicationFactory<Program>
         base.Dispose(disposing);
         if (disposing)
         {
-            _connection.Dispose();
+            SqliteConnection.ClearAllPools();
+            try
+            {
+                File.Delete(_dbPath);
+            }
+            catch (IOException)
+            {
+                // A stray background task may still hold the file for a moment;
+                // temp-dir leftovers are harmless.
+            }
         }
     }
 
@@ -173,6 +189,42 @@ public sealed class RecordingQueryExecutor : IQueryExecutor
         var truncated = Rows.Count > options.MaxRows;
         var rows = truncated ? Rows.Take(options.MaxRows).ToArray() : Rows;
         return Task.FromResult(new ExecutedQuery(rows, truncated, ElapsedMs: 3));
+    }
+}
+
+/// <summary>
+/// Records every message; can HOLD sends open (a TaskCompletionSource dam) so
+/// a test can observe the in-flight state of a manual dispatch — e.g. that a
+/// second Send now gets 429 while the first is still running.
+/// </summary>
+public sealed class GatedEmailSink : IRcdEmailSender
+{
+    private readonly object _gate = new();
+    private volatile TaskCompletionSource? _hold;
+
+    public List<RcdEmailMessage> Sent { get; } = [];
+
+    public void HoldSends() =>
+        _hold = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    public void ReleaseSends()
+    {
+        _hold?.TrySetResult();
+        _hold = null;
+    }
+
+    public async Task SendAsync(RcdEmailMessage message, CancellationToken cancellationToken)
+    {
+        var hold = _hold;
+        if (hold is not null)
+        {
+            await hold.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken);
+        }
+
+        lock (_gate)
+        {
+            Sent.Add(message);
+        }
     }
 }
 

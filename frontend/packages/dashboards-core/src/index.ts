@@ -21,6 +21,7 @@ export type {
   ExportCsvResult,
   UnderlyingQueryBody,
   UnderlyingQueryResult,
+  RcdMeta,
 } from './api/DashboardsApi';
 
 export { QueryCache } from './state/queryCache';
@@ -39,6 +40,7 @@ export type {
   CalendarDate,
   CrossFilterClauseOptions,
   DashboardStoreState,
+  DispatchLiveProgress,
   FilterCardOverride,
   HoverHighlight,
   OpenDashboard,

@@ -27,6 +27,10 @@ import {
   type DashboardParameter,
   type DashboardSummary,
   type DashboardTile,
+  type DispatchProgressEvent,
+  type DispatchRecipientStatus,
+  type DispatchStatus,
+  type DispatchTrigger,
   type DrillthroughState,
   type FilterCard,
   type FilterIndicatorStyle,
@@ -72,9 +76,40 @@ export interface OpenDashboard {
   layout: DashboardLayoutDoc;
 }
 
+/**
+ * Live per-subscription send progress, built from host-forwarded
+ * DispatchProgressEvents (runtime.dashboards.applyDispatchProgress). Keyed by
+ * SUBSCRIPTION id — the manager rows look progress up per subscription. An
+ * entry survives after 'finished' so the strip can show the final roll-up
+ * until the list refreshes; hosts that forward nothing simply never populate
+ * this and UIs poll instead.
+ */
+export interface DispatchLiveProgress {
+  dispatchId: number;
+  subscriptionId: number;
+  subscriptionName: string;
+  trigger: DispatchTrigger;
+  /** 'running' until the finished event lands. */
+  status: DispatchStatus;
+  recipientCount: number;
+  startedUtc: string;
+  /** Upserted per recipient event, keyed by email. */
+  recipients: Record<
+    string,
+    { status: DispatchRecipientStatus; attempts: number; error: string | null }
+  >;
+  sentCount: number | null;
+  failedCount: number | null;
+  optedOutCount: number | null;
+  error: string | null;
+  finishedUtc: string | null;
+}
+
 export interface DashboardStoreState {
   list: DashboardSummary[];
   listStatus: AsyncStatus;
+  /** See DispatchLiveProgress — realtime send-now/scheduled dispatch progress per subscription. */
+  dispatchProgress: Record<number, DispatchLiveProgress>;
   current: OpenDashboard | null;
   mode: 'view' | 'edit';
   dirty: boolean;
@@ -437,6 +472,7 @@ export const cloneChartForCopy = (
 const initialState: DashboardStoreState = {
   list: [],
   listStatus: 'idle',
+  dispatchProgress: {},
   current: null,
   mode: 'view',
   dirty: false,
@@ -494,6 +530,94 @@ export class DashboardStore {
 
   private get state(): DashboardStoreState {
     return this.store.getState();
+  }
+
+  /* ------------------------------------------------ live dispatch progress */
+
+  /**
+   * The host's realtime bridge calls this with each dispatch-progress event
+   * its backend forwarded from IRcdDispatchProgressNotifier (e.g. the
+   * tracker's SignalR rcdDispatchProgress event). This is deliberately the
+   * ONLY store action a host pushes events INTO — everything else here is
+   * user-driven. Out-of-order/stale events (a recipient event for a dispatch
+   * we are no longer tracking) are dropped rather than inventing state; UIs
+   * always have the polling fallback for ground truth.
+   */
+  applyDispatchProgress(event: DispatchProgressEvent): void {
+    const progress = { ...this.state.dispatchProgress };
+    switch (event.kind) {
+      case 'started':
+        progress[event.subscriptionId] = {
+          dispatchId: event.dispatchId,
+          subscriptionId: event.subscriptionId,
+          subscriptionName: event.subscriptionName,
+          trigger: event.trigger,
+          status: 'running',
+          recipientCount: event.recipientCount,
+          startedUtc: event.startedUtc,
+          recipients: {},
+          sentCount: null,
+          failedCount: null,
+          optedOutCount: null,
+          error: null,
+          finishedUtc: null,
+        };
+        break;
+      case 'recipient': {
+        const entry = progress[event.subscriptionId];
+        if (!entry || entry.dispatchId !== event.dispatchId) return;
+        progress[event.subscriptionId] = {
+          ...entry,
+          recipients: {
+            ...entry.recipients,
+            [event.email]: {
+              status: event.status,
+              attempts: event.attempts,
+              error: event.error,
+            },
+          },
+        };
+        break;
+      }
+      case 'finished': {
+        const entry = progress[event.subscriptionId];
+        if (entry !== undefined && entry.dispatchId !== event.dispatchId) return;
+        // A finished without its started (bridge connected mid-send) still
+        // paints the roll-up — the strip shows counts without per-recipient rows.
+        progress[event.subscriptionId] = {
+          dispatchId: event.dispatchId,
+          subscriptionId: event.subscriptionId,
+          subscriptionName: entry?.subscriptionName ?? '',
+          trigger: entry?.trigger ?? 'manual',
+          status: event.status,
+          recipientCount:
+            entry?.recipientCount ?? event.sentCount + event.failedCount + event.optedOutCount,
+          startedUtc: entry?.startedUtc ?? event.finishedUtc,
+          recipients: entry?.recipients ?? {},
+          sentCount: event.sentCount,
+          failedCount: event.failedCount,
+          optedOutCount: event.optedOutCount,
+          error: event.error,
+          finishedUtc: event.finishedUtc,
+        };
+        break;
+      }
+    }
+
+    this.set({ dispatchProgress: progress });
+  }
+
+  /** Drops tracked progress (one subscription, or all when omitted) — e.g. when the manager dialog closes. */
+  clearDispatchProgress(subscriptionId?: number): void {
+    if (subscriptionId === undefined) {
+      this.set({ dispatchProgress: {} });
+      return;
+    }
+
+    if (!(subscriptionId in this.state.dispatchProgress)) return;
+    const progress = { ...this.state.dispatchProgress };
+    delete progress[subscriptionId];
+    this.set({ dispatchProgress: progress });
   }
 
   /**

@@ -15,12 +15,25 @@ namespace ReconDashboards.AspNetCore.Controllers;
 [RcdPolicySlot(RcdPolicySlot.View)]
 public sealed class AlertsController(AlertService alerts) : RcdControllerBase
 {
-    /// <summary>Lists the caller's alerts, optionally for one dashboard.</summary>
+    /// <summary>Lists alerts: scope=mine (default) or scope=all (admin), optionally for one dashboard.</summary>
     [HttpGet]
-    public async Task<IReadOnlyList<AlertResponse>> List([FromQuery] int? dashboardId, CancellationToken ct) =>
-        (await alerts.ListMineAsync(dashboardId, ct))
-            .Select(SchedulingDtoMapping.ToResponse)
-            .ToArray();
+    public async Task<IActionResult> List(
+        [FromQuery] string? scope, [FromQuery] int? dashboardId, CancellationToken ct)
+    {
+        var result = await alerts.ListAsync(
+            string.Equals(scope, "all", StringComparison.OrdinalIgnoreCase), dashboardId, ct);
+        return result.Succeeded
+            ? Ok(result.Value!.Select(SchedulingDtoMapping.ToResponse).ToArray())
+            : FromError(result.Error!);
+    }
+
+    /// <summary>One-click pause/resume; owner or admin.</summary>
+    [HttpPost("{id:int}/enabled")]
+    public async Task<IActionResult> SetEnabled(int id, [FromBody] SetEnabledRequest request, CancellationToken ct)
+    {
+        var result = await alerts.SetEnabledAsync(id, request.Enabled, ct);
+        return result.Succeeded ? Ok(SchedulingDtoMapping.ToResponse(result.Value!)) : FromError(result.Error!);
+    }
 
     [HttpPost]
     public async Task<IActionResult> Create([FromBody] SaveAlertRequest request, CancellationToken ct)

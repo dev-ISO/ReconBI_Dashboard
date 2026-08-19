@@ -132,6 +132,39 @@ subscription snapshots and data alerts.
   (0 = Sunday); recipients travel as ONE `';'`-joined string. The storage
   columns keep their historical `*Utc` names — no schema change on upgrade.
 
+### Subscriptions & alerts management (0.11.0+)
+
+Every send — scheduled or the manager UI's **Send now** — runs the same
+per-recipient pipeline and is recorded in `rcd_subscription_dispatches` +
+`rcd_subscription_dispatch_recipients` (90-day retention, library-pruned).
+Failed recipients retry in-process at +2min/+8min; a restart abandons retries
+and the next tick closes the orphaned dispatch as `failed`, honestly.
+
+- **Unsubscribe + open tracking** — set BOTH `rcd.UnsubscribeSecret` (any long
+  random string; e.g. from an `RCD_UNSUBSCRIBE_SECRET` env var) and
+  `rcd.PublicBaseUrl` (the public origin mail clients can reach, e.g. the
+  tunnel URL). Emails then carry an HMAC-token unsubscribe footer (anonymous
+  confirm page offering per-subscription AND global scopes; opt-outs land in
+  `rcd_subscription_optouts` / `rcd_global_optouts`) and a 1×1 open pixel
+  ("Opened (approximate)" in the history UI). With either option unset,
+  emails simply omit footer and pixel — never broken links.
+- **Host seams (both optional, no-op by default)** —
+  `IRcdDispatchProgressNotifier` (DispatchStarted / RecipientResult /
+  DispatchFinished, targeted at the subscription OWNER's user id) lets the
+  host forward live send progress over its own socket; the frontend applies
+  events via `runtime.dashboards.applyDispatchProgress(event)` and falls back
+  to 2s polling when no events arrive. `IRcdDeliveryFailureNotifier` fires
+  once per dispatch that closes failed/partial — e.g. write a notification-
+  bell row. Register either AFTER `AddReconDashboards` (same override
+  pattern as `IUserDirectory`); implementations must be best-effort.
+- **UI** — export `SubscriptionsManager` is the management dialog (host
+  mounts it inside `DashboardsProvider`, e.g. from a sidebar footer
+  "Manage subscriptions" button); the per-dashboard Subscribe… dialog links
+  to it via its `onManageAll` prop. `GET /meta` now reports
+  `canManageShared`, which drives the manager's Mine/All admin scope switch.
+- **Schema** — re-apply `db/rcd_schema.sql` (idempotent) on upgrade: it adds
+  the four tables above.
+
 ### Dashboard permissions (0.8.0+)
 
 Three distinct verbs (see SHARING-DESIGN.md for the full contract):
