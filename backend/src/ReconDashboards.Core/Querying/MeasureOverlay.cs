@@ -51,6 +51,38 @@ public static class MeasureOverlay
     /// 400 with an rcd.query.* code) when the overlay breaks a rule.
     /// </summary>
     public static ModelDefinition Merge(
+        ModelDefinition model, IReadOnlyList<Measure>? definitions, RcdLimits limits) =>
+        Merge(model, definitions, derivedFields: null, limits);
+
+    /// <summary>
+    /// The overlaid definition carrying BOTH caller-supplied channels: measure
+    /// definitions and DERIVED FIELD definitions.
+    ///
+    /// <para>Derived fields ride the SAME mechanism for the same reason: they
+    /// are merged into the ModelDefinition BEFORE
+    /// <see cref="QueryCompiler.Prepare"/>, so the compiler injects them into
+    /// the resolved schema, resolves them, and plans joins with them exactly as
+    /// it does model-held ones. There is no second overlay path to keep in
+    /// sync — and no path on which a caller-supplied definition could be
+    /// resolved after the join plan (and therefore after row-filter collection)
+    /// was built.</para>
+    ///
+    /// <para>A derived field is same-table by construction (enforced in the
+    /// compiler), so unlike a measure expression it can never widen the join
+    /// plan at all: the table it reads is the one the dimension naming it
+    /// already put there.</para>
+    /// </summary>
+    public static ModelDefinition Merge(
+        ModelDefinition model,
+        IReadOnlyList<Measure>? definitions,
+        IReadOnlyList<DerivedField>? derivedFields,
+        RcdLimits limits)
+    {
+        var merged = MergeMeasures(model, definitions, limits);
+        return MergeDerivedFields(merged, derivedFields, limits);
+    }
+
+    private static ModelDefinition MergeMeasures(
         ModelDefinition model, IReadOnlyList<Measure>? definitions, RcdLimits limits)
     {
         if (definitions is null || definitions.Count == 0)
@@ -124,6 +156,133 @@ public static class MeasureOverlay
         // ModelDefinition is a record — `with` is a shallow copy, and nothing
         // downstream mutates Measures.
         return model with { Measures = [.. model.Measures, .. definitions] };
+    }
+
+    /// <summary>
+    /// The derived-field half of the overlay, under the same duplicate-id /
+    /// duplicate-name / count / byte discipline as measures.
+    ///
+    /// NAME UNIQUENESS IS PER TABLE, not global: a derived field IS a column of
+    /// its table, so "Uploaded?" on two different tables is as legitimate as two
+    /// tables both having an "id". What must never happen is two fields
+    /// competing for one column name on one table — the compiler would inject
+    /// both and <c>FindColumn</c> would pick whichever came first.
+    /// </summary>
+    private static ModelDefinition MergeDerivedFields(
+        ModelDefinition model, IReadOnlyList<DerivedField>? derivedFields, RcdLimits limits)
+    {
+        if (derivedFields is null || derivedFields.Count == 0)
+        {
+            return model;
+        }
+
+        if (derivedFields.Count > limits.MaxQueryDerivedFieldDefinitions)
+        {
+            throw new QueryCompilationException(
+                "QRY_TOO_MANY_DERIVED_FIELDS",
+                $"A query may carry at most {limits.MaxQueryDerivedFieldDefinitions} derived-field definitions; this one carries {derivedFields.Count}.");
+        }
+
+        var bytes = Encoding.UTF8.GetByteCount(JsonSerializer.Serialize(derivedFields, ModelJson.Options));
+        if (bytes > limits.MaxQueryDerivedFieldBytes)
+        {
+            throw new QueryCompilationException(
+                "QRY_DERIVED_FIELDS_TOO_LARGE",
+                $"The query's derived-field definitions are {bytes} bytes; the limit is {limits.MaxQueryDerivedFieldBytes}.");
+        }
+
+        var ids = new HashSet<Guid>(model.DerivedFieldDefs.Select(f => f.Id));
+        var names = new HashSet<(string Table, string Name)>(
+            model.DerivedFieldDefs.Select(f => (f.Table, f.Name)),
+            TableColumnComparer.Instance);
+
+        foreach (var field in derivedFields)
+        {
+            if (field is null)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DERIVED", "A derived-field definition on the query is null.");
+            }
+
+            if (field.Id == Guid.Empty)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DERIVED", $"Derived-field definition '{field.Name}' has no id.");
+            }
+
+            if (string.IsNullOrWhiteSpace(field.Name))
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DERIVED", $"Derived-field definition {field.Id} has no name.");
+            }
+
+            if (string.IsNullOrWhiteSpace(field.Table))
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DERIVED", $"Derived-field definition '{field.Name}' has no table.");
+            }
+
+            if (!ids.Add(field.Id))
+            {
+                throw new QueryCompilationException(
+                    "QRY_DUPLICATE_DERIVED_ID",
+                    $"Derived-field definition {field.Id} ('{field.Name}') collides with a derived field the model already defines.");
+            }
+
+            if (!names.Add((field.Table, field.Name)))
+            {
+                throw new QueryCompilationException(
+                    "QRY_DUPLICATE_DERIVED_NAME",
+                    $"Derived-field definition '{field.Name}' collides with another derived field of the same name on '{field.Table}'; one of them would silently shadow the other.");
+            }
+        }
+
+        return model with { DerivedFields = [.. model.DerivedFieldDefs, .. derivedFields] };
+    }
+
+    /// <summary>Table names are case-sensitive catalog keys; column names compare loosely, like the compiler's injection guard.</summary>
+    private sealed class TableColumnComparer : IEqualityComparer<(string Table, string Name)>
+    {
+        public static readonly TableColumnComparer Instance = new();
+
+        public bool Equals((string Table, string Name) x, (string Table, string Name) y) =>
+            string.Equals(x.Table, y.Table, StringComparison.Ordinal)
+            && string.Equals(x.Name, y.Name, StringComparison.OrdinalIgnoreCase);
+
+        public int GetHashCode((string Table, string Name) obj) =>
+            HashCode.Combine(obj.Table, obj.Name.ToLowerInvariant());
+    }
+
+    /// <summary>
+    /// The derived fields a set of {table, column} references needs — the
+    /// scheduling/alert twin of <see cref="CollectReferenced"/>. A reference
+    /// matches by NAME or by ID, mirroring how the compiler resolves one.
+    /// Ids/names <paramref name="available"/> does not hold are silently
+    /// skipped: those are model fields, which the server already has.
+    /// </summary>
+    public static IReadOnlyList<DerivedField> CollectReferencedFields(
+        IReadOnlyList<DerivedField> available, IEnumerable<(string Table, string Column)> references)
+    {
+        if (available.Count == 0)
+        {
+            return [];
+        }
+
+        var taken = new HashSet<Guid>();
+        foreach (var (table, column) in references)
+        {
+            foreach (var field in available)
+            {
+                if (string.Equals(field.Table, table, StringComparison.Ordinal)
+                    && (string.Equals(field.Name, column, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(field.Id.ToString(), column, StringComparison.OrdinalIgnoreCase)))
+                {
+                    taken.Add(field.Id);
+                }
+            }
+        }
+
+        return taken.Count == 0 ? [] : [.. available.Where(f => taken.Contains(f.Id))];
     }
 
     /// <summary>

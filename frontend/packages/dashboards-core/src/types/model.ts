@@ -101,6 +101,42 @@ export interface Measure {
   formatString?: string | null;
 }
 
+/**
+ * A DERIVED FIELD — a named, reusable text expression evaluated PER ROW, which
+ * the engine exposes as a VIRTUAL COLUMN ON `table`.
+ *
+ * That framing is the whole design. A derived field is NOT a new shape of
+ * DimensionRef: a dimension that uses one is an ordinary
+ * `{ table, column: <the derived field's name> }`, so every consumer that
+ * assumes a dimension has a real table and a real column — drill-down,
+ * cross-filter, see-records, drillthrough, table header filters, cross-tile
+ * hover matching, chip captions, the format panel, the email snapshot parser —
+ * keeps working unchanged, and the query wire keeps its shape.
+ *
+ * It is same-table by construction, and that is a SECURITY property rather
+ * than a limitation: an expression that can only name the table the dimension
+ * already names adds no table to the join plan, so it can never smuggle a
+ * column past that table's row filters.
+ *
+ * `dataType` is 'text' and only 'text' in this wave: the expression produces a
+ * category LABEL. A derived column therefore never offers a date grain (it is
+ * already text) and never lands in a Values well (there is nothing to
+ * aggregate).
+ */
+export interface DerivedField {
+  id: string;
+  /** Also the COLUMN TOKEN a DimensionRef uses — see derivedFieldOf. */
+  name: string;
+  /** Model table key ('schema.table'); the only table the expression may name. */
+  table: string;
+  expression: string;
+  dataType: 'text';
+  /** Free-text documentation shown in field lists / tooltips. */
+  description?: string | null;
+  /** Grouping folder for field lists, exactly like Measure.displayFolder. */
+  displayFolder?: string | null;
+}
+
 /** Wire mirror of the backend WeekStartDay enum. */
 export type WeekStartDay = 'monday' | 'sunday';
 
@@ -125,6 +161,16 @@ export interface ModelDefinition {
   relationships: Relationship[];
   measures: Measure[];
   dateTables?: DateTableDef[] | null;
+  /**
+   * SYSTEM-scope derived fields. Dashboard- and personal-scope ones are not
+   * here — they ride the query wire and the client merges them into an
+   * EFFECTIVE definition, exactly as it does for scoped measures.
+   *
+   * *** The server rejects unknown members outright (ModelJson's
+   * UnmappedMemberHandling.Disallow), so a model document carrying this field
+   * fails to LOAD on an engine that predates derived fields. ***
+   */
+  derivedFields?: DerivedField[] | null;
 }
 
 export interface ModelSummary {
@@ -169,6 +215,37 @@ export const columnLabelOf = (model: ModelDefinition, table: string, column: str
   const modelTable = model.tables.find((t) => tableKey(t.schema, t.name) === table);
   return modelTable?.columns?.find((c) => c.name === column)?.friendlyName ?? column;
 };
+
+/**
+ * The derived field a `{ table, column }` pair names, or null for an ordinary
+ * physical column.
+ *
+ * Matching is by NAME first — the name IS the column token a DimensionRef
+ * carries, which is what lets `columnLabelOf`, chip captions, the format
+ * panel's per-column editor and every result-column label read correctly with
+ * no special case — and by ID as a fallback, so a spec authored against an
+ * engine that addresses derived columns by id still resolves here.
+ */
+export const derivedFieldOf = (
+  model: Pick<ModelDefinition, 'derivedFields'>,
+  table: string,
+  column: string,
+): DerivedField | null => {
+  const fields = model.derivedFields;
+  if (!fields || fields.length === 0) return null;
+  return (
+    fields.find((field) => field.table === table && field.name === column) ??
+    fields.find((field) => field.table === table && field.id === column) ??
+    null
+  );
+};
+
+/** True when `{ table, column }` names a derived field rather than a real column. */
+export const isDerivedColumn = (
+  model: Pick<ModelDefinition, 'derivedFields'>,
+  table: string,
+  column: string,
+): boolean => derivedFieldOf(model, table, column) !== null;
 
 /**
  * The fixed columns every engine date table exposes, in display order

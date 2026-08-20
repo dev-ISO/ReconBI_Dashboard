@@ -1,5 +1,5 @@
 // Wire mirror of POST /query and /query/values.
-import type { Aggregation, Measure } from './model';
+import type { Aggregation, DerivedField, Measure } from './model';
 import type { ColumnType } from './schema';
 
 export type DateBucket = 'year' | 'quarter' | 'month' | 'week' | 'day';
@@ -17,12 +17,67 @@ export type FilterOperator =
   | 'contains'
   | 'startsWith'
   | 'isNull'
-  | 'notNull';
+  | 'notNull'
+  /**
+   * NULL *or* the empty string — the exact complement pair for a value
+   * grouping's blank bucket, which collects both. `isNull` alone under-matches
+   * a grouped bar by its empty-string rows; filters have no OR, so this has to
+   * be one operator.
+   */
+  | 'isBlank'
+  | 'notBlank';
+
+/**
+ * One bucket of a value grouping: a label, the raw values it collects, and
+ * whether it also collects BLANK rows (NULL or empty).
+ */
+export interface ValueGroup {
+  label: string;
+  values?: FilterValue[];
+  matchBlank?: boolean;
+}
+
+/**
+ * CHART-LOCAL VALUE GROUPING on one dimension — "show these values as one bar".
+ *
+ * Deliberately anonymous and deliberately chart-local: it creates NO entry in
+ * the field list, because the standing complaint this answers is field-list
+ * pollution. Most of the time an author wants the bars fixed, not a new field;
+ * when they DO want a reusable one, the editor offers to promote it into a
+ * named DerivedField, which is the same mechanism with a name on it.
+ *
+ * The engine compiles it through the SAME seam dateBucket already uses
+ * (DimensionExpression), so the expression reaches SELECT, GROUP BY, ORDER BY
+ * and the Top-N tie-break verbatim, and every label and match value is BOUND
+ * AS A PARAMETER — never emitted into SQL.
+ *
+ * Rows matching no group fall into `otherLabel`. When it is null or absent the
+ * engine does NOT invent an "Other" caption — it emits the value's own text, so
+ * unmatched rows keep their identity instead of collapsing into one anonymous
+ * bar. Set it explicitly to collapse them.
+ */
+export interface ValueGrouping {
+  groups: ValueGroup[];
+  otherLabel?: string | null;
+}
 
 export interface DimensionRef {
   table: string;
   column: string;
   dateBucket?: DateBucket | null;
+  /**
+   * Collapses this dimension's raw values into labelled buckets (see
+   * ValueGrouping). Never set on a derived column, which is already an
+   * expression.
+   *
+   * The ENGINE composes grouping over dateBucket (it layers column -> bucket ->
+   * grouping), so the pair is legal on the wire. This CLIENT nonetheless never
+   * emits both: grouping raw values and grouping bucketed periods are two
+   * different questions, and offering both at once in the chip reads as a bug.
+   * The editor therefore clears the grain when a grouping is applied. Treat
+   * this as a UI convention, not an engine constraint.
+   */
+  grouping?: ValueGrouping | null;
 }
 
 /**
@@ -106,6 +161,19 @@ export interface ChartQuerySpec {
    * dashboard measures serialize byte-identically (and keep their cache key).
    */
   definitions?: Measure[] | null;
+  /**
+   * DERIVED FIELD definitions this query carries because they are not in the
+   * stored model — dashboard-scoped and personal ones. The sibling of
+   * `definitions`, merged onto the model definition by the SAME overlay before
+   * the compiler runs, so a derived column resolves and row-filters exactly
+   * like a model-held one; dimensions referencing them stay
+   * `{ table, column }`.
+   *
+   * Absent when the chart cites only model-held derived fields (or none), so
+   * specs that predate this wave serialize byte-identically and keep their
+   * cache key.
+   */
+  derivedFields?: DerivedField[] | null;
 }
 
 export interface QueryColumn {
@@ -173,6 +241,14 @@ export interface DistinctValuesSpec {
   search?: string | null;
   filters: FilterClause[];
   limit?: number | null;
+  /**
+   * Derived-field definitions this lookup needs — the same overlay
+   * ChartQuerySpec.derivedFields carries, because `column` may name a
+   * dashboard- or personal-scope derived field the stored model does not hold.
+   * Omitted (and therefore byte-identical to a pre-derived-fields request)
+   * whenever the column is physical or model-held.
+   */
+  derivedFields?: DerivedField[] | null;
 }
 
 export interface DistinctValuesResult {

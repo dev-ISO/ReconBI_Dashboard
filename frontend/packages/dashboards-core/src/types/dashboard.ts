@@ -1,6 +1,6 @@
 // Dashboard layout document (rcd_dashboards.LayoutJson) + API envelopes.
 import type { ChartSpec, ContainerStyle } from './chart';
-import type { Measure } from './model';
+import type { DerivedField, Measure } from './model';
 import type {
   ChartQuerySpec,
   DimensionRef,
@@ -363,6 +363,8 @@ export interface FilterCard {
 export const isCompleteFilterCondition = (condition: FilterCardCondition): boolean =>
   condition.operator === 'isNull' ||
   condition.operator === 'notNull' ||
+  condition.operator === 'isBlank' ||
+  condition.operator === 'notBlank' ||
   (condition.value !== null && condition.value !== undefined);
 
 const completeConditions = (card: FilterCard): FilterCardCondition[] =>
@@ -407,7 +409,13 @@ export const filterCardClauses = (card: FilterCard): FilterClause[] => {
     column,
     operator: c.operator,
     values:
-      c.operator === 'isNull' || c.operator === 'notNull' || c.value == null ? [] : [c.value],
+      c.operator === 'isNull' ||
+      c.operator === 'notNull' ||
+      c.operator === 'isBlank' ||
+      c.operator === 'notBlank' ||
+      c.value == null
+        ? []
+        : [c.value],
   }));
 };
 
@@ -566,6 +574,15 @@ export interface DashboardLayoutDoc {
    * array server-side.
    */
   measures?: Measure[] | null;
+  /**
+   * DASHBOARD-SCOPED derived fields (v1-compatible evolution; the wire version
+   * stays 1). The exact sibling of `measures` above, for the same reasons:
+   * they travel with duplicate and share for free, they are NOT in the
+   * semantic model, and every query whose dimensions name one must carry its
+   * definition on the wire (`toWireSpec`'s definitions bundle,
+   * `chartDerivedFieldDefinitions`).
+   */
+  derivedFields?: DerivedField[] | null;
   /**
    * Default view-mode sizing (v1-compatible evolution; absent = 'actual').
    * 'fitPage' scales the page's grid DOWN (never up past 1:1) so its full

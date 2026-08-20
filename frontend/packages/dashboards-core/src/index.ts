@@ -73,13 +73,47 @@ export {
 } from './state/measureScope';
 export type { MeasureMergeResult } from './state/measureScope';
 export {
+  chartDerivedFieldDefinitions,
+  chartDimensionRefs,
+  mergeDerivedFields,
+  nextDerivedFieldCopyName,
+  repointDerivedColumn,
+} from './state/derivedFieldScope';
+export type { DerivedFieldMergeResult } from './state/derivedFieldScope';
+export {
+  DEFAULT_OTHER_LABEL,
+  MAX_GROUP_LABEL_LENGTH,
+  MAX_GROUP_VALUES,
+  MAX_VALUE_GROUPS,
+  blankVsRestGrouping,
+  groupForLabel,
+  groupIsEmpty as valueGroupIsEmpty,
+  groupingClauseFor,
+  groupingClausesForLabels,
+  groupingKeyOf,
+  groupingLabels,
+  groupingProblems,
+  groupingPromotionProblems,
+  groupingSurvives,
+  groupingToExpression,
+  hasGrouping,
+  normalizeGrouping,
+  otherLabelOf,
+} from './state/valueGrouping';
+export {
+  PERSONAL_DERIVED_FIELDS_SECTION,
   PERSONAL_MEASURES_SECTION,
   migrateFlatPersonalMeasures,
   personalMeasuresModelKey,
+  readPersonalDerivedFields,
   readPersonalMeasures,
+  writePersonalDerivedFields,
   writePersonalMeasures,
 } from './state/personalMeasures';
-export type { PersonalMeasuresByModel } from './state/personalMeasures';
+export type {
+  PersonalDerivedFieldsByModel,
+  PersonalMeasuresByModel,
+} from './state/personalMeasures';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
 

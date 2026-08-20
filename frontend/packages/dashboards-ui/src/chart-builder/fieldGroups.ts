@@ -18,6 +18,7 @@ import {
   type Catalog,
   type ChartSpec,
   type ColumnType,
+  type DerivedField,
   type ModelDefinition,
 } from '@recon/dashboards-core';
 import { buildFolderTree, joinFolderPath, type FolderNode } from '../util/folderTree';
@@ -69,6 +70,15 @@ export interface FieldColumnRow {
   label: string;
   /** Owning table's display label — shown when a group mixes tables. */
   tableLabel: string;
+  /**
+   * The DERIVED FIELD this row is, when it is one. A derived field is a
+   * virtual column OF ITS TABLE, so it is collected as an ordinary column and
+   * every grouping mode files it exactly where the author would look for it —
+   * beside the columns it is computed from in Table mode, under its category
+   * in Category mode, and with the other text fields in Type mode. Only the
+   * row's badge, its action menu and its refusal from a Values well differ.
+   */
+  derived?: DerivedField;
 }
 
 /** What the group's header glyph should be. */
@@ -112,6 +122,20 @@ interface SourceColumn extends FieldColumnRow {
   dateTable: string | null;
 }
 
+/** A derived field as a field-list row — a text column of its own table. */
+const derivedRow = (field: DerivedField, tableLabel: string): SourceColumn => ({
+  id: `column:${field.table}:${field.name}`,
+  table: field.table,
+  column: field.name,
+  type: 'text',
+  kind: 'text',
+  label: field.name,
+  tableLabel,
+  derived: field,
+  folders: field.displayFolder ? [field.displayFolder] : [],
+  dateTable: null,
+});
+
 const rowMatches = (row: FieldColumnRow, query: string): boolean =>
   query === '' || row.label.toLowerCase().includes(query) || row.column.toLowerCase().includes(query);
 
@@ -138,6 +162,12 @@ const collectColumns = (
       continue;
     }
     const overrides = new Map((table.columns ?? []).map((column) => [column.name, column]));
+    // Derived fields FIRST: they are the author's own vocabulary for this
+    // table, and burying them under seventy physical columns would hide the
+    // thing they just made.
+    for (const field of model.derivedFields ?? []) {
+      if (field.table === key) columns.push(derivedRow(field, tableLabel));
+    }
     for (const column of catalogTable?.columns ?? []) {
       const override = overrides.get(column.name);
       if (!isQueryableType(column.type) || override?.hidden) continue;

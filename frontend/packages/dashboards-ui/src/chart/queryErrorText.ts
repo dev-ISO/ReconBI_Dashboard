@@ -42,6 +42,44 @@ const QUERY_ERROR_TEXT: Record<string, QueryErrorText> = {
     message: 'A date grouping in this chart is applied to a non-date column.',
     hint: 'Edit the chart’s fields and remove the date bucket.',
   },
+  // Value grouping + derived fields. Codes mirror the compiler's QRY_* names
+  // through ChartQueryService.ToErrorCode, same as every entry above.
+  'rcd.query.bad_grouping': {
+    message: 'A value grouping in this chart is not valid.',
+    hint: 'Edit the chart, open “Group values…” on the grouped field and fix or remove the rule.',
+  },
+  'rcd.query.too_many_values': {
+    message: 'A value grouping in this chart matches more values than one group allows.',
+    hint: 'Split the group, or make it a computed field with a formula instead.',
+  },
+  'rcd.query.bad_derived': {
+    message: 'A computed field in this chart has a formula the engine cannot run.',
+    hint: 'Open Measures and fields from the chart builder and fix the field’s formula.',
+  },
+  'rcd.query.derived_cross_table': {
+    message: 'A computed field in this chart refers to a table other than its own.',
+    hint: 'A computed field may only use the columns of the table it belongs to.',
+  },
+  'rcd.query.derived_name_conflict': {
+    message: 'A computed field in this chart has the same name as a real column of its table.',
+    hint: 'Rename the field — two things with one name on one table cannot be told apart.',
+  },
+  'rcd.query.duplicate_derived_name': {
+    message: 'Two computed fields this chart carries answer to the same name.',
+    hint: 'Rename one of them in Measures and fields.',
+  },
+  'rcd.query.duplicate_derived_id': {
+    message: 'This chart carries a computed field the model already defines.',
+    hint: 'Delete the copy on this dashboard, or in My fields, and use the model’s.',
+  },
+  'rcd.query.too_many_derived_fields': {
+    message: 'This chart carries more computed fields than one query allows.',
+    hint: 'Move some of them into the model so the query does not have to carry them.',
+  },
+  'rcd.query.derived_fields_too_large': {
+    message: 'This chart’s computed fields are too large to send with one query.',
+    hint: 'Simplify their formulas, or move some of them into the model.',
+  },
   'rcd.query.bad_column': {
     message: 'A column in this chart has a type that cannot be queried.',
     hint: 'Edit the chart’s fields to remove or replace it.',

@@ -4,6 +4,7 @@
 // is values-only, scatter wants exactly two measures, ...).
 import {
   columnLabelOf,
+  groupingSurvives,
   isNumericType,
   isTemporalType,
   toWireSpec,
@@ -22,6 +23,7 @@ import {
   type ModelDefinition,
   type SortSpec,
   type TableOptions,
+  type ValueGrouping,
 } from '@recon/dashboards-core';
 
 /**
@@ -339,11 +341,19 @@ export interface ChipDragData {
   type: ColumnType | null;
   /** The chip's visible text — the drag overlay and confirmations show it. */
   label: string;
+  /**
+   * The chip's column is a DERIVED FIELD. Carried on the payload rather than
+   * looked up at the drop, because `canAccept` runs on every dragged-over
+   * frame and has no model in scope — and because a well that lights up for a
+   * drop it will then refuse is the exact lie the wells' live styling exists
+   * to avoid.
+   */
+  derived?: boolean;
 }
 
 /** Drag payload carried by every field-list entry (dnd-kit `data`). */
 export type FieldDragData =
-  | { kind: 'column'; table: string; column: string; type: ColumnType }
+  | { kind: 'column'; table: string; column: string; type: ColumnType; derived?: boolean }
   | { kind: 'measure'; measureId: string; name: string }
   | { kind: 'parameter'; parameterId: string; name: string; paramKind: 'dimension' | 'measure' }
   | ChipDragData;
@@ -365,7 +375,18 @@ export const chipColumnOf = (ref: ChipShape): { table: string; column: string } 
   return { table: measure.table, column: measure.column };
 };
 
+/**
+ * A DERIVED column produces a row-level LABEL, so it has no value form: there
+ * is nothing to sum, and Distinct-count-of-a-CASE is a number nobody asked
+ * for. Refusing it at the well is the honest place — the drag never highlights
+ * a Values well, so the refusal is visible before the drop rather than as a
+ * validation error after it.
+ */
+const derivedDrag = (data: FieldDragData): boolean =>
+  data.kind === 'column' ? data.derived === true : data.kind === 'chip' && data.derived === true;
+
 export const canAccept = (well: WellId, data: FieldDragData): boolean => {
+  if (well === 'values' && derivedDrag(data)) return false;
   if (data.kind === 'chip') {
     // Any column can be aggregated, so every chip has a measure form; only the
     // shapes that resolve to a real table+column have a dimension form.
@@ -397,7 +418,9 @@ const toDimension = (
 ): DimensionRef => ({
   table: data.table,
   column: data.column,
-  dateBucket: isTemporalType(data.type) ? defaultBucket : null,
+  // A derived column is text by construction, so it never lands on a grain
+  // even if a caller mislabels its type.
+  dateBucket: data.derived !== true && isTemporalType(data.type) ? defaultBucket : null,
 });
 
 /**
@@ -463,6 +486,7 @@ const sameMeasure = (a: MeasureRef, b: MeasureRef): boolean => {
 
 const sameDimension = (a: DimensionRef, b: DimensionRef): boolean =>
   a.table === b.table && a.column === b.column && (a.dateBucket ?? null) === (b.dateBucket ?? null);
+
 
 /** Axis + drill levels as one ordered list (the wire keeps them split). */
 const axisLevels = (query: ChartQuery): DimensionRef[] => [
@@ -616,14 +640,24 @@ const chipAsDimension = (
 ): DimensionRef | null => {
   const column = chipColumnOf(ref);
   if (column === null) return null;
+  const grouping: ValueGrouping | null =
+    ref.kind === 'dimension' ? (ref.dimension.grouping ?? null) : null;
   const current = ref.kind === 'dimension' ? (ref.dimension.dateBucket ?? null) : null;
   // With no catalog an existing bucket is the only evidence the column is a date.
-  const temporal = columnType !== null ? isTemporalType(columnType) : current !== null;
+  // A GROUPED chip is categorical whatever its column type: the values it plots
+  // are labels, so it must not pick up a month grain on the way into a legend.
+  const temporal =
+    grouping === null && (columnType !== null ? isTemporalType(columnType) : current !== null);
   const flatRows = well === 'axis' && hasRowsList(type);
+  const dateBucket = !temporal ? null : flatRows ? current : (current ?? 'month');
   return {
     table: column.table,
     column: column.column,
-    dateBucket: !temporal ? null : flatRows ? current : (current ?? 'month'),
+    dateBucket,
+    // The grouping belongs to the FIELD, not to the well it sits in: dropping
+    // it on a move would silently un-group a chart the author grouped on
+    // purpose.
+    ...(groupingSurvives(grouping, dateBucket) ? { grouping } : {}),
   };
 };
 
@@ -1302,6 +1336,9 @@ export const OPERATOR_LABELS: Record<FilterOperator, string> = {
   startsWith: 'starts with',
   isNull: 'is null',
   notNull: 'is not null',
+  // "blank" = NULL or empty string, matching a value grouping's blank bucket.
+  isBlank: 'is blank',
+  notBlank: 'is not blank',
 };
 
 /** Chip summary: "operator" plus a compact value rendering. */

@@ -128,6 +128,57 @@ public sealed record Measure(
     public IReadOnlyList<FilterSpec> MeasureFilters => Filters ?? [];
 }
 
+/// <summary>
+/// A DERIVED FIELD: a VIRTUAL COLUMN on <see cref="Table"/>, computed row by row
+/// from other columns of THAT SAME TABLE.
+///
+/// <para>*** THE ARCHITECTURAL DECISION. *** A derived field is a column, not a
+/// new shape of dimension reference. A chart that groups by one still sends an
+/// ordinary <c>{ table, column }</c> — the column name is this field's
+/// <see cref="Name"/> (or its <see cref="Id"/>) — so the query wire, the email
+/// snapshot parser, drill-down, cross-filter, see-records, drillthrough, header
+/// filters, hover matching and every golden statement keep working unchanged,
+/// because table and column stay real, populated strings. The compiler injects
+/// these into the resolved schema (exactly as it injects date tables) and
+/// resolves the column to its expression SQL through the ONE seam
+/// <c>DimensionExpression</c> already used by dateBucket.</para>
+///
+/// <para>*** SAME-TABLE IS A SECURITY PROPERTY, NOT A LIMITATION. *** The
+/// expression may only name columns of <see cref="Table"/>. That table is in
+/// the join plan already — the dimension/filter that reaches the derived column
+/// names it — so it already receives its row filters and the derived field adds
+/// NO new bypass surface. An expression naming any other table is rejected with
+/// QRY_DERIVED_CROSS_TABLE. Relaxing this would reintroduce exactly the
+/// "row filters silently skipped for a table only an expression names" hazard
+/// that <see cref="Querying.MeasureOverlay"/> exists to prevent.</para>
+///
+/// <para><see cref="DataType"/> is "text" — the only kind this engine derives
+/// (a derived field produces a category LABEL). Anything else is rejected.
+/// Description/DisplayFolder are pure UI metadata, like Measure's.</para>
+///
+/// <para>WIRE COMPATIBILITY: <see cref="ModelJson"/> sets
+/// UnmappedMemberHandling.Disallow, so a model document that CARRIES derived
+/// fields is a hard load failure on an engine that predates them. Serialization
+/// omits the list when null, so a model without any is byte-identical to one
+/// written before the field existed.</para>
+/// </summary>
+public sealed record DerivedField(
+    Guid Id,
+    string Name,
+    string Table,
+    string Expression,
+    string? DataType = null,
+    string? Description = null,
+    string? DisplayFolder = null)
+{
+    /// <summary>The only supported derived data type.</summary>
+    public const string TextDataType = "text";
+
+    /// <summary>True unless the document names a type this engine cannot derive.</summary>
+    public bool IsTextTyped =>
+        DataType is null || string.Equals(DataType, TextDataType, StringComparison.OrdinalIgnoreCase);
+}
+
 /// <summary>Wire names via the converter: "monday", "sunday".</summary>
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<WeekStartDay>))]
 public enum WeekStartDay
@@ -170,14 +221,22 @@ public sealed record ModelDefinition(
     IReadOnlyList<ModelTable> Tables,
     IReadOnlyList<Relationship> Relationships,
     IReadOnlyList<Measure> Measures,
-    IReadOnlyList<DateTableDef>? DateTables = null)
+    IReadOnlyList<DateTableDef>? DateTables = null,
+    IReadOnlyList<DerivedField>? DerivedFields = null)
 {
     public const int CurrentVersion = 1;
 
     public IReadOnlyList<DateTableDef> DateTableDefs => DateTables ?? [];
 
+    /// <summary>SYSTEM-scoped derived fields. Dashboard/personal ones ride the query wire instead.</summary>
+    public IReadOnlyList<DerivedField> DerivedFieldDefs => DerivedFields ?? [];
+
     public ModelTable? FindTable(string key) =>
         Tables.FirstOrDefault(t => string.Equals(t.Key, key, StringComparison.Ordinal));
+
+    /// <summary>The derived fields attached to one table, in declaration order.</summary>
+    public IReadOnlyList<DerivedField> DerivedFieldsOn(string tableKey) =>
+        [.. DerivedFieldDefs.Where(f => string.Equals(f.Table, tableKey, StringComparison.Ordinal))];
 
     public DateTableDef? FindDateTable(string key) =>
         DateTableDefs.FirstOrDefault(d => string.Equals(d.Key, key, StringComparison.Ordinal));

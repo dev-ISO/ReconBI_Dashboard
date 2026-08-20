@@ -424,10 +424,22 @@ function DrillthroughSection({ page }: { page: DashboardPage }) {
     if (!usableCatalog || pendingTable === '') return [];
     const modelTable = tables.find((t) => tableKey(t.schema, t.name) === pendingTable);
     const overrides = new Map((modelTable?.columns ?? []).map((c) => [c.name, c]));
-    return (usableCatalog.tables.find((t) => t.key === pendingTable)?.columns ?? [])
-      .filter((c) => isQueryableType(c.type) && !overrides.get(c.name)?.hidden)
-      .map((c) => ({ name: c.name, label: overrides.get(c.name)?.friendlyName ?? c.name }));
-  }, [usableCatalog, pendingTable, tables]);
+    // MODEL-held derived fields are offerable here — they are columns of this
+    // table for every viewer of every dashboard. Dashboard- and personal-scope
+    // ones deliberately are NOT: a drillthrough field is resolved on the TARGET
+    // page, by whoever opens it, so one that lives in another document (or in
+    // one person's settings) would be a target that works for its author and
+    // fails for everyone else.
+    const derived = (openModel?.definition.derivedFields ?? [])
+      .filter((field) => field.table === pendingTable)
+      .map((field) => ({ name: field.name, label: field.name }));
+    return [
+      ...derived,
+      ...(usableCatalog.tables.find((t) => t.key === pendingTable)?.columns ?? [])
+        .filter((c) => isQueryableType(c.type) && !overrides.get(c.name)?.hidden)
+        .map((c) => ({ name: c.name, label: overrides.get(c.name)?.friendlyName ?? c.name })),
+    ];
+  }, [usableCatalog, pendingTable, tables, openModel]);
 
   // When the model arrives AFTER the user started typing (the inputs swap to
   // selects), carry typed values over by case-insensitive match so they don't

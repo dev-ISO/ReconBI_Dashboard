@@ -27,7 +27,7 @@ import {
   type DashboardRemoteSlicerValueEvent,
   type DashboardTileLockEvent,
 } from '../types/ops';
-import type { ChartSpec, ContainerStyle } from '../types/chart';
+import type { ChartSpec, ContainerStyle, WireDefinitions } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
   dashboardAccessOf,
@@ -77,13 +77,18 @@ import type {
   FilterValue,
 } from '../types/query';
 import type { ColumnType } from '../types/schema';
-import type { Measure } from '../types/model';
+import type { DerivedField, Measure } from '../types/model';
 import {
   chartMeasureDefinitions,
   chartMeasureIds,
   collectMeasureDefinitions,
   mergeMeasureDefinitions,
 } from './measureScope';
+import {
+  chartDerivedFieldDefinitions,
+  mergeDerivedFields,
+} from './derivedFieldScope';
+import { groupingClauseFor, hasGrouping } from './valueGrouping';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
 import { sanitizeButtonCss } from '../util/buttonStyle';
@@ -332,7 +337,21 @@ export interface DashboardStoreState {
      * nothing else carries them across.
      */
     definitions: Measure[];
+    /**
+     * The scoped DERIVED FIELD definitions the copied chart's dimensions name.
+     * Same reason as `definitions` above and the same failure without them —
+     * QRY_UNKNOWN_COLUMN this time, because a derived column is addressed by
+     * name and the target dashboard has never heard of it.
+     */
+    derivedFields: DerivedField[];
   } | null;
+  /**
+   * PERSONAL-scope derived fields (the per-user settings document's
+   * `derivedFields`), the sibling of personalMeasures below and held here for
+   * exactly the same two reasons: the query wire has to send them, and a chart
+   * saved into a dashboard may not be left citing one.
+   */
+  personalDerivedFields: DerivedField[];
   /**
    * PERSONAL-scope measures (the per-user settings document's `measures`).
    * Held here so the query wire can send them and so the promotion rule can be
@@ -389,6 +408,8 @@ export interface DashboardCollabSenders {
    * second one would be a distinction without a difference.
    */
   onPersistPersonalMeasures?: (measures: Measure[], modelId: number | null) => void;
+  /** The derived-field twin of onPersistPersonalMeasures; same store, same debounce. */
+  onPersistPersonalDerivedFields?: (fields: DerivedField[], modelId: number | null) => void;
 }
 
 /**
@@ -407,8 +428,15 @@ export const isCollabLiveDashboard = (dashboard: OpenDashboard): boolean =>
 
 /** Transient hover cross-highlight payload (see DashboardStoreState.hoverHighlight). */
 export interface HoverHighlight {
-  /** Dimension of the hovered category on the SOURCE chart (its effective axis/legend). */
-  dimension: { table: string; column: string };
+  /**
+   * Dimension of the hovered category on the SOURCE chart (its effective
+   * axis/legend). `groupingKey` distinguishes two charts that plot the SAME
+   * column under different value groupings: without it a tile showing raw
+   * dates and a tile showing "Yes"/"No" over that column match on table+column
+   * and then dim each other on a label neither of them means. Absent/null =
+   * the raw column, which is what every pre-grouping chart sends.
+   */
+  dimension: { table: string; column: string; groupingKey?: string | null };
   /** RAW (pre-format) hovered cell value. */
   raw: CellValue;
   /** Formatted category label — the key other charts dim against. */
@@ -609,8 +637,19 @@ export const crossFilterClauseFor = (
   dimension: DimensionRef,
   raw: CellValue | Date,
   options: CrossFilterClauseOptions = {},
-): FilterClause => {
+): FilterClause | null => {
   const { table, column } = dimension;
+  // A GROUPED dimension hands back a LABEL, not a value: the cell says "Yes"
+  // where the column holds a date. Filtering the raw column with the label
+  // would match nothing at all, so the label is translated back through the
+  // grouping rule - and when no single clause can say it without over-matching,
+  // the answer is null and the caller declines the cross-filter rather than
+  // applying a filter that means something else.
+  if (hasGrouping(dimension)) {
+    return raw === null || raw instanceof Date
+      ? null
+      : groupingClauseFor(dimension, String(raw));
+  }
   if (raw === null) return { table, column, operator: 'isNull', values: [] };
   const bucket = options.dateBucket ?? dimension.dateBucket ?? null;
   if (bucket !== null) {
@@ -632,6 +671,9 @@ export const dateRangeClauseFor = (
   toRaw: unknown,
   options: CrossFilterClauseOptions = {},
 ): FilterClause | null => {
+  // A grouped axis is categorical text; a dragged "range" over it has no
+  // meaning to translate.
+  if (hasGrouping(dimension)) return null;
   const bucket = options.dateBucket ?? dimension.dateBucket ?? 'day';
   const from = dateBucketRange(fromRaw, bucket);
   const to = dateBucketRange(toRaw, bucket);
@@ -712,6 +754,7 @@ const initialState: DashboardStoreState = {
   error: null,
   chartClipboard: null,
   personalMeasures: [],
+  personalDerivedFields: [],
 };
 
 /** localStorage key of the per-user "Show live cursors" preference. */
@@ -3721,6 +3764,132 @@ export class DashboardStore {
     return chartMeasureDefinitions(available, chart);
   }
 
+  /* -------------------------------- scoped derived fields (dashboard scope) */
+
+  /** The open dashboard's own derived fields; [] when none/closed. */
+  get dashboardDerivedFields(): DerivedField[] {
+    return this.state.current?.layout.derivedFields ?? [];
+  }
+
+  /** Every derived field the open dashboard can offer, widest scope first. */
+  get availableDerivedFields(): DerivedField[] {
+    return [...this.dashboardDerivedFields, ...this.state.personalDerivedFields];
+  }
+
+  /** Seeds the PERSONAL derived fields from the per-user settings document. */
+  hydratePersonalDerivedFields(fields: DerivedField[]): void {
+    this.set({ personalDerivedFields: [...fields] });
+  }
+
+  /** Replaces the PERSONAL derived fields and persists them (see setPersonalMeasures). */
+  setPersonalDerivedFields(fields: DerivedField[]): void {
+    const next = [...fields];
+    this.set({ personalDerivedFields: next });
+    this.collab.onPersistPersonalDerivedFields?.(next, this.state.current?.modelId ?? null);
+  }
+
+  /** The derived-field definitions a chart's dimensions need on the wire. */
+  derivedFieldsForChart(chart: ChartSpec): DerivedField[] {
+    return chartDerivedFieldDefinitions(this.availableDerivedFields, chart);
+  }
+
+  /**
+   * BOTH overlays a chart needs on the wire, in the shape toWireSpec takes.
+   * Every query-building call site goes through this rather than through
+   * definitionsForChart alone, so a chart can never be sent with its measures
+   * and without the derived columns its dimensions name.
+   */
+  wireDefinitionsForChart(chart: ChartSpec): WireDefinitions {
+    return {
+      measures: this.definitionsForChart(chart),
+      derivedFields: this.derivedFieldsForChart(chart),
+    };
+  }
+
+  /** Replaces the open dashboard's derivedFields[] through the doc seam. */
+  private mutateDerivedFields(mutate: (fields: DerivedField[]) => DerivedField[]): void {
+    this.mutateLayout((layout) => ({
+      ...layout,
+      derivedFields: mutate(layout.derivedFields ?? []),
+    }));
+  }
+
+  addDashboardDerivedField(
+    field: Omit<DerivedField, 'id'> & { id?: string },
+  ): DerivedField | null {
+    if (!this.state.current) return null;
+    const withId: DerivedField = { ...field, id: field.id ?? newId() };
+    this.mutateDerivedFields((fields) => [...fields, withId]);
+    return withId;
+  }
+
+  updateDashboardDerivedField(id: string, patch: Partial<Omit<DerivedField, 'id'>>): void {
+    if (!this.dashboardDerivedFields.some((f) => f.id === id)) return;
+    this.mutateDerivedFields((fields) =>
+      fields.map((f) => (f.id === id ? { ...f, ...patch, id: f.id } : f)),
+    );
+  }
+
+  removeDashboardDerivedField(id: string): void {
+    if (!this.dashboardDerivedFields.some((f) => f.id === id)) return;
+    this.mutateDerivedFields((fields) => fields.filter((f) => f.id !== id));
+  }
+
+  /**
+   * Promotes derived fields INTO the open dashboard's scope, collision-safe
+   * (the same merge chart copy uses), re-pointing the given chart at whatever
+   * name the merge settled on. Returns null when no dashboard is open.
+   */
+  promoteDerivedFieldsToDashboard(
+    fields: DerivedField[],
+    chart: ChartSpec,
+  ): { chart: ChartSpec; added: DerivedField[]; renamed: [string, string][] } | null {
+    if (!this.state.current) return null;
+    if (fields.length === 0) return { chart, added: [], renamed: [] };
+    const merged = mergeDerivedFields(this.dashboardDerivedFields, fields, chart);
+    if (merged.added.length > 0) this.mutateDerivedFields(() => merged.fields);
+    return { chart: merged.chart ?? chart, added: merged.added, renamed: merged.renamed };
+  }
+
+  /**
+   * Promotes a dashboard derived field to SYSTEM scope by appending it to the
+   * dashboard's model. Server-gated exactly like promoteMeasureToModel, and
+   * the dashboard copy is likewise LEFT in place — a derived column is
+   * addressed by name, so removing the nearer copy before the model copy is
+   * saved would break every chart on this dashboard that names it.
+   */
+  async promoteDerivedFieldToModel(fieldId: string): Promise<DerivedField | null> {
+    const current = this.state.current;
+    const modelId = current?.modelId ?? null;
+    if (!current || modelId === null) return null;
+    const source = this.dashboardDerivedFields.find((f) => f.id === fieldId);
+    if (!source) return null;
+    try {
+      const model = await this.api.getModel(modelId);
+      const merged = mergeDerivedFields(model.definition.derivedFields ?? [], [source]);
+      if (merged.added.length === 0) return merged.reused[0] ?? source;
+      await this.api.updateModel(modelId, {
+        name: model.name,
+        description: model.description,
+        dataSourceName: model.dataSourceName,
+        definition: { ...model.definition, derivedFields: merged.fields },
+        isShared: model.isShared,
+        expectedUpdatedAtUtc: model.updatedAtUtc,
+      });
+      return merged.added.find((f) => f.name === source.name) ?? merged.added[0] ?? null;
+    } catch (error) {
+      this.set({ error: rcdErrorMessage(error) });
+      throw error;
+    }
+  }
+
+  /** The personal derived fields a chart cites, transitively-free (no [refs]). */
+  private citedPersonalDerivedFields(chart: ChartSpec): DerivedField[] {
+    return this.state.personalDerivedFields.length === 0
+      ? []
+      : chartDerivedFieldDefinitions(this.state.personalDerivedFields, chart);
+  }
+
   /** Replaces the open dashboard's measures[] through the normal doc seam. */
   private mutateMeasures(mutate: (measures: Measure[]) => Measure[]): void {
     this.mutateLayout((layout) => ({ ...layout, measures: mutate(layout.measures ?? []) }));
@@ -3834,11 +4003,29 @@ export class DashboardStore {
    * user's store so the scratchpad keeps working.
    */
   private promotePersonalMeasuresFor(chart: ChartSpec): ChartSpec {
-    const cited = this.citedPersonalMeasures(chart);
-    if (cited.length === 0) return chart;
-    const merged = mergeMeasureDefinitions(this.dashboardMeasures, cited, chart);
-    if (merged.added.length === 0) return merged.chart ?? chart;
+    const withFields = this.promotePersonalDerivedFieldsFor(chart);
+    const cited = this.citedPersonalMeasures(withFields);
+    if (cited.length === 0) return withFields;
+    const merged = mergeMeasureDefinitions(this.dashboardMeasures, cited, withFields);
+    if (merged.added.length === 0) return merged.chart ?? withFields;
     this.mutateMeasures(() => merged.measures);
+    return merged.chart ?? withFields;
+  }
+
+  /**
+   * The promotion rule again, for derived fields, and for the same reason: a
+   * chart saved into a dashboard may not name a column that exists only in one
+   * person's settings document. The failure it prevents is sharper here than
+   * for measures - a dimension naming a missing derived column is
+   * QRY_UNKNOWN_COLUMN, so the chart does not render AT ALL rather than losing
+   * one series.
+   */
+  private promotePersonalDerivedFieldsFor(chart: ChartSpec): ChartSpec {
+    const cited = this.citedPersonalDerivedFields(chart);
+    if (cited.length === 0) return chart;
+    const merged = mergeDerivedFields(this.dashboardDerivedFields, cited, chart);
+    if (merged.added.length === 0) return merged.chart ?? chart;
+    this.mutateDerivedFields(() => merged.fields);
     return merged.chart ?? chart;
   }
 
@@ -3862,6 +4049,7 @@ export class DashboardStore {
         chart: structuredClone(chart),
         sourceModelId,
         definitions: structuredClone(this.definitionsForChart(chart)),
+        derivedFields: structuredClone(this.derivedFieldsForChart(chart)),
       },
     });
   }
@@ -3879,9 +4067,18 @@ export class DashboardStore {
     if (!clip || this.state.mode !== 'edit' || !this.state.current) return;
     const copy = cloneChartForCopy(clip.chart, { suffix: true });
     this.groupHistory(() => {
-      const merged = mergeMeasureDefinitions(this.dashboardMeasures, clip.definitions, copy);
+      // Derived fields first: a name collision RENAMES the field and re-points
+      // the chart's dimensions, and the measure merge must see that chart.
+      const fields = mergeDerivedFields(
+        this.dashboardDerivedFields,
+        clip.derivedFields ?? [],
+        copy,
+      );
+      if (fields.added.length > 0) this.mutateDerivedFields(() => fields.fields);
+      const carried = fields.chart ?? copy;
+      const merged = mergeMeasureDefinitions(this.dashboardMeasures, clip.definitions, carried);
       if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
-      this.addTile(merged.chart ?? copy);
+      this.addTile(merged.chart ?? carried);
     });
   }
 
@@ -3914,20 +4111,24 @@ export class DashboardStore {
     _sourceModelId: number | null,
   ): Promise<void> {
     const definitions = this.definitionsForChart(chart);
+    const derivedFields = this.derivedFieldsForChart(chart);
     const current = this.state.current;
     if (current && current.id === targetId) {
       // Same dashboard: the definitions are already here — merge is a no-op
       // for anything identical, and promotes a cited personal measure.
       const copy = cloneChartForCopy(chart, { suffix: true });
       this.groupHistory(() => {
-        const merged = mergeMeasureDefinitions(this.dashboardMeasures, definitions, copy);
+        const fields = mergeDerivedFields(this.dashboardDerivedFields, derivedFields, copy);
+        if (fields.added.length > 0) this.mutateDerivedFields(() => fields.fields);
+        const carried = fields.chart ?? copy;
+        const merged = mergeMeasureDefinitions(this.dashboardMeasures, definitions, carried);
         if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
-        this.addTile(merged.chart ?? copy);
+        this.addTile(merged.chart ?? carried);
       });
       return;
     }
     try {
-      await this.appendChartRemote(targetId, chart, definitions);
+      await this.appendChartRemote(targetId, chart, definitions, derivedFields);
     } catch (error) {
       const stale =
         error instanceof RcdApiError && error.errorCode === 'rcd.dashboard.stale';
@@ -3936,7 +4137,7 @@ export class DashboardStore {
         throw error;
       }
       try {
-        await this.appendChartRemote(targetId, chart, definitions);
+        await this.appendChartRemote(targetId, chart, definitions, derivedFields);
       } catch (retryError) {
         this.set({ error: messageOf(retryError) });
         throw retryError;
@@ -3953,19 +4154,32 @@ export class DashboardStore {
     return this.definitionsForChart(chart).length;
   }
 
+  /** The same count for DERIVED FIELDS — they travel by the same merge. */
+  derivedFieldCarryCount(chart: ChartSpec): number {
+    return this.derivedFieldsForChart(chart).length;
+  }
+
   /** One fetch → append → save round-trip (copyChartToDashboard's engine). */
   private async appendChartRemote(
     targetId: number,
     chart: ChartSpec,
     definitions: Measure[],
+    derivedFields: DerivedField[] = [],
   ): Promise<void> {
     const detail = await this.api.getDashboard(targetId);
     const layout = detail.layout?.tiles ? detail.layout : emptyLayout();
     // Merge the carried definitions into the TARGET's measures first: the
     // merge may re-point the chart's refs (same id, different definition) or
     // dedupe a name, and the tile must be built from the rewritten chart.
-    const merged = mergeMeasureDefinitions(layout.measures ?? [], definitions, chart);
-    const carried = merged.chart ?? chart;
+    // Derived fields go one step earlier for the same reason: they are
+    // addressed BY NAME, so a dedupe rewrites the chart's dimensions.
+    const fieldMerge = mergeDerivedFields(layout.derivedFields ?? [], derivedFields, chart);
+    const merged = mergeMeasureDefinitions(
+      layout.measures ?? [],
+      definitions,
+      fieldMerge.chart ?? chart,
+    );
+    const carried = merged.chart ?? fieldMerge.chart ?? chart;
     const tileFor = (tiles: DashboardTile[]): DashboardTile => ({
       id: newId(),
       layout: {
@@ -3982,8 +4196,10 @@ export class DashboardStore {
       chart: cloneChartForCopy(carried),
     });
     const pages = layout.pages ?? [];
+    const withFields: DashboardLayoutDoc =
+      fieldMerge.added.length > 0 ? { ...layout, derivedFields: fieldMerge.fields } : layout;
     const withMeasures: DashboardLayoutDoc =
-      merged.added.length > 0 ? { ...layout, measures: merged.measures } : layout;
+      merged.added.length > 0 ? { ...withFields, measures: merged.measures } : withFields;
     const nextLayout: DashboardLayoutDoc =
       pages.length > 0
         ? {

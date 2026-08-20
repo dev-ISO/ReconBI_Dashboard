@@ -3,10 +3,13 @@ import type { RcdFetcher } from '../api/fetcher';
 import { DashboardStore, type DashboardCollabSenders } from './dashboardStore';
 import { ModelStore } from './modelStore';
 import {
+  PERSONAL_DERIVED_FIELDS_SECTION,
   PERSONAL_MEASURES_SECTION,
   migrateFlatPersonalMeasures,
   personalMeasuresModelKey,
+  readPersonalDerivedFields,
   readPersonalMeasures,
+  writePersonalDerivedFields,
   writePersonalMeasures,
 } from './personalMeasures';
 import { QueryCache, type QueryCacheOptions } from './queryCache';
@@ -94,6 +97,17 @@ export const createDashboardsRuntime = (
           measures,
         ),
       })),
+    // PERSONAL derived fields: the same document, the same debounce, its own
+    // model-keyed section.
+    onPersistPersonalDerivedFields: (fields, modelId) =>
+      userSettings.update((doc) => ({
+        ...doc,
+        [PERSONAL_DERIVED_FIELDS_SECTION]: writePersonalDerivedFields(
+          doc[PERSONAL_DERIVED_FIELDS_SECTION],
+          modelId,
+          fields,
+        ),
+      })),
   });
 
   /**
@@ -116,6 +130,12 @@ export const createDashboardsRuntime = (
     const migrated = migrateFlatPersonalMeasures(raw, current.modelId);
     if (migrated !== null) userSettings.setSection(PERSONAL_MEASURES_SECTION, migrated);
     dashboards.hydratePersonalMeasures(readPersonalMeasures(migrated ?? raw, current.modelId));
+    dashboards.hydratePersonalDerivedFields(
+      readPersonalDerivedFields(
+        userSettings.section<unknown>(PERSONAL_DERIVED_FIELDS_SECTION, null),
+        current.modelId,
+      ),
+    );
   };
   dashboards.store.subscribe(syncPersonalMeasures);
 

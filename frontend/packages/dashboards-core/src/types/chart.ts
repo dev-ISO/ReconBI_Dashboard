@@ -10,7 +10,7 @@ import type {
   MeasureRef,
   SortSpec,
 } from './query';
-import type { Measure } from './model';
+import type { DerivedField, Measure } from './model';
 
 export type ChartType =
   | 'column'
@@ -619,6 +619,17 @@ export interface ChartSpec {
   format: ChartFormat;
 }
 
+/**
+ * The definitions a chart carries because the stored model does not hold them:
+ * dashboard-scoped and personal MEASURES, and the DERIVED FIELDS its
+ * dimensions name. Both are merged onto the model definition by the same
+ * server-side overlay before the compiler runs.
+ */
+export interface WireDefinitions {
+  measures?: Measure[] | null;
+  derivedFields?: DerivedField[] | null;
+}
+
 export const emptyChart = (id: string): ChartSpec => ({
   id,
   type: 'column',
@@ -655,8 +666,18 @@ export const toWireSpec = (
   chart: ChartSpec,
   modelId: number,
   extraFilters: FilterClause[] = [],
-  definitions: Measure[] | null = null,
+  definitions: Measure[] | WireDefinitions | null = null,
 ): ChartQuerySpec => {
+  // One argument, two shapes: the historic Measure[] and the bundle that also
+  // carries derived fields. Widening it here rather than adding a fifth
+  // positional parameter keeps every existing call site byte-identical (and
+  // therefore cache-key-identical) while giving the ~10 call sites that go
+  // through the store's wireDefinitionsForChart both overlays at once.
+  const bundle: WireDefinitions = Array.isArray(definitions)
+    ? { measures: definitions }
+    : (definitions ?? {});
+  const measureDefs = bundle.measures ?? null;
+  const derivedDefs = bundle.derivedFields ?? null;
   // Order matters downstream. Non-table charts KEEP the
   // [axis, legend?, smallMultiples?] guarantee — LayoutSnapshotParser and the
   // email renderer rely on it. Matrix tables (and ONLY matrix tables) splice
@@ -692,7 +713,8 @@ export const toWireSpec = (
     filters: [...chart.query.filters, ...extraFilters],
     sort,
     limit: chart.query.limit ?? null,
-    ...(definitions && definitions.length > 0 ? { definitions } : {}),
+    ...(measureDefs && measureDefs.length > 0 ? { definitions: measureDefs } : {}),
+    ...(derivedDefs && derivedDefs.length > 0 ? { derivedFields: derivedDefs } : {}),
   };
 };
 

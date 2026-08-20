@@ -13,6 +13,8 @@ import {
   columnLabelOf,
   crossFilterClauseFor,
   dateRangeClauseFor,
+  groupingClauseFor,
+  hasGrouping,
   emptyChart,
   filterCardIsActive,
   isChartTile,
@@ -203,6 +205,10 @@ const dimensionMeta = (
   dimension: DimensionRef,
   columns: QueryColumn[] | null,
 ): CrossFilterClauseOptions => {
+  // A grouped dimension's result column is text whatever the underlying column
+  // is, and it never carries a bucket — reporting the raw column's type here
+  // would send the clause down the date-range branch.
+  if (hasGrouping(dimension)) return { columnType: 'text', dateBucket: null };
   const wire = wireDimensions(chart);
   const index = wire.findIndex(
     (dim) => dim.table === dimension.table && dim.column === dimension.column,
@@ -822,11 +828,18 @@ export function DashboardView({
         if (applied.some((a) => a.dimension.table === dimension.table && a.dimension.column === dimension.column)) {
           continue;
         }
-        applied.push({
-          clause: crossFilterClauseFor(dimension, facet.value, dimensionMeta(chart, dimension, columns)),
+        const clause = crossFilterClauseFor(
           dimension,
-          label: facet.label,
-        });
+          facet.value,
+          dimensionMeta(chart, dimension, columns),
+        );
+        // A GROUPED dimension whose clicked bucket has no honest single-clause
+        // translation (see groupingClauseFor) yields null. Skipping is the only
+        // correct answer: filtering the raw column with a group LABEL would
+        // match nothing, and approximating the bucket would silently show rows
+        // the user did not click.
+        if (clause === null) continue;
+        applied.push({ clause, dimension, label: facet.label });
       }
       if (applied.length === 0) return;
       const additive = readAdditiveModifier();
@@ -931,9 +944,12 @@ export function DashboardView({
       // same range-vs-eq decision applies here.
       const clause = crossFilterClauseFor(
         dimension,
-        e.raw === '' ? null : e.raw,
+        // A grouped legend reports its LABEL, which is the identity the rule
+        // speaks; an ungrouped one keeps the historic blank-is-null reading.
+        hasGrouping(dimension) ? e.label : e.raw === '' ? null : e.raw,
         dimensionMeta(chart, dimension, columns),
       );
+      if (clause === null) return;
       runtime.dashboards.applyCrossFilter({
         sourceTileId: tileId,
         clause,
@@ -984,7 +1000,7 @@ export function DashboardView({
         chart,
         state.current.modelId,
         clauses,
-        runtime.dashboards.definitionsForChart(chart),
+        runtime.dashboards.wireDefinitionsForChart(chart),
       );
       try {
         const { blob, truncated } = await runtime.api.exportQueryCsv({
@@ -1039,6 +1055,20 @@ export function DashboardView({
         const value = hit.value;
         if (value === undefined || value === null) {
           disabledReason ??= `The clicked point has no ${chipColumnLabel(field.table, field.column)} value`;
+          continue;
+        }
+        if (hit.dim != null && hasGrouping(hit.dim)) {
+          // The drillthrough FIELD names a real column; the clicked point
+          // carries a group label. Translate, and disable the target when the
+          // bucket cannot be said in one clause — a drillthrough that lands on
+          // the wrong rows is worse than one the menu greys out.
+          const grouped = groupingClauseFor(hit.dim, String(value));
+          if (grouped === null) {
+            disabledReason ??= `“${String(value)}” is a group of values that cannot be carried across as a filter`;
+            continue;
+          }
+          clauses.push(grouped);
+          labels.push(hit.label ?? String(value));
           continue;
         }
         clauses.push({
@@ -1133,6 +1163,14 @@ export function DashboardView({
     ];
     for (const { dim, value } of pointDims) {
       if (!dim || value === undefined) continue;
+      if (hasGrouping(dim)) {
+        // The point carries a group LABEL. Translate it, and drop the facet
+        // rather than narrow "See records" by a filter that means something
+        // else — the rows shown would not be the rows clicked.
+        const grouped = value === null ? null : groupingClauseFor(dim, String(value));
+        if (grouped !== null) clauses.push(grouped);
+        continue;
+      }
       clauses.push(
         value === null
           ? { table: dim.table, column: dim.column, operator: 'isNull', values: [] }
@@ -1156,7 +1194,7 @@ export function DashboardView({
         chart,
         state.current.modelId,
         clauses,
-        runtime.dashboards.definitionsForChart(chart),
+        runtime.dashboards.wireDefinitionsForChart(chart),
       ),
     });
   }, [pointMenu, runtime]);
@@ -1534,7 +1572,7 @@ export function DashboardView({
               tile.chart,
               inputs.modelId,
               inputs.filtersByTile.get(id) ?? NO_FILTERS,
-              runtime.dashboards.definitionsForChart(tile.chart),
+              runtime.dashboards.wireDefinitionsForChart(tile.chart),
             ),
           ),
         );

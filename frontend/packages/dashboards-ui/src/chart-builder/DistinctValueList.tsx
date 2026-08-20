@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { AlertTriangle, RefreshCw, Search } from 'lucide-react';
-import type { CellValue, FilterValue } from '@recon/dashboards-core';
+import type { CellValue, DerivedField, FilterValue } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton, RcdInput, RcdSpinner } from '../primitives';
 
@@ -9,6 +9,14 @@ export interface DistinctValueListProps {
   table: string;
   column: string;
   selected: readonly FilterValue[];
+  /**
+   * Derived-field definitions the lookup must carry when `column` names one
+   * that is NOT in the stored model (dashboard- or personal-scope). Without
+   * them the server has no such column and answers unknown_column. Omitted for
+   * a physical or model-held column, which keeps the request — and its cache
+   * key — byte-identical to before derived fields existed.
+   */
+  derivedFields?: readonly DerivedField[];
   onToggle: (value: FilterValue) => void;
 }
 
@@ -26,7 +34,14 @@ const keyOf = (value: FilterValue): string => `${typeof value}:${String(value)}`
  * shared query cache (`runtime.queries.distinct`, server-side search). Used by
  * the chart FilterEditor ('in' operator) and dashboard slicer popovers.
  */
-export function DistinctValueList({ modelId, table, column, selected, onToggle }: DistinctValueListProps) {
+export function DistinctValueList({
+  modelId,
+  table,
+  column,
+  selected,
+  derivedFields,
+  onToggle,
+}: DistinctValueListProps) {
   const runtime = useRuntime();
   const [search, setSearch] = useState('');
   const [debounced, setDebounced] = useState('');
@@ -43,13 +58,30 @@ export function DistinctValueList({ modelId, table, column, selected, onToggle }
     return () => clearTimeout(timer);
   }, [search]);
 
+  // Identity, not reference: the caller usually rebuilds this array each
+  // render, and a reference dependency would refetch on every keystroke.
+  const overlayKey =
+    derivedFields === undefined || derivedFields.length === 0
+      ? ''
+      : derivedFields.map((field) => `${field.table}.${field.name}=${field.expression}`).join('|');
+  const overlayRef = useRef(derivedFields);
+  overlayRef.current = derivedFields;
+
   useEffect(() => {
     const controller = new AbortController();
     let cancelled = false;
     setState((prev) => ({ ...prev, status: 'loading', error: null }));
+    const overlay = overlayRef.current;
     runtime.queries
       .distinct(
-        { modelId, table, column, search: debounced.trim() || null, filters: [] },
+        {
+          modelId,
+          table,
+          column,
+          search: debounced.trim() || null,
+          filters: [],
+          ...(overlay && overlay.length > 0 ? { derivedFields: [...overlay] } : {}),
+        },
         controller.signal,
       )
       .then((result) => {
@@ -69,7 +101,7 @@ export function DistinctValueList({ modelId, table, column, selected, onToggle }
       cancelled = true;
       controller.abort();
     };
-  }, [runtime, modelId, table, column, debounced, retryToken]);
+  }, [runtime, modelId, table, column, debounced, retryToken, overlayKey]);
 
   // Keep already-selected values visible (and un-toggleable) even when the
   // current search response doesn't include them.

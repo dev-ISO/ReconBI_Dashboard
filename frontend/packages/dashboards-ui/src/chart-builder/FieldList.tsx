@@ -43,6 +43,11 @@ import {
 import { MeasureRowMenu } from './MeasureRowMenu';
 import { buildMeasureMenuItems, type MeasureMenuHandlers } from './measureMenu';
 import {
+  buildDerivedFieldMenuItems,
+  type DerivedFieldMenuHandlers,
+} from './DerivedFieldSections';
+import type { ScopedDerivedField } from './derivedFieldActions';
+import {
   MEASURE_SCOPES,
   scopeBlurb,
   scopeLabel,
@@ -70,6 +75,21 @@ export interface FieldListMeasureManagement {
   onManage: () => void;
 }
 
+/**
+ * Everything the DERIVED FIELD rows need to become manageable in place. A
+ * derived field renders as a COLUMN of its table (that is what it is), so
+ * there is no new section — only a badge, a row menu, and one entry point for
+ * making a new one.
+ */
+export interface FieldListDerivedManagement {
+  /** Where each derived field lives, keyed by table+name (its address). */
+  scoped: readonly ScopedDerivedField[];
+  rights: Record<MeasureScope, MeasureScopeRights>;
+  handlers: DerivedFieldMenuHandlers;
+  /** "New field…" — scope chosen in the manager, like the measure "+". */
+  onCreate: () => void;
+}
+
 export interface FieldListProps {
   /**
    * The EFFECTIVE model: the stored definition with the dashboard-scoped and
@@ -92,6 +112,8 @@ export interface FieldListProps {
   onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
   /** Present = the Measures section gains a "+" and a per-row action menu. */
   measures?: FieldListMeasureManagement;
+  /** Present = derived-field rows gain a scope badge and an action menu. */
+  derived?: FieldListDerivedManagement;
   /**
    * Per-user grouping / expansion / hidden-group preferences. Omit and the
    * list keeps them in memory for the session — the pre-wave behaviour, and
@@ -133,6 +155,7 @@ export function FieldList({
   onAdd,
   onAddFilter,
   measures: management,
+  derived: derivedManagement,
   prefs: providedPrefs,
   inUse = EMPTY_IN_USE,
 }: FieldListProps) {
@@ -335,10 +358,23 @@ export function FieldList({
           prefs={prefs}
           query={q}
           inUse={inUse}
+          derived={derivedManagement}
           onAdd={onAdd}
           onAddFilter={onAddFilter}
         />
       ))}
+
+      {derivedManagement !== undefined && (
+        <button
+          type="button"
+          onClick={derivedManagement.onCreate}
+          title="A field computed per row — group values, or write a small formula"
+          className="mx-1 mt-1 flex w-[calc(100%-0.5rem)] items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+        >
+          <Plus size={12} className="shrink-0" />
+          New field…
+        </button>
+      )}
 
       {measuresVisible && (
         <>
@@ -481,6 +517,7 @@ function ColumnGroupSection({
   prefs,
   query,
   inUse,
+  derived,
   onAdd,
   onAddFilter,
 }: {
@@ -489,6 +526,7 @@ function ColumnGroupSection({
   /** Trimmed lowercase search query ('' = not searching). */
   query: string;
   inUse: ReadonlySet<string>;
+  derived?: FieldListDerivedManagement;
   onAdd: (data: FieldDragData) => void;
   onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
 }) {
@@ -510,18 +548,43 @@ function ColumnGroupSection({
       table: row.table,
       column: row.column,
       type: row.type,
+      // The marker the wells read to refuse a Values drop before it happens.
+      ...(row.derived ? { derived: true as const } : null),
     } as const;
+    const entry =
+      row.derived === undefined
+        ? undefined
+        : derived?.scoped.find(
+            (candidate) =>
+              candidate.field.table === row.table && candidate.field.name === row.column,
+          );
     return (
       <FieldEntry
         key={row.id}
         id={row.id}
         data={data}
         label={row.label}
-        icon={<ColumnTypeIcon type={row.type} />}
+        icon={row.derived ? <Type size={13} /> : <ColumnTypeIcon type={row.type} />}
         iconKind={row.kind}
-        badge={group.qualifyRows ? <TableQualifier label={row.tableLabel} /> : undefined}
+        title={row.derived ? `Computed per row: ${row.derived.expression}` : undefined}
+        badge={
+          row.derived ? (
+            <DerivedBadge scope={entry?.scope ?? null} />
+          ) : group.qualifyRows ? (
+            <TableQualifier label={row.tableLabel} />
+          ) : undefined
+        }
         onAdd={onAdd}
         onFilter={onAddFilter ? () => onAddFilter(data) : undefined}
+        action={
+          derived && entry ? (
+            <MeasureRowMenu
+              compact
+              label={`Actions for ${row.label}`}
+              items={buildDerivedFieldMenuItems(entry, derived.rights, derived.handlers)}
+            />
+          ) : undefined
+        }
       />
     );
   };
@@ -824,6 +887,29 @@ function ScopeBadge({ scope }: { scope: MeasureScope }) {
   );
 }
 
+/**
+ * Marks a row as a DERIVED field rather than a real column, and says where it
+ * lives when that is not the widest scope — the same reading a measure row's
+ * scope badge gives, for the same reason: a row read out of context (searched,
+ * or nested in a folder) is one drag away from being in a chart.
+ */
+function DerivedBadge({ scope }: { scope: MeasureScope | null }) {
+  return (
+    <span
+      title={
+        scope === 'dashboard'
+          ? 'A field computed per row — belongs to this dashboard'
+          : scope === 'personal'
+            ? 'A field computed per row — private to you'
+            : 'A field computed per row'
+      }
+      className="ml-auto shrink-0 rounded border border-rcd-border px-1 text-[10px] font-medium leading-4 text-rcd-muted"
+    >
+      {scope === 'system' || scope === null ? 'field' : scopeShortLabel(scope)}
+    </span>
+  );
+}
+
 /** Cosmetic suffix marking a calculated (expression-backed) measure. */
 function FxBadge() {
   return (
@@ -1034,6 +1120,7 @@ function FieldEntry({
   icon,
   iconKind,
   badge,
+  title,
   onAdd,
   onFilter,
   action,
@@ -1042,6 +1129,8 @@ function FieldEntry({
   data: FieldDragData;
   label: string;
   icon: React.ReactNode;
+  /** Row tooltip (a derived field shows its formula). */
+  title?: string;
   /**
    * Colours the glyph by what kind of field this is. An ACCENT only: the icon
    * shape and the label already carry the same information, so the row is
@@ -1070,7 +1159,7 @@ function FieldEntry({
         {...attributes}
         {...listeners}
         onClick={() => onAdd(data)}
-        title="Drag into a well, or click to add"
+        title={title ?? 'Drag into a well, or click to add'}
         className="flex min-w-0 flex-1 cursor-grab items-center gap-2 px-2 py-1 text-left text-sm text-rcd-text"
       >
         <span

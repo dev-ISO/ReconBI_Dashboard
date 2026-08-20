@@ -19,7 +19,7 @@ import { act, type ReactNode } from 'react';
 // react-dom requires an explicit opt-in for act() outside its own test renderer.
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 import { createRoot, type Root } from 'react-dom/client';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   ChartSpec,
   MeasureFailure,
@@ -66,6 +66,21 @@ const resultWith = (
     sql: null,
     ...(failures !== undefined ? { measureFailures: failures } : {}),
   },
+});
+
+/**
+ * PRELOAD THE LAZY CHART CHUNK.
+ *
+ * ChartTile renders its renderer behind Suspense, whose fallback is an ANIMATED
+ * skeleton. Under full-suite load that chunk resolves slowly, the skeleton keeps
+ * mutating, and no amount of "wait for the DOM to stop changing" can ever be
+ * true — the markup legitimately never stops. Importing the module here puts it
+ * in the module cache, so Suspense resolves immediately and the tile reaches a
+ * genuinely static state. The notice under test renders OUTSIDE that boundary
+ * and never depended on the chunk at all; only the waiting did.
+ */
+beforeAll(async () => {
+  await import('../src/chart/ChartRenderer');
 });
 
 let host: HTMLDivElement;
@@ -125,16 +140,20 @@ const mount = async (fetcher: RcdFetcher, children: ReactNode) => {
     await queryDelivered;
   });
 
-  let previous = '';
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+  // With the chunk preloaded the tile really does reach a static DOM, so two
+  // consecutive identical samples after a small floor of flushes is sound.
+  let previous: string | null = null;
+  let stable = 0;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
     const current = host.innerHTML;
-    if (attempt > 0 && current === previous) return;
+    stable = current === previous ? stable + 1 : 0;
     previous = current;
+    if (attempt >= 3 && stable >= 2) return;
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
   }
-  throw new Error('Tile never settled: the markup kept changing for 50 flushes.');
+  throw new Error('Tile never settled: the markup kept changing for 200 flushes.');
 };
 
 const notice = (): HTMLElement | null =>

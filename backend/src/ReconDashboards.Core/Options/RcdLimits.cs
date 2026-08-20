@@ -30,6 +30,17 @@ public sealed class RcdLimits
     /// <summary>Maximum total size of a query's measure definitions, bytes.</summary>
     public int MaxQueryMeasureDefinitionBytes { get; set; } = 128 * 1024;
 
+    /// <summary>
+    /// Maximum number of caller-supplied DERIVED FIELD definitions one query
+    /// may carry (ChartQuerySpec.DerivedFields — dashboard/personal-scoped
+    /// fields that are not in the stored model). Separate from the measure cap:
+    /// they are a separate channel with a separate blast radius.
+    /// </summary>
+    public int MaxQueryDerivedFieldDefinitions { get; set; } = 64;
+
+    /// <summary>Maximum total size of a query's derived-field definitions, bytes.</summary>
+    public int MaxQueryDerivedFieldBytes { get; set; } = 64 * 1024;
+
     /// <summary>Maximum size of one user's private settings document, bytes.</summary>
     public int MaxUserSettingsBytes { get; set; } = 128 * 1024;
 

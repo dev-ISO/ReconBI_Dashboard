@@ -76,6 +76,53 @@ public sealed record PercentOfTotalNode(MeasureExprNode Inner) : MeasureExprNode
 /// <summary>[Measure Name] reference to another model measure (plain or expression-based).</summary>
 public sealed record MeasureRefNode(string Name) : MeasureExprNode;
 
+/// <summary>
+/// A BARE column leaf (schema.table.column) — the row-level counterpart of
+/// <see cref="AggregateCallNode"/>. Legal ONLY in
+/// <see cref="ExpressionContext.Dimension"/>: inside a measure the SELECT list
+/// is already grouped, so a bare column is a "not in GROUP BY" SQL error, not a
+/// style choice. Identifiers are raw text here and are resolved against the
+/// catalog — and against the derived field's OWN table — before any SQL.
+/// </summary>
+public sealed record ColumnRefNode(string TableKey, string Column) : MeasureExprNode;
+
+/// <summary>
+/// A text literal. *** THE VALUE IS NEVER EMITTED. *** It is bound through
+/// <see cref="ParameterBag"/> exactly as a filter value is, because this is the
+/// first and only category of author text the renderer can output at all —
+/// everything else in an expression is a validated digit, a whitelisted
+/// operator, or a resolved catalog identifier. Legal only in
+/// <see cref="ExpressionContext.Dimension"/>.
+/// </summary>
+public sealed record StringLiteralNode(string Value) : MeasureExprNode;
+
+/// <summary>x IS NULL / x IS NOT NULL. Row-level only.</summary>
+public sealed record IsNullNode(MeasureExprNode Operand, bool Negated) : MeasureExprNode;
+
+/// <summary>
+/// ISBLANK(x) — NULL or the empty string, which is exactly the "(Blank)" bucket
+/// a category axis shows. Row-level only.
+/// </summary>
+public sealed record IsBlankNode(MeasureExprNode Operand) : MeasureExprNode;
+
+/// <summary>
+/// Which grammar a text is parsed against.
+///
+/// <para><see cref="Measure"/> — the historical grammar, UNCHANGED: aggregate
+/// calls and [references] are required, the result must be a number, and there
+/// is no way to name a bare column or write a literal string.</para>
+///
+/// <para><see cref="Dimension"/> — the ROW-LEVEL grammar of a derived field:
+/// bare column leaves, string literals, ISBLANK/IS NULL and TEXT results are
+/// legal; aggregates and [references] are ERRORS (they would make the
+/// expression a measure, and a measure cannot be a category).</para>
+/// </summary>
+public enum ExpressionContext
+{
+    Measure,
+    Dimension,
+}
+
 /// <summary>Parse failure with a zero-based character position.</summary>
 public sealed class MeasureExpressionParseException(string reason, int position)
     : Exception($"Invalid expression at position {position}: {reason}.")
@@ -119,20 +166,63 @@ public sealed class MeasureExpressionParseException(string reason, int position)
 /// PERCENTOFTOTAL may only wrap the entire expression. Whitespace-insensitive;
 /// keywords and function names are case-insensitive.
 ///
+/// <para>*** ROW-LEVEL GRAMMAR (<see cref="ExpressionContext.Dimension"/>) ***
+/// A derived FIELD is parsed against the same grammar plus, gated STRICTLY on
+/// the context flag:
+/// <code>
+///   field     := condition checked to produce TEXT
+///   primary   += string | column
+///   compare   += additive 'IS' ['NOT'] 'NULL'
+///   call      += ISBLANK '(' value ')'
+///   column    := ident '.' ident '.' ident        (schema.table.column)
+///   string    := '"' chars '"' | '\'' chars '\''  (doubled delimiter escapes)
+/// </code>
+/// and MINUS aggregates and [references], which are positioned errors there.
+/// The two directions are exact complements: a bare column in a measure is an
+/// error, an aggregate in a dimension is an error.</para>
+///
+/// <para>TYPES are a three-way lattice — number | bool | text — plus the top
+/// element <c>any</c>, which ONLY a leaf whose type the catalog owns (a column
+/// ref) or a NULL (BLANK()) can have; it unifies with either number or text.
+/// Arithmetic requires number, AND/OR/NOT/IF-conditions require bool,
+/// comparisons require two operands of the SAME side of the lattice, a measure
+/// must produce number, and a derived field must produce text.</para>
+///
 /// This is the SECURITY chokepoint for expressions: nothing outside this
 /// grammar parses, every identifier must later resolve against the
 /// catalog/model, operators are re-emitted from a normalized whitelist, ROUND
 /// digits are range-checked integers, and no input substring is ever copied
-/// into SQL — only validated numeric literals and dialect-rendered fragments
-/// are emitted.
+/// into SQL — only validated numeric literals, dialect-rendered fragments, and
+/// string literals BOUND AS PARAMETERS are emitted.
 /// </summary>
 public static class MeasureExpressionParser
 {
     private const int MaxLength = 2_000;
     private const int MaxDepth = 32;
 
+    /// <summary>Longest single string literal, characters.</summary>
+    private const int MaxStringLiteralLength = 256;
+
+    /// <summary>
+    /// COMPLEXITY CAP for a row-level expression, in AST nodes. Unlike a measure
+    /// expression — which the database evaluates once per GROUP — a derived
+    /// field is evaluated FOR EVERY ROW, inside GROUP BY, with no index to help
+    /// it. The length and depth caps bound the text; this bounds the work.
+    /// </summary>
+    private const int MaxRowLevelNodes = 120;
+
     /// <summary>Parses or throws <see cref="MeasureExpressionParseException"/>. The result always contains at least one aggregate call or measure reference.</summary>
-    public static MeasureExprNode Parse(string expression)
+    public static MeasureExprNode Parse(string expression) => Parse(expression, ExpressionContext.Measure);
+
+    /// <summary>
+    /// Parses <paramref name="expression"/> against the grammar of
+    /// <paramref name="context"/>, or throws
+    /// <see cref="MeasureExpressionParseException"/> with a zero-based position.
+    /// A measure tree always holds at least one aggregate call or [reference]
+    /// and never a row-level leaf; a dimension tree always holds at least one
+    /// column ref and never an aggregate or [reference].
+    /// </summary>
+    public static MeasureExprNode Parse(string expression, ExpressionContext context)
     {
         ArgumentNullException.ThrowIfNull(expression);
         if (expression.Length > MaxLength)
@@ -140,15 +230,71 @@ public static class MeasureExpressionParser
             throw new MeasureExpressionParseException($"expression is longer than {MaxLength} characters", 0);
         }
 
-        var parser = new Parser(expression);
-        var root = parser.ParseMeasure();
+        var parser = new Parser(expression, context);
+        var root = context == ExpressionContext.Dimension ? parser.ParseField() : parser.ParseMeasure();
         parser.SkipWhitespace();
         if (!parser.AtEnd)
         {
             throw parser.Error("unexpected trailing input");
         }
 
-        if (!Flatten(root).Any(n => n is AggregateCallNode or MeasureRefNode))
+        // Belt and braces behind the context gates above: the shape of the tree
+        // is asserted independently of the path that built it, so a future
+        // production that forgets its gate fails here instead of emitting SQL.
+        if (context == ExpressionContext.Dimension)
+        {
+            var nodes = 0;
+            var columns = 0;
+            foreach (var node in Flatten(root))
+            {
+                nodes++;
+                switch (node)
+                {
+                    case AggregateCallNode:
+                        throw new MeasureExpressionParseException(
+                            "a derived field is computed row by row and cannot contain an aggregate; put the aggregate in a measure instead", 0);
+                    case MeasureRefNode:
+                        throw new MeasureExpressionParseException(
+                            "a derived field cannot reference a [measure]; measures are aggregates and a derived field is computed row by row", 0);
+                    case PercentOfTotalNode:
+                        throw new MeasureExpressionParseException(
+                            "PERCENTOFTOTAL is a measure calculation and has no meaning in a derived field", 0);
+                    case ColumnRefNode:
+                        columns++;
+                        break;
+                }
+            }
+
+            if (columns == 0)
+            {
+                throw new MeasureExpressionParseException(
+                    "a derived field must reference at least one column of its table", 0);
+            }
+
+            if (nodes > MaxRowLevelNodes)
+            {
+                throw new MeasureExpressionParseException(
+                    $"a derived field may use at most {MaxRowLevelNodes} operations; this one uses {nodes}", 0);
+            }
+
+            return root;
+        }
+
+        var hasAggregate = false;
+        foreach (var node in Flatten(root))
+        {
+            switch (node)
+            {
+                case AggregateCallNode or MeasureRefNode:
+                    hasAggregate = true;
+                    break;
+                case ColumnRefNode or StringLiteralNode or IsNullNode or IsBlankNode:
+                    throw new MeasureExpressionParseException(
+                        "row-level values (a bare column, a text literal, ISBLANK, IS NULL) belong in a derived field, not a measure", 0);
+            }
+        }
+
+        if (!hasAggregate)
         {
             throw new MeasureExpressionParseException(
                 "expression must contain at least one aggregate call or [measure] reference", 0);
@@ -187,6 +333,8 @@ public static class MeasureExpressionParser
         ScalarCallNode scalar => scalar.Arguments,
         RoundNode round => [round.Argument],
         PercentOfTotalNode pct => [pct.Inner],
+        IsNullNode isNull => [isNull.Operand],
+        IsBlankNode isBlank => [isBlank.Operand],
         _ => [],
     };
 
@@ -227,12 +375,37 @@ public static class MeasureExpressionParser
         };
     }
 
-    private sealed class Parser(string text)
+    /// <summary>
+    /// The three-way result lattice plus its top element.
+    /// <see cref="Any"/> belongs to leaves whose real type only the CATALOG
+    /// knows (a column ref) and to NULL (BLANK()): it unifies with
+    /// <see cref="Number"/> or <see cref="Text"/> and never with
+    /// <see cref="Bool"/>, so "aggregates only in measures, row-level only in
+    /// dimensions" stays decidable at parse time without a schema.
+    /// </summary>
+    private enum ValueType
+    {
+        Number,
+        Bool,
+        Text,
+        Any,
+    }
+
+    private sealed class Parser(string text, ExpressionContext context)
     {
         /// <summary>Comparison tokens, longest first so the tokenizer never mis-splits.</summary>
         private static readonly string[] ComparisonOperators = ["<>", "!=", "<=", ">=", "=", "<", ">"];
 
         private int _position;
+
+        private bool RowLevel => context == ExpressionContext.Dimension;
+
+        /// <summary>
+        /// The noun a type-discipline message uses. In a measure a non-condition
+        /// is always a number, so every historical message is byte-identical;
+        /// in a derived field it may be text as well.
+        /// </summary>
+        private string ValueNoun => RowLevel ? "values" : "numbers";
 
         public bool AtEnd => _position >= text.Length;
 
@@ -268,6 +441,28 @@ public static class MeasureExpressionParser
             }
 
             return root;
+        }
+
+        /// <summary>
+        /// Top level of a DERIVED FIELD: any row-level expression whose result
+        /// is a category label. A condition is not a label (wrap it in IF); a
+        /// number is not a label either — that is a measure.
+        /// </summary>
+        public MeasureExprNode ParseField()
+        {
+            SkipWhitespace();
+            var start = _position;
+            var root = ParseCondition(0);
+            return TypeOf(root) switch
+            {
+                ValueType.Text or ValueType.Any => root,
+                ValueType.Bool => throw ErrorAt(
+                    start,
+                    "a derived field must produce a label; wrap the condition in IF(condition, \"Yes\", \"No\")"),
+                _ => throw ErrorAt(
+                    start,
+                    "a derived field must produce a label, not a number; name the buckets with IF(condition, \"...\", \"...\") or make it a measure"),
+            };
         }
 
         // ---------- boolean layer ----------
@@ -337,15 +532,36 @@ public static class MeasureExpressionParser
             var left = ParseAdditive(depth);
             SkipWhitespace();
             var opPosition = _position;
+
+            // Row-level only: "x IS NULL" / "x IS NOT NULL". Gated on the
+            // context so the measure tokenizer is byte-identical to before.
+            if (RowLevel && TryConsumeWord("is"))
+            {
+                SkipWhitespace();
+                var negated = TryConsumeWord("not");
+                SkipWhitespace();
+                if (!TryConsumeWord("null"))
+                {
+                    throw Error("expected NULL after IS (write 'x IS NULL' or 'x IS NOT NULL')");
+                }
+
+                RequireValue(left, opPosition, "IS NULL tests a value, not a condition");
+                return new IsNullNode(left, negated);
+            }
+
             var op = TryConsumeComparisonOperator();
             if (op is null)
             {
                 return left;
             }
 
-            RequireNumeric(left, opPosition, $"the left side of '{op}' must be a number, not a condition");
+            RequireValue(left, opPosition, $"the left side of '{op}' must be a {ValueNoun[..^1]}, not a condition");
             var right = ParseAdditive(depth);
-            RequireNumeric(right, opPosition, $"the right side of '{op}' must be a number, not a condition");
+            RequireValue(right, opPosition, $"the right side of '{op}' must be a {ValueNoun[..^1]}, not a condition");
+            if (Unify(TypeOf(left), TypeOf(right)) is null)
+            {
+                throw ErrorAt(opPosition, $"'{op}' cannot compare a number with text");
+            }
 
             SkipWhitespace();
             var chainPosition = _position;
@@ -422,10 +638,17 @@ public static class MeasureExpressionParser
             SkipWhitespace();
             if (AtEnd)
             {
-                throw Error("expected a number, function call, [measure] reference, or '('");
+                throw Error(RowLevel
+                    ? "expected a column, text literal, number, function call, or '('"
+                    : "expected a number, function call, [measure] reference, or '('");
             }
 
             var c = text[_position];
+            if (RowLevel && (c == '"' || c == '\''))
+            {
+                return ParseStringLiteral();
+            }
+
             if (c == '(')
             {
                 _position++;
@@ -439,6 +662,12 @@ public static class MeasureExpressionParser
 
             if (c == '[')
             {
+                if (RowLevel)
+                {
+                    throw Error(
+                        "a derived field cannot reference a [measure]; measures are aggregates and a derived field is computed row by row");
+                }
+
                 return ParseMeasureRef();
             }
 
@@ -449,10 +678,88 @@ public static class MeasureExpressionParser
 
             if (IsIdentStart(c))
             {
-                return ParseCall(depth);
+                return ParseCallOrColumn(depth);
             }
 
             throw Error($"unexpected character '{c}'");
+        }
+
+        /// <summary>
+        /// A quoted text literal, with the delimiter doubled to escape itself
+        /// ("a ""b""" / 'a ''b'''). The VALUE is kept as data on the node and is
+        /// bound as a parameter at emission — it is never concatenated into SQL,
+        /// so no escaping decision here can become an injection.
+        /// </summary>
+        private MeasureExprNode ParseStringLiteral()
+        {
+            var quote = text[_position];
+            var start = _position;
+            _position++;
+
+            var value = new System.Text.StringBuilder();
+            while (true)
+            {
+                if (AtEnd)
+                {
+                    throw ErrorAt(start, "unterminated text literal");
+                }
+
+                var c = text[_position];
+                if (c == quote)
+                {
+                    if (_position + 1 < text.Length && text[_position + 1] == quote)
+                    {
+                        value.Append(quote);
+                        _position += 2;
+                        continue;
+                    }
+
+                    _position++;
+                    break;
+                }
+
+                if (c is '\n' or '\r')
+                {
+                    throw ErrorAt(start, "a text literal may not span lines");
+                }
+
+                value.Append(c);
+                _position++;
+            }
+
+            if (value.Length > MaxStringLiteralLength)
+            {
+                throw ErrorAt(start, $"a text literal may be at most {MaxStringLiteralLength} characters");
+            }
+
+            return new StringLiteralNode(value.ToString());
+        }
+
+        /// <summary>
+        /// An identifier starts either a function call or — row-level only — a
+        /// bare schema.table.column leaf. The '.' after the first identifier is
+        /// what tells them apart, so no keyword is reserved and 'sum' still
+        /// means the aggregate everywhere it did before.
+        /// </summary>
+        private MeasureExprNode ParseCallOrColumn(int depth)
+        {
+            var namePosition = _position;
+            var name = ParseIdentifier();
+            SkipWhitespace();
+
+            if (RowLevel && !AtEnd && text[_position] == '.')
+            {
+                _position++;
+                SkipWhitespace();
+                var table = ParseIdentifier();
+                SkipWhitespace();
+                Expect('.');
+                SkipWhitespace();
+                var column = ParseIdentifier();
+                return new ColumnRefNode($"{name}.{table}", column);
+            }
+
+            return ParseCall(name, namePosition, depth);
         }
 
         private MeasureExprNode ParseNumber()
@@ -503,18 +810,29 @@ public static class MeasureExpressionParser
 
         // ---------- calls ----------
 
-        private MeasureExprNode ParseCall(int depth)
+        private MeasureExprNode ParseCall(string name, int namePosition, int depth)
         {
-            var namePosition = _position;
-            var name = ParseIdentifier();
-
             if (TryMapAggregation(name) is { } aggregation)
             {
+                if (RowLevel)
+                {
+                    throw ErrorAt(
+                        namePosition,
+                        $"a derived field is computed row by row and cannot use the aggregate '{name}'; put the aggregate in a measure instead");
+                }
+
                 return ParseAggregateArguments(aggregation);
             }
 
             switch (name.ToLowerInvariant())
             {
+                case "isblank":
+                    if (!RowLevel)
+                    {
+                        throw ErrorAt(namePosition, "ISBLANK tests a row-level value and is only available in a derived field");
+                    }
+
+                    return ParseIsBlank(depth);
                 case "if":
                     return ParseIf(depth);
                 case "switch":
@@ -550,8 +868,21 @@ public static class MeasureExpressionParser
                 default:
                     throw ErrorAt(
                         namePosition,
-                        $"unknown function '{name}' (expected an aggregate like sum/avg/min/max/count/countDistinct/stdDev/variance/median, or IF, SWITCH, DIVIDE, COALESCE, ABS, ROUND, CEILING, FLOOR, SQRT, POWER, EXP, LN, BLANK)");
+                        RowLevel
+                            ? $"unknown function '{name}' (expected IF, SWITCH, ISBLANK, COALESCE, BLANK, or a schema.table.column reference)"
+                            : $"unknown function '{name}' (expected an aggregate like sum/avg/min/max/count/countDistinct/stdDev/variance/median, or IF, SWITCH, DIVIDE, COALESCE, ABS, ROUND, CEILING, FLOOR, SQRT, POWER, EXP, LN, BLANK)");
             }
+        }
+
+        /// <summary>ISBLANK(x) — NULL or empty, the "(Blank)" bucket of a category axis.</summary>
+        private MeasureExprNode ParseIsBlank(int depth)
+        {
+            SkipWhitespace();
+            Expect('(');
+            var argument = ParseValue(depth + 1, "ISBLANK tests a value, not a condition");
+            SkipWhitespace();
+            Expect(')');
+            return new IsBlankNode(argument);
         }
 
         private static Aggregation? TryMapAggregation(string name) => name.ToLowerInvariant() switch
@@ -610,13 +941,18 @@ public static class MeasureExpressionParser
             RequireBoolean(condition, conditionPosition, "IF needs a condition (e.g. [Measure] > 0) as its first argument");
             SkipWhitespace();
             Expect(',');
-            var thenExpr = ParseNumeric(depth + 1, "IF branches must be numbers, not conditions");
+            var branchPosition = _position;
+            var thenExpr = ParseValue(depth + 1, $"IF branches must be {ValueNoun}, not conditions");
             SkipWhitespace();
             MeasureExprNode? elseExpr = null;
             if (TryConsume(','))
             {
-                elseExpr = ParseNumeric(depth + 1, "IF branches must be numbers, not conditions");
+                elseExpr = ParseValue(depth + 1, $"IF branches must be {ValueNoun}, not conditions");
                 SkipWhitespace();
+                if (Unify(TypeOf(thenExpr), TypeOf(elseExpr)) is null)
+                {
+                    throw ErrorAt(branchPosition, "IF branches must both be numbers or both be text");
+                }
             }
 
             Expect(')');
@@ -627,12 +963,12 @@ public static class MeasureExpressionParser
         {
             SkipWhitespace();
             Expect('(');
-            var subject = ParseNumeric(depth + 1, "SWITCH arguments must be numbers, not conditions");
+            var subject = ParseValue(depth + 1, $"SWITCH arguments must be {ValueNoun}, not conditions");
             var args = new List<MeasureExprNode>();
             SkipWhitespace();
             while (TryConsume(','))
             {
-                args.Add(ParseNumeric(depth + 1, "SWITCH arguments must be numbers, not conditions"));
+                args.Add(ParseValue(depth + 1, $"SWITCH arguments must be {ValueNoun}, not conditions"));
                 SkipWhitespace();
             }
 
@@ -747,12 +1083,12 @@ public static class MeasureExpressionParser
             Expect('(');
             var arguments = new List<MeasureExprNode>
             {
-                ParseNumeric(depth + 1, "COALESCE arguments must be numbers, not conditions"),
+                ParseValue(depth + 1, $"COALESCE arguments must be {ValueNoun}, not conditions"),
             };
             SkipWhitespace();
             while (TryConsume(','))
             {
-                arguments.Add(ParseNumeric(depth + 1, "COALESCE arguments must be numbers, not conditions"));
+                arguments.Add(ParseValue(depth + 1, $"COALESCE arguments must be {ValueNoun}, not conditions"));
                 SkipWhitespace();
             }
 
@@ -765,13 +1101,29 @@ public static class MeasureExpressionParser
             return new ScalarCallNode(ScalarFunction.Coalesce, arguments);
         }
 
-        /// <summary>Parses a full sub-expression and requires it to be numeric.</summary>
+        /// <summary>Parses a full sub-expression and requires it to be numeric (never a condition, never text).</summary>
         private MeasureExprNode ParseNumeric(int depth, string boolMessage)
         {
             SkipWhitespace();
             var start = _position;
             var node = ParseCondition(depth);
             RequireNumeric(node, start, boolMessage);
+            return node;
+        }
+
+        /// <summary>
+        /// Parses a full sub-expression and requires it to be a VALUE — a
+        /// number or, row-level, text — but never a condition. In a measure
+        /// this is exactly <see cref="ParseNumeric"/> (text cannot be spelled
+        /// there at all), which is why every historical message and position
+        /// is unchanged.
+        /// </summary>
+        private MeasureExprNode ParseValue(int depth, string boolMessage)
+        {
+            SkipWhitespace();
+            var start = _position;
+            var node = ParseCondition(depth);
+            RequireValue(node, start, boolMessage);
             return node;
         }
 
@@ -796,7 +1148,54 @@ public static class MeasureExpressionParser
 
         private static bool IsIdentStart(char c) => char.IsAsciiLetter(c) || c == '_';
 
-        private static bool IsBoolean(MeasureExprNode node) => node is ComparisonNode or BooleanBinaryNode or NotNode;
+        private static bool IsBoolean(MeasureExprNode node) => TypeOf(node) == ValueType.Bool;
+
+        /// <summary>
+        /// The lattice type of a subtree, structurally — the parser has no
+        /// catalog, so a column ref (and a NULL) is <see cref="ValueType.Any"/>
+        /// and unifies with whatever it meets. Branching forms take the
+        /// unification of their result arms; an unresolvable pair was already
+        /// rejected where it was parsed, so falling back to
+        /// <see cref="ValueType.Any"/> here is unreachable, not lenient.
+        /// </summary>
+        private static ValueType TypeOf(MeasureExprNode node) => node switch
+        {
+            ComparisonNode or BooleanBinaryNode or NotNode or IsNullNode or IsBlankNode => ValueType.Bool,
+            StringLiteralNode => ValueType.Text,
+            ColumnRefNode or BlankNode => ValueType.Any,
+            IfNode conditional => Unify(
+                TypeOf(conditional.Then),
+                conditional.Else is null ? ValueType.Any : TypeOf(conditional.Else)) ?? ValueType.Any,
+            SwitchNode sw => sw.Cases
+                .Select(c => TypeOf(c.Result))
+                .Append(sw.Default is null ? ValueType.Any : TypeOf(sw.Default))
+                .Aggregate((ValueType?)ValueType.Any, (a, b) => a is null ? null : Unify(a.Value, b)) ?? ValueType.Any,
+            ScalarCallNode { Function: ScalarFunction.Coalesce } coalesce => coalesce.Arguments
+                .Select(TypeOf)
+                .Aggregate((ValueType?)ValueType.Any, (a, b) => a is null ? null : Unify(a.Value, b)) ?? ValueType.Any,
+            _ => ValueType.Number,
+        };
+
+        /// <summary>
+        /// The lattice join. <see cref="ValueType.Any"/> is the top element and
+        /// absorbs into whatever it meets; number and text never unify, and
+        /// bool unifies with nothing but itself. Null means "these cannot be
+        /// the same value".
+        /// </summary>
+        private static ValueType? Unify(ValueType left, ValueType right)
+        {
+            if (left == ValueType.Any)
+            {
+                return right;
+            }
+
+            if (right == ValueType.Any)
+            {
+                return left;
+            }
+
+            return left == right ? left : null;
+        }
 
         private MeasureExpressionParseException ErrorAt(int position, string reason) => new(reason, position);
 
@@ -808,11 +1207,24 @@ public static class MeasureExpressionParser
             }
         }
 
-        private void RequireNumeric(MeasureExprNode node, int position, string message)
+        /// <summary>Rejects a condition where a value is expected; text is allowed.</summary>
+        private void RequireValue(MeasureExprNode node, int position, string message)
         {
             if (IsBoolean(node))
             {
                 throw ErrorAt(position, message);
+            }
+        }
+
+        /// <summary>Rejects a condition (with the caller's message) and text (with the lattice's).</summary>
+        private void RequireNumeric(MeasureExprNode node, int position, string message)
+        {
+            switch (TypeOf(node))
+            {
+                case ValueType.Bool:
+                    throw ErrorAt(position, message);
+                case ValueType.Text:
+                    throw ErrorAt(position, "text cannot be used where a number is required");
             }
         }
 

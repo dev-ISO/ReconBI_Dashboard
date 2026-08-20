@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
 import { AlertTriangle, BarChart3, RefreshCw, Sigma } from 'lucide-react';
 import {
+  chartDerivedFieldDefinitions,
   chartMeasureDefinitions,
   isRunnable,
   toWireSpec,
@@ -9,6 +10,7 @@ import {
   type ChartQuerySpec,
   type ChartSpec,
   type FilterClause,
+  type DerivedField,
   type Measure,
   type MeasureFailure,
   type QueryResult,
@@ -248,15 +250,34 @@ export function ChartTile({
   // key and refetch, exactly like editing a filter would.
   const docMeasures = useDashboardState((state) => state.current?.layout.measures ?? null);
   const personalMeasures = useDashboardState((state) => state.personalMeasures);
+  // Derived fields ride the same channel and are subscribed for the same
+  // reason: editing one must change the cache key and refetch.
+  const docFields = useDashboardState((state) => state.current?.layout.derivedFields ?? null);
+  const personalFields = useDashboardState((state) => state.personalDerivedFields);
   const wireSpec = useMemo(() => {
     if (!runnable) return null;
     const scoped: Measure[] = [...(docMeasures ?? []), ...personalMeasures];
-    const base = toWireSpec(spec, modelId, filters, chartMeasureDefinitions(scoped, spec));
+    const scopedFields: DerivedField[] = [...(docFields ?? []), ...personalFields];
+    const base = toWireSpec(spec, modelId, filters, {
+      measures: chartMeasureDefinitions(scoped, spec),
+      derivedFields: chartDerivedFieldDefinitions(scopedFields, spec),
+    });
     // Offset and having ride the wire spec directly (ChartQuery carries
     // neither); both participate in the cache key like every other spec field.
     const withOffset = offset != null && offset > 0 ? { ...base, offset } : base;
     return having != null && having.length > 0 ? { ...withOffset, having } : withOffset;
-  }, [spec, modelId, filters, offset, having, runnable, docMeasures, personalMeasures]);
+  }, [
+    spec,
+    modelId,
+    filters,
+    offset,
+    having,
+    runnable,
+    docMeasures,
+    personalMeasures,
+    docFields,
+    personalFields,
+  ]);
   const cacheKey = wireSpec ? runtime.queries.keyFor(wireSpec) : null;
   const entry = useQueryCacheState((state) => (cacheKey ? state.entries[cacheKey] : undefined));
   const [retryToken, setRetryToken] = useState(0);

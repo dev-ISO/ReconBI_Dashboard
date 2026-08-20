@@ -47,6 +47,15 @@ public interface ISqlDialect
     string CastToDate(string expression);
 
     /// <summary>
+    /// CAST(expr AS text) or equivalent. Used where a derived field or a value
+    /// grouping must compare or return a column of ANY type as a label — the
+    /// owner's case is a column holding either a keyword or a date, whose
+    /// "is it blank" test and "everything else" arm must both be well-typed
+    /// against text branches. The default suits Postgres/ANSI engines.
+    /// </summary>
+    string CastToText(string expression) => $"CAST({expression} AS text)";
+
+    /// <summary>
     /// The SELECT body of a virtual calendar CTE — one row per day from start
     /// to end inclusive, emitting exactly the columns of
     /// <see cref="Modeling.DateTableSchema.Build"/> in order. Both range

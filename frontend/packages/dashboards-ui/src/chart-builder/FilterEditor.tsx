@@ -3,6 +3,7 @@ import {
   isNumericType,
   isTemporalType,
   type ColumnType,
+  type DerivedField,
   type FilterClause,
   type FilterOperator,
   type FilterValue,
@@ -15,6 +16,8 @@ export interface FilterEditorProps {
   modelId: number;
   table: string;
   column: string;
+  /** Overlay definitions when `column` is a derived field (see DistinctValueList). */
+  derivedFields?: readonly DerivedField[];
   /** Catalog type of the column; null when the catalog is unavailable. */
   columnType: ColumnType | null;
   /** Friendly column label for the dialog title. */
@@ -28,7 +31,15 @@ export interface FilterEditorProps {
 type ValueMode = 'none' | 'single' | 'pair' | 'checklist' | 'boolean';
 
 const valueModeFor = (operator: FilterOperator, type: ColumnType | null): ValueMode => {
-  if (operator === 'isNull' || operator === 'notNull') return 'none';
+  // Value-less operators. "blank" = NULL or empty string (a grouping's blank bucket).
+  if (
+    operator === 'isNull' ||
+    operator === 'notNull' ||
+    operator === 'isBlank' ||
+    operator === 'notBlank'
+  ) {
+    return 'none';
+  }
   if (operator === 'between') return 'pair';
   if (operator === 'in' || operator === 'notIn') return 'checklist';
   if (type === 'boolean') return 'boolean';
@@ -66,6 +77,7 @@ export function FilterEditor({
   modelId,
   table,
   column,
+  derivedFields,
   columnType,
   label,
   initial,
@@ -232,6 +244,7 @@ export function FilterEditor({
               modelId={modelId}
               table={table}
               column={column}
+              derivedFields={derivedFields}
               selected={selected}
               onToggle={toggleSelected}
             />

@@ -223,4 +223,39 @@ public class ModelJsonNewFieldsTests
         Assert.Equal(new DateOnly(2026, 1, 1), dateTable.RangeStart);
         Assert.Null(dateTable.RangeEnd);
     }
+
+    [Fact]
+    public void DerivedFieldsRoundTripAndAreOmittedWhenAbsent()
+    {
+        const string json = """
+            {
+              "version": 1,
+              "tables": [{"schema":"public","name":"orders"}],
+              "relationships": [],
+              "measures": [],
+              "derivedFields": [
+                {"id":"11111111-2222-3333-4444-555555555555","name":"Shipped?","table":"public.orders",
+                 "expression":"IF(ISBLANK(public.orders.status), 'No', 'Yes')","dataType":"text"}
+              ]
+            }
+            """;
+
+        var definition = ModelJson.TryDeserialize(json, out var error);
+
+        Assert.Null(error);
+        Assert.NotNull(definition);
+        var field = Assert.Single(definition.DerivedFieldDefs);
+        Assert.Equal("Shipped?", field.Name);
+        Assert.Equal("public.orders", field.Table);
+        Assert.True(field.IsTextTyped);
+
+        // Re-serializing keeps it, and a model WITHOUT derived fields stays
+        // byte-identical to one written before the field existed — which is
+        // what lets this ship ahead of any host that populates it.
+        Assert.Contains("derivedFields", ModelJson.Serialize(definition), StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            "derivedFields",
+            ModelJson.Serialize(definition with { DerivedFields = null }),
+            StringComparison.Ordinal);
+    }
 }

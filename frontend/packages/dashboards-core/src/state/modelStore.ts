@@ -8,6 +8,7 @@ import {
   tableKey,
   type Cardinality,
   type DateTableDef,
+  type DerivedField,
   type Measure,
   type ModelDefinition,
   type ModelDetail,
@@ -305,6 +306,41 @@ export class ModelStore {
     this.mutateDefinition((definition) => ({
       ...definition,
       measures: definition.measures.filter((m) => m.id !== id),
+    }));
+  }
+
+  /* ------------------------------------------ derived fields (SYSTEM scope) */
+
+  /** Appends a derived field to the model; returns it with its minted id. */
+  addDerivedField(field: Omit<DerivedField, 'id'>): DerivedField {
+    const withId: DerivedField = { ...field, id: newId() };
+    this.mutateDefinition((definition) => ({
+      ...definition,
+      derivedFields: [...(definition.derivedFields ?? []), withId],
+    }));
+    return withId;
+  }
+
+  updateDerivedField(id: string, patch: Partial<Omit<DerivedField, 'id'>>): void {
+    this.mutateDefinition((definition) => ({
+      ...definition,
+      derivedFields: (definition.derivedFields ?? []).map((f) =>
+        f.id === id ? { ...f, ...patch, id: f.id } : f,
+      ),
+    }));
+  }
+
+  /**
+   * Removes a derived field. Charts whose dimensions still name it fail with
+   * QRY_UNKNOWN_COLUMN — deliberately not silently repaired, exactly as
+   * removeMeasure leaves QRY_UNKNOWN_MEASURE standing: the manager warns
+   * before it calls this, and quietly rewriting other people's charts is worse
+   * than an explicit error.
+   */
+  removeDerivedField(id: string): void {
+    this.mutateDefinition((definition) => ({
+      ...definition,
+      derivedFields: (definition.derivedFields ?? []).filter((f) => f.id !== id),
     }));
   }
 

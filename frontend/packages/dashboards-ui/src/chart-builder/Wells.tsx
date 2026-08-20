@@ -24,13 +24,18 @@ import {
   ChevronRight,
   Filter,
   GripVertical,
+  Layers,
   Pencil,
   Sigma,
   TrendingUp,
+  Type,
   Variable,
   X,
 } from 'lucide-react';
 import {
+  derivedFieldOf,
+  groupingLabels,
+  hasGrouping,
   isTemporalType,
   reconcileOrder,
   type Aggregation,
@@ -45,6 +50,7 @@ import {
   type MeasureRef,
   type ModelDefinition,
   type SortSpec,
+  type ValueGrouping,
 } from '@recon/dashboards-core';
 import { ColumnTypeIcon } from '../data-pane/SchemaExplorer';
 import { RcdInput, RcdSelect } from '../primitives';
@@ -75,6 +81,16 @@ export interface WellsProps {
   query: ChartQuery;
   model: ModelDefinition;
   catalog: Catalog | null;
+  /**
+   * Opens the value-grouping editor for one dimension. Absent = the "Group
+   * values…" affordance is not offered (a host that does not want chart-local
+   * grouping, or one with no model id to fetch distinct values against).
+   *
+   * The chip does not own the editor: the editor is a dialog, and a dialog
+   * mounted inside a chip that a re-render can replace loses its state
+   * mid-edit. So the chip asks, and the builder holds it open.
+   */
+  onGroupValues?: (target: GroupingTarget) => void;
   /** Dashboard field parameters; resolves binding chips' display names. */
   parameters?: BuilderParameter[];
   onChange: (query: ChartQuery) => void;
@@ -93,6 +109,18 @@ export interface WellsProps {
    * messages; the flat summary list stays with ChartBuilder.
    */
   issues?: ChartIssue[];
+}
+
+/**
+ * Which dimension a "Group values…" click means, and how to write the rule
+ * back. The setter is a closure over the well the chip lives in, so the editor
+ * never has to know whether it is editing an axis, a legend, a small-multiples
+ * dimension or the third row of a table.
+ */
+export interface GroupingTarget {
+  dimension: DimensionRef;
+  label: string;
+  onApply: (grouping: ValueGrouping | null) => void;
 }
 
 /**
@@ -379,6 +407,7 @@ export function Wells({
   parameters,
   onChange,
   onEditFilter,
+  onGroupValues,
   ordering,
   issues,
 }: WellsProps) {
@@ -422,6 +451,46 @@ export function Wells({
 
   const axisBucket = query.axis?.dateBucket ?? null;
   const hasAxis = query.axis != null;
+
+  /**
+   * Hands the builder everything the grouping editor needs for ONE dimension:
+   * which field it is, what it is called, and how to write the finished rule
+   * back into whichever well it came from. Applying a grouping also clears the
+   * date grain — they compile to the same expression, and a chip carrying both
+   * would be a spec the compiler refuses.
+   */
+  const groupingTargetFor = (
+    dimension: DimensionRef,
+    write: (next: DimensionRef) => void,
+  ): (() => void) | undefined => {
+    if (!onGroupValues) return undefined;
+    return () =>
+      onGroupValues({
+        dimension,
+        label: columnLabelOf(model, dimension.table, dimension.column),
+        onApply: (grouping) => {
+          const next: DimensionRef = { ...dimension };
+          if (grouping === null) delete next.grouping;
+          else {
+            next.grouping = grouping;
+            next.dateBucket = null;
+          }
+          write(next);
+        },
+      });
+  };
+
+  /** The same, for a positional row in a Rows / drill-levels list. */
+  const groupingTargetForLevels = (
+    levels: DimensionRef[],
+    onLevels: (next: DimensionRef[]) => void,
+  ) =>
+    onGroupValues
+      ? (index: number, dimension: DimensionRef) =>
+          groupingTargetFor(dimension, (next) =>
+            onLevels(levels.map((level, i) => (i === index ? next : level))),
+          )?.()
+      : undefined;
 
   const axisBinding = query.paramBindings?.axis ?? null;
   const measuresBinding = query.paramBindings?.measures ?? null;
@@ -619,6 +688,15 @@ export function Wells({
                 model={model}
                 catalog={catalog}
                 chipData={chipData}
+                onGroup={groupingTargetForLevels(
+                  [query.axis, ...(query.drillLevels ?? [])],
+                  (next) =>
+                    onChange({
+                      ...query,
+                      axis: next[0] ?? null,
+                      drillLevels: next.length > 1 ? next.slice(1) : undefined,
+                    }),
+                )}
                 onLevels={(next) =>
                   onChange({
                     ...query,
@@ -648,6 +726,7 @@ export function Wells({
                 catalog={catalog}
                 chipData={chipData}
                 accepts={acceptsInto('drill')}
+                onGroupValues={onGroupValues}
                 onChange={onChange}
                 issues={(issues ?? [])
                   .filter((issue) => issue.well === 'drill')
@@ -665,6 +744,7 @@ export function Wells({
               chipData={chipData}
               showBucket
               onBucket={(dateBucket) => onChange({ ...query, axis: { ...query.axis!, dateBucket } })}
+              onGroup={groupingTargetFor(query.axis, (axis) => onChange({ ...query, axis }))}
               onRemove={() => onChange({ ...query, axis: null })}
             />
           )}
@@ -695,6 +775,7 @@ export function Wells({
             chipData={chipData}
             showBucket={def.id === 'smallMultiples'}
             onBucket={(dateBucket) => setDimension({ ...dimension, dateBucket })}
+            onGroup={groupingTargetFor(dimension, setDimension)}
             onRemove={() => setDimension(null)}
           />
         )}
@@ -843,6 +924,7 @@ function DrillSection({
   catalog,
   chipData,
   accepts,
+  onGroupValues,
   onChange,
   issues = [],
 }: {
@@ -851,6 +933,7 @@ function DrillSection({
   catalog: Catalog | null;
   chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
   accepts: (data: FieldDragData) => boolean;
+  onGroupValues?: (target: GroupingTarget) => void;
   onChange: (query: ChartQuery) => void;
   /** Validation messages badging the drill levels (red ring + tooltip). */
   issues?: string[];
@@ -926,6 +1009,28 @@ function DrillSection({
                 model={model}
                 catalog={catalog}
                 chipData={chipData}
+                onGroup={
+                  onGroupValues
+                    ? (index, dimension) =>
+                        onGroupValues({
+                          dimension,
+                          label: columnLabelOf(model, dimension.table, dimension.column),
+                          onApply: (grouping) =>
+                            setLevels(
+                              levels.map((level, i) => {
+                                if (i !== index) return level;
+                                const next: DimensionRef = { ...level };
+                                if (grouping === null) delete next.grouping;
+                                else {
+                                  next.grouping = grouping;
+                                  next.dateBucket = null;
+                                }
+                                return next;
+                              }),
+                            ),
+                        })
+                    : undefined
+                }
                 onLevels={setLevels}
               />
             </div>
@@ -987,6 +1092,7 @@ function OrderedDimensionList({
   model,
   catalog,
   chipData,
+  onGroup,
   onLevels,
 }: {
   idPrefix: string;
@@ -996,6 +1102,8 @@ function OrderedDimensionList({
   model: ModelDefinition;
   catalog: Catalog | null;
   chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
+  /** Opens the grouping editor for the row at `index`. */
+  onGroup?: (index: number, dimension: DimensionRef) => void;
   onLevels: (levels: DimensionRef[]) => void;
 }) {
   const setLevel = (index: number, dimension: DimensionRef) =>
@@ -1024,6 +1132,7 @@ function OrderedDimensionList({
               columnLabelOf(model, level.table, level.column),
             )}
             onBucket={(dateBucket) => setLevel(index, { ...level, dateBucket })}
+            onGroup={onGroup ? () => onGroup(index, level) : undefined}
             onRemove={() => removeLevel(index)}
           />
         ))}
@@ -1041,6 +1150,7 @@ function SortableLevelRow({
   catalog,
   data,
   onBucket,
+  onGroup,
   onRemove,
 }: {
   id: string;
@@ -1051,6 +1161,7 @@ function SortableLevelRow({
   catalog: Catalog | null;
   data: ChipDropData;
   onBucket: (bucket: DateBucket | null) => void;
+  onGroup?: () => void;
   onRemove: () => void;
 }) {
   const label = columnLabelOf(model, dimension.table, dimension.column);
@@ -1080,6 +1191,7 @@ function SortableLevelRow({
               showBucket
               drag={bodyDragOnly(drag)}
               onBucket={onBucket}
+              onGroup={onGroup}
               onRemove={onRemove}
               leading={sortable ? <ChipGrip drag={drag} label={label} /> : undefined}
             />
@@ -1575,6 +1687,7 @@ function SingleDimensionChip({
   chipData,
   showBucket,
   onBucket,
+  onGroup,
   onRemove,
 }: {
   well: WellId;
@@ -1584,6 +1697,7 @@ function SingleDimensionChip({
   chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
   showBucket: boolean;
   onBucket: (bucket: DateBucket | null) => void;
+  onGroup?: () => void;
   onRemove: () => void;
 }) {
   const label = columnLabelOf(model, dimension.table, dimension.column);
@@ -1600,6 +1714,7 @@ function SingleDimensionChip({
           showBucket={showBucket}
           drag={drag}
           onBucket={onBucket}
+          onGroup={onGroup}
           onRemove={onRemove}
         />
       )}
@@ -1615,6 +1730,7 @@ function DimensionChip({
   leading,
   drag,
   onBucket,
+  onGroup,
   onRemove,
 }: {
   dimension: DimensionRef;
@@ -1624,39 +1740,86 @@ function DimensionChip({
   leading?: React.ReactNode;
   drag?: ChipDrag;
   onBucket: (bucket: DateBucket | null) => void;
+  /** Opens the value-grouping editor; absent = the affordance is not offered. */
+  onGroup?: () => void;
   onRemove: () => void;
 }) {
   const type = columnTypeOf(catalog, dimension.table, dimension.column);
+  const derived = derivedFieldOf(model, dimension.table, dimension.column);
+  const grouped = hasGrouping(dimension);
   // With no catalog the chip can only infer "temporal" from an existing
   // bucket; an unbucketed date then hides the select, so keep it visible
   // whenever the column type IS known to be temporal.
-  const temporal = type !== null ? isTemporalType(type) : dimension.dateBucket != null;
+  //
+  // TWO CHIPS NEVER GET A DATE GRAIN: a DERIVED column (already text — there
+  // is no date underneath to truncate) and a GROUPED one (the grain and the
+  // grouping rewrite the same expression, so offering both would let the
+  // author build a spec the compiler must then reject).
+  const temporal =
+    derived === null &&
+    !grouped &&
+    (type !== null ? isTemporalType(type) : dimension.dateBucket != null);
   const label = columnLabelOf(model, dimension.table, dimension.column);
+  const groupCount = grouped ? groupingLabels(dimension.grouping!).length : 0;
 
   return (
     <Chip
       label={label}
-      icon={type !== null ? <ColumnTypeIcon type={type} /> : undefined}
-      iconKind={type !== null ? fieldKindOfColumnType(type) : undefined}
+      icon={
+        derived !== null ? (
+          <Type size={12} />
+        ) : type !== null ? (
+          <ColumnTypeIcon type={type} />
+        ) : undefined
+      }
+      iconKind={derived !== null ? 'text' : type !== null ? fieldKindOfColumnType(type) : undefined}
       leading={leading}
       drag={drag}
       onRemove={onRemove}
       controls={
-        showBucket && temporal ? (
-          <RcdSelect
-            aria-label={`Date bucket for ${label}`}
-            value={dimension.dateBucket ?? EXACT_DATE}
-            onChange={(event) =>
-              onBucket(event.target.value === EXACT_DATE ? null : (event.target.value as DateBucket))
-            }
-          >
-            {DATE_BUCKETS.map((bucket) => (
-              <option key={bucket.value ?? 'exact'} value={bucket.value ?? EXACT_DATE}>
-                {bucket.label}
-              </option>
-            ))}
-          </RcdSelect>
-        ) : undefined
+        <>
+          {showBucket && temporal && (
+            <RcdSelect
+              aria-label={`Date bucket for ${label}`}
+              value={dimension.dateBucket ?? EXACT_DATE}
+              onChange={(event) =>
+                onBucket(
+                  event.target.value === EXACT_DATE ? null : (event.target.value as DateBucket),
+                )
+              }
+            >
+              {DATE_BUCKETS.map((bucket) => (
+                <option key={bucket.value ?? 'exact'} value={bucket.value ?? EXACT_DATE}>
+                  {bucket.label}
+                </option>
+              ))}
+            </RcdSelect>
+          )}
+          {onGroup !== undefined && derived === null && (
+            // Beside the date grain, and for the same reason it is there: both
+            // answer "what should one bar MEAN?" — a month, or a bucket of
+            // values — and that question belongs on the chip, where the field
+            // already is.
+            <button
+              type="button"
+              onClick={onGroup}
+              aria-label={grouped ? `Edit value grouping for ${label}` : `Group values of ${label}`}
+              title={
+                grouped
+                  ? `${groupCount} groups — click to edit`
+                  : 'Group values: show one bar per group instead of one per value'
+              }
+              className={`shrink-0 rounded px-1 py-0.5 text-[10px] font-medium leading-4 ${
+                grouped
+                  ? 'bg-[color-mix(in_srgb,var(--rcd-accent)_15%,transparent)] text-rcd-accent'
+                  : 'text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10'
+              }`}
+            >
+              <Layers size={11} className="mr-0.5 inline-block align-[-1px]" />
+              {grouped ? `${groupCount} groups` : 'Group values…'}
+            </button>
+          )}
+        </>
       }
     />
   );

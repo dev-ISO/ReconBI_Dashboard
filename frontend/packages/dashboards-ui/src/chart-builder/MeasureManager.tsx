@@ -7,6 +7,10 @@ import { MeasureDialog, type MeasureDraft } from '../model-editor/MeasureDialog'
 import { MeasureRowMenu } from './MeasureRowMenu';
 import { buildMeasureMenuItems } from './measureMenu';
 import type { MeasureActions } from './measureActions';
+import { DerivedFieldDialog, type DerivedFieldDraft } from './DerivedFieldDialog';
+import { DerivedFieldSections } from './DerivedFieldSections';
+import type { DerivedFieldActions, ScopedDerivedField } from './derivedFieldActions';
+import { derivedUsageCount } from './derivedFieldActions';
 import {
   MEASURE_SCOPES,
   measureUsageCount,
@@ -31,8 +35,29 @@ export interface MeasureManagerProps {
   focusMeasureId?: string | null;
   /** Open with the delete confirmation up (the field list's Delete). */
   deleteMeasureId?: string | null;
+  /**
+   * The DERIVED FIELD half of the same manager. Optional so a host that wants
+   * measure management alone keeps exactly the wave-3 dialog: with it absent
+   * the tab strip does not render and nothing else changes.
+   */
+  derived?: DerivedFieldActions;
+  /** Open on the Fields tab (the field list's "new field" entry points). */
+  initialTab?: ManagerTab;
+  /** Open straight into the editor for this derived field. */
+  focusDerivedFieldId?: string | null;
+  /** Open straight into the delete confirmation for this derived field. */
+  deleteDerivedFieldId?: string | null;
+  /**
+   * A rule PROMOTED out of the value-grouping editor: opens the field dialog
+   * pre-filled, so "make this reusable" is a name and a scope rather than a
+   * formula typed from memory.
+   */
+  seedDerivedField?: { table: string; expression: string; name?: string } | null;
   onClose: () => void;
 }
+
+/** Which half of the manager is showing. */
+export type ManagerTab = 'measures' | 'fields';
 
 const isCalculated = (measure: Measure): boolean =>
   measure.expression != null && measure.expression !== '';
@@ -72,13 +97,30 @@ export function MeasureManager({
   actions,
   focusMeasureId = null,
   deleteMeasureId = null,
+  derived,
+  initialTab = 'measures',
+  focusDerivedFieldId = null,
+  deleteDerivedFieldId = null,
+  seedDerivedField = null,
   onClose,
 }: MeasureManagerProps) {
   const dataSourceName = useModelState((s) => s.current?.dataSourceName ?? null);
   const catalog = useModelState((s) => s.catalog);
 
-  const { scoped, effective, rights, busy, error, notice } = actions;
+  const { scoped, effective, rights } = actions;
 
+  const [tab, setTab] = useState<ManagerTab>(
+    derived !== undefined && (initialTab === 'fields' || seedDerivedField !== null)
+      ? 'fields'
+      : 'measures',
+  );
+  // Busy/error/notice come from whichever half is showing: the two action
+  // layers are independent, and a failed measure save must not paint an error
+  // over the Fields tab (or the other way round).
+  /** True while the FIELDS half is showing (and there is one to show). */
+  const showFields = tab === 'fields' && derived !== undefined;
+  const active = showFields && derived !== undefined ? derived : actions;
+  const { busy, error, notice } = active;
   const [search, setSearch] = useState('');
   const [editor, setEditor] = useState<EditorTarget | null>(() => {
     const entry = focusMeasureId
@@ -115,6 +157,59 @@ export function MeasureManager({
     }
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [scoped]);
+
+  /* ------------------------------------------------------- derived fields */
+
+  type DerivedEditorTarget =
+    | { mode: 'create'; scope: MeasureScope; seed?: { table: string; expression: string; name?: string } }
+    | { mode: 'edit'; entry: ScopedDerivedField };
+
+  const [derivedEditor, setDerivedEditor] = useState<DerivedEditorTarget | null>(() => {
+    if (!derived) return null;
+    if (seedDerivedField !== null) {
+      // A promoted grouping arrives with nowhere to live yet. Personal is the
+      // default because it is the one scope every author can always write, and
+      // widening it later is one menu item.
+      const scope: MeasureScope = derived.rights.dashboard.canWrite ? 'dashboard' : 'personal';
+      return { mode: 'create', scope, seed: seedDerivedField };
+    }
+    const entry = focusDerivedFieldId
+      ? (derived.scoped.find((e) => e.field.id === focusDerivedFieldId) ?? null)
+      : null;
+    return entry ? { mode: 'edit', entry } : null;
+  });
+  const [deletingField, setDeletingField] = useState<ScopedDerivedField | null>(
+    () =>
+      (deleteDerivedFieldId && derived
+        ? derived.scoped.find((e) => e.field.id === deleteDerivedFieldId)
+        : undefined) ?? null,
+  );
+
+  const derivedFolders = useMemo(() => {
+    const set = new Set<string>();
+    for (const entry of derived?.scoped ?? []) {
+      const folder = (entry.field.displayFolder ?? '').trim();
+      if (folder !== '') set.add(folder);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [derived]);
+
+  const derivedHandlers = {
+    onEdit: (entry: ScopedDerivedField) => setDerivedEditor({ mode: 'edit', entry }),
+    onDuplicate: (entry: ScopedDerivedField) =>
+      void derived?.duplicate(entry.scope, entry.field.id),
+    onDelete: (entry: ScopedDerivedField) => setDeletingField(entry),
+    onTransfer: (entry: ScopedDerivedField, to: MeasureScope) =>
+      void derived?.transfer(entry.scope, to, entry.field.id),
+  };
+
+  const handleDerivedSave = (draft: DerivedFieldDraft) => {
+    const target = derivedEditor;
+    setDerivedEditor(null);
+    if (!target || !derived) return;
+    if (target.mode === 'create') void derived.create(target.scope, draft);
+    else void derived.update(target.entry.scope, target.entry.field.id, draft);
+  };
 
   const handleSave = (draft: MeasureDraft) => {
     const target = editor;
@@ -190,11 +285,43 @@ export function MeasureManager({
   };
 
   return (
-    <RcdDialog title="Measures" open wide onClose={onClose} footer={<RcdButton onClick={onClose}>Done</RcdButton>}>
+    <RcdDialog
+      title={derived === undefined ? 'Measures' : 'Measures and fields'}
+      open
+      wide
+      onClose={onClose}
+      footer={<RcdButton onClick={onClose}>Done</RcdButton>}
+    >
       <div className="flex flex-col gap-3">
+        {derived !== undefined && (
+          <div
+            role="tablist"
+            aria-label="What to manage"
+            className="flex w-fit items-center gap-1 rounded-lg bg-black/5 p-1 dark:bg-white/10"
+          >
+            {(['measures', 'fields'] as ManagerTab[]).map((id) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={tab === id}
+                onClick={() => setTab(id)}
+                className={`rounded-md px-3 py-1 text-sm font-medium transition-colors ${
+                  tab === id
+                    ? 'bg-rcd-surface text-rcd-text shadow-[var(--rcd-shadow-1)]'
+                    : 'text-rcd-muted hover:text-rcd-text'
+                }`}
+              >
+                {id === 'measures' ? 'Measures' : 'Fields'}
+              </button>
+            ))}
+          </div>
+        )}
+
         <p className="text-xs text-rcd-muted">
-          A measure lives in one of three places. Move one wider to share it, or copy one narrower to
-          experiment without touching what everyone else sees.
+          {tab === 'fields'
+            ? 'A field computed per row — a label you can put on an axis, in a legend or in a filter. It lives in one of three places, same as a measure.'
+            : 'A measure lives in one of three places. Move one wider to share it, or copy one narrower to experiment without touching what everyone else sees.'}
         </p>
 
         <div className="relative">
@@ -205,8 +332,8 @@ export function MeasureManager({
           <RcdInput
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search measures…"
-            aria-label="Search measures"
+            placeholder={tab === 'fields' ? 'Search fields…' : 'Search measures…'}
+            aria-label={tab === 'fields' ? 'Search fields' : 'Search measures'}
             className="w-full pl-7"
           />
         </div>
@@ -229,7 +356,21 @@ export function MeasureManager({
           </p>
         )}
 
-        {sections.map(({ scope, rows }) => {
+        {showFields && derived !== undefined && (
+          <DerivedFieldSections
+            model={model}
+            chart={chart}
+            scoped={derived.scoped}
+            rights={derived.rights}
+            busy={derived.busy}
+            search={search}
+            handlers={derivedHandlers}
+            onCreate={(scope) => setDerivedEditor({ mode: 'create', scope })}
+          />
+        )}
+
+        {!showFields &&
+          sections.map(({ scope, rows }) => {
           const scopeRight = rights[scope];
           return (
             <section key={scope} className="flex flex-col gap-1.5" aria-label={scopeLabel(scope)}>
@@ -276,7 +417,7 @@ export function MeasureManager({
               )}
             </section>
           );
-        })}
+            })}
       </div>
 
       {editor !== null && (
@@ -308,6 +449,65 @@ export function MeasureManager({
           onSave={handleSave}
         />
       )}
+
+      {derivedEditor !== null && derived !== undefined && (
+        <DerivedFieldDialog
+          key={
+            derivedEditor.mode === 'create'
+              ? `new-field-${derivedEditor.scope}`
+              : derivedEditor.entry.field.id
+          }
+          initial={derivedEditor.mode === 'create' ? null : derivedEditor.entry.field}
+          definition={model}
+          dataSourceName={dataSourceName}
+          catalog={catalog}
+          // Uniqueness spans every scope: a name is an ADDRESS, and two
+          // addresses that collide are not a style problem.
+          siblings={derived.scoped.map((entry) => entry.field)}
+          folders={derivedFolders}
+          seed={derivedEditor.mode === 'create' ? (derivedEditor.seed ?? null) : null}
+          title={
+            derivedEditor.mode === 'create'
+              ? `New field — ${scopeLabel(derivedEditor.scope)}`
+              : `Edit field — ${scopeLabel(derivedEditor.entry.scope)}`
+          }
+          note={
+            derivedEditor.mode === 'create'
+              ? scopeBlurb(derivedEditor.scope)
+              : derived.rights[derivedEditor.entry.scope].canWrite
+                ? scopeBlurb(derivedEditor.entry.scope)
+                : derived.rights[derivedEditor.entry.scope].reason
+          }
+          readOnly={
+            derivedEditor.mode === 'edit' &&
+            !derived.rights[derivedEditor.entry.scope].canWrite
+          }
+          onClose={() => setDerivedEditor(null)}
+          onSave={handleDerivedSave}
+        />
+      )}
+
+      <ConfirmDialog
+        title="Delete field"
+        message={
+          deletingField
+            ? `Delete “${deletingField.field.name}” from ${scopeLabel(deletingField.scope)}?${
+                derivedUsageCount(chart, deletingField.field) > 0
+                  ? ' The chart you are editing uses it and will stop rendering until you replace it.'
+                  : ''
+              }`
+            : ''
+        }
+        confirmLabel="Delete"
+        danger
+        open={deletingField !== null}
+        onCancel={() => setDeletingField(null)}
+        onConfirm={() => {
+          const target = deletingField;
+          setDeletingField(null);
+          if (target && derived) void derived.remove(target.scope, target.field.id);
+        }}
+      />
 
       <ConfirmDialog
         title="Delete measure"

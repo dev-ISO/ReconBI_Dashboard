@@ -5,6 +5,7 @@ import {
   CHART_THEMES,
   formatDatePattern,
   formatNumberPattern,
+  hasGrouping,
   isMatrixChart,
   newId,
   sanitizeRichHtml,
@@ -1658,9 +1659,17 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
         : [spec.query.axis, spec.query.legend, spec.query.smallMultiples]
     ).filter((dim): dim is NonNullable<typeof dim> => dim != null);
     dims.forEach((dim, index) => {
+      // A GROUPED dimension's column is the raw column, but the cells under it
+      // are group labels — so the per-column editor names it as grouped rather
+      // than pretending the reader will find raw values there.
+      const grouped = hasGrouping(dim);
       tableColumns.push({
         key: `dim${index}`,
-        label: dim.dateBucket ? `${dim.column} (${dim.dateBucket})` : dim.column,
+        label: grouped
+          ? `${dim.column} (grouped)`
+          : dim.dateBucket
+            ? `${dim.column} (${dim.dateBucket})`
+            : dim.column,
       });
     });
     spec.query.measures.forEach((measure, index) => {
@@ -2195,7 +2204,9 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               )}
             </>
           )}
-          {spec.query.axis?.dateBucket && (
+          {/* A grouped axis plots labels, so the date-label presets have nothing
+              to format even when the underlying column is a date. */}
+          {spec.query.axis?.dateBucket && !hasGrouping(spec.query.axis) && (
             <>
               <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
                 Date labels

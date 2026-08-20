@@ -8,6 +8,11 @@ import {
 } from 'react';
 import { ArrowDown, ArrowUp, ChevronsDown, CornerUpLeft } from 'lucide-react';
 import {
+  groupingClauseFor,
+  groupingClausesForLabels,
+  groupingKeyOf,
+  groupingLabels,
+  hasGrouping,
   isMatrixChart,
   isTemporalType,
   stableStringify,
@@ -217,6 +222,21 @@ const translateTableFilters = (
     if (dimIndex !== -1) {
       const dim = dims[dimIndex];
       if (!dim) continue;
+      if (hasGrouping(dim)) {
+        // A grouped column's cells ARE labels, so the checklist is a set of
+        // buckets. groupingClausesForLabels expresses "keep these buckets" as
+        // a CONJUNCTION of exclusions (the only form a FilterClause list can
+        // take); an inexpressible selection drops the filter rather than
+        // guessing, and the note the renderer already shows for an unfiltered
+        // column applies.
+        if (filter.kind !== 'values') continue;
+        const labels = filter.values
+          .filter((v): v is FilterValue => v !== null)
+          .map((v) => String(v));
+        const grouped = groupingClausesForLabels(dim, labels);
+        if (grouped !== null) clauses.push(...grouped);
+        continue;
+      }
       if (filter.kind === 'values') {
         const nonNull = filter.values.filter((v): v is FilterValue => v !== null);
         if (nonNull.length === 0 && filter.values.length > 0) {
@@ -494,6 +514,17 @@ export function DashboardChartTile({
     drill.path.slice(0, level).forEach((slot, i) => {
       if (slot === null) return;
       const dim = dimensionAt(i);
+      if (hasGrouping(dim)) {
+        // The traversed step carries the group's LABEL, because that is what
+        // the grouped level plotted. Filtering the raw column with it would
+        // match nothing at all, so it goes back through the grouping rule; a
+        // bucket with no honest single-clause form contributes NO filter (the
+        // deeper level is then unfiltered rather than wrongly filtered, and
+        // the breadcrumb still names the step the user took).
+        const clause = groupingClauseFor(dim, slot.label ?? String(slot.value ?? ''));
+        if (clause !== null) pathFilters.push(clause);
+        return;
+      }
       pathFilters.push(
         slot.value === null
           ? { table: dim.table, column: dim.column, operator: 'isNull', values: [] }
@@ -739,7 +770,7 @@ export function DashboardChartTile({
           inputs.drilledChart,
           modelId,
           [...inputs.filters, ...others.clauses],
-          runtime.dashboards.definitionsForChart(inputs.drilledChart),
+          runtime.dashboards.wireDefinitionsForChart(inputs.drilledChart),
         );
         const spec = others.having.length > 0 ? { ...base, having: others.having } : base;
         const full = await runtime.queries.run(spec);
@@ -760,11 +791,19 @@ export function DashboardChartTile({
           })
           .slice(0, 200);
       }
+      // A GROUPED column's distinct values are its LABELS, and they are known
+      // without asking the server — asking would return the raw values, which
+      // are not what any cell in that column shows.
+      if (hasGrouping(dim)) return groupingLabels(dim.grouping!);
       const values = await runtime.queries.distinct({
         modelId,
         table: dim.table,
         column: dim.column,
         filters: [...inputs.drilledChart.query.filters, ...inputs.filters, ...others.clauses],
+        // A DERIVED column exists only in the overlay, so the lookup carries
+        // the same definitions the chart's own query carries or the server
+        // cannot resolve the column at all.
+        derivedFields: runtime.dashboards.derivedFieldsForChart(inputs.drilledChart),
         limit: 1000,
       });
       return values.values;
@@ -907,7 +946,7 @@ export function DashboardChartTile({
       },
       modelId,
       mergedFilters,
-      runtime.dashboards.definitionsForChart(drilledChart),
+      runtime.dashboards.wireDefinitionsForChart(drilledChart),
     );
   }, [
     isTable,
@@ -964,7 +1003,7 @@ export function DashboardChartTile({
       { ...drilledChart, query: { ...drilledChart.query, sort: [], limit: authoredLimit } },
       modelId,
       mergedFilters,
-      runtime.dashboards.definitionsForChart(drilledChart),
+      runtime.dashboards.wireDefinitionsForChart(drilledChart),
     );
     return tableHaving.length > 0 ? { ...base, having: tableHaving } : base;
   }, [
@@ -1027,7 +1066,12 @@ export function DashboardChartTile({
     const hh = state.hoverHighlight;
     if (!hoverEnabled || hh === null || hh.sourceTileId === tileId) return null;
     const matches = (dim: DimensionRef | null): boolean =>
-      dim !== null && dim.table === hh.dimension.table && dim.column === hh.dimension.column;
+      dim !== null &&
+      dim.table === hh.dimension.table &&
+      dim.column === hh.dimension.column &&
+      // Same column, different buckets = different labels. Without this a
+      // chart showing raw dates dims itself against a "Yes" it never plots.
+      groupingKeyOf(dim) === (hh.dimension.groupingKey ?? null);
     return matches(drilledAxis) || matches(drilledLegend) ? hh.label : null;
   });
 
@@ -1064,7 +1108,11 @@ export function DashboardChartTile({
       // The store no-ops on identical payloads, so hover jitter never storms
       // subscribers (and hover can never trigger fetches or grid re-layout).
       store.setHoverHighlight({
-        dimension: { table: dimension.table, column: dimension.column },
+        dimension: {
+          table: dimension.table,
+          column: dimension.column,
+          groupingKey: groupingKeyOf(dimension),
+        },
         raw,
         label,
         sourceTileId: tileId,

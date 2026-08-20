@@ -77,6 +77,11 @@ export function CopyChartDialog({
   // Scoped (dashboard/personal) measures the chart cites travel WITH it — say
   // how many, because they land in the target dashboard as its own measures
   // and that is a real edit to somebody else's dashboard.
+  const derivedCarryCount = useMemo(
+    () => (chart ? runtime.dashboards.derivedFieldCarryCount(chart) : 0),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- same inputs as below
+    [chart, runtime],
+  );
   const measureCarryCount = useMemo(
     () => (chart ? runtime.dashboards.measureCarryCount(chart) : 0),
     [chart, runtime],
@@ -194,6 +199,20 @@ export function CopyChartDialog({
                 {measureCarryCount === 1
                   ? '1 measure this chart uses belongs to this dashboard and will be copied across too.'
                   : `${measureCarryCount} measures this chart uses belong to this dashboard and will be copied across too.`}
+              </span>
+            </p>
+          )}
+
+          {derivedCarryCount > 0 && (
+            // Said separately from measures because the consequence differs: a
+            // missing measure loses one series, a missing derived field is an
+            // unknown COLUMN and the chart does not render at all.
+            <p className="flex items-start gap-1.5 text-xs text-rcd-text-2">
+              <Sigma size={13} aria-hidden className="mt-[1px] shrink-0 text-rcd-muted" />
+              <span>
+                {derivedCarryCount === 1
+                  ? '1 computed field this chart uses belongs to this dashboard and will be copied across too.'
+                  : `${derivedCarryCount} computed fields this chart uses belong to this dashboard and will be copied across too.`}
               </span>
             </p>
           )}

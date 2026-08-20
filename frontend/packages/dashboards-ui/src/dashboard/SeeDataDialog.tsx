@@ -227,7 +227,7 @@ export function SeeDataDialog({
             request.chart,
             modelId,
             request.filters,
-            runtime.dashboards.definitionsForChart(request.chart),
+            runtime.dashboards.wireDefinitionsForChart(request.chart),
           );
           const spec =
             request.having !== null && request.having.length > 0

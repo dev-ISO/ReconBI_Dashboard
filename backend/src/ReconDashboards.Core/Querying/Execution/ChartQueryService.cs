@@ -125,7 +125,8 @@ public sealed class ChartQueryService(
         {
             // Outside the retry: the overlay is a pure function of the spec, so
             // re-merging it on every pass could only produce the same answer.
-            effective = MeasureOverlay.Merge(model.Definition, spec.Definitions, options.Limits);
+            effective = MeasureOverlay.Merge(
+                model.Definition, spec.Definitions, spec.DerivedFields, options.Limits);
         }
         catch (QueryCompilationException ex)
         {
@@ -355,7 +356,8 @@ public sealed class ChartQueryService(
             // raw rows are returned — so tombstoning the anchor would leave
             // nothing to select from. A broken measure here is a whole-query
             // failure, and correctly so.
-            var effective = MeasureOverlay.Merge(model.Definition, spec.Definitions, options.Limits);
+            var effective = MeasureOverlay.Merge(
+                model.Definition, spec.Definitions, spec.DerivedFields, options.Limits);
             var prepared = compiler.PrepareUnderlying(spec, effective, schema, options.Limits);
             var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
             compiled = compiler.EmitUnderlying(prepared, rowFilters, rowCap);
@@ -395,11 +397,19 @@ public sealed class ChartQueryService(
         int limit;
         try
         {
-            // No MeasureOverlay.Merge here, unlike the three query paths above:
-            // a distinct-values spec resolves ONE column plus its filters and
-            // never touches model.Measures, so there is no measure resolution
-            // for an overlay to reach — and DistinctValuesSpec carries none.
-            var prepared = compiler.PrepareDistinct(spec, model.Definition, schema, options.Limits);
+            // MEASURES are still not overlaid here — a distinct-values spec
+            // resolves ONE column plus its filters and never touches
+            // model.Measures, so there is nothing for a measure overlay to
+            // reach, and DistinctValuesSpec carries none.
+            //
+            // DERIVED FIELDS are, because a distinct-values spec CAN name one:
+            // the grouping editor's value picker and a header filter on a
+            // derived column both ask for the distinct values of a derived
+            // column, and the compiler can only see a non-model definition if
+            // the same pre-Prepare merge put it in the effective model.
+            var effective = MeasureOverlay.Merge(
+                model.Definition, definitions: null, spec.DerivedFields, options.Limits);
+            var prepared = compiler.PrepareDistinct(spec, effective, schema, options.Limits);
             limit = prepared.Limit;
             var rowFilters = await CollectRowFiltersAsync(source.Name, prepared.Plan.Tables, schema, principal, ct);
             compiled = compiler.EmitDistinct(prepared, rowFilters);

@@ -10,10 +10,18 @@
 // So the settings document keys them by model id and every reader filters to
 // the model actually in play. Nothing else about them changes: still one blob,
 // still private, still available on every dashboard — of that model.
-import type { Measure } from '../types/model';
+import type { DerivedField, Measure } from '../types/model';
 
 /** Section key inside the per-user settings document. */
 export const PERSONAL_MEASURES_SECTION = 'measures';
+
+/**
+ * Section key for PERSONAL derived fields. A separate section rather than a
+ * second array inside `measures`: the two are different entities with
+ * different validation, and a reader of one must never have to skip past the
+ * other. Same model-keyed bucket shape, same read/write helpers.
+ */
+export const PERSONAL_DERIVED_FIELDS_SECTION = 'derivedFields';
 
 /** modelId -> that model's personal measures. */
 export type PersonalMeasuresByModel = Record<string, Measure[]>;
@@ -97,4 +105,48 @@ export const writePersonalMeasures = (
       ? { ...(raw as PersonalMeasuresByModel) }
       : {};
   return { ...base, [personalMeasuresModelKey(modelId)]: [...measures] };
+};
+
+/* ---------------------------------------------------- personal derived fields
+ * Same document, same model-keyed buckets, different section. There is no
+ * legacy flat shape to migrate here — the section was born keyed — so these
+ * are the measure helpers minus the one-time guess.
+ */
+
+/** modelId -> that model's personal derived fields. */
+export type PersonalDerivedFieldsByModel = Record<string, DerivedField[]>;
+
+const isDerivedFieldArray = (value: unknown): value is DerivedField[] =>
+  Array.isArray(value) &&
+  value.every(
+    (entry) =>
+      typeof entry === 'object' &&
+      entry !== null &&
+      typeof (entry as DerivedField).id === 'string' &&
+      typeof (entry as DerivedField).name === 'string' &&
+      typeof (entry as DerivedField).table === 'string' &&
+      typeof (entry as DerivedField).expression === 'string',
+  );
+
+/** The personal derived fields for one model; tolerates any stored shape. */
+export const readPersonalDerivedFields = (
+  raw: unknown,
+  modelId: number | null,
+): DerivedField[] => {
+  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return [];
+  const bucket = (raw as Record<string, unknown>)[personalMeasuresModelKey(modelId)];
+  return isDerivedFieldArray(bucket) ? bucket : [];
+};
+
+/** Replaces ONE model's bucket, leaving every other model's alone. */
+export const writePersonalDerivedFields = (
+  raw: unknown,
+  modelId: number | null,
+  fields: readonly DerivedField[],
+): PersonalDerivedFieldsByModel => {
+  const base =
+    typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? { ...(raw as PersonalDerivedFieldsByModel) }
+      : {};
+  return { ...base, [personalMeasuresModelKey(modelId)]: [...fields] };
 };

@@ -155,6 +155,7 @@ public static class LayoutSnapshotParser
 
         var cards = doc.FilterCards ?? [];
         var measures = ReadMeasures(doc.Measures);
+        var derivedFields = ReadDerivedFields(doc.DerivedFields);
         var pages = doc.Pages is { Count: > 0 }
             ? doc.Pages
             : [new PageDoc(null, "Page 1", doc.Tiles)];
@@ -165,7 +166,7 @@ public static class LayoutSnapshotParser
             var tiles = new List<SnapshotTile>();
             foreach (var tile in page.Tiles ?? [])
             {
-                if (BuildTile(tile, page, cards, measures, modelId) is { } snapshot)
+                if (BuildTile(tile, page, cards, measures, derivedFields, modelId) is { } snapshot)
                 {
                     tiles.Add(snapshot);
                 }
@@ -196,7 +197,8 @@ public static class LayoutSnapshotParser
     }
 
     private static SnapshotTile? BuildTile(
-        TileDoc tile, PageDoc page, List<FilterCardDoc> cards, List<Measure> docMeasures, int modelId)
+        TileDoc tile, PageDoc page, List<FilterCardDoc> cards, List<Measure> docMeasures,
+        List<DerivedField> docDerivedFields, int modelId)
     {
         if (tile.Kind is not (null or "chart") || tile.Chart?.Query is not { } query)
         {
@@ -255,9 +257,22 @@ public static class LayoutSnapshotParser
             : MeasureOverlay.CollectReferenced(
                 docMeasures, measures.Where(m => m.MeasureId is not null).Select(m => m.MeasureId!.Value));
 
+        // Dashboard-scoped DERIVED FIELDS the tile's dimensions or filters
+        // name travel the same way, for the same reason: without them a
+        // scheduled email of a chart grouped by a dashboard-scoped derived
+        // field would fail the tile with QRY_UNKNOWN_COLUMN while the
+        // definition sat unread in the very document being rendered.
+        var fields = docDerivedFields.Count == 0
+            ? null
+            : MeasureOverlay.CollectReferencedFields(
+                docDerivedFields,
+                dimensions.Select(d => (d.Table, d.Column))
+                    .Concat(filters.Select(f => (f.Table, f.Column))));
+
         var spec = new ChartQuerySpec(
             modelId, dimensions, measures, filters, query.Sort ?? [], TopN: null, query.Limit,
-            Definitions: definitions is { Count: > 0 } ? definitions : null);
+            Definitions: definitions is { Count: > 0 } ? definitions : null,
+            DerivedFields: fields is { Count: > 0 } ? fields : null);
 
         return new SnapshotTile(
             tile.Id ?? "", tile.Chart.Title ?? "Chart", tile.Chart.Type ?? "column", spec,
@@ -449,6 +464,15 @@ public static class LayoutSnapshotParser
     }
 
     /// <summary>Mirrors the GUI's filterCardClauses compilation.</summary>
+    /// <summary>
+    /// Operators carrying no operand. A filter card using one has a null Value, so
+    /// without this it would be discarded as "incomplete" and the scheduled email
+    /// would render MORE rows than the dashboard the recipient is looking at.
+    /// </summary>
+    private static bool TakesNoValue(FilterOperator? op) =>
+        op is FilterOperator.IsNull or FilterOperator.NotNull
+            or FilterOperator.IsBlank or FilterOperator.NotBlank;
+
     private static IEnumerable<FilterSpec> CardClauses(FilterCardDoc card)
     {
         if (card.Table is null || card.Column is null)
@@ -468,7 +492,7 @@ public static class LayoutSnapshotParser
         }
 
         var complete = (card.Conditions ?? [])
-            .Where(c => c.Operator is FilterOperator.IsNull or FilterOperator.NotNull
+            .Where(c => TakesNoValue(c.Operator)
                 || c.Value is { ValueKind: not (JsonValueKind.Null or JsonValueKind.Undefined) })
             .ToArray();
         if (complete.Length == 0)
@@ -497,7 +521,7 @@ public static class LayoutSnapshotParser
             }
 
             IReadOnlyList<JsonElement> values =
-                op is FilterOperator.IsNull or FilterOperator.NotNull || condition.Value is null
+                TakesNoValue(op) || condition.Value is null
                     ? []
                     : [condition.Value.Value];
             yield return new FilterSpec(card.Table, card.Column, op, values);
@@ -553,7 +577,57 @@ public static class LayoutSnapshotParser
         List<TileDoc>? Tiles,
         List<PageDoc>? Pages,
         List<FilterCardDoc>? FilterCards,
-        JsonElement? Measures);
+        JsonElement? Measures,
+        JsonElement? DerivedFields);
+
+    /// <summary>
+    /// The DASHBOARD-SCOPED derived fields a stored layout declares. Read as
+    /// tolerantly as the measures array: one malformed field degrades to "that
+    /// field is missing" — its tile reports QRY_UNKNOWN_COLUMN — instead of
+    /// failing the whole document.
+    /// </summary>
+    public static IReadOnlyList<DerivedField> ParseDerivedFields(string layoutJson)
+    {
+        try
+        {
+            return ReadDerivedFields(JsonSerializer.Deserialize<LayoutDoc>(layoutJson, Options)?.DerivedFields);
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static List<DerivedField> ReadDerivedFields(JsonElement? derivedFields)
+    {
+        var result = new List<DerivedField>();
+        if (derivedFields is not { ValueKind: JsonValueKind.Array } array)
+        {
+            return result;
+        }
+
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind is not JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            try
+            {
+                if (item.Deserialize<DerivedField>(Options) is { } field)
+                {
+                    result.Add(field);
+                }
+            }
+            catch (JsonException)
+            {
+                // See ReadMeasures.
+            }
+        }
+
+        return result;
+    }
 
     /// <summary>Tolerant reader for the doc's measures array; see LayoutDoc.Measures.</summary>
     private static List<Measure> ReadMeasures(JsonElement? measures)

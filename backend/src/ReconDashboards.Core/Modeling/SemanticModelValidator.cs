@@ -19,7 +19,12 @@ namespace ReconDashboards.Core.Modeling;
 /// PERCENTOFTOTAL measures) · MDL014 expression measure also sets a column ·
 /// MDL015 date-table settings invalid (empty range, fiscalYearStartMonth
 /// outside 1-12, unknown weekStartDay) · MDL016 measure reference cycle or a
-/// reference chain nested more than 8 expression measures deep.
+/// reference chain nested more than 8 expression measures deep · MDL017 derived
+/// field invalid (missing name/table/expression, unsupported data type, unknown
+/// table, expression parse error, a reference to another table — which is
+/// refused as a SECURITY rule, not a style rule — an unknown or unusable
+/// referenced column, a reference to another derived field, or a name that
+/// collides with a real column of the same table).
 /// </summary>
 public sealed class SemanticModelValidator
 {
@@ -35,9 +40,130 @@ public sealed class SemanticModelValidator
         ValidateRelationships(definition, catalogTables, result);
         ValidateMeasures(definition, catalogTables, result);
         ValidateMeasureReferenceGraph(definition, result);
+        ValidateDerivedFields(definition, catalogTables, result);
         ValidateNameCollisions(definition, result);
 
         return result;
+    }
+
+    /// <summary>
+    /// MDL017: derived fields. The checks mirror the compiler's exactly — the
+    /// compiler is the enforcement, this is the EDITOR's copy so an author sees
+    /// the mistake while writing instead of when a chart runs.
+    ///
+    /// The same-table rule is checked here too, and it is not a style rule: a
+    /// derived field that could read another table would be a table the join
+    /// plan does not know about, and therefore a table whose row filters would
+    /// be silently skipped.
+    /// </summary>
+    private static void ValidateDerivedFields(
+        ModelDefinition definition,
+        Dictionary<string, TableSchema> catalogTables,
+        ValidationResult result)
+    {
+        var seen = new HashSet<(string Table, string Name)>();
+
+        for (var i = 0; i < definition.DerivedFieldDefs.Count; i++)
+        {
+            var field = definition.DerivedFieldDefs[i];
+            var path = $"derivedFields[{i}]";
+
+            if (string.IsNullOrWhiteSpace(field.Name))
+            {
+                result.AddError("MDL017", "A derived field needs a name.", path);
+                continue;
+            }
+
+            if (!seen.Add((field.Table ?? "", field.Name.ToLowerInvariant())))
+            {
+                result.AddError(
+                    "MDL017",
+                    $"'{field.Table}' already has a derived field named '{field.Name}'; one would silently shadow the other.",
+                    $"{path}.name");
+            }
+
+            if (!field.IsTextTyped)
+            {
+                result.AddError(
+                    "MDL017",
+                    $"Derived field '{field.Name}' declares data type '{field.DataType}'; only '{DerivedField.TextDataType}' is supported.",
+                    path);
+            }
+
+            if (string.IsNullOrWhiteSpace(field.Table) || definition.FindTable(field.Table) is null)
+            {
+                result.AddError(
+                    "MDL017",
+                    $"Derived field '{field.Name}' belongs to table '{field.Table}', which is not part of the model.",
+                    $"{path}.table");
+                continue;
+            }
+
+            if (!catalogTables.TryGetValue(field.Table, out var table))
+            {
+                continue; // Catalog absence already reported as MDL001.
+            }
+
+            if (table.FindColumn(field.Name) is not null)
+            {
+                result.AddError(
+                    "MDL017",
+                    $"Derived field '{field.Name}' has the same name as a real column of '{field.Table}'; rename it so it cannot shadow that column.",
+                    $"{path}.name");
+            }
+
+            if (string.IsNullOrWhiteSpace(field.Expression))
+            {
+                result.AddError("MDL017", $"Derived field '{field.Name}' needs an expression.", $"{path}.expression");
+                continue;
+            }
+
+            MeasureExprNode root;
+            try
+            {
+                root = MeasureExpressionParser.Parse(field.Expression, ExpressionContext.Dimension);
+            }
+            catch (MeasureExpressionParseException ex)
+            {
+                result.AddError("MDL017", $"Derived field '{field.Name}': {ex.Message}", $"{path}.expression");
+                continue;
+            }
+
+            foreach (var node in MeasureExpressionParser.Flatten(root))
+            {
+                if (node is not ColumnRefNode reference)
+                {
+                    continue;
+                }
+
+                if (!string.Equals(reference.TableKey, field.Table, StringComparison.Ordinal))
+                {
+                    result.AddError(
+                        "MDL017",
+                        $"Derived field '{field.Name}' belongs to '{field.Table}' and may only use that table's columns, but it references '{reference.TableKey}.{reference.Column}'.",
+                        $"{path}.expression");
+                    continue;
+                }
+
+                var target = table.FindColumn(reference.Column);
+                if (target is null)
+                {
+                    result.AddError(
+                        "MDL017",
+                        $"Derived field '{field.Name}' references column '{reference.Column}', which does not exist on '{field.Table}'.",
+                        $"{path}.expression");
+                    continue;
+                }
+
+                if (IsUnusableEndpointType(target.Type))
+                {
+                    result.AddError(
+                        "MDL017",
+                        $"Derived field '{field.Name}' references column '{reference.Column}', whose type {target.Type} cannot be used in an expression.",
+                        $"{path}.expression");
+                }
+            }
+        }
     }
 
     /// <summary>

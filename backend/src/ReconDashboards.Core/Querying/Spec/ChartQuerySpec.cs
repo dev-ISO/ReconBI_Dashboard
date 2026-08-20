@@ -31,6 +31,14 @@ public enum FilterOperator
     StartsWith,
     IsNull,
     NotNull,
+
+    /// NULL or the empty string — the exact complement pair for a value grouping's
+    /// blank bucket, which groups both. Without these, clicking that bar drills
+    /// with IsNull and silently under-matches by the empty-string rows: the bar
+    /// says 3, the drill shows 2. FilterClause has no disjunction, so this has to
+    /// be one operator rather than an OR of two.
+    IsBlank,
+    NotBlank,
 }
 
 [JsonConverter(typeof(CamelCaseJsonStringEnumConverter<SortDirection>))]
@@ -47,8 +55,45 @@ public enum SortTargetKind
     Measure,
 }
 
-/// <summary>Table refs are canonical "schema.table" keys; columns are catalog names.</summary>
-public sealed record DimensionSpec(string Table, string Column, DateBucket? DateBucket);
+/// <summary>
+/// One bucket of a chart-local VALUE GROUPING. Rows whose column value is in
+/// <see cref="Values"/> — or, when <see cref="MatchBlank"/> is set, whose value
+/// is NULL or empty — are labelled <see cref="Label"/>. Buckets are tested in
+/// order, first match wins. Every label AND every match value is BOUND as a
+/// parameter; none of them reaches SQL as text.
+/// </summary>
+public sealed record GroupingBucket(
+    string Label,
+    IReadOnlyList<JsonElement>? Values = null,
+    bool MatchBlank = false)
+{
+    public IReadOnlyList<JsonElement> MatchValues => Values ?? [];
+}
+
+/// <summary>
+/// A chart-local mapping from raw column values to category labels — the
+/// no-formula path onto the same CASE seam a derived field uses. It is
+/// deliberately NOT a field: it creates nothing in the field list, because it
+/// belongs to one chart.
+///
+/// <para><see cref="OtherLabel"/> names the "everything else" bucket. When it
+/// is null every unmatched value keeps its own text.</para>
+/// </summary>
+public sealed record GroupingRule(
+    IReadOnlyList<GroupingBucket> Groups,
+    string? OtherLabel = null);
+
+/// <summary>
+/// Table refs are canonical "schema.table" keys; columns are catalog names —
+/// or the name (or id) of a <see cref="Modeling.DerivedField"/> on that table,
+/// which resolves to a VIRTUAL column and is otherwise an ordinary dimension.
+/// <see cref="Grouping"/> folds the column's values into named buckets.
+/// </summary>
+public sealed record DimensionSpec(
+    string Table,
+    string Column,
+    DateBucket? DateBucket,
+    GroupingRule? Grouping = null);
 
 /// <summary>
 /// Time-intelligence transform applied AFTER aggregation via SQL window
@@ -149,6 +194,10 @@ public sealed record HavingSpec(int MeasureIndex, HavingOperator Operator, IRead
 /// the query, so they resolve, join-plan and ROW-FILTER exactly like model
 /// measures. Measure REFERENCES stay <c>{ measureId }</c> — nothing about the
 /// existing measure wire changes.
+/// DerivedFields (wire "derivedFields") is the same channel for DERIVED FIELD
+/// definitions that are not in the stored model, merged by the same overlay at
+/// the same moment and under the same caps. A dimension or filter referencing
+/// one stays an ordinary <c>{ table, column }</c>.
 /// </summary>
 public sealed record ChartQuerySpec(
     int ModelId,
@@ -160,7 +209,8 @@ public sealed record ChartQuerySpec(
     int? Limit,
     int? Offset = null,
     IReadOnlyList<HavingSpec>? Having = null,
-    IReadOnlyList<Measure>? Definitions = null);
+    IReadOnlyList<Measure>? Definitions = null,
+    IReadOnlyList<DerivedField>? DerivedFields = null);
 
 /// <summary>
 /// CSV export mode: "summarized" runs the normal aggregate pipeline (including
@@ -173,11 +223,18 @@ public enum ExportMode
     Underlying,
 }
 
-/// <summary>Feeds slicer dropdowns. Filters may span tables (cascading slicers).</summary>
+/// <summary>
+/// Feeds slicer dropdowns and the value pickers of the filter / grouping
+/// editors. Filters may span tables (cascading slicers). DerivedFields carries
+/// non-model derived definitions so a dropdown can list the DISTINCT VALUES OF
+/// A DERIVED COLUMN — the grouping editor picks from real values, and a header
+/// filter on a derived column needs the same list.
+/// </summary>
 public sealed record DistinctValuesSpec(
     int ModelId,
     string Table,
     string Column,
     string? Search,
     IReadOnlyList<FilterSpec> Filters,
-    int? Limit);
+    int? Limit,
+    IReadOnlyList<DerivedField>? DerivedFields = null);

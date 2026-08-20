@@ -11,6 +11,20 @@ namespace ReconDashboards.Core.Querying.Compilation;
 public sealed record ResolvedDimension(DimensionSpec Spec, TableSchema Table, ColumnSchema Column, string Label, string? FormatHint);
 
 /// <summary>
+/// A model <see cref="DerivedField"/> whose expression has been parsed and
+/// whose every column reference has been checked to exist ON ITS OWN TABLE.
+/// Keyed by "{tableKey}.{columnName}" in <see cref="PreparedQuery.DerivedColumns"/>,
+/// this is what emission renders instead of a quoted identifier.
+///
+/// *** THE SAME-TABLE INVARIANT LIVES HERE. *** Nothing else in the pipeline
+/// re-checks it, and nothing else needs to: because every leaf names
+/// <see cref="TableKey"/>, the derived column adds no table to the query that
+/// the dimension/filter naming it had not already added — so it can never move
+/// a table out of reach of <c>AppendRowFilterPredicates</c>.
+/// </summary>
+public sealed record ResolvedDerivedColumn(string Id, string Name, string TableKey, MeasureExprNode Root);
+
+/// <summary>
 /// A calculated measure's parsed expression with its references resolved:
 /// the distinct table keys used by direct aggregate calls, and each [reference]
 /// mapped to the model measure it names — plain (Expression null) or itself
@@ -50,10 +64,15 @@ public sealed record PreparedQuery(
     IReadOnlyList<ResolvedFilter> Filters,
     JoinPlan Plan,
     DatabaseSchema Schema,
-    IReadOnlyList<DateTableDef>? DateTables = null)
+    IReadOnlyList<DateTableDef>? DateTables = null,
+    IReadOnlyDictionary<string, ResolvedDerivedColumn>? DerivedColumns = null)
 {
     /// <summary>Date tables the join plan touches, in emission order.</summary>
     public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+
+    /// <summary>Derived columns this query actually reached, by "{table}.{column}".</summary>
+    public IReadOnlyDictionary<string, ResolvedDerivedColumn> Derived =>
+        DerivedColumns ?? QueryCompiler.NoDerivedColumns;
 }
 
 /// <summary>
@@ -67,10 +86,15 @@ public sealed record PreparedUnderlyingQuery(
     JoinPlan Plan,
     DatabaseSchema Schema,
     IReadOnlyList<DateTableDef>? DateTables = null,
-    IReadOnlyList<ModelColumn>? ColumnOverrides = null)
+    IReadOnlyList<ModelColumn>? ColumnOverrides = null,
+    IReadOnlyDictionary<string, ResolvedDerivedColumn>? DerivedColumns = null)
 {
     /// <summary>Date tables the join plan touches, in emission order.</summary>
     public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+
+    /// <inheritdoc cref="PreparedQuery.Derived"/>
+    public IReadOnlyDictionary<string, ResolvedDerivedColumn> Derived =>
+        DerivedColumns ?? QueryCompiler.NoDerivedColumns;
 
     /// <summary>
     /// The anchor table's model column overrides (FriendlyName), carried here
@@ -88,10 +112,15 @@ public sealed record PreparedDistinctQuery(
     int Limit,
     JoinPlan Plan,
     DatabaseSchema Schema,
-    IReadOnlyList<DateTableDef>? DateTables = null)
+    IReadOnlyList<DateTableDef>? DateTables = null,
+    IReadOnlyDictionary<string, ResolvedDerivedColumn>? DerivedColumns = null)
 {
     /// <summary>Date tables the join plan touches, in emission order.</summary>
     public IReadOnlyList<DateTableDef> CalendarTables => DateTables ?? [];
+
+    /// <inheritdoc cref="PreparedQuery.Derived"/>
+    public IReadOnlyDictionary<string, ResolvedDerivedColumn> Derived =>
+        DerivedColumns ?? QueryCompiler.NoDerivedColumns;
 }
 
 /// <summary>
@@ -104,6 +133,19 @@ public sealed record PreparedDistinctQuery(
 public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvider = null)
 {
     private readonly TimeProvider _clock = timeProvider ?? TimeProvider.System;
+
+    /// <summary>The empty derived-column map every query without one shares.</summary>
+    internal static readonly IReadOnlyDictionary<string, ResolvedDerivedColumn> NoDerivedColumns =
+        new Dictionary<string, ResolvedDerivedColumn>(StringComparer.Ordinal);
+
+    private static readonly IReadOnlyDictionary<string, ResolvedMeasure> NoMeasureReferences =
+        new Dictionary<string, ResolvedMeasure>(StringComparer.Ordinal);
+
+    /// <summary>Maximum buckets one <see cref="GroupingRule"/> may define.</summary>
+    public const int MaxGroupingBuckets = 64;
+
+    /// <summary>Maximum characters in one grouping label.</summary>
+    public const int MaxGroupingLabelLength = 200;
 
     // ---------- Phase 1: resolution ----------
 
@@ -189,12 +231,19 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
 
         schema = AugmentWithDateTables(model, schema);
+        schema = AugmentWithDerivedColumns(model, schema);
+
+        // Derived columns this query actually reaches, parsed and same-table
+        // checked once and carried to emission. Populated during resolution so
+        // a broken derived field is attributed to the well that used it — and
+        // so a derived field the query never touches is never parsed at all.
+        var derived = new Dictionary<string, ResolvedDerivedColumn>(StringComparer.Ordinal);
 
         // Resolution failures are attributed to the wire item that caused them
         // (see WithPath) so the builder can badge the offending well instead of
         // only printing the sentence.
         var dimensions = spec.Dimensions
-            .Select((d, i) => WithPath($"dimensions[{i}]", () => ResolveDimension(d, model, schema)))
+            .Select((d, i) => WithPath($"dimensions[{i}]", () => ResolveDimension(d, model, schema, derived, limits)))
             .ToArray();
         // Tombstoned indexes are skipped here and filled in below, once the
         // anchor table is known: a tombstone resolves nothing, so it can only
@@ -202,11 +251,11 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var measures = spec.Measures
             .Select((m, i) => tombstonedMeasures is not null && tombstonedMeasures.Contains(i)
                 ? null
-                : WithPath($"measures[{i}]", () => ResolveMeasure(m, model, schema)))
+                : WithPath($"measures[{i}]", () => ResolveMeasure(m, model, schema, derived)))
             .ToArray();
         var filters = spec.Filters
             .Select((f, i) => WithPath(
-                $"filters[{i}]", () => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)))
+                $"filters[{i}]", () => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, derived, limits)))
             .ToArray();
 
         // The join plan anchors on the first measure's table; a measure-less
@@ -279,7 +328,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var active = model.Relationships.Where(r => r.IsActive).ToArray();
         var plan = JoinPathResolver.Resolve(baseTable, involved, active, limits.MaxJoins);
 
-        return new PreparedQuery(dimensions, resolved, filters, plan, schema, CollectDateTables(model, plan));
+        return new PreparedQuery(
+            dimensions, resolved, filters, plan, schema, CollectDateTables(model, plan),
+            derived.Count == 0 ? null : derived);
     }
 
     /// <summary>
@@ -338,8 +389,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         DistinctValuesSpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
     {
         schema = AugmentWithDateTables(model, schema);
+        schema = AugmentWithDerivedColumns(model, schema);
 
-        var (table, column) = ResolveColumn(spec.Table, spec.Column, model, schema);
+        var derived = new Dictionary<string, ResolvedDerivedColumn>(StringComparer.Ordinal);
+        var (table, column) = ResolveColumn(spec.Table, spec.Column, model, schema, derived);
         EnsureUsable(column, $"Column '{spec.Table}.{spec.Column}'");
 
         if (!string.IsNullOrEmpty(spec.Search) && column.Type != NormalizedType.Text)
@@ -348,7 +401,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 "QRY_BAD_FILTER", $"Search is only supported on text columns; '{spec.Column}' is {column.Type}.");
         }
 
-        var filters = spec.Filters.Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)).ToArray();
+        var filters = spec.Filters
+            .Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, derived, limits))
+            .ToArray();
 
         var involved = new HashSet<string>(StringComparer.Ordinal) { table.Key };
         foreach (var f in filters)
@@ -362,7 +417,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var limit = Math.Clamp(spec.Limit ?? 100, 1, limits.MaxDistinctValues);
 
         return new PreparedDistinctQuery(
-            table, column, spec.Search, filters, limit, plan, schema, CollectDateTables(model, plan));
+            table, column, spec.Search, filters, limit, plan, schema, CollectDateTables(model, plan),
+            derived.Count == 0 ? null : derived);
     }
 
     /// <summary>
@@ -388,6 +444,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
 
         schema = AugmentWithDateTables(model, schema);
+        schema = AugmentWithDerivedColumns(model, schema);
 
         var first = spec.Measures[0];
         string anchorKey;
@@ -414,8 +471,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             ?? throw new QueryCompilationException(
                 "QRY_UNKNOWN_TABLE", $"Table '{anchorKey}' no longer exists in the data source.");
 
+        var derived = new Dictionary<string, ResolvedDerivedColumn>(StringComparer.Ordinal);
         var filters = spec.Filters
-            .Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits))
+            .Select(f => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, derived, limits))
             .ToArray();
 
         var involved = new HashSet<string>(StringComparer.Ordinal) { table.Key };
@@ -429,7 +487,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         return new PreparedUnderlyingQuery(
             table, filters, plan, schema, CollectDateTables(model, plan),
-            model.FindTable(anchorKey)?.ColumnOverrides);
+            model.FindTable(anchorKey)?.ColumnOverrides,
+            derived.Count == 0 ? null : derived);
     }
 
     /// <summary>
@@ -479,6 +538,158 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             .Where(d => !string.IsNullOrWhiteSpace(d.Name))
             .Select(DateTableSchema.Build);
         return schema with { Tables = [.. schema.Tables, .. synthesized] };
+    }
+
+    /// <summary>
+    /// Injects every model <see cref="DerivedField"/> into its table's column
+    /// list as a VIRTUAL text column, so <c>FindColumn</c> — and therefore every
+    /// dimension, filter and distinct-values resolution — sees it exactly like a
+    /// catalog column. This mirrors <see cref="AugmentWithDateTables"/>: nothing
+    /// is introspected, the augmentation is compile-scoped, and the cached
+    /// schema snapshot (and its hash) is untouched.
+    ///
+    /// <para>*** THE SHADOWING GUARD. *** A derived field whose name equals a
+    /// PHYSICAL column of the same table is rejected outright rather than
+    /// injected. Silent shadowing would be a security bug, not a naming
+    /// annoyance: a row-level security filter names its column by string, and
+    /// <c>AppendRowFilterPredicates</c> resolves that string through
+    /// <c>FindColumn</c> — so a shadowing derived field could turn the host's
+    /// row filter into a filter over an author-written expression. (The
+    /// injection order plus <see cref="TableSchema.FindColumn"/>'s
+    /// physical-first rule is the second lock on the same door.)</para>
+    ///
+    /// <para>The checks here are STRUCTURAL only — no expression is parsed
+    /// until something actually references the field, so an unused derived
+    /// field with a broken formula costs nothing and breaks nothing.</para>
+    /// </summary>
+    private static DatabaseSchema AugmentWithDerivedColumns(ModelDefinition model, DatabaseSchema schema)
+    {
+        if (model.DerivedFieldDefs.Count == 0)
+        {
+            return schema;
+        }
+
+        var tables = new List<TableSchema>(schema.Tables.Count);
+        foreach (var table in schema.Tables)
+        {
+            var fields = model.DerivedFieldsOn(table.Key);
+            if (fields.Count == 0)
+            {
+                tables.Add(table);
+                continue;
+            }
+
+            var columns = new List<ColumnSchema>(table.Columns);
+            var taken = new HashSet<string>(table.Columns.Select(c => c.Name), StringComparer.OrdinalIgnoreCase);
+            foreach (var field in fields)
+            {
+                if (string.IsNullOrWhiteSpace(field.Name))
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_DERIVED", $"A derived field on '{table.Key}' has no name.");
+                }
+
+                if (string.IsNullOrWhiteSpace(field.Expression))
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_DERIVED", $"Derived field '{field.Name}' has no expression.");
+                }
+
+                if (!field.IsTextTyped)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_DERIVED",
+                        $"Derived field '{field.Name}' declares data type '{field.DataType}'; only '{DerivedField.TextDataType}' is supported.");
+                }
+
+                if (!taken.Add(field.Name))
+                {
+                    throw new QueryCompilationException(
+                        "QRY_DERIVED_NAME_CONFLICT",
+                        $"Derived field '{field.Name}' collides with a column that '{table.Key}' already has; rename it. A derived field must never shadow a real column.");
+                }
+
+                columns.Add(new ColumnSchema(
+                    field.Name,
+                    columns.Count + 1,
+                    DerivedField.TextDataType,
+                    NormalizedType.Text,
+                    IsNullable: true,
+                    Comment: field.Description,
+                    DerivedExpression: field.Expression,
+                    DerivedId: field.Id.ToString()));
+            }
+
+            tables.Add(table with { Columns = columns });
+        }
+
+        return schema with { Tables = tables };
+    }
+
+    /// <summary>
+    /// Parses and validates one derived column the query actually reached,
+    /// memoizing it into <paramref name="derived"/> for emission.
+    ///
+    /// *** SAME-TABLE ENFORCEMENT. *** Every column leaf must name
+    /// <paramref name="table"/>. That is what makes a derived field free of
+    /// row-level-security consequences: the only table it can read is the one
+    /// the referencing dimension/filter already put in the join plan, so the
+    /// plan — and therefore the set of tables <c>CollectRowFiltersAsync</c>
+    /// consults — is identical with and without the derived field. A leaf
+    /// naming any other table is QRY_DERIVED_CROSS_TABLE.
+    /// </summary>
+    private static ResolvedDerivedColumn ResolveDerivedColumn(
+        TableSchema table, ColumnSchema column, IDictionary<string, ResolvedDerivedColumn> derived)
+    {
+        var key = $"{table.Key}.{column.Name}";
+        if (derived.TryGetValue(key, out var cached))
+        {
+            return cached;
+        }
+
+        MeasureExprNode root;
+        try
+        {
+            root = MeasureExpressionParser.Parse(column.DerivedExpression!, ExpressionContext.Dimension);
+        }
+        catch (MeasureExpressionParseException ex)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_DERIVED", $"Derived field '{column.Name}': {ex.Message}");
+        }
+
+        foreach (var node in MeasureExpressionParser.Flatten(root))
+        {
+            if (node is not ColumnRefNode reference)
+            {
+                continue;
+            }
+
+            if (!string.Equals(reference.TableKey, table.Key, StringComparison.Ordinal))
+            {
+                throw new QueryCompilationException(
+                    "QRY_DERIVED_CROSS_TABLE",
+                    $"Derived field '{column.Name}' belongs to '{table.Key}' and may only use that table's columns, but it references '{reference.TableKey}.{reference.Column}'.");
+            }
+
+            var target = table.FindColumn(reference.Column)
+                ?? throw new QueryCompilationException(
+                    "QRY_UNKNOWN_COLUMN",
+                    $"Derived field '{column.Name}' references column '{reference.Column}', which does not exist on '{table.Key}'.");
+
+            if (target.IsDerived)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_DERIVED",
+                    $"Derived field '{column.Name}' references derived field '{target.Name}'; a derived field may only use physical columns.");
+            }
+
+            EnsureUsable(target, $"Column '{table.Key}.{target.Name}'");
+        }
+
+        var resolved = new ResolvedDerivedColumn(column.DerivedId ?? column.Name, column.Name, table.Key, root);
+        derived[key] = resolved;
+        return resolved;
     }
 
     /// <summary>The date tables the join plan touches, base table first then join order.</summary>
@@ -535,7 +746,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
 
         var dimensionExprs = prepared.Dimensions
-            .Select(d => DimensionExpression(d, plan))
+            .Select(d => DimensionExpression(d, plan, prepared.Derived, bag))
             .ToArray();
 
         var selectItems = new List<string>();
@@ -547,7 +758,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var measureExprs = new List<string>();
         for (var i = 0; i < prepared.Measures.Count; i++)
         {
-            var expr = MeasureExpression(prepared.Measures[i], plan, bag);
+            var expr = MeasureExpression(prepared.Measures[i], plan, prepared.Derived, bag);
             measureExprs.Add(expr);
             selectItems.Add($"{expr} AS {dialect.QuoteIdentifier($"meas{i}")}");
         }
@@ -555,7 +766,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var whereParts = new List<string>();
         foreach (var filter in prepared.Filters)
         {
-            whereParts.Add(BuildPredicate(filter, plan, bag));
+            whereParts.Add(BuildPredicate(filter, plan, prepared.Derived, bag));
         }
 
         AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
@@ -851,7 +1062,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         string? truncationProbe = null)
     {
         var baseAlias = dialect.QuoteIdentifier("__rcd_base");
-        var axisBucket = prepared.Dimensions.Count > 0 ? prepared.Dimensions[0].Spec.DateBucket : null;
+        // A GROUPED axis is no longer a date axis: its values are labels, so
+        // there is no bucket series to densify against and LAG-by-rows cannot
+        // be made to equal LAG-by-bucket. Densifying one would generate a date
+        // grid and LEFT JOIN text onto it.
+        var axisBucket = prepared.Dimensions.Count > 0 && prepared.Dimensions[0].Spec.Grouping is null
+            ? prepared.Dimensions[0].Spec.DateBucket
+            : null;
         var densify = axisBucket is not null
             && prepared.Measures.Any(m => m.Calc is not null && m.Calc.Kind != MeasureCalcKind.RunningTotal);
 
@@ -1048,12 +1265,17 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var bag = new ParameterBag();
         var plan = prepared.Plan;
         var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
-        var expr = QualifiedColumn(plan.AliasByTable[prepared.Table.Key], prepared.Column.Name);
+
+        // A DERIVED column's distinct values are the distinct values of its
+        // EXPRESSION — which is what makes the grouping editor's value picker
+        // (and a header filter on a derived column) list the labels the chart
+        // actually shows, not the raw values behind them.
+        var expr = ColumnExpression(prepared.Table.Key, prepared.Column, plan, prepared.Derived, bag);
 
         var whereParts = new List<string>();
         foreach (var filter in prepared.Filters)
         {
-            whereParts.Add(BuildPredicate(filter, plan, bag));
+            whereParts.Add(BuildPredicate(filter, plan, prepared.Derived, bag));
         }
 
         if (!string.IsNullOrEmpty(prepared.Search))
@@ -1083,7 +1305,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var columns = new[]
         {
             new ResultColumnPlan("value", prepared.Column.Name, ResultColumnRole.Dimension,
-                prepared.Column.Type, $"{prepared.Table.Key}.{prepared.Column.Name}", null, null),
+                prepared.Column.Type, DimensionSource(prepared.Table.Key, prepared.Column, grouping: null), null, null),
         };
 
         return new CompiledQuery(CalendarWithPrefix(calendarCtes) + sql, bag.Parameters, columns, Warnings: []);
@@ -1104,14 +1326,19 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var calendarCtes = BuildCalendarCtes(prepared.CalendarTables, bag);
         var alias = plan.AliasByTable[prepared.Table.Key];
 
-        var selectItems = prepared.Table.Columns
+        // PHYSICAL columns only — the documented contract of an underlying
+        // export is "the rows behind the chart", and derived fields are a
+        // presentation of those rows, not data in them. Keeping them out also
+        // keeps one broken derived field from failing a whole export.
+        var exportColumns = prepared.Table.Columns.Where(c => !c.IsDerived).ToArray();
+        var selectItems = exportColumns
             .Select(c => QualifiedColumn(alias, c.Name))
             .ToArray();
 
         var whereParts = new List<string>();
         foreach (var filter in prepared.Filters)
         {
-            whereParts.Add(BuildPredicate(filter, plan, bag));
+            whereParts.Add(BuildPredicate(filter, plan, prepared.Derived, bag));
         }
 
         AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
@@ -1129,7 +1356,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
 
         sql.Append('\n').Append("ORDER BY ")
-            .Append(QualifiedColumn(alias, prepared.Table.Columns[0].Name))
+            .Append(QualifiedColumn(alias, exportColumns[0].Name))
             .Append(" ASC").Append(dialect.NullsLastSuffix);
         sql.Append('\n').Append(dialect.LimitClause(limitPlaceholder));
 
@@ -1139,7 +1366,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         // "See records" drill-through table and its CSV export read friendly
         // without any consumer changes.
         var overrides = prepared.AnchorColumnOverrides;
-        var columns = prepared.Table.Columns
+        var columns = exportColumns
             .Select(c => new ResultColumnPlan(
                 c.Name,
                 overrides.FirstOrDefault(o => string.Equals(o.Name, c.Name, StringComparison.Ordinal))
@@ -1190,8 +1417,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     // ---------- resolution helpers ----------
 
+    /// <summary>
+    /// The single column-resolution gate every dimension, filter and
+    /// distinct-values spec passes through. A name that resolves to an injected
+    /// DERIVED column is parsed and same-table checked here (once, memoized in
+    /// <paramref name="derived"/>) so a broken derived field fails with the
+    /// path of the well that used it — and so emission can never meet an
+    /// unvalidated one. A derived field is addressable by its NAME or by its
+    /// ID, so a chart survives a rename.
+    /// </summary>
     private static (TableSchema Table, ColumnSchema Column) ResolveColumn(
-        string tableKey, string columnName, ModelDefinition model, DatabaseSchema schema)
+        string tableKey, string columnName, ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived)
     {
         if (!model.ContainsTable(tableKey))
         {
@@ -1203,8 +1440,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 "QRY_UNKNOWN_TABLE", $"Table '{tableKey}' no longer exists in the data source.");
 
         var column = table.FindColumn(columnName)
+            ?? table.FindDerivedColumnById(columnName)
             ?? throw new QueryCompilationException(
                 "QRY_UNKNOWN_COLUMN", $"Column '{columnName}' does not exist on '{tableKey}'.");
+
+        if (column.IsDerived)
+        {
+            ResolveDerivedColumn(table, column, derived);
+        }
 
         return (table, column);
     }
@@ -1218,16 +1461,33 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
     }
 
-    private ResolvedDimension ResolveDimension(DimensionSpec spec, ModelDefinition model, DatabaseSchema schema)
+    private ResolvedDimension ResolveDimension(
+        DimensionSpec spec, ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived, RcdLimits limits)
     {
-        var (table, column) = ResolveColumn(spec.Table, spec.Column, model, schema);
+        var (table, column) = ResolveColumn(spec.Table, spec.Column, model, schema, derived);
         EnsureUsable(column, $"Column '{spec.Table}.{spec.Column}'");
+
+        if (spec.DateBucket is not null && column.IsDerived)
+        {
+            // Refused explicitly rather than falling into the type check below,
+            // whose "is Text" wording would read as a catalog fact about a
+            // column the database does not have.
+            throw new QueryCompilationException(
+                "QRY_BAD_BUCKET",
+                $"'{spec.Table}.{spec.Column}' is a derived field, which already produces a text label; date bucketing needs a date or timestamp column.");
+        }
 
         if (spec.DateBucket is not null && column.Type is not (NormalizedType.Date or NormalizedType.Timestamp))
         {
             throw new QueryCompilationException(
                 "QRY_BAD_BUCKET",
                 $"'{spec.Table}.{spec.Column}' is {column.Type}; date bucketing needs a date or timestamp column.");
+        }
+
+        if (spec.Grouping is { } grouping)
+        {
+            ValidateGrouping(grouping, spec, limits);
         }
 
         var overrideColumn = model.FindTable(spec.Table)?.ColumnOverrides
@@ -1241,7 +1501,66 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         return new ResolvedDimension(spec, table, column, label, overrideColumn?.FormatHint);
     }
 
-    private ResolvedMeasure ResolveMeasure(MeasureSpec spec, ModelDefinition model, DatabaseSchema schema)
+    /// <summary>
+    /// Shape checks for a chart-local value grouping. Labels and match values
+    /// are NOT inspected beyond their count and length — they are data, bound
+    /// as parameters at emission, and there is nothing about their content the
+    /// compiler needs to know.
+    /// </summary>
+    private static void ValidateGrouping(GroupingRule grouping, DimensionSpec spec, RcdLimits limits)
+    {
+        if (grouping.Groups is null || grouping.Groups.Count == 0)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_GROUPING", $"The grouping on '{spec.Table}.{spec.Column}' defines no groups.");
+        }
+
+        if (grouping.Groups.Count > MaxGroupingBuckets)
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_GROUPING",
+                $"A grouping may define at most {MaxGroupingBuckets} groups; this one defines {grouping.Groups.Count}.");
+        }
+
+        if (grouping.OtherLabel is { Length: > MaxGroupingLabelLength })
+        {
+            throw new QueryCompilationException(
+                "QRY_BAD_GROUPING", $"A grouping label may be at most {MaxGroupingLabelLength} characters.");
+        }
+
+        foreach (var group in grouping.Groups)
+        {
+            if (group is null || string.IsNullOrEmpty(group.Label))
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING", $"Every group of '{spec.Table}.{spec.Column}' needs a label.");
+            }
+
+            if (group.Label.Length > MaxGroupingLabelLength)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING", $"A grouping label may be at most {MaxGroupingLabelLength} characters.");
+            }
+
+            if (!group.MatchBlank && group.MatchValues.Count == 0)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING",
+                    $"Group '{group.Label}' matches nothing; give it values or mark it as the blank group.");
+            }
+
+            if (group.MatchValues.Count > limits.MaxInValues)
+            {
+                throw new QueryCompilationException(
+                    "QRY_TOO_MANY_VALUES",
+                    $"Group '{group.Label}' lists {group.MatchValues.Count} values; at most {limits.MaxInValues} are allowed.");
+            }
+        }
+    }
+
+    private ResolvedMeasure ResolveMeasure(
+        MeasureSpec spec, ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived)
     {
         if (spec.MeasureId is { } measureId)
         {
@@ -1250,12 +1569,12 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                     "QRY_UNKNOWN_MEASURE", $"The model has no measure with id {measureId}.");
             if (measure.Expression is not null)
             {
-                return ResolveExpressionMeasure(measure, model, schema);
+                return ResolveExpressionMeasure(measure, model, schema, derived);
             }
 
             return ResolveMeasureCore(
                 measure.Name, measure.Table, measure.Aggregation, measure.Column,
-                measure.MeasureFilters, measure.FormatHint, measure.FormatString, model, schema);
+                measure.MeasureFilters, measure.FormatHint, measure.FormatString, model, schema, derived);
         }
 
         if (spec.Table is null || spec.Aggregation is null)
@@ -1279,14 +1598,17 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 ?.FriendlyName ?? spec.Column;
         var label = spec.Alias
             ?? (columnLabel is null ? $"{spec.Aggregation}" : $"{spec.Aggregation} of {columnLabel}");
-        return ResolveMeasureCore(label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, null, model, schema);
+        return ResolveMeasureCore(
+            label, spec.Table, spec.Aggregation.Value, spec.Column, [], null, null, model, schema, derived);
     }
 
     /// <summary>Maximum expression-measure reference chain; mirrors <see cref="SemanticModelValidator.MaxMeasureReferenceDepth"/>.</summary>
     private const int MaxMeasureReferenceDepth = 8;
 
-    private ResolvedMeasure ResolveExpressionMeasure(Measure measure, ModelDefinition model, DatabaseSchema schema) =>
-        ResolveExpressionMeasure(measure, model, schema, new HashSet<Guid>(), depth: 0);
+    private ResolvedMeasure ResolveExpressionMeasure(
+        Measure measure, ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived) =>
+        ResolveExpressionMeasure(measure, model, schema, derived, new HashSet<Guid>(), depth: 0);
 
     /// <summary>
     /// Resolves a calculated measure: parse (QRY_BAD_MEASURE on failure), then
@@ -1302,7 +1624,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// cannot be inlined into a grouped aggregate).
     /// </summary>
     private ResolvedMeasure ResolveExpressionMeasure(
-        Measure measure, ModelDefinition model, DatabaseSchema schema, HashSet<Guid> visiting, int depth)
+        Measure measure, ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived, HashSet<Guid> visiting, int depth)
     {
         if (!visiting.Add(measure.Id))
         {
@@ -1373,6 +1696,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                             ?? throw new QueryCompilationException(
                                 "QRY_UNKNOWN_COLUMN",
                                 $"Measure '{measure.Name}' expression references column '{call.Column}', which does not exist on '{tableKey}'.");
+                        if (callColumn.IsDerived)
+                        {
+                            // Same scope line as ResolveMeasureCore's.
+                            throw new QueryCompilationException(
+                                "QRY_BAD_MEASURE",
+                                $"Measure '{measure.Name}' expression aggregates '{call.Column}', which is a derived field (a category label); aggregate the column it derives from instead.");
+                        }
+
                         if (!IsAggregationCompatible(call.Aggregation, callColumn.Type))
                         {
                             throw new QueryCompilationException(
@@ -1405,7 +1736,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
                         if (target.Expression is not null)
                         {
-                            var resolvedTarget = ResolveExpressionMeasure(target, model, schema, visiting, depth + 1);
+                            var resolvedTarget = ResolveExpressionMeasure(
+                                target, model, schema, derived, visiting, depth + 1);
                             if (resolvedTarget.PercentOfTotal)
                             {
                                 throw new QueryCompilationException(
@@ -1419,7 +1751,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                         {
                             references[reference.Name] = ResolveMeasureCore(
                                 target.Name, target.Table, target.Aggregation, target.Column,
-                                target.MeasureFilters, target.FormatHint, target.FormatString, model, schema);
+                                target.MeasureFilters, target.FormatHint, target.FormatString, model, schema, derived);
                         }
 
                         break;
@@ -1427,7 +1759,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             }
 
             var resolvedFilters = measure.MeasureFilters
-                .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
+                .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema, derived))
                 .ToArray();
 
             return new ResolvedMeasure(
@@ -1450,7 +1782,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         string? formatHint,
         string? formatString,
         ModelDefinition model,
-        DatabaseSchema schema)
+        DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived)
     {
         if (model.FindTable(tableKey) is null)
         {
@@ -1467,6 +1800,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             column = table.FindColumn(columnName)
                 ?? throw new QueryCompilationException(
                     "QRY_UNKNOWN_COLUMN", $"Column '{columnName}' does not exist on '{tableKey}'.");
+            if (column.IsDerived)
+            {
+                // A DELIBERATE SCOPE LINE for this wave. A derived field is a
+                // category, and aggregating one would put an author-written
+                // row-level expression inside every aggregate, FILTER(WHERE …)
+                // and HAVING repetition — surface this wave has not tested.
+                // Aggregate the column it derives from instead.
+                throw new QueryCompilationException(
+                    "QRY_BAD_MEASURE",
+                    $"'{columnName}' is a derived field, which is a category label, not a value to aggregate; aggregate the column it derives from instead.");
+            }
+
             if (!IsAggregationCompatible(aggregation, column.Type))
             {
                 throw new QueryCompilationException(
@@ -1480,7 +1825,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
 
         var resolvedFilters = filters
-            .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema))
+            .Select(f => ResolveFilterUnbounded(f.Table, f.Column, f.Operator, f.Values, model, schema, derived))
             .ToArray();
 
         return new ResolvedMeasure(label, table, aggregation, column, resolvedFilters, formatHint, FormatString: formatString);
@@ -1488,9 +1833,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     private ResolvedFilter ResolveFilter(
         string tableKey, string columnName, FilterOperator op, IReadOnlyList<JsonElement> values,
-        ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
+        ModelDefinition model, DatabaseSchema schema,
+        IDictionary<string, ResolvedDerivedColumn> derived, RcdLimits limits)
     {
-        var filter = ResolveFilterUnbounded(tableKey, columnName, op, values, model, schema);
+        var filter = ResolveFilterUnbounded(tableKey, columnName, op, values, model, schema, derived);
         if (op is FilterOperator.In or FilterOperator.NotIn && values.Count > limits.MaxInValues)
         {
             throw new QueryCompilationException(
@@ -1502,15 +1848,16 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     private ResolvedFilter ResolveFilterUnbounded(
         string tableKey, string columnName, FilterOperator op, IReadOnlyList<JsonElement> values,
-        ModelDefinition model, DatabaseSchema schema)
+        ModelDefinition model, DatabaseSchema schema, IDictionary<string, ResolvedDerivedColumn> derived)
     {
-        var (table, column) = ResolveColumn(tableKey, columnName, model, schema);
+        var (table, column) = ResolveColumn(tableKey, columnName, model, schema, derived);
         EnsureUsable(column, $"Filter column '{tableKey}.{columnName}'");
 
         var context = $"Filter on '{tableKey}.{columnName}'";
         var arity = op switch
         {
-            FilterOperator.IsNull or FilterOperator.NotNull => 0,
+            FilterOperator.IsNull or FilterOperator.NotNull
+                or FilterOperator.IsBlank or FilterOperator.NotBlank => 0,
             FilterOperator.Between => 2,
             FilterOperator.In or FilterOperator.NotIn => -1, // one or more
             _ => 1,
@@ -1564,7 +1911,8 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 $"Measure '{label}': calculation offset must be between 1 and 1000, got {offset}.");
         }
 
-        if (calc.Kind != MeasureCalcKind.RunningTotal && dimensions[0].Spec.DateBucket is null)
+        if (calc.Kind != MeasureCalcKind.RunningTotal
+            && (dimensions[0].Spec.DateBucket is null || dimensions[0].Spec.Grouping is not null))
         {
             throw new QueryCompilationException(
                 "QRY_CALC_NEEDS_DATE_AXIS",
@@ -1907,10 +2255,114 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
     }
 
-    private string DimensionExpression(ResolvedDimension dimension, JoinPlan plan)
+    /// <summary>
+    /// *** THE ONE SEAM. *** Every place that reads a user-named column goes
+    /// through here, so a DERIVED column resolves to its expression SQL instead
+    /// of a quoted identifier — and a physical column emits byte-identically to
+    /// before, which is why every existing golden statement is unchanged.
+    ///
+    /// The returned string is computed ONCE per use site and reused verbatim in
+    /// SELECT / GROUP BY / ORDER BY / tie-breaks, exactly as dateBucket's is:
+    /// re-deriving it would bind the same literals twice.
+    /// </summary>
+    private string ColumnExpression(
+        string tableKey,
+        ColumnSchema column,
+        JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
+        ParameterBag bag)
     {
-        var expr = QualifiedColumn(plan.AliasByTable[dimension.Table.Key], dimension.Column.Name);
-        return dimension.Spec.DateBucket is { } bucket ? dialect.DateTrunc(bucket, expr) : expr;
+        var alias = plan.AliasByTable[tableKey];
+        if (!column.IsDerived)
+        {
+            return QualifiedColumn(alias, column.Name);
+        }
+
+        // Resolution put it here; a miss would mean an emission path that never
+        // went through ResolveColumn, which is a bug, not a runtime condition.
+        var resolved = derived[$"{tableKey}.{column.Name}"];
+        return ExpressionSql(
+            resolved.Root, new ResolvedMeasureExpression(resolved.Root, [], NoMeasureReferences), [], plan, derived, bag);
+    }
+
+    /// <summary>
+    /// The dimension's grouping SQL: the raw column, then a date bucket, then a
+    /// value grouping — each layer wrapping the last, so a grouping over a
+    /// derived column (or over a bucketed date) composes without special cases.
+    /// </summary>
+    private string DimensionExpression(
+        ResolvedDimension dimension,
+        JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
+        ParameterBag bag)
+    {
+        var expr = ColumnExpression(dimension.Table.Key, dimension.Column, plan, derived, bag);
+        if (dimension.Spec.DateBucket is { } bucket)
+        {
+            expr = dialect.DateTrunc(bucket, expr);
+        }
+
+        return dimension.Spec.Grouping is { } grouping
+            ? GroupingExpression(grouping, expr, dimension.Column.Type, dimension, bag)
+            : expr;
+    }
+
+    /// <summary>
+    /// Compiles a value grouping to a CASE over the column expression:
+    /// <code>
+    ///   CASE WHEN e IS NULL OR CAST(e AS text) = @p0 THEN @p1
+    ///        WHEN e = ANY(@p2) THEN @p3
+    ///        ELSE @p4 END
+    /// </code>
+    /// *** EVERY LABEL AND EVERY MATCH VALUE IS A BOUND PARAMETER. *** Nothing
+    /// the author typed is concatenated into the statement — the only text this
+    /// method emits is fixed SQL keywords and the already-validated column
+    /// expression. Buckets are tested in author order, first match wins, which
+    /// is what makes overlapping buckets predictable.
+    ///
+    /// With no "everything else" label the unmatched values keep their own text
+    /// (CAST so the CASE has one result type — the THEN arms are text
+    /// parameters).
+    /// </summary>
+    private string GroupingExpression(
+        GroupingRule grouping,
+        string columnExpr,
+        NormalizedType columnType,
+        ResolvedDimension dimension,
+        ParameterBag bag)
+    {
+        // A date-bucketed column is a date again after date_trunc, so grouping
+        // values are converted against the column's own type either way.
+        var context = $"Grouping on '{dimension.Spec.Table}.{dimension.Spec.Column}'";
+        var sql = new StringBuilder("CASE");
+
+        foreach (var group in grouping.Groups)
+        {
+            var conditions = new List<string>();
+            if (group.MatchBlank)
+            {
+                var blank = dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text));
+                conditions.Add($"{columnExpr} IS NULL");
+                conditions.Add($"{dialect.CastToText(columnExpr)} = {blank}");
+            }
+
+            if (group.MatchValues.Count > 0)
+            {
+                var values = group.MatchValues
+                    .Select(v => (object?)SpecValueConverter.Convert(v, columnType, context))
+                    .ToArray();
+                conditions.Add(dialect.InPredicate(columnExpr, negated: false, values, columnType, bag));
+            }
+
+            var label = dialect.ParameterPlaceholder(bag.Add(group.Label, NormalizedType.Text));
+            sql.Append(" WHEN ").Append(string.Join(" OR ", conditions)).Append(" THEN ").Append(label);
+        }
+
+        sql.Append(" ELSE ").Append(grouping.OtherLabel is { } other
+            ? dialect.ParameterPlaceholder(bag.Add(other, NormalizedType.Text))
+            : dialect.CastToText(columnExpr));
+
+        return sql.Append(" END").ToString();
     }
 
     /// <summary>
@@ -1921,14 +2373,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// </summary>
     private const string TombstoneSql = "CAST(NULL AS decimal)";
 
-    private string MeasureExpression(ResolvedMeasure measure, JoinPlan plan, ParameterBag bag) =>
+    private string MeasureExpression(
+        ResolvedMeasure measure,
+        JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
+        ParameterBag bag) =>
         measure.Tombstone
             ? TombstoneSql
             : measure.Expression is { } expression
-                ? ExpressionSql(expression.Root, expression, measure.Filters, plan, bag)
+                ? ExpressionSql(expression.Root, expression, measure.Filters, plan, derived, bag)
                 : AggregateWithFilters(
                     dialect.Aggregate(measure.Aggregation, AggregateArgument(measure, plan)),
-                    measure.Filters, plan, bag);
+                    measure.Filters, plan, derived, bag);
 
     private string? AggregateArgument(ResolvedMeasure measure, JoinPlan plan) =>
         measure.Column is null
@@ -1936,14 +2392,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             : QualifiedColumn(plan.AliasByTable[measure.Table.Key], measure.Column.Name);
 
     private string AggregateWithFilters(
-        string aggregate, IReadOnlyList<ResolvedFilter> filters, JoinPlan plan, ParameterBag bag)
+        string aggregate,
+        IReadOnlyList<ResolvedFilter> filters,
+        JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
+        ParameterBag bag)
     {
         if (filters.Count == 0)
         {
             return aggregate;
         }
 
-        var predicate = string.Join(" AND ", filters.Select(f => BuildPredicate(f, plan, bag)));
+        var predicate = string.Join(" AND ", filters.Select(f => BuildPredicate(f, plan, derived, bag)));
         return dialect.AggregateFilter(aggregate, predicate);
     }
 
@@ -1967,9 +2427,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         ResolvedMeasureExpression expression,
         IReadOnlyList<ResolvedFilter> outerFilters,
         JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
         ParameterBag bag)
     {
-        string Render(MeasureExprNode child) => ExpressionSql(child, expression, outerFilters, plan, bag);
+        string Render(MeasureExprNode child) => ExpressionSql(child, expression, outerFilters, plan, derived, bag);
 
         switch (node)
         {
@@ -2055,11 +2516,41 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             case BlankNode:
                 return "NULL";
 
+            // ---------- row-level nodes (derived fields only) ----------
+
+            case StringLiteralNode literal:
+                // *** THE ONLY AUTHOR TEXT THE RENDERER CAN OUTPUT — AND IT
+                // DOES NOT OUTPUT IT. *** The value is bound exactly like a
+                // filter value; what reaches the statement is "@pN".
+                return dialect.ParameterPlaceholder(bag.Add(literal.Value, NormalizedType.Text));
+
+            case ColumnRefNode columnRef:
+                // The alias comes from the join plan and the column name was
+                // matched Ordinal-exact against the catalog during resolution,
+                // so this is a resolved identifier, never parsed text passed
+                // through. Same-table was enforced there too.
+                return QualifiedColumn(plan.AliasByTable[columnRef.TableKey], columnRef.Column);
+
+            case IsNullNode isNull:
+                return isNull.Negated
+                    ? $"({Render(isNull.Operand)} IS NOT NULL)"
+                    : $"({Render(isNull.Operand)} IS NULL)";
+
+            case IsBlankNode isBlank:
+                // Rendered ONCE and reused: a second Render would bind any
+                // literal inside the operand a second time. The cast keeps the
+                // comparison well-typed for a date or numeric operand, which is
+                // exactly the owner's case — a column holding either a keyword
+                // or a date.
+                var blankOperand = Render(isBlank.Operand);
+                var emptyPlaceholder = dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text));
+                return $"({blankOperand} IS NULL OR {dialect.CastToText(blankOperand)} = {emptyPlaceholder})";
+
             case AggregateCallNode call:
                 var argument = call.Column is null
                     ? null
                     : QualifiedColumn(plan.AliasByTable[call.TableKey!], call.Column);
-                return AggregateWithFilters(dialect.Aggregate(call.Aggregation, argument), outerFilters, plan, bag);
+                return AggregateWithFilters(dialect.Aggregate(call.Aggregation, argument), outerFilters, plan, derived, bag);
 
             case MeasureRefNode reference:
                 var target = expression.References[reference.Name];
@@ -2070,20 +2561,34 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 {
                     // Inline the nested expression measure with the combined
                     // filter set as ITS outer filters (see composition rule).
-                    return ExpressionSql(nested.Root, nested, combined, plan, bag);
+                    return ExpressionSql(nested.Root, nested, combined, plan, derived, bag);
                 }
 
                 return AggregateWithFilters(
-                    dialect.Aggregate(target.Aggregation, AggregateArgument(target, plan)), combined, plan, bag);
+                    dialect.Aggregate(target.Aggregation, AggregateArgument(target, plan)), combined, plan, derived, bag);
 
             default:
                 throw new InvalidOperationException($"Unknown expression node {node.GetType().Name}.");
         }
     }
 
-    private string BuildPredicate(ResolvedFilter filter, JoinPlan plan, ParameterBag bag)
+    /// <summary>
+    /// A filter predicate. When the column is DERIVED the predicate is compiled
+    /// against the EXPRESSION — "WHERE CASE … END = @p" — which is what makes
+    /// drill-down, cross-filter, see-records and header filters work on a
+    /// derived dimension: they all send an ordinary eq/in/isNull clause naming
+    /// the column, and it means the same thing here as in the GROUP BY.
+    /// PERFORMANCE NOTE: no index applies to an expression predicate; the
+    /// database scans. That is the accepted cost of correctness for a feature
+    /// whose whole point is folding many values into few.
+    /// </summary>
+    private string BuildPredicate(
+        ResolvedFilter filter,
+        JoinPlan plan,
+        IReadOnlyDictionary<string, ResolvedDerivedColumn> derived,
+        ParameterBag bag)
     {
-        var expr = QualifiedColumn(plan.AliasByTable[filter.Table.Key], filter.Column.Name);
+        var expr = ColumnExpression(filter.Table.Key, filter.Column, plan, derived, bag);
         var context = $"Filter on '{filter.Table.Key}.{filter.Column.Name}'";
 
         string Placeholder(int index) =>
@@ -2124,6 +2629,22 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 return $"{expr} IS NULL";
             case FilterOperator.NotNull:
                 return $"{expr} IS NOT NULL";
+            // Mirrors a grouping blank bucket EXACTLY (see EmitGrouping: IS NULL OR
+            // CastToText(col) = ''), so drilling into that bar returns precisely the
+            // rows it counted. `expr` is reused rather than re-rendered, so a derived
+            // column's CASE binds its parameters once and is merely referenced twice.
+            case FilterOperator.IsBlank:
+            {
+                var empty = dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text));
+                return $"({expr} IS NULL OR {dialect.CastToText(expr)} = {empty})";
+            }
+
+            case FilterOperator.NotBlank:
+            {
+                var empty = dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text));
+                return $"({expr} IS NOT NULL AND {dialect.CastToText(expr)} <> {empty})";
+            }
+
             default:
                 throw new QueryCompilationException("QRY_BAD_FILTER", $"{context}: unsupported operator.");
         }
@@ -2209,7 +2730,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         {
             // Default: time first (natural for series), then remaining dimensions.
             var ordered = Enumerable.Range(0, prepared.Dimensions.Count)
-                .OrderByDescending(i => prepared.Dimensions[i].Spec.DateBucket is not null)
+                .OrderByDescending(i =>
+                    prepared.Dimensions[i].Spec.DateBucket is not null
+                    && prepared.Dimensions[i].Spec.Grouping is null)
                 .ThenBy(i => i);
             foreach (var i in ordered)
             {
@@ -2277,15 +2800,53 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     private static string EscapeLikePattern(string value) =>
         value.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_");
 
+    /// <summary>
+    /// The result column's SOURCE — the identity consumers match a rendered
+    /// column back to.
+    ///
+    /// <para>A physical column reports "{table}.{column}", exactly as before.
+    /// A DERIVED one reports the SYNTHETIC, STABLE "#derived.{id}" and a GROUPED
+    /// one "#group.{table}.{column}". Both are deliberately NOT null: the table
+    /// renderer treats a null source as a WILDCARD and matches on the label
+    /// alone, so two columns that happen to share a label would highlight each
+    /// other's cells. They are also deliberately not the raw "{table}.{column}"
+    /// — a grouped column and its ungrouped twin in the same chart are different
+    /// series and must not collide.</para>
+    /// </summary>
+    private static string DimensionSource(string tableKey, ColumnSchema column, GroupingRule? grouping)
+    {
+        if (column.IsDerived)
+        {
+            return $"#derived.{column.DerivedId ?? column.Name}";
+        }
+
+        return grouping is null ? $"{tableKey}.{column.Name}" : $"#group.{tableKey}.{column.Name}";
+    }
+
     private static IReadOnlyList<ResultColumnPlan> BuildColumnPlans(PreparedQuery prepared, bool includeIsTopN = false)
     {
         var columns = new List<ResultColumnPlan>();
         for (var i = 0; i < prepared.Dimensions.Count; i++)
         {
             var d = prepared.Dimensions[i];
+
+            // A derived column, and any grouped column, produces LABELS: the
+            // declared type is Text, not the column's own type and not the
+            // hard-coded Decimal the expression path uses for measures.
+            var type = d.Column.IsDerived || d.Spec.Grouping is not null
+                ? NormalizedType.Text
+                : d.Column.Type;
             columns.Add(new ResultColumnPlan(
-                $"dim{i}", d.Label, ResultColumnRole.Dimension, d.Column.Type,
-                $"{d.Table.Key}.{d.Column.Name}", d.Spec.DateBucket, d.FormatHint));
+                $"dim{i}", d.Label, ResultColumnRole.Dimension, type,
+                DimensionSource(d.Table.Key, d.Column, d.Spec.Grouping),
+
+                // A grouped column reports NO bucket even when the underlying
+                // column was bucketed: the renderer formats a bucket as a date
+                // and the layout engine DROPS the blank bucket of a date axis —
+                // which would silently delete the "(Blank) -> No" bar this
+                // feature exists to create.
+                d.Spec.Grouping is null ? d.Spec.DateBucket : null,
+                d.FormatHint));
         }
 
         if (includeIsTopN)

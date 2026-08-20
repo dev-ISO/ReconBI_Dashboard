@@ -603,3 +603,104 @@ describe('validateChartSpec wire paths', () => {
     expect(codes(validateChartSpec(spec, model, catalog))).not.toContain('too_many_dimensions');
   });
 });
+
+/**
+ * DERIVED FIELDS AND VALUE GROUPINGS.
+ *
+ * The load-bearing one is the first test. A derived field is a VIRTUAL column:
+ * the catalog has never heard of it, so without the validator knowing the
+ * model's `derivedFields`, every chart built on one reports `unknown_column`
+ * on every keystroke — the field would be unusable the moment it was made.
+ */
+const withDerived = (): ModelDefinition => ({
+  ...model,
+  derivedFields: [
+    {
+      id: 'df1',
+      name: 'Shipped?',
+      table: 'public.orders',
+      expression: 'IF(ISBLANK(public.orders.order_date), "No", "Yes")',
+      dataType: 'text',
+    },
+  ],
+});
+
+const derivedSpec = (): ChartSpec => {
+  const spec = baseSpec();
+  spec.query.axis = { table: 'public.orders', column: 'Shipped?' };
+  return spec;
+};
+
+describe('validateChartSpec — derived fields', () => {
+  it('accepts a dimension on a derived column the catalog does not have', () => {
+    expect(validateChartSpec(derivedSpec(), withDerived(), catalog)).toEqual([]);
+  });
+
+  it('still reports unknown_column when the model has no such derived field', () => {
+    expect(codes(errors(validateChartSpec(derivedSpec(), model, catalog)))).toContain(
+      'unknown_column',
+    );
+  });
+
+  it('refuses a date grain on a derived column, and says why', () => {
+    const spec = derivedSpec();
+    spec.query.axis = { ...spec.query.axis!, dateBucket: 'month' };
+    const issues = errors(validateChartSpec(spec, withDerived(), catalog));
+    expect(issues).toMatchObject([
+      { code: 'bad_bucket', well: 'axis', path: 'dimensions[0].dateBucket' },
+    ]);
+    expect(issues[0]!.message).toContain('already produces text');
+  });
+
+  it('refuses a derived column in a VALUES well — there is nothing to aggregate', () => {
+    const spec = baseSpec();
+    spec.query.measures = [
+      { table: 'public.orders', column: 'Shipped?', aggregation: 'countDistinct' },
+    ];
+    const issues = errors(validateChartSpec(spec, withDerived(), catalog));
+    expect(issues).toMatchObject([
+      { code: 'bad_measure', well: 'values', path: 'measures[0].column' },
+    ]);
+    expect(issues[0]!.message).toContain('produces a label, not a number');
+  });
+
+  it('refuses a value grouping ON a derived column (it is already an expression)', () => {
+    const spec = derivedSpec();
+    spec.query.axis = {
+      ...spec.query.axis!,
+      grouping: { groups: [{ label: 'Yes', values: ['Yes'] }] },
+    };
+    const issues = errors(validateChartSpec(spec, withDerived(), catalog));
+    expect(codes(issues)).toContain('bad_grouping');
+  });
+});
+
+describe('validateChartSpec — value groupings', () => {
+  const grouped = (grouping: NonNullable<ChartSpec['query']['axis']>['grouping']): ChartSpec => {
+    const spec = baseSpec();
+    spec.query.axis = { table: 'public.orders', column: 'order_date', grouping };
+    return spec;
+  };
+
+  it('accepts the owner`s rule on a DATE column — grouping is not bucketing', () => {
+    const spec = grouped({ groups: [{ label: 'No', matchBlank: true }], otherLabel: 'Yes' });
+    expect(validateChartSpec(spec, model, catalog)).toEqual([]);
+  });
+
+  it('refuses a grouping and a date grain at once', () => {
+    const spec = grouped({ groups: [{ label: 'No', matchBlank: true }] });
+    spec.query.axis = { ...spec.query.axis!, dateBucket: 'month' };
+    const issues = errors(validateChartSpec(spec, model, catalog));
+    expect(issues.some((i) => i.code === 'bad_grouping')).toBe(true);
+    expect(issues.find((i) => i.code === 'bad_grouping')!.path).toBe('dimensions[0].grouping');
+  });
+
+  it('reports an incomplete rule at the grouping`s own path', () => {
+    const spec = grouped({ groups: [{ label: '', values: ['x'] }] });
+    const issues = errors(validateChartSpec(spec, model, catalog));
+    expect(issues).toMatchObject([
+      { code: 'bad_grouping', well: 'axis', path: 'dimensions[0].grouping' },
+    ]);
+    expect(issues[0]!.message).toContain('give every group a name');
+  });
+});

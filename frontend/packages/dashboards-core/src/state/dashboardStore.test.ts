@@ -4,7 +4,12 @@ import { RcdApiError } from '../api/fetcher';
 import type { ChartSpec } from '../types/chart';
 import type { DashboardDetail, DashboardLayoutDoc } from '../types/dashboard';
 import type { Measure } from '../types/model';
-import { cloneChartForCopy, DashboardStore } from './dashboardStore';
+import {
+  cloneChartForCopy,
+  crossFilterClauseFor,
+  DashboardStore,
+  dateRangeClauseFor,
+} from './dashboardStore';
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -947,5 +952,71 @@ describe('cloneChartForCopy (the shared copy-path clone)', () => {
     expect(tiles[0]!.chart!.format.container?.innerTitleHtml).toContain(
       '<b>Valve Status (copy)</b>',
     );
+  });
+});
+
+/**
+ * CROSS-FILTER OVER A GROUPED DIMENSION.
+ *
+ * `crossFilterClauseFor` is the single funnel every clicked point goes through.
+ * A grouped dimension hands it a LABEL where every other dimension hands it a
+ * value, so this is the one place a wrong answer would spread to every tile on
+ * the page at once.
+ */
+describe('crossFilterClauseFor with a value grouping', () => {
+  const grouped = {
+    table: 'public.orders',
+    column: 'shipped_at',
+    grouping: { groups: [{ label: 'No', matchBlank: true }], otherLabel: 'Yes' },
+  };
+
+  it('translates the clicked LABEL back onto the raw column', () => {
+    expect(crossFilterClauseFor(grouped, 'Yes')).toEqual({
+      table: 'public.orders',
+      column: 'shipped_at',
+      operator: 'notBlank',
+      values: [],
+    });
+    expect(crossFilterClauseFor(grouped, 'No')).toEqual({
+      table: 'public.orders',
+      column: 'shipped_at',
+      operator: 'isBlank',
+      values: [],
+    });
+  });
+
+  it('never takes the date-range branch, even though the column IS a date', () => {
+    // Without the grouping check, a "Yes" over a date column with a bucket
+    // would compile to a `between` over a range parsed from the word "Yes".
+    const bucketed = { ...grouped, dateBucket: 'month' as const };
+    expect(crossFilterClauseFor(bucketed, 'Yes')).toMatchObject({ operator: 'notBlank' });
+  });
+
+  it('returns null for a bucket with no honest single-clause form', () => {
+    const mixed = {
+      table: 'public.orders',
+      column: 'status',
+      grouping: { groups: [{ label: 'None', values: ['n/a'], matchBlank: true }] },
+    };
+    expect(crossFilterClauseFor(mixed, 'None')).toBeNull();
+  });
+
+  it('an axis-range drag over a grouped axis is refused outright', () => {
+    expect(dateRangeClauseFor(grouped, '2026-01-01', '2026-02-01')).toBeNull();
+  });
+
+  it('leaves an ungrouped dimension exactly as it was', () => {
+    expect(crossFilterClauseFor({ table: 't', column: 'c' }, 'x')).toEqual({
+      table: 't',
+      column: 'c',
+      operator: 'eq',
+      values: ['x'],
+    });
+    expect(crossFilterClauseFor({ table: 't', column: 'c' }, null)).toEqual({
+      table: 't',
+      column: 'c',
+      operator: 'isNull',
+      values: [],
+    });
   });
 });

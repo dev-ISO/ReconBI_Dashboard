@@ -73,6 +73,26 @@ public sealed class PostgresContainerFixture : IAsyncLifetime
             ('2025-02-20', 'B', 60),
             ('2025-04-20', 'B', 80);
 
+        -- THE OWNER'S REAL SHAPE: a column that holds EITHER a keyword or a
+        -- date, plus blanks — five of their live columns look like this. Today
+        -- it yields one bar per distinct date; the derived-field engine must
+        -- fold it into exactly two, "Yes" and "No". Region is here so a row
+        -- filter can restrict the same table in the RLS test.
+        CREATE TABLE reviews (
+            id serial PRIMARY KEY,
+            region text NOT NULL,
+            edms_uploaded text
+        );
+
+        INSERT INTO reviews (region, edms_uploaded) VALUES
+            ('West', 'Yes'),
+            ('West', '02/03/2026'),
+            ('West', NULL),
+            ('East', '04/22/2026'),
+            ('East', '12/15/2021'),
+            ('East', ''),
+            ('East', NULL);
+
         CREATE VIEW open_orders AS SELECT * FROM orders WHERE status = 'open';
 
         CREATE MATERIALIZED VIEW region_totals AS

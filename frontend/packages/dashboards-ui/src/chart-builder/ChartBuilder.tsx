@@ -14,7 +14,10 @@ import {
 import { AlertTriangle, Filter, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   boldRunText,
+  chartDerivedFieldDefinitions,
   chartMeasureDefinitions,
+  derivedFieldOf,
+  groupingToExpression,
   isRunnable,
   pathToWell,
   retitleInnerTitleHtml,
@@ -26,9 +29,11 @@ import {
   type ChartIssue,
   type ChartSpec,
   type ChartType,
+  type DerivedField,
   type FilterClause,
   type Measure,
   type ModelDefinition,
+  type ValueGrouping,
 } from '@recon/dashboards-core';
 import { shapeChartData, shapePieData } from '../chart/chartData';
 import { ChartTile, type ChartTableLayoutPatch } from '../chart/ChartTile';
@@ -41,10 +46,12 @@ import { FieldList } from './FieldList';
 import { chartFieldUsage } from './fieldGroups';
 import { useFieldListPrefs } from './fieldListPrefs';
 import { FilterEditor } from './FilterEditor';
-import { MeasureManager } from './MeasureManager';
+import { MeasureManager, type ManagerTab } from './MeasureManager';
 import { useMeasureActions } from './measureActions';
+import { useDerivedFieldActions, type ScopedDerivedField } from './derivedFieldActions';
+import { ValueGroupingEditor } from './ValueGroupingEditor';
 import type { MeasureScope, ScopedMeasure } from './measureScopes';
-import { Wells, type ManualOrderInputs } from './Wells';
+import { Wells, type GroupingTarget, type ManualOrderInputs } from './Wells';
 import {
   applyDrop,
   chipColumnOf,
@@ -129,10 +136,21 @@ interface FilterMove {
  * manager opens over it and the builder (and the half-built chart) survives.
  */
 interface MeasureManagerRequest {
+  /** Which half of the manager to show. */
+  tab?: ManagerTab;
   /** Open straight into the editor for this measure. */
   focusMeasureId?: string;
   /** Open straight into the delete confirmation for this measure. */
   deleteMeasureId?: string;
+  /** Open straight into the editor for this derived field. */
+  focusDerivedFieldId?: string;
+  /** Open straight into the delete confirmation for this derived field. */
+  deleteDerivedFieldId?: string;
+  /**
+   * A chart-local grouping being PROMOTED into a named field: the manager
+   * opens on Fields with the formula already written.
+   */
+  seedDerivedField?: { table: string; expression: string; name?: string };
 }
 
 /**
@@ -225,6 +243,13 @@ export function ChartBuilder({
   const [filterTarget, setFilterTarget] = useState<FilterEditorTarget | null>(null);
   const [filterMove, setFilterMove] = useState<FilterMove | null>(null);
   const [measureManager, setMeasureManager] = useState<MeasureManagerRequest | null>(null);
+  /**
+   * The dimension whose values are being grouped. Held HERE rather than inside
+   * the chip: the chip is re-created on every query change (including the one
+   * the editor itself makes), and a dialog owned by a component that a
+   * re-render replaces loses its half-finished rule.
+   */
+  const [grouping, setGrouping] = useState<GroupingTarget | null>(null);
   const lastDragEndAt = useRef(0);
 
   /**
@@ -242,9 +267,25 @@ export function ChartBuilder({
     chart: draft,
     onChartChange: setDraft,
   });
+  /**
+   * The same overlay, for DERIVED FIELDS. Without it the field list would not
+   * offer a dashboard-scoped or personal one, the client validator would call
+   * every dimension using one `unknown_column` on every keystroke, and the
+   * chips would show a name nothing could resolve.
+   */
+  const derivedActions = useDerivedFieldActions({
+    modelId,
+    fallbackSystemFields: model.derivedFields ?? [],
+    chart: draft,
+    onChartChange: setDraft,
+  });
   const effectiveModel = useMemo<ModelDefinition>(
-    () => ({ ...model, measures: measureActions.effective }),
-    [model, measureActions.effective],
+    () => ({
+      ...model,
+      measures: measureActions.effective,
+      derivedFields: derivedActions.effective,
+    }),
+    [model, measureActions.effective, derivedActions.effective],
   );
 
   /**
@@ -257,6 +298,25 @@ export function ChartBuilder({
   const fieldListPrefs = useFieldListPrefs(runtime.userSettings);
   /** What the DRAFT references — the exception a hidden group cannot override. */
   const fieldsInUse = useMemo(() => chartFieldUsage(draft), [draft]);
+
+  const derivedManagement = useMemo(
+    () => ({
+      scoped: derivedActions.scoped,
+      rights: derivedActions.rights,
+      onCreate: () => setMeasureManager({ tab: 'fields' as ManagerTab }),
+      handlers: {
+        onEdit: (entry: ScopedDerivedField) =>
+          setMeasureManager({ tab: 'fields' as ManagerTab, focusDerivedFieldId: entry.field.id }),
+        onDuplicate: (entry: ScopedDerivedField) =>
+          void derivedActions.duplicate(entry.scope, entry.field.id),
+        onDelete: (entry: ScopedDerivedField) =>
+          setMeasureManager({ tab: 'fields' as ManagerTab, deleteDerivedFieldId: entry.field.id }),
+        onTransfer: (entry: ScopedDerivedField, to: MeasureScope) =>
+          void derivedActions.transfer(entry.scope, to, entry.field.id),
+      },
+    }),
+    [derivedActions],
+  );
 
   const measureManagement = useMemo(
     () => ({
@@ -458,6 +518,39 @@ export function ChartBuilder({
     setDraft((current) => remapIndexedRefs(current, { ...current, type, query }));
   };
 
+  /**
+   * "Make this a reusable field" — the upgrade path out of the chart-local
+   * grouping editor.
+   *
+   * It hands the FINISHED RULE to the field manager as a formula and lets the
+   * author name it and choose a scope there, rather than creating a field
+   * behind their back: the whole reason chart-local grouping exists is that a
+   * new field is a commitment, so the moment they choose to make one is the
+   * moment they should also choose where it lives.
+   *
+   * The chart-local grouping is deliberately LEFT on the chip. It keeps
+   * rendering exactly what it rendered a second ago while the field is being
+   * authored, and swapping the axis onto a field that does not exist yet (or
+   * that the author then cancels) would break the chart to make a point.
+   */
+  const promoteGrouping = (target: GroupingTarget, rule: ValueGrouping) => {
+    const expression = groupingToExpression(
+      target.dimension.table,
+      target.dimension.column,
+      rule,
+    );
+    if (expression === null) return;
+    setGrouping(null);
+    setMeasureManager({
+      tab: 'fields',
+      seedDerivedField: {
+        table: target.dimension.table,
+        expression,
+        name: `${target.label} (grouped)`,
+      },
+    });
+  };
+
   const handleCancel = () => {
     if (dirty) setConfirmCancel(true);
     else onCancel();
@@ -531,13 +624,19 @@ export function ChartBuilder({
   // ever writes, and the Format/Sort panels silently lose their series lists.
   const docMeasures = useDashboardState((state) => state.current?.layout.measures ?? null);
   const personalMeasures = useDashboardState((state) => state.personalMeasures);
+  const docFields = useDashboardState((state) => state.current?.layout.derivedFields ?? null);
+  const personalFields = useDashboardState((state) => state.personalDerivedFields);
   const previewCacheKey = useMemo(() => {
     if (!isRunnable(draft)) return null;
     const scoped: Measure[] = [...(docMeasures ?? []), ...personalMeasures];
+    const scopedFields: DerivedField[] = [...(docFields ?? []), ...personalFields];
     return runtime.queries.keyFor(
-      toWireSpec(draft, modelId, [], chartMeasureDefinitions(scoped, draft)),
+      toWireSpec(draft, modelId, [], {
+        measures: chartMeasureDefinitions(scoped, draft),
+        derivedFields: chartDerivedFieldDefinitions(scopedFields, draft),
+      }),
     );
-  }, [runtime, draft, modelId, docMeasures, personalMeasures]);
+  }, [runtime, draft, modelId, docMeasures, personalMeasures, docFields, personalFields]);
   const previewEntry = useQueryCacheState((state) =>
     previewCacheKey ? state.entries[previewCacheKey] : undefined,
   );
@@ -654,6 +753,7 @@ export function ChartBuilder({
                 setFilterTarget({ index: null, table: data.table, column: data.column })
               }
               measures={measureManagement}
+              derived={derivedManagement}
               prefs={fieldListPrefs}
               inUse={fieldsInUse}
             />
@@ -734,6 +834,7 @@ export function ChartBuilder({
                   parameters={parameters}
                   ordering={ordering}
                   issues={allIssues}
+                  onGroupValues={setGrouping}
                   onChange={(query) => applyQuery(() => query)}
                   onEditFilter={(index) => {
                     const clause = draft.query.filters[index];
@@ -860,7 +961,15 @@ export function ChartBuilder({
           modelId={modelId}
           table={filterTarget.table}
           column={filterTarget.column}
-          columnType={columnTypeOf(catalog ?? null, filterTarget.table, filterTarget.column)}
+          // A derived column is not in the catalog, so its type is null there;
+          // it is text by construction, which is what decides the operator
+          // list and the value input.
+          columnType={
+            derivedFieldOf(effectiveModel, filterTarget.table, filterTarget.column) !== null
+              ? 'text'
+              : columnTypeOf(catalog ?? null, filterTarget.table, filterTarget.column)
+          }
+          derivedFields={derivedActions.effective}
           label={columnLabelOf(effectiveModel, filterTarget.table, filterTarget.column)}
           initial={editingClause}
           onApply={applyFilter}
@@ -901,6 +1010,20 @@ export function ChartBuilder({
         onCancel={() => setConfirmCancel(false)}
       />
 
+      {grouping !== null && (
+        <ValueGroupingEditor
+          key={`${grouping.dimension.table}.${grouping.dimension.column}`}
+          modelId={modelId}
+          table={grouping.dimension.table}
+          column={grouping.dimension.column}
+          label={grouping.label}
+          initial={grouping.dimension.grouping ?? null}
+          onApply={grouping.onApply}
+          onPromote={(rule) => promoteGrouping(grouping, rule)}
+          onClose={() => setGrouping(null)}
+        />
+      )}
+
       {measureManager !== null && (
         <MeasureManager
           model={model}
@@ -908,6 +1031,11 @@ export function ChartBuilder({
           actions={measureActions}
           focusMeasureId={measureManager.focusMeasureId ?? null}
           deleteMeasureId={measureManager.deleteMeasureId ?? null}
+          derived={derivedActions}
+          initialTab={measureManager.tab ?? 'measures'}
+          focusDerivedFieldId={measureManager.focusDerivedFieldId ?? null}
+          deleteDerivedFieldId={measureManager.deleteDerivedFieldId ?? null}
+          seedDerivedField={measureManager.seedDerivedField ?? null}
           onClose={() => setMeasureManager(null)}
         />
       )}

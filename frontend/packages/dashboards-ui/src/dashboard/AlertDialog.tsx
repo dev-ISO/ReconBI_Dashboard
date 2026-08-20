@@ -116,7 +116,7 @@ export function AlertDialog({ open, dashboardId, modelId, source, onClose, onErr
       watched,
       modelId,
       source.filters,
-      runtime.dashboards.definitionsForChart(watched),
+      runtime.dashboards.wireDefinitionsForChart(watched),
     );
   }, [source, measures, measureIndex, modelId, runtime]);
 

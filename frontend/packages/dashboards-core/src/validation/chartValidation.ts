@@ -10,7 +10,8 @@ import type {
   ModelDefinition,
   Relationship,
 } from '../types/model';
-import { DATE_TABLE_COLUMNS, dateTableKey, tableKey } from '../types/model';
+import { DATE_TABLE_COLUMNS, dateTableKey, derivedFieldOf, tableKey } from '../types/model';
+import { groupingProblems, hasGrouping } from '../state/valueGrouping';
 import type { DimensionRef, MeasureRef, SortSpec } from '../types/query';
 import type { Catalog, ColumnType } from '../types/schema';
 import { isNumericType, isQueryableType, isTemporalType } from '../types/schema';
@@ -145,6 +146,13 @@ export function validateChartSpec(
   const dateColumnTypes = new Map(DATE_TABLE_COLUMNS.map((c) => [c.name, c.type]));
 
   const lookup = (table: string, column: string): ColumnLookup => {
+    // A DERIVED column is a virtual column of a real table: the catalog has
+    // never heard of it, so without this the validator would report
+    // unknown_column on every keystroke of every chart that uses one. It is
+    // always text - the expression produces a label.
+    if (derivedFieldOf(model, table, column) !== null && modelTables.has(table)) {
+      return { status: 'ok', type: 'text' };
+    }
     if (dateTables.has(table)) {
       const type = dateColumnTypes.get(column);
       return type === undefined ? { status: 'unknownColumn' } : { status: 'ok', type };
@@ -220,6 +228,7 @@ export function validateChartSpec(
       path,
     );
     involve(dimension.table);
+    const derived = derivedFieldOf(model, dimension.table, dimension.column);
     if (
       dimension.dateBucket != null &&
       found.status === 'ok' &&
@@ -228,9 +237,38 @@ export function validateChartSpec(
     ) {
       error(
         'bad_bucket',
-        `'${dimension.table}.${dimension.column}' is ${found.type}; date bucketing needs a date or timestamp column.`,
+        derived !== null
+          ? `'${derived.name}' is a derived field, which already produces text - it has no date grain to group by.`
+          : `'${dimension.table}.${dimension.column}' is ${found.type}; date bucketing needs a date or timestamp column.`,
         well,
         path === undefined ? undefined : `${path}.dateBucket`,
+      );
+    }
+    if (!hasGrouping(dimension)) return;
+    const groupingPath = path === undefined ? undefined : `${path}.grouping`;
+    if (dimension.dateBucket != null) {
+      error(
+        'bad_grouping',
+        `'${dimension.table}.${dimension.column}' cannot have a date grain and a value grouping at once - they rewrite the same expression.`,
+        well,
+        groupingPath,
+      );
+    }
+    if (derived !== null) {
+      error(
+        'bad_grouping',
+        `'${derived.name}' is already a derived field; group its values by editing the field instead.`,
+        well,
+        groupingPath,
+      );
+    }
+    const problems = groupingProblems(dimension.grouping!);
+    if (problems.length > 0) {
+      error(
+        'bad_grouping',
+        `The value grouping on '${dimension.table}.${dimension.column}' is incomplete - ${problems.join('; ')}.`,
+        well,
+        groupingPath,
       );
     }
   };
@@ -297,6 +335,20 @@ export function validateChartSpec(
       return;
     }
 
+    const derived = derivedFieldOf(model, measure.table, measure.column);
+    if (derived !== null) {
+      // The backstop behind the wells' refusal: a derived field is a row-level
+      // LABEL, so there is nothing here to aggregate. Caught client-side
+      // because the server's message would be about an expression the author
+      // never wrote.
+      error(
+        'bad_measure',
+        `'${derived.name}' is a derived field - it produces a label, not a number, so it cannot be a value. Use it on an axis, a legend or a filter instead.`,
+        'values',
+        `${path}.column`,
+      );
+      return;
+    }
     const found = checkColumn(
       measure.table,
       measure.column,

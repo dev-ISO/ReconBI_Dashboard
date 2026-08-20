@@ -182,3 +182,60 @@ describe('toWireSpec measure definitions', () => {
     );
   });
 });
+
+/**
+ * THE DEFINITIONS BUNDLE. `toWireSpec`'s fourth argument widened from a plain
+ * measure array to a bundle that also carries derived fields. The contract
+ * worth pinning is byte-identity: a chart that carries neither must serialize
+ * exactly as it did before the bundle existed, because the cache key IS the
+ * serialized spec.
+ */
+describe('toWireSpec definitions bundle', () => {
+  const MEASURE: Measure = {
+    id: 'm1',
+    name: 'Total',
+    table: 'public.orders',
+    aggregation: 'sum',
+    column: 'total',
+  };
+  const FIELD = {
+    id: 'f1',
+    name: 'Shipped?',
+    table: 'public.orders',
+    expression: 'IF(ISBLANK(public.orders.shipped_at), "No", "Yes")',
+    dataType: 'text' as const,
+  };
+
+  it('the historic array form still means "measure definitions"', () => {
+    const wire = toWireSpec(specOf('column'), 1, [], [MEASURE]);
+    expect(wire.definitions).toEqual([MEASURE]);
+    expect('derivedFields' in wire).toBe(false);
+  });
+
+  it('carries both halves of the bundle when both are present', () => {
+    const wire = toWireSpec(specOf('column'), 1, [], {
+      measures: [MEASURE],
+      derivedFields: [FIELD],
+    });
+    expect(wire.definitions).toEqual([MEASURE]);
+    expect(wire.derivedFields).toEqual([FIELD]);
+  });
+
+  it('an EMPTY bundle serializes byte-identically to no bundle at all', () => {
+    const plain = toWireSpec(specOf('column'), 1);
+    const empty = toWireSpec(specOf('column'), 1, [], { measures: [], derivedFields: [] });
+    expect(stableStringify(empty)).toBe(stableStringify(plain));
+  });
+
+  it('a grouped dimension rides the wire on the dimension itself', () => {
+    const grouped = specOf('column', {
+      axis: { ...REGION, grouping: { groups: [{ label: 'No', matchBlank: true }], otherLabel: 'Yes' } },
+    });
+    const wire = toWireSpec(grouped, 1);
+    expect(wire.dimensions[0]).toMatchObject({
+      table: 'public.orders',
+      column: 'region',
+      grouping: { groups: [{ label: 'No', matchBlank: true }], otherLabel: 'Yes' },
+    });
+  });
+});
