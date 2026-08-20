@@ -102,11 +102,18 @@ export const normalizeGrouping = (grouping: ValueGrouping | null): ValueGrouping
     })
     .filter((group) => !groupIsEmpty(group));
   if (groups.length === 0) return null;
-  const other = grouping.otherLabel?.trim();
-  return {
-    groups,
-    ...(other !== undefined && other !== '' ? { otherLabel: other } : {}),
-  };
+  // ALWAYS write the effective "everything else" label, never omit it.
+  //
+  // Omitting it is not the same as leaving it to a default: the engine reads a
+  // missing otherLabel as "keep each unmatched value's OWN text" (QueryCompiler
+  // EmitGrouping: `ELSE CAST(col AS text)`), while this module's otherLabelOf
+  // reports 'Other'. That disagreement is invisible until it bites — the chart
+  // plots raw values under a bucket the UI calls "Other", clicking one of those
+  // bars cross-filters nothing because no group answers to that label, and
+  // promoting the rule to a reusable field emits IF(..., "Other"), which
+  // RELABELS rows the grouping itself left alone. Writing the label the UI
+  // already shows makes the two agree by construction.
+  return { groups, otherLabel: otherLabelOf(grouping) };
 };
 
 /** What is wrong with a grouping, in the client validator's wording. */
@@ -294,9 +301,33 @@ export const blankVsRestGrouping = (blankLabel: string, otherLabel: string): Val
  */
 const literalIsSafe = (text: string): boolean => !/["\\\r\n]/.test(text);
 
+/**
+ * How many matched values (plus a blank bucket) a grouping may have and still be
+ * PROMOTABLE to a derived field.
+ *
+ * A chart-local grouping has no such limit — its values compile to one bound
+ * array (`= ANY(@p)`), so a thousand of them cost nothing. A promoted field is
+ * a FORMULA, and every value becomes one nested IF, which the engine's
+ * row-level complexity cap counts (MeasureExpressionParser.MaxRowLevelNodes =
+ * 120 AST nodes; each branch spends about five). Twenty leaves real headroom.
+ *
+ * Without this the editor would happily offer "make this a reusable field" for
+ * a rule it knows the engine will reject, and the author would meet a node-count
+ * error from a formula they never wrote.
+ */
+export const MAX_PROMOTABLE_BRANCHES = 20;
+
 /** Why this grouping cannot be written as an expression, or [] when it can. */
 export const groupingPromotionProblems = (grouping: ValueGrouping): string[] => {
   const problems = groupingProblems(grouping);
+  const branches =
+    grouping.groups.reduce((total, group) => total + valuesOf(group).length, 0) +
+    grouping.groups.filter((group) => group.matchBlank === true).length;
+  if (branches > MAX_PROMOTABLE_BRANCHES) {
+    problems.push(
+      `a reusable field can hold at most ${MAX_PROMOTABLE_BRANCHES} matched values (this rule has ${branches}) — keep it as a chart grouping instead`,
+    );
+  }
   const texts = [
     ...groupingLabels(grouping),
     ...grouping.groups.flatMap((group) => valuesOf(group).map(String)),

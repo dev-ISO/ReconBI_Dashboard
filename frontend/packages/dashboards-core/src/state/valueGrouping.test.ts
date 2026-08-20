@@ -24,6 +24,7 @@ import {
   groupingLabels,
   groupingProblems,
   groupingPromotionProblems,
+  MAX_PROMOTABLE_BRANCHES,
   groupingToExpression,
   groupingSurvives,
   hasGrouping,
@@ -163,7 +164,9 @@ describe('normalizeGrouping', () => {
       groups: [{ label: '  Yes  ', values: ['y'] }, { label: 'Empty' }],
       otherLabel: '  ',
     });
-    expect(normalized).toEqual({ groups: [{ label: 'Yes', values: ['y'] }] });
+    // A blank "everything else" label normalizes to the effective one rather
+    // than being dropped — see "the everything-else label is always written".
+    expect(normalized).toEqual({ groups: [{ label: 'Yes', values: ['y'] }], otherLabel: 'Other' });
   });
 
   it('a rule with nothing left is the ABSENCE of a grouping, not an empty one', () => {
@@ -256,5 +259,92 @@ describe('identity helpers', () => {
     expect(groupForLabel(OWNER, 'No')).toEqual({ kind: 'group', group: OWNER.groups[0] });
     expect(groupForLabel(OWNER, 'Yes')).toEqual({ kind: 'other' });
     expect(groupForLabel(OWNER, 'nope')).toBeNull();
+  });
+});
+
+/**
+ * THE "OTHER" LABEL MUST REACH THE ENGINE.
+ *
+ * The engine and this module disagree about a MISSING otherLabel: the compiler
+ * emits `ELSE CAST(col AS text)` (each unmatched value keeps its own text)
+ * while otherLabelOf reports 'Other'. Normalization closes that by always
+ * writing the label, so the bucket the UI names is the bucket the SQL builds.
+ */
+describe('the everything-else label is always written', () => {
+  const valuesOnly = { groups: [{ label: 'Open', values: ['open'] }] };
+
+  it('normalization fills in the effective label rather than omitting it', () => {
+    expect(normalizeGrouping(valuesOnly)?.otherLabel).toBe('Other');
+    expect(normalizeGrouping({ ...valuesOnly, otherLabel: '   ' })?.otherLabel).toBe('Other');
+  });
+
+  it('keeps an explicit label verbatim', () => {
+    expect(normalizeGrouping({ ...valuesOnly, otherLabel: 'Everything else' })?.otherLabel).toBe(
+      'Everything else',
+    );
+  });
+
+  it('the label the UI shows is the one a click can filter on', () => {
+    // Before the fix this label existed only client-side: the engine emitted
+    // raw values, so groupForLabel found nothing and the click did nothing.
+    const normalized = normalizeGrouping(valuesOnly)!;
+    expect(groupingLabels(normalized)).toContain(otherLabelOf(normalized));
+    expect(groupForLabel(normalized, 'Other')).toEqual({ kind: 'other' });
+    expect(groupingClauseFor(dim(normalized), 'Other')).toMatchObject({ operator: 'notIn' });
+  });
+
+  it('promotion cannot relabel rows the grouping left alone', () => {
+    // IF(..., "Other") is only honest because normalization made "Other" the
+    // grouping's real answer too.
+    const normalized = normalizeGrouping(valuesOnly)!;
+    expect(groupingToExpression('public.report_systems', 'uploaded_to_edms', normalized)).toBe(
+      'IF(public.report_systems.uploaded_to_edms = "open", "Open", "Other")',
+    );
+  });
+});
+
+/**
+ * A GROUPING MAY BE BIGGER THAN A FORMULA.
+ *
+ * Chart-local values compile to one bound array, so a thousand cost nothing.
+ * Promotion turns each into a nested IF that the engine counts against its
+ * row-level node cap — so the editor must refuse up front rather than hand the
+ * author a node-count error from a formula they never wrote.
+ */
+describe('promotion has a smaller budget than grouping', () => {
+  const withValues = (count: number) => ({
+    groups: [{ label: 'Listed', values: Array.from({ length: count }, (_, i) => `v${i}`) }],
+    otherLabel: 'Other',
+  });
+
+  it('accepts a rule at the budget', () => {
+    expect(groupingPromotionProblems(withValues(MAX_PROMOTABLE_BRANCHES))).toEqual([]);
+    expect(
+      groupingToExpression('public.report_systems', 'uploaded_to_edms', withValues(MAX_PROMOTABLE_BRANCHES)),
+    ).not.toBeNull();
+  });
+
+  it('refuses one past it, and says what to do instead', () => {
+    const problems = groupingPromotionProblems(withValues(MAX_PROMOTABLE_BRANCHES + 1));
+    expect(problems.join(' ')).toContain('chart grouping instead');
+    // And refuses to emit — the caller cannot promote past the check.
+    expect(
+      groupingToExpression('public.report_systems', 'uploaded_to_edms', withValues(MAX_PROMOTABLE_BRANCHES + 1)),
+    ).toBeNull();
+  });
+
+  it('the same rule is still perfectly valid as a chart grouping', () => {
+    expect(groupingProblems(withValues(MAX_PROMOTABLE_BRANCHES + 1))).toEqual([]);
+  });
+
+  it('a blank bucket spends budget too — it is another nested IF', () => {
+    const grouping = {
+      groups: [
+        { label: 'Listed', values: Array.from({ length: MAX_PROMOTABLE_BRANCHES }, (_, i) => `v${i}`) },
+        { label: 'No', matchBlank: true },
+      ],
+      otherLabel: 'Other',
+    };
+    expect(groupingPromotionProblems(grouping).join(' ')).toContain('chart grouping instead');
   });
 });

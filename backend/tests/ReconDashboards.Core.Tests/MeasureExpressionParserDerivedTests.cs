@@ -229,4 +229,65 @@ public class MeasureExpressionParserDerivedTests
     [InlineData("DIVIDE([A], [B], 0)")]
     public void MeasureGrammarStillParses(string expression) =>
         Assert.NotNull(MeasureExpressionParser.Parse(expression));
+    // ---------- the client's promotion budget ----------
+
+    /// <summary>
+    /// Builds exactly what the frontend's groupingToExpression emits when a value
+    /// grouping is PROMOTED to a derived field: one nested IF per matched value,
+    /// innermost-last, optionally wrapped in an ISBLANK branch.
+    /// </summary>
+    private static string PromotedGrouping(int valueCount, bool withBlank)
+    {
+        var expression = "\"Other\"";
+        for (var i = valueCount - 1; i >= 0; i--)
+        {
+            expression = $"IF({Uploaded} = \"v{i}\", \"Listed\", {expression})";
+        }
+
+        return withBlank ? $"IF(ISBLANK({Uploaded}), \"No\", {expression})" : expression;
+    }
+
+    /// <summary>
+    /// PINS THE FRONTEND'S MAX_PROMOTABLE_BRANCHES (20) AGAINST THIS PARSER.
+    ///
+    /// The editor lets a chart grouping hold a thousand values — they compile to
+    /// one bound array and cost nothing. A PROMOTED grouping is a formula, and
+    /// every value becomes a nested IF that this parser counts against
+    /// MaxRowLevelNodes. The client refuses to promote past 20 so the author
+    /// never meets a node-count error from a formula they did not write; if that
+    /// budget ever stops fitting, this test fails instead of the user.
+    /// </summary>
+    [Fact]
+    public void TheClientsPromotionBudgetFitsTheRowLevelComplexityCap()
+    {
+        // 20 values plus a blank bucket — the largest rule the editor will promote.
+        ParseField(PromotedGrouping(20, withBlank: true));
+    }
+
+    /// <summary>
+    /// The refusal is real, not theoretical: a rule the editor would ALLOW as a
+    /// chart grouping (64 groups x many values) is rejected outright once spelled
+    /// as a formula. Which guard bites first depends on the labels — at this size
+    /// the 2000-character length cap arrives before the node count — so this
+    /// asserts the refusal, not which limit produced it. That is exactly the
+    /// experience the client-side budget exists to pre-empt.
+    /// </summary>
+    [Fact]
+    public void FarPastThatBudgetTheParserRefuses()
+    {
+        var error = FieldError(PromotedGrouping(64, withBlank: true));
+        Assert.Contains("Invalid expression", error.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// And the NODE cap specifically is reachable with short labels, so the
+    /// budget is not merely a length proxy.
+    /// </summary>
+    [Fact]
+    public void WithShortLabelsItIsTheNodeCapThatBites()
+    {
+        var error = FieldError(PromotedGrouping(30, withBlank: false));
+        Assert.Contains("operations", error.Message, StringComparison.Ordinal);
+    }
+
 }
