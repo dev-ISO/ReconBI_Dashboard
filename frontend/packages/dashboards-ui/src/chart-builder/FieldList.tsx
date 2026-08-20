@@ -8,6 +8,7 @@ import {
   Folder,
   Plus,
   Search,
+  Settings2,
   Sigma,
   Variable,
 } from 'lucide-react';
@@ -23,9 +24,41 @@ import {
 } from '@recon/dashboards-core';
 import { ColumnTypeIcon } from '../data-pane/SchemaExplorer';
 import { RcdInput } from '../primitives';
+import { MeasureRowMenu } from './MeasureRowMenu';
+import { buildMeasureMenuItems, type MeasureMenuHandlers } from './measureMenu';
+import {
+  scopeShortLabel,
+  type MeasureScope,
+  type MeasureScopeRights,
+  type ScopedMeasure,
+} from './measureScopes';
 import type { BuilderParameter, FieldDragData } from './wellConfig';
 
+/**
+ * Everything the Measures section needs to become a MANAGEMENT surface rather
+ * than a read-only list. Optional: the standalone builder and any host that
+ * does not want authoring here simply omits it and the section renders exactly
+ * as it always did.
+ */
+export interface FieldListMeasureManagement {
+  /** Where each measure lives, keyed by the same ids `model.measures` carries. */
+  scoped: readonly ScopedMeasure[];
+  rights: Record<MeasureScope, MeasureScopeRights>;
+  handlers: MeasureMenuHandlers;
+  /** The section's "+" — a new measure, scope chosen in the manager. */
+  onCreate: () => void;
+  /** Opens the full three-scope manager. */
+  onManage: () => void;
+}
+
 export interface FieldListProps {
+  /**
+   * The EFFECTIVE model: the stored definition with the dashboard-scoped and
+   * personal measures merged into `measures`, mirroring the overlay the server
+   * applies before it compiles. Everything downstream — this list, the client
+   * validator, the well chips — then treats a scoped measure exactly like a
+   * model one, which is the whole reason a scoped measure is usable at all.
+   */
   model: ModelDefinition;
   /** Column metadata for the model's data source; measure-only fallback when null. */
   catalog: Catalog | null;
@@ -38,6 +71,8 @@ export interface FieldListProps {
   onAdd: (data: FieldDragData) => void;
   /** Funnel affordance on column rows: adds the column as a chart filter. */
   onAddFilter?: (data: Extract<FieldDragData, { kind: 'column' }>) => void;
+  /** Present = the Measures section gains a "+" and a per-row action menu. */
+  measures?: FieldListMeasureManagement;
 }
 
 /** Expansion-state keys for the fixed sections (table sections use their tableKey). */
@@ -106,7 +141,14 @@ const collectFolderKeys = (nodes: MeasureFolderNode[], into: string[]): string[]
  * post-drag swallow upstream), and the funnel affordance are unchanged; the
  * disclosure buttons themselves are never draggable.
  */
-export function FieldList({ model, catalog, parameters, onAdd, onAddFilter }: FieldListProps) {
+export function FieldList({
+  model,
+  catalog,
+  parameters,
+  onAdd,
+  onAddFilter,
+  measures: management,
+}: FieldListProps) {
   const tables = model.tables.filter((table) => !table.hidden);
   const dateTables = model.dateTables ?? [];
 
@@ -166,17 +208,44 @@ export function FieldList({ model, catalog, parameters, onAdd, onAddFilter }: Fi
         ? parameters
         : parameters.filter((p) => matches(p.name));
 
-  const renderMeasure = (measure: Measure) => (
-    <FieldEntry
-      key={measure.id}
-      id={`measure:${measure.id}`}
-      data={{ kind: 'measure', measureId: measure.id, name: measure.name }}
-      label={measure.name}
-      icon={<Sigma size={13} />}
-      badge={measure.expression ? <FxBadge /> : undefined}
-      onAdd={onAdd}
-    />
-  );
+  const scopeEntryOf = (measureId: string): ScopedMeasure | undefined =>
+    management?.scoped.find((entry) => entry.measure.id === measureId);
+
+  const renderMeasure = (measure: Measure) => {
+    const entry = scopeEntryOf(measure.id);
+    // Scope is worth a glance on the ROW: the same list now mixes a measure
+    // everyone shares with one only this user can see, and dragging the wrong
+    // one into a chart is a silent mistake. The widest scope is the unmarked
+    // default — badging System would badge nearly every row.
+    const scopeBadge = entry && entry.scope !== 'system' ? entry.scope : null;
+    const badge =
+      scopeBadge === null && !measure.expression ? undefined : (
+        <>
+          {scopeBadge !== null && <ScopeBadge scope={scopeBadge} />}
+          {measure.expression ? <FxBadge /> : null}
+        </>
+      );
+    return (
+      <FieldEntry
+        key={measure.id}
+        id={`measure:${measure.id}`}
+        data={{ kind: 'measure', measureId: measure.id, name: measure.name }}
+        label={measure.name}
+        icon={<Sigma size={13} />}
+        badge={badge}
+        onAdd={onAdd}
+        action={
+          management && entry ? (
+            <MeasureRowMenu
+              compact
+              label={`Actions for ${measure.name}`}
+              items={buildMeasureMenuItems(entry, management.rights, management.handlers)}
+            />
+          ) : undefined
+        }
+      />
+    );
+  };
 
   const renderFolder = (node: MeasureFolderNode): React.ReactNode => {
     // Column-only search matches force folders open (same rule as tables).
@@ -266,16 +335,46 @@ export function FieldList({ model, catalog, parameters, onAdd, onAddFilter }: Fi
             label="Measures"
             expanded={measuresOpen}
             onToggle={() => toggleExpanded(MEASURES_KEY)}
+            action={
+              management ? (
+                <button
+                  type="button"
+                  aria-label="New measure"
+                  title="New measure"
+                  onClick={management.onCreate}
+                  className="mr-2 shrink-0 rounded p-0.5 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+                >
+                  <Plus size={13} />
+                </button>
+              ) : undefined
+            }
           />
-          {measuresOpen &&
-            (model.measures.length === 0 ? (
-              <p className="px-3 py-1 text-xs text-rcd-muted">No measures defined in this model.</p>
-            ) : (
-              <>
-                {measureRows.folders.map(renderFolder)}
-                {measureRows.root.map(renderMeasure)}
-              </>
-            ))}
+          {measuresOpen && (
+            <>
+              {model.measures.length === 0 ? (
+                <p className="px-3 py-1 text-xs text-rcd-muted">
+                  {management
+                    ? 'No measures yet — add one to plot something.'
+                    : 'No measures defined in this model.'}
+                </p>
+              ) : (
+                <>
+                  {measureRows.folders.map(renderFolder)}
+                  {measureRows.root.map(renderMeasure)}
+                </>
+              )}
+              {management && (
+                <button
+                  type="button"
+                  onClick={management.onManage}
+                  className="mx-1 mt-1 flex w-[calc(100%-0.5rem)] items-center gap-1.5 rounded-md px-2 py-1 text-left text-xs text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
+                >
+                  <Settings2 size={12} className="shrink-0" />
+                  Manage measures…
+                </button>
+              )}
+            </>
+          )}
         </>
       )}
 
@@ -461,6 +560,25 @@ function DateTableSection({
   );
 }
 
+/**
+ * Where a measure lives. Rendered only for the narrower scopes — a System
+ * measure is the norm and marking it would badge nearly every row.
+ */
+function ScopeBadge({ scope }: { scope: MeasureScope }) {
+  return (
+    <span
+      title={
+        scope === 'dashboard'
+          ? 'Belongs to this dashboard — travels when it is copied or shared'
+          : 'Your own measure — nobody else can see it'
+      }
+      className="ml-auto shrink-0 rounded border border-rcd-border px-1 text-[10px] font-medium leading-4 text-rcd-muted"
+    >
+      {scopeShortLabel(scope)}
+    </span>
+  );
+}
+
 /** Cosmetic suffix marking a calculated (expression-backed) measure. */
 function FxBadge() {
   return (
@@ -482,18 +600,22 @@ function SectionHeader({
   icon,
   expanded,
   onToggle,
+  action,
 }: {
   label: string;
   icon?: React.ReactNode;
   expanded: boolean;
   onToggle: () => void;
+  /** Trailing control (the Measures "+"). Kept OUTSIDE the toggle button —
+   *  a nested button is invalid HTML and swallows the disclosure click. */
+  action?: React.ReactNode;
 }) {
-  return (
+  const disclosure = (
     <button
       type="button"
       onClick={onToggle}
       aria-expanded={expanded}
-      className="flex w-full items-center gap-1 px-3 pb-1 pt-3 text-left text-xs font-medium uppercase tracking-wide text-rcd-muted hover:text-rcd-text"
+      className="flex min-w-0 flex-1 items-center gap-1 px-3 pb-1 pt-3 text-left text-xs font-medium uppercase tracking-wide text-rcd-muted hover:text-rcd-text"
     >
       {expanded ? (
         <ChevronDown size={12} className="shrink-0" />
@@ -506,6 +628,13 @@ function SectionHeader({
       </span>
     </button>
   );
+  if (!action) return disclosure;
+  return (
+    <div className="flex w-full items-center">
+      {disclosure}
+      <span className="flex shrink-0 items-center pb-1 pt-3">{action}</span>
+    </div>
+  );
 }
 
 function FieldEntry({
@@ -516,6 +645,7 @@ function FieldEntry({
   badge,
   onAdd,
   onFilter,
+  action,
 }: {
   id: string;
   data: FieldDragData;
@@ -526,6 +656,8 @@ function FieldEntry({
   onAdd: (data: FieldDragData) => void;
   /** When present, shows the funnel button that adds the field as a filter. */
   onFilter?: () => void;
+  /** Trailing control rendered outside the draggable button (the row menu). */
+  action?: React.ReactNode;
 }) {
   const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id, data });
 
@@ -566,6 +698,7 @@ function FieldEntry({
           <Filter size={12} />
         </button>
       )}
+      {action && <span className="mr-1 flex shrink-0 items-center">{action}</span>}
     </div>
   );
 }

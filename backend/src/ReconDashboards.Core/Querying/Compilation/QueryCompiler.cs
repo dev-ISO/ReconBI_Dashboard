@@ -30,8 +30,16 @@ public sealed record ResolvedMeasureExpression(
 /// holds the unwrapped inner expression and the compiler divides the grouped
 /// value by its grand total in the window stage. FormatString is the measure's
 /// Excel-style pattern, threaded to result columns for the renderer.
+///
+/// TOMBSTONE marks a measure that could NOT be resolved and was replaced (see
+/// <see cref="QueryCompiler.Prepare"/>'s tombstonedMeasures argument) by a
+/// column that selects a typed NULL. It keeps its position, its alias and its
+/// result-column plan; it contributes NOTHING else — no table to the join plan,
+/// no fan-out warning, no HAVING predicate. Its Table is the query's anchor
+/// table purely so that any expression that dereferences it finds a table the
+/// plan actually contains; nothing reads its columns.
 /// </summary>
-public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null, MeasureCalcSpec? Calc = null, bool PercentOfTotal = false, string? FormatString = null);
+public sealed record ResolvedMeasure(string Label, TableSchema Table, Aggregation Aggregation, ColumnSchema? Column, IReadOnlyList<ResolvedFilter> Filters, string? FormatHint, ResolvedMeasureExpression? Expression = null, MeasureCalcSpec? Calc = null, bool PercentOfTotal = false, string? FormatString = null, bool Tombstone = false);
 
 public sealed record ResolvedFilter(TableSchema Table, ColumnSchema Column, FilterOperator Operator, IReadOnlyList<JsonElement> Values);
 
@@ -132,7 +140,25 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         }
     }
 
-    public PreparedQuery Prepare(ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
+    /// <summary>
+    /// Resolution + join planning.
+    ///
+    /// <paramref name="tombstonedMeasures"/> holds WIRE indexes into
+    /// <see cref="ChartQuerySpec.Measures"/> that must NOT be resolved: each one
+    /// becomes a TOMBSTONE measure that selects a typed NULL under its original
+    /// alias. This is how <see cref="Execution.ChartQueryService"/> contains a
+    /// single broken measure without disturbing the others — dropping the
+    /// measure instead would renumber every result column after it ("meas1"
+    /// becoming what used to be "meas2"), silently re-pointing sort targets,
+    /// having indexes and the table's column-keyed format maps at the wrong
+    /// series. Normal callers pass null.
+    /// </summary>
+    public PreparedQuery Prepare(
+        ChartQuerySpec spec,
+        ModelDefinition model,
+        DatabaseSchema schema,
+        RcdLimits limits,
+        IReadOnlySet<int>? tombstonedMeasures = null)
     {
         // An EMPTY SELECT LIST is the only universally invalid shape. Zero
         // measures with at least one dimension is a passthrough list: the
@@ -170,33 +196,68 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         var dimensions = spec.Dimensions
             .Select((d, i) => WithPath($"dimensions[{i}]", () => ResolveDimension(d, model, schema)))
             .ToArray();
+        // Tombstoned indexes are skipped here and filled in below, once the
+        // anchor table is known: a tombstone resolves nothing, so it can only
+        // borrow a table the plan already has.
         var measures = spec.Measures
-            .Select((m, i) => WithPath($"measures[{i}]", () => ResolveMeasure(m, model, schema)))
+            .Select((m, i) => tombstonedMeasures is not null && tombstonedMeasures.Contains(i)
+                ? null
+                : WithPath($"measures[{i}]", () => ResolveMeasure(m, model, schema)))
             .ToArray();
         var filters = spec.Filters
             .Select((f, i) => WithPath(
                 $"filters[{i}]", () => ResolveFilter(f.Table, f.Column, f.Operator, f.Values, model, schema, limits)))
             .ToArray();
 
+        // The join plan anchors on the first measure's table; a measure-less
+        // passthrough query anchors on its first dimension instead. The guard
+        // above guarantees one of the two lists is non-empty. A tombstone
+        // contributes no table, so the anchor is the first SURVIVING measure.
+        var anchor = measures.FirstOrDefault(m => m is not null)?.Table
+            ?? (dimensions.Length > 0 ? dimensions[0].Table : null)
+            ?? throw new QueryCompilationException(
+                "QRY_NO_MEASURES", "Every measure in this query failed to compile.");
+
+        var resolved = new ResolvedMeasure[measures.Length];
+        for (var i = 0; i < measures.Length; i++)
+        {
+            resolved[i] = measures[i] ?? Tombstone(TombstoneLabel(spec.Measures[i], model, i), anchor);
+        }
+
         for (var i = 0; i < spec.Measures.Count; i++)
         {
             if (spec.Measures[i].Calc is { } calc)
             {
-                if (measures[i].PercentOfTotal)
+                if (resolved[i].Tombstone)
+                {
+                    // Cosmetic only: the calc contributes the label suffix
+                    // ("(YTD)") that keeps the tombstone's result column
+                    // byte-identical to the one the caller expected. It is
+                    // still validated, because an invalid calc would emit
+                    // broken SQL — and the calc may be exactly what failed.
+                    if (CalcIsValid(calc, dimensions, resolved[i].Label))
+                    {
+                        resolved[i] = resolved[i] with { Calc = calc };
+                    }
+
+                    continue;
+                }
+
+                if (resolved[i].PercentOfTotal)
                 {
                     throw new QueryCompilationException(
                         "QRY_PCT_TOTAL_UNSUPPORTED",
-                        $"Measure '{measures[i].Label}': a {calc.Kind} calculation cannot be combined with PERCENTOFTOTAL.",
+                        $"Measure '{resolved[i].Label}': a {calc.Kind} calculation cannot be combined with PERCENTOFTOTAL.",
                         $"measures[{i}]");
                 }
 
                 var index = i;
-                WithPath($"measures[{index}]", () => ValidateCalc(calc, dimensions, measures[index].Label));
-                measures[i] = measures[i] with { Calc = calc };
+                WithPath($"measures[{index}]", () => ValidateCalc(calc, dimensions, resolved[index].Label));
+                resolved[i] = resolved[i] with { Calc = calc };
             }
         }
 
-        ValidateHaving(spec.Having, measures, limits);
+        ValidateHaving(spec.Having, resolved, limits);
 
         var involved = new HashSet<string>(StringComparer.Ordinal);
         foreach (var d in dimensions)
@@ -204,7 +265,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             involved.Add(d.Table.Key);
         }
 
-        foreach (var m in measures)
+        foreach (var m in resolved)
         {
             CollectInvolvedTables(m, involved);
         }
@@ -214,14 +275,63 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             involved.Add(f.Table.Key);
         }
 
-        // The join plan anchors on the first measure's table; a measure-less
-        // passthrough query anchors on its first dimension instead. The guard
-        // above guarantees one of the two lists is non-empty.
-        var baseTable = measures.Length > 0 ? measures[0].Table.Key : dimensions[0].Table.Key;
+        var baseTable = anchor.Key;
         var active = model.Relationships.Where(r => r.IsActive).ToArray();
         var plan = JoinPathResolver.Resolve(baseTable, involved, active, limits.MaxJoins);
 
-        return new PreparedQuery(dimensions, measures, filters, plan, schema, CollectDateTables(model, plan));
+        return new PreparedQuery(dimensions, resolved, filters, plan, schema, CollectDateTables(model, plan));
+    }
+
+    /// <summary>
+    /// A measure that selects nothing. Aggregation is irrelevant (Sum reads as
+    /// the additive identity for the Top-N "Others" fold, the only place an
+    /// aggregation is applied to a tombstone's own alias) and Column is null so
+    /// its result column reports no source.
+    /// </summary>
+    private static ResolvedMeasure Tombstone(string label, TableSchema anchor) =>
+        new(label, anchor, Aggregation.Sum, Column: null, Filters: [], FormatHint: null, Tombstone: true);
+
+    /// <summary>
+    /// The best name available for a measure that did NOT resolve: the wire
+    /// alias, else the referenced definition's name (present whenever the
+    /// measure exists but its expression, column or filters are broken — the
+    /// common case, and the one that keeps series-label / colour-override keys
+    /// stable), else a positional stand-in.
+    /// </summary>
+    private static string TombstoneLabel(MeasureSpec spec, ModelDefinition model, int index)
+    {
+        if (!string.IsNullOrWhiteSpace(spec.Alias))
+        {
+            return spec.Alias;
+        }
+
+        if (spec.MeasureId is { } id
+            && model.Measures.FirstOrDefault(m => m.Id == id) is { } measure
+            && !string.IsNullOrWhiteSpace(measure.Name))
+        {
+            return measure.Name;
+        }
+
+        return $"Measure {index + 1}";
+    }
+
+    /// <summary>
+    /// <see cref="ValidateCalc"/> as a predicate, for the one caller that must
+    /// not propagate the failure: a tombstone whose calc is unusable simply
+    /// carries none.
+    /// </summary>
+    private static bool CalcIsValid(
+        MeasureCalcSpec calc, IReadOnlyList<ResolvedDimension> dimensions, string label)
+    {
+        try
+        {
+            ValidateCalc(calc, dimensions, label);
+            return true;
+        }
+        catch (QueryCompilationException)
+        {
+            return false;
+        }
     }
 
     public PreparedDistinctQuery PrepareDistinct(
@@ -328,6 +438,15 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// </summary>
     private static void CollectInvolvedTables(ResolvedMeasure measure, HashSet<string> involved)
     {
+        if (measure.Tombstone)
+        {
+            // A tombstone selects NULL. Registering its borrowed anchor table
+            // would be harmless (the anchor is in the plan by definition) but
+            // registering anything else would pull a table — and therefore its
+            // row filters and its fan-out — into a query that does not read it.
+            return;
+        }
+
         involved.Add(measure.Table.Key);
         foreach (var f in measure.Filters)
         {
@@ -441,7 +560,7 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
         AppendRowFilterPredicates(rowFiltersByTable, plan, prepared.Schema, bag, whereParts);
 
-        var havingParts = BuildHavingParts(spec.Having, measureExprs, bag);
+        var havingParts = BuildHavingParts(spec.Having, measureExprs, prepared.Measures, bag);
 
         var effectiveLimit = EffectiveLimit(spec.Limit, limits, sourceOptions);
 
@@ -520,6 +639,18 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             throw new QueryCompilationException(
                 "QRY_PCT_TOTAL_UNSUPPORTED",
                 $"Top N cannot rank by '{prepared.Measures[topN.ByMeasureIndex].Label}': PERCENTOFTOTAL is computed after ranking, so ranking by it would silently rank by the raw value instead. Rank by another measure.");
+        }
+
+        if (prepared.Measures[topN.ByMeasureIndex].Tombstone)
+        {
+            // The ranking measure is the one that failed. Its column is NULL,
+            // so the ORDER BY no longer discriminates and the "top" N rows are
+            // whichever N the engine returns. Rendering the other series on an
+            // arbitrary slice still beats failing the tile, but it must not be
+            // silent.
+            warnings.Add(new EngineWarning(
+                "QRY_TOPN_MEASURE_UNAVAILABLE",
+                $"Top N ranks by '{prepared.Measures[topN.ByMeasureIndex].Label}', which failed to compile; the rows shown are an arbitrary {topN.N} rather than the top {topN.N}."));
         }
 
         var n = Math.Clamp(topN.N, 1, effectiveLimit);
@@ -1465,6 +1596,14 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                     $"Having condition targets measure {condition.MeasureIndex}, which does not exist.");
             }
 
+            if (measures[condition.MeasureIndex].Tombstone)
+            {
+                // BuildHavingParts drops this condition; validating a threshold
+                // that will never be rendered would fail the whole query over a
+                // measure that already failed on its own.
+                continue;
+            }
+
             var label = measures[condition.MeasureIndex].Label;
             if (measures[condition.MeasureIndex].PercentOfTotal)
             {
@@ -1628,9 +1767,19 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     /// In/NotIn bind their value list through the dialect's set-membership
     /// predicate; NotIn additionally keeps NULL aggregates (OR ... IS NULL) so
     /// the pair are exact complements — see <see cref="HavingSpec"/>.
+    ///
+    /// A condition on a TOMBSTONED measure is DROPPED, not rendered: the
+    /// tombstone's expression is NULL, so "HAVING NULL &gt; 5" is UNKNOWN for
+    /// every group and would return an empty result — turning one broken
+    /// measure into a blank chart, which is exactly what tombstoning exists to
+    /// prevent. The surviving series therefore show more groups than the
+    /// caller asked for; the measure failure reported alongside says why.
     /// </summary>
     private List<string> BuildHavingParts(
-        IReadOnlyList<HavingSpec>? having, IReadOnlyList<string> measureExprs, ParameterBag bag)
+        IReadOnlyList<HavingSpec>? having,
+        IReadOnlyList<string> measureExprs,
+        IReadOnlyList<ResolvedMeasure> measures,
+        ParameterBag bag)
     {
         var parts = new List<string>();
         if (having is null)
@@ -1645,6 +1794,11 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 throw new QueryCompilationException(
                     "QRY_BAD_HAVING",
                     $"Having condition targets measure {condition.MeasureIndex}, which does not exist.");
+            }
+
+            if (measures[condition.MeasureIndex].Tombstone)
+            {
+                continue;
             }
 
             var expr = measureExprs[condition.MeasureIndex];
@@ -1713,7 +1867,13 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             for (var i = 0; i < prepared.Measures.Count; i++)
             {
                 var measure = prepared.Measures[i];
-                if (IsInSubtree(measure.Table.Key, step.TableKey, parentOf) || !seen.Add((i, step.TableKey)))
+
+                // A tombstone aggregates nothing, so nothing about it can be
+                // over-counted; warning about it would name a measure the
+                // caller has already been told is broken.
+                if (measure.Tombstone
+                    || IsInSubtree(measure.Table.Key, step.TableKey, parentOf)
+                    || !seen.Add((i, step.TableKey)))
                 {
                     continue;
                 }
@@ -1753,12 +1913,22 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         return dimension.Spec.DateBucket is { } bucket ? dialect.DateTrunc(bucket, expr) : expr;
     }
 
+    /// <summary>
+    /// A TOMBSTONE's SQL. The cast is not cosmetic: a bare NULL has no type, so
+    /// SUM(NULL) (the Top-N "Others" fold) and LAG(NULL, n) (the window calc
+    /// stage) are ambiguous-overload errors on Postgres. Decimal is the type
+    /// <see cref="BuildColumnPlans"/> declares for the same column.
+    /// </summary>
+    private const string TombstoneSql = "CAST(NULL AS decimal)";
+
     private string MeasureExpression(ResolvedMeasure measure, JoinPlan plan, ParameterBag bag) =>
-        measure.Expression is { } expression
-            ? ExpressionSql(expression.Root, expression, measure.Filters, plan, bag)
-            : AggregateWithFilters(
-                dialect.Aggregate(measure.Aggregation, AggregateArgument(measure, plan)),
-                measure.Filters, plan, bag);
+        measure.Tombstone
+            ? TombstoneSql
+            : measure.Expression is { } expression
+                ? ExpressionSql(expression.Root, expression, measure.Filters, plan, bag)
+                : AggregateWithFilters(
+                    dialect.Aggregate(measure.Aggregation, AggregateArgument(measure, plan)),
+                    measure.Filters, plan, bag);
 
     private string? AggregateArgument(ResolvedMeasure measure, JoinPlan plan) =>
         measure.Column is null
@@ -2128,7 +2298,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
         for (var i = 0; i < prepared.Measures.Count; i++)
         {
             var m = prepared.Measures[i];
-            var type = m.Expression is not null
+            var type = m.Tombstone
+                ? NormalizedType.Decimal // matches TombstoneSql's cast
+                : m.Expression is not null
                 ? NormalizedType.Decimal // arithmetic (esp. division) promotes
                 : m.Aggregation is Aggregation.Count or Aggregation.CountDistinct
                     ? NormalizedType.Integer

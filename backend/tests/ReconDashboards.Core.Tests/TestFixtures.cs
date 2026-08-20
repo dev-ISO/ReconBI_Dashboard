@@ -219,6 +219,15 @@ public sealed class ServiceTestHarness : IDisposable
         new(Db, CurrentUser, UserDirectory, Options, TimeProvider.System);
 
     /// <summary>
+    /// Per-user settings over the same harness state. The identity provider is
+    /// injectable so a test can supply one that THROWS — the documented
+    /// behaviour of ICurrentUserProvider for an unauthenticated caller.
+    /// </summary>
+    public Services.UserSettingsService CreateUserSettingsService(
+        ICurrentUserProvider? currentUser = null, TimeProvider? clock = null) =>
+        new(Db, currentUser ?? CurrentUser, Options, clock ?? TimeProvider.System);
+
+    /// <summary>
     /// Ops-path service over the same harness state. Clock, lock table and
     /// notifier are injectable so lock-TTL and broadcast tests can observe
     /// them; defaults mirror production wiring (no-op notifier).

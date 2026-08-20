@@ -105,6 +105,7 @@ public static class AddReconDashboardsExtensions
         services.AddScoped<DashboardService>();
         services.AddScoped<DashboardOpService>();
         services.AddScoped<ChartQueryService>();
+        services.AddScoped<UserSettingsService>();
         services.AddScoped<SubscriptionService>();
         services.AddScoped<AlertService>(sp => new AlertService(
             sp.GetRequiredService<ReconDashboardsDbContext>(),

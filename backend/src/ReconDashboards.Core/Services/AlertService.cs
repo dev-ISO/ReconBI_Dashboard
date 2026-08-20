@@ -55,6 +55,16 @@ public sealed record AlertFiring(
 /// owner-or-admin; the test endpoint evaluates under the OWNER's row-filter
 /// identity (same impersonation path the scheduler uses) without touching
 /// state.
+///
+/// SCOPED MEASURES: an alert may watch a measure that is not in the model —
+/// a DASHBOARD-scoped one. AlertRecord carries a dashboard id, so those are
+/// resolved LIVE from that dashboard's document at evaluation time
+/// (SchedulingEvaluator.WithDashboardDefinitionsAsync), which both the
+/// scheduler and the "Test now" endpoint below go through — an edited formula
+/// is picked up rather than firing on a stale copy. Whatever `definitions` the
+/// client snapshotted into SpecJson stays as the fallback for an alert with no
+/// dashboard (built on an unsaved chart, or citing a personal measure). Nothing
+/// here needs to inspect them: they are just part of the opaque stored spec.
 /// </summary>
 public sealed class AlertService(
     ReconDashboardsDbContext db,

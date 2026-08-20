@@ -1,6 +1,7 @@
 using ReconDashboards.Core.Abstractions;
 using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
+using ReconDashboards.Core.Querying;
 using ReconDashboards.Core.Querying.Compilation;
 using ReconDashboards.Core.Querying.Spec;
 using ReconDashboards.Core.Schema;
@@ -104,6 +105,53 @@ FROM "public"."orders" AS "t0"
 LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
 LIMIT @p0
 """, compiled);
+    }
+
+    /// <summary>
+    /// *** THE JOIN-PLAN HALF OF THE MEASURE-DEFINITIONS SECURITY CONTRACT.
+    /// A FAILURE HERE IS NOT COSMETIC: the join plan is what row filters attach
+    /// to (AppendRowFilterPredicates skips any table absent from
+    /// plan.AliasByTable), so an overlay table that stops reaching the plan is
+    /// an unfiltered read. ***
+    ///
+    /// The twin of <see cref="CrossTableAggregateCallPullsTheOtherTableIntoTheJoinPlan"/>,
+    /// with the measure arriving as a caller-supplied DEFINITION merged by
+    /// MeasureOverlay.Merge instead of living in the stored model. Byte-identical
+    /// SQL and an identical plan is the whole point: merging upstream of
+    /// Prepare means an overlay measure is indistinguishable from a model one
+    /// everywhere downstream.
+    /// </summary>
+    [Fact]
+    public void OverlayMeasureTablesReachTheJoinPlanExactlyLikeModelMeasures()
+    {
+        var overlay = ExpressionMeasure(
+            "Utilization", "SUM(public.orders.order_total) / SUM(public.customers.credit_limit)");
+
+        // The model does NOT contain the measure; the spec carries it.
+        var model = ModelWith();
+        var spec = SpecFor(overlay) with { Definitions = [overlay] };
+
+        var limits = new RcdLimits();
+        var effective = MeasureOverlay.Merge(model, spec.Definitions, limits);
+        var prepared = Compiler.Prepare(spec, effective, TestFixtures.BuildDemoSchema(), limits);
+
+        // public.customers is named ONLY by the overlay expression — no
+        // dimension, filter or home table mentions it.
+        Assert.Contains("public.customers", prepared.Plan.Tables);
+        Assert.Contains("public.customers", prepared.Plan.AliasByTable.Keys);
+
+        AssertSql("""
+SELECT ROUND(CAST(SUM("t0"."order_total") AS decimal) / NULLIF(SUM("t1"."credit_limit"), 0), 12) AS "meas0"
+FROM "public"."orders" AS "t0"
+LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
+LIMIT @p0
+""", Compiler.Emit(prepared, spec, NoRowFilters, limits, new DataSourceOptions()));
+
+        // Without the merge the measure is simply unknown — which is what makes
+        // the merge, not a special case inside ResolveMeasure, the seam.
+        var ex = Assert.Throws<QueryCompilationException>(
+            () => Compiler.Prepare(spec, model, TestFixtures.BuildDemoSchema(), limits));
+        Assert.Equal("QRY_UNKNOWN_MEASURE", ex.Code);
     }
 
     [Fact]

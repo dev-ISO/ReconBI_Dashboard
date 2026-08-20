@@ -463,6 +463,24 @@ public class DashboardLayoutDifferTests
         Assert.True(summary.SettingsChanged);
     }
 
+    /// <summary>
+    /// Dashboard-scoped measures are a top-level doc key like filterCards, so
+    /// editing one lands in the same class: LayoutChanged (gated by
+    /// CanEditLayout) with the settings flag — never charts, never pages.
+    /// </summary>
+    [Fact]
+    public void DashboardMeasuresChange_IsLayoutWithSettingsFlag()
+    {
+        var newDoc = BaseDoc.Replace(
+            "\"filterCards\": [{ \"id\": \"f1\", \"scope\": \"allPages\" }]",
+            "\"filterCards\": [{ \"id\": \"f1\", \"scope\": \"allPages\" }],\n  \"measures\": [{ \"id\": \"m1\", \"name\": \"Revenue\" }]");
+
+        var summary = Diff(BaseDoc, newDoc);
+
+        AssertFlags(summary, layout: true);
+        Assert.True(summary.SettingsChanged);
+    }
+
     // ------------------------------ legacy docs ------------------------------
 
     private const string LegacyDoc = """

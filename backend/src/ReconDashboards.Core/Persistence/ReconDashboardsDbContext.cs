@@ -28,6 +28,7 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
         Set<SubscriptionDispatchRecipientRecord>();
     public DbSet<SubscriptionOptOutRecord> SubscriptionOptOuts => Set<SubscriptionOptOutRecord>();
     public DbSet<GlobalOptOutRecord> GlobalOptOuts => Set<GlobalOptOutRecord>();
+    public DbSet<UserSettingsRecord> UserSettings => Set<UserSettingsRecord>();
 
     /// <summary>Same provider probe the model build uses (jsonb, index filters, timestamps).</summary>
     private bool IsNpgsql =>
@@ -230,6 +231,20 @@ public sealed class ReconDashboardsDbContext(DbContextOptions<ReconDashboardsDbC
             entity.ToTable("rcd_global_optouts");
             entity.HasKey(e => e.Email);
             entity.Property(e => e.Email).HasMaxLength(320);
+        });
+
+        modelBuilder.Entity<UserSettingsRecord>(entity =>
+        {
+            entity.ToTable("rcd_user_settings");
+            // Natural key: the opaque host user id IS the row identity, so a
+            // second row for the same user is impossible by construction and
+            // the read path needs no filter beyond the key.
+            entity.HasKey(e => e.UserId);
+            entity.Property(e => e.UserId).HasMaxLength(128);
+            if (jsonColumnType is not null)
+            {
+                entity.Property(e => e.SettingsJson).HasColumnType(jsonColumnType);
+            }
         });
 
         modelBuilder.Entity<QueryAuditRecord>(entity =>

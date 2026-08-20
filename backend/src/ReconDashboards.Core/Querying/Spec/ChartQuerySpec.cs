@@ -142,6 +142,13 @@ public sealed record HavingSpec(int MeasureIndex, HavingOperator Operator, IRead
 /// dimensions it applies to the single global aggregate row (alert-style
 /// specs). Only the aggregate pipeline honors it — row-level ("underlying")
 /// exports ignore it.
+/// Definitions (wire "definitions") carries measure DEFINITIONS that are not
+/// in the stored model — dashboard-scoped and personal-scoped measures. They
+/// are OVERLAID onto the model definition by
+/// <see cref="Querying.MeasureOverlay.Merge"/> BEFORE the compiler prepares
+/// the query, so they resolve, join-plan and ROW-FILTER exactly like model
+/// measures. Measure REFERENCES stay <c>{ measureId }</c> — nothing about the
+/// existing measure wire changes.
 /// </summary>
 public sealed record ChartQuerySpec(
     int ModelId,
@@ -152,7 +159,8 @@ public sealed record ChartQuerySpec(
     TopNSpec? TopN,
     int? Limit,
     int? Offset = null,
-    IReadOnlyList<HavingSpec>? Having = null);
+    IReadOnlyList<HavingSpec>? Having = null,
+    IReadOnlyList<Measure>? Definitions = null);
 
 /// <summary>
 /// CSV export mode: "summarized" runs the normal aggregate pipeline (including

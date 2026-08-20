@@ -14,6 +14,7 @@ import {
 import { AlertTriangle, Filter, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   boldRunText,
+  chartMeasureDefinitions,
   isRunnable,
   pathToWell,
   retitleInnerTitleHtml,
@@ -26,17 +27,21 @@ import {
   type ChartSpec,
   type ChartType,
   type FilterClause,
+  type Measure,
   type ModelDefinition,
 } from '@recon/dashboards-core';
 import { shapeChartData, shapePieData } from '../chart/chartData';
 import { ChartTile, type ChartTableLayoutPatch } from '../chart/ChartTile';
 import { FormatPanel } from '../chart/FormatPanel';
-import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
+import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdInput } from '../primitives';
 import { PaneDivider, useBuilderPanes } from './builderLayout';
 import { ChartTypePicker } from './ChartTypePicker';
 import { FieldList } from './FieldList';
 import { FilterEditor } from './FilterEditor';
+import { MeasureManager } from './MeasureManager';
+import { useMeasureActions } from './measureActions';
+import type { MeasureScope, ScopedMeasure } from './measureScopes';
 import { Wells, type ManualOrderInputs } from './Wells';
 import {
   applyDrop,
@@ -114,6 +119,18 @@ interface FilterEditorTarget {
 interface FilterMove {
   data: ChipDragData;
   to: ChipDropTarget;
+}
+
+/**
+ * What the measure manager should be showing when it opens. The builder is a
+ * MODAL inside the dashboard, so authoring cannot navigate anywhere — the
+ * manager opens over it and the builder (and the half-built chart) survives.
+ */
+interface MeasureManagerRequest {
+  /** Open straight into the editor for this measure. */
+  focusMeasureId?: string;
+  /** Open straight into the delete confirmation for this measure. */
+  deleteMeasureId?: string;
 }
 
 /**
@@ -205,7 +222,54 @@ export function ChartBuilder({
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [filterTarget, setFilterTarget] = useState<FilterEditorTarget | null>(null);
   const [filterMove, setFilterMove] = useState<FilterMove | null>(null);
+  const [measureManager, setMeasureManager] = useState<MeasureManagerRequest | null>(null);
   const lastDragEndAt = useRef(0);
+
+  /**
+   * THE MEASURE OVERLAY, client side. Dashboard-scoped and personal measures
+   * are not in the stored model, so the field list would not offer them, the
+   * client validator would call every one of them `unknown_measure`, and the
+   * well chips would render an id. Merging them into ONE effective definition
+   * mirrors exactly what the server does before it compiles (the query's
+   * `definitions` overlay is merged into ModelDefinition.Measures), so every
+   * consumer downstream needs no idea that scopes exist.
+   */
+  const measureActions = useMeasureActions({
+    modelId,
+    fallbackSystemMeasures: model.measures,
+    chart: draft,
+    onChartChange: setDraft,
+  });
+  const effectiveModel = useMemo<ModelDefinition>(
+    () => ({ ...model, measures: measureActions.effective }),
+    [model, measureActions.effective],
+  );
+
+  const measureManagement = useMemo(
+    () => ({
+      scoped: measureActions.scoped,
+      rights: measureActions.rights,
+      // The "+" opens the manager rather than guessing a scope: choosing
+      // WHERE a measure lives is the decision this wave exists to surface,
+      // and all three "New" buttons are one glance away there.
+      onCreate: () => setMeasureManager({}),
+      onManage: () => setMeasureManager({}),
+      handlers: {
+        onEdit: (entry: ScopedMeasure) =>
+          setMeasureManager({ focusMeasureId: entry.measure.id }),
+        onDuplicate: (entry: ScopedMeasure) =>
+          void measureActions.duplicate(entry.scope, entry.measure.id),
+        onDelete: (entry: ScopedMeasure) =>
+          // Deletion is confirmed, and the manager owns that confirmation —
+          // one dialog, one wording, one place that spells out what a delete
+          // costs the chart being edited, whichever surface asked for it.
+          setMeasureManager({ deleteMeasureId: entry.measure.id }),
+        onTransfer: (entry: ScopedMeasure, to: MeasureScope) =>
+          void measureActions.transfer(entry.scope, to, entry.measure.id),
+      },
+    }),
+    [measureActions],
+  );
 
   // Manual pane sizing (drag the hairline dividers); fluid grid until touched.
   const gridRef = useRef<HTMLDivElement>(null);
@@ -228,8 +292,8 @@ export function ChartBuilder({
   // Errors block Save; warnings only advise. Memoized on the draft/model/
   // catalog identities — the validator is pure.
   const issues = useMemo<ChartIssue[]>(
-    () => validateChartSpec(draft, model, catalog ?? null),
-    [draft, model, catalog],
+    () => validateChartSpec(draft, effectiveModel, catalog ?? null),
+    [draft, effectiveModel, catalog],
   );
   const validationErrors = useMemo(
     () => issues.filter((issue) => issue.severity === 'error'),
@@ -449,10 +513,18 @@ export function ChartBuilder({
   // preview ChartTile's own fetch, so reading it never issues a query — an
   // unknown/loading entry just yields empty lists. Feeds the Format panel's
   // series keys (legend charts) and the Sort section's manual-order lists.
-  const previewCacheKey = useMemo(
-    () => (isRunnable(draft) ? runtime.queries.keyFor(toWireSpec(draft, modelId)) : null),
-    [runtime, draft, modelId],
-  );
+  // Must mirror the preview ChartTile's key EXACTLY, scoped measure
+  // definitions included — a key that omits them reads a cache slot nothing
+  // ever writes, and the Format/Sort panels silently lose their series lists.
+  const docMeasures = useDashboardState((state) => state.current?.layout.measures ?? null);
+  const personalMeasures = useDashboardState((state) => state.personalMeasures);
+  const previewCacheKey = useMemo(() => {
+    if (!isRunnable(draft)) return null;
+    const scoped: Measure[] = [...(docMeasures ?? []), ...personalMeasures];
+    return runtime.queries.keyFor(
+      toWireSpec(draft, modelId, [], chartMeasureDefinitions(scoped, draft)),
+    );
+  }, [runtime, draft, modelId, docMeasures, personalMeasures]);
   const previewEntry = useQueryCacheState((state) =>
     previewCacheKey ? state.entries[previewCacheKey] : undefined,
   );
@@ -501,8 +573,8 @@ export function ChartBuilder({
   const seriesKeys = useMemo<string[]>(() => {
     if (previewShaped) return previewShaped.series.map((series) => series.styleKey);
     if (draft.query.legend) return [];
-    return draft.query.measures.map((measure) => measureLabel(model, measure));
-  }, [draft, previewShaped, model]);
+    return draft.query.measures.map((measure) => measureLabel(effectiveModel, measure));
+  }, [draft, previewShaped, effectiveModel]);
 
   // Manual-order inputs for the Wells sort section (orderable families only).
   // Categories/series come from the CURRENT shaped preview — exactly the
@@ -561,13 +633,14 @@ export function ChartBuilder({
             className="min-h-0 overflow-y-auto rounded-md border border-rcd-border bg-rcd-surface"
           >
             <FieldList
-              model={model}
+              model={effectiveModel}
               catalog={catalog ?? null}
               parameters={parameters}
               onAdd={handleClickAdd}
               onAddFilter={(data) =>
                 setFilterTarget({ index: null, table: data.table, column: data.column })
               }
+              measures={measureManagement}
             />
           </div>
 
@@ -641,7 +714,7 @@ export function ChartBuilder({
                 <Wells
                   chartType={draft.type}
                   query={draft.query}
-                  model={model}
+                  model={effectiveModel}
                   catalog={catalog ?? null}
                   parameters={parameters}
                   ordering={ordering}
@@ -707,6 +780,16 @@ export function ChartBuilder({
                 onTableLayoutChange={
                   draft.type === 'table' ? handlePreviewTableLayout : undefined
                 }
+                // D3: a measure the engine could not compile renders as an
+                // empty series. The notice names it and this shortcut opens
+                // its editor — in the builder that is one click, because the
+                // manager is right here.
+                onEditMeasure={(failure) => {
+                  const ref = draft.query.measures[failure.index];
+                  setMeasureManager(
+                    ref?.measureId ? { focusMeasureId: ref.measureId } : {},
+                  );
+                }}
               />
             </div>
           </div>
@@ -726,7 +809,7 @@ export function ChartBuilder({
                 <Sigma size={12} className="text-rcd-muted" />
               )}
               {activeDrag.kind === 'column'
-                ? columnLabelOf(model, activeDrag.table, activeDrag.column)
+                ? columnLabelOf(effectiveModel, activeDrag.table, activeDrag.column)
                 : activeDrag.kind === 'chip'
                   ? activeDrag.label
                   : activeDrag.name}
@@ -763,7 +846,7 @@ export function ChartBuilder({
           table={filterTarget.table}
           column={filterTarget.column}
           columnType={columnTypeOf(catalog ?? null, filterTarget.table, filterTarget.column)}
-          label={columnLabelOf(model, filterTarget.table, filterTarget.column)}
+          label={columnLabelOf(effectiveModel, filterTarget.table, filterTarget.column)}
           initial={editingClause}
           onApply={applyFilter}
           onCancel={() => setFilterTarget(null)}
@@ -802,6 +885,17 @@ export function ChartBuilder({
         }}
         onCancel={() => setConfirmCancel(false)}
       />
+
+      {measureManager !== null && (
+        <MeasureManager
+          model={model}
+          chart={draft}
+          actions={measureActions}
+          focusMeasureId={measureManager.focusMeasureId ?? null}
+          deleteMeasureId={measureManager.deleteMeasureId ?? null}
+          onClose={() => setMeasureManager(null)}
+        />
+      )}
     </div>
   );
 }

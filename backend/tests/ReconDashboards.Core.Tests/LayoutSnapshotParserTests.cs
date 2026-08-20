@@ -577,4 +577,89 @@ public class LayoutSnapshotParserTests
 
         Assert.Null(Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(layout, ModelId)).Tiles).GridSize);
     }
+
+    // ---------------------- dashboard-scoped measures ----------------------
+
+    private const string MeasureLayout = """
+    {
+      "version": 1, "tiles": [], "slicers": [],
+      "measures": [
+        { "id": "11111111-1111-1111-1111-111111111111", "name": "Revenue",
+          "table": "public.orders", "aggregation": "sum", "column": "order_total" },
+        { "id": "22222222-2222-2222-2222-222222222222", "name": "Avg Revenue",
+          "table": "public.orders", "aggregation": "sum", "expression": "[Revenue] / 2" },
+        { "id": "33333333-3333-3333-3333-333333333333", "name": "Unused",
+          "table": "public.orders", "aggregation": "count" }
+      ],
+      "pages": [{ "id": "p1", "name": "One", "tiles": [
+        { "id": "t1", "chart": { "id": "c1", "type": "kpi", "title": "A", "query": {
+          "measures": [{ "measureId": "22222222-2222-2222-2222-222222222222" }], "filters": [] } } },
+        { "id": "t2", "chart": { "id": "c2", "type": "kpi", "title": "B", "query": {
+          "measures": [{ "table": "public.orders", "aggregation": "count" }], "filters": [] } } }
+      ]}]
+    }
+    """;
+
+    /// <summary>
+    /// The regression that made scheduled email fail on a dashboard measure:
+    /// LayoutDoc did not map `measures`, JsonSerializer skipped it silently,
+    /// and every tile citing one came back QRY_UNKNOWN_MEASURE. Each tile now
+    /// carries the definitions it references — TRANSITIVELY, since a
+    /// calculated measure resolves its [references] by name — and only those.
+    /// </summary>
+    [Fact]
+    public void DashboardMeasuresTravelWithTheTilesThatCiteThem()
+    {
+        var tiles = Assert.Single(LayoutSnapshotParser.Parse(MeasureLayout, ModelId)).Tiles;
+
+        var citing = tiles.Single(t => t.TileId == "t1");
+        Assert.NotNull(citing.Spec.Definitions);
+        Assert.Equal(["Revenue", "Avg Revenue"], citing.Spec.Definitions!.Select(m => m.Name));
+
+        // A tile that cites no dashboard measure carries nothing: the overlay
+        // is per-QUERY, and a dashboard may hold far more definitions than one
+        // query is allowed to send.
+        Assert.Null(tiles.Single(t => t.TileId == "t2").Spec.Definitions);
+    }
+
+    [Fact]
+    public void ParseMeasuresReadsTheDocsMeasuresWithoutItsTiles()
+    {
+        Assert.Equal(
+            ["Revenue", "Avg Revenue", "Unused"],
+            LayoutSnapshotParser.ParseMeasures(MeasureLayout).Select(m => m.Name));
+
+        Assert.Empty(LayoutSnapshotParser.ParseMeasures("""{"version":1,"tiles":[]}"""));
+        Assert.Empty(LayoutSnapshotParser.ParseMeasures("not json"));
+    }
+
+    /// <summary>
+    /// One unreadable measure must not take the document down with it — the
+    /// parser's standing contract is that a malformed part degrades, never
+    /// fails the whole send.
+    /// </summary>
+    [Fact]
+    public void AMalformedMeasureIsSkippedRatherThanFailingTheDocument()
+    {
+        const string layout = """
+        {
+          "version": 1, "tiles": [], "slicers": [],
+          "measures": [
+            { "id": "not-a-guid", "name": "Broken", "table": "public.orders", "aggregation": "sum" },
+            "nonsense",
+            { "id": "11111111-1111-1111-1111-111111111111", "name": "Fine",
+              "table": "public.orders", "aggregation": "count" }
+          ],
+          "pages": [{ "id": "p1", "name": "One", "tiles": [
+            { "id": "t1", "chart": { "id": "c1", "type": "kpi", "title": "A", "query": {
+              "measures": [{ "measureId": "11111111-1111-1111-1111-111111111111" }], "filters": [] } } }
+          ]}]
+        }
+        """;
+
+        Assert.Equal(["Fine"], LayoutSnapshotParser.ParseMeasures(layout).Select(m => m.Name));
+
+        var tile = Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(layout, ModelId)).Tiles);
+        Assert.Equal(["Fine"], tile.Spec.Definitions!.Select(m => m.Name));
+    }
 }

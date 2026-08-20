@@ -411,6 +411,203 @@ public sealed class SchedulingEvaluatorTests : IDisposable
         Assert.Null(alert.LastFiredUtc); // not recorded, so the next pass may retry
     }
 
+    // ------------------------------------- dashboard-scoped measures in email
+
+    /// <summary>
+    /// The scheduled-email half of the breakage: LayoutSnapshotParser's
+    /// LayoutDoc did not map `measures`, JsonSerializer skipped it silently,
+    /// and every tile citing a dashboard measure came back as an error card in
+    /// the email. The tile must now compile and render its data.
+    /// </summary>
+    [Fact]
+    public async Task ScheduledEmailResolvesDashboardMeasuresFromTheDocument()
+    {
+        SetDashboardLayout($$"""
+            {
+              "version": 1, "tiles": [], "slicers": [],
+              "measures": [{ "id": "{{DocMeasureId}}", "name": "Doc Revenue",
+                             "table": "public.orders", "aggregation": "sum", "column": "order_total" }],
+              "pages": [{ "id": "p1", "name": "Main", "tiles": [
+                { "id": "t1", "chart": { "id": "c1", "type": "column", "title": "Scoped sales", "query": {
+                  "axis": { "table": "public.customers", "column": "region" },
+                  "measures": [{ "measureId": "{{DocMeasureId}}" }],
+                  "filters": [] } } }
+              ]}]
+            }
+            """);
+        AddSubscription();
+        _executor.Rows = [["West", 120m]];
+
+        await _evaluator.RunOnceAsync(CancellationToken.None);
+
+        Assert.NotEmpty(_emails.Sent);
+        foreach (var message in _emails.Sent)
+        {
+            Assert.Contains("Scoped sales", message.HtmlBody, StringComparison.Ordinal);
+            Assert.Contains("West", message.HtmlBody, StringComparison.Ordinal);
+            // The old failure mode, spelled out so a regression is unmistakable.
+            Assert.DoesNotContain("no measure with id", message.HtmlBody, StringComparison.OrdinalIgnoreCase);
+        }
+
+        Assert.Contains("\"order_total\"", _executor.LastQuery!.Sql, StringComparison.Ordinal);
+    }
+
+    // ------------------------------------- dashboard-scoped measures in alerts
+
+    private const string DocMeasureId = "44444444-4444-4444-4444-444444444444";
+
+    private void SetDashboardLayout(string layout)
+    {
+        using var scope = _services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<ReconDashboardsDbContext>();
+        db.Dashboards.Find(_dashboardId)!.LayoutJson = layout;
+        db.SaveChanges();
+    }
+
+    private async Task<(decimal? Value, string? Error)> EvaluateAsync(AlertRecord alert)
+    {
+        using var scope = _services.CreateScope();
+        return await SchedulingEvaluator.EvaluateAlertValueAsync(
+            scope.ServiceProvider, alert, CancellationToken.None);
+    }
+
+    private static AlertRecord AlertCiting(string specJson, int? dashboardId) => new()
+    {
+        OwnerUserId = "alice",
+        DashboardId = dashboardId,
+        Name = "Scoped measure alert",
+        SpecJson = specJson,
+        Operator = AlertOperator.Gt,
+        Threshold = 0m,
+        Recipients = "ops@example.com",
+        EveryMinutes = 5,
+        CooldownMinutes = 60,
+        Enabled = true,
+        CreatedUtc = Now.AddDays(-1),
+    };
+
+    /// <summary>
+    /// An alert whose stored spec cites a DASHBOARD-scoped measure used to fail
+    /// with QRY_UNKNOWN_MEASURE: the spec is deserialized with no document in
+    /// hand, and the measure is not in the model. AlertRecord carries a
+    /// dashboard id, so the definition now resolves LIVE from that dashboard's
+    /// document at evaluation time — an edited formula is picked up rather than
+    /// firing on a stale copy.
+    /// </summary>
+    [Fact]
+    public async Task AlertCitingADashboardMeasureResolvesItLiveFromTheDashboardDocument()
+    {
+        SetDashboardLayout($$"""
+            {
+              "version": 1, "tiles": [], "slicers": [],
+              "measures": [{ "id": "{{DocMeasureId}}", "name": "Doc Revenue",
+                             "table": "public.orders", "aggregation": "sum", "column": "order_total" }],
+              "pages": [{ "id": "p1", "name": "Main", "tiles": [] }]
+            }
+            """);
+        _executor.Rows = [[500m]];
+
+        // No `definitions` on the stored spec at all — the doc is the source.
+        var alert = AlertCiting(
+            $$"""{"modelId":{{_modelId}},"dimensions":[],"measures":[{"measureId":"{{DocMeasureId}}"}],"filters":[],"sort":[]}""",
+            _dashboardId);
+
+        var (value, error) = await EvaluateAsync(alert);
+
+        Assert.Null(error);
+        Assert.Equal(500m, value);
+        Assert.Contains("\"order_total\"", _executor.LastQuery!.Sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The live document WINS over the copy snapshotted into the spec at save
+    /// time — that copy exists only as a fallback for definitions the document
+    /// no longer holds.
+    /// </summary>
+    [Fact]
+    public async Task LiveDashboardDefinitionWinsOverTheOneStoredInTheSpec()
+    {
+        SetDashboardLayout($$"""
+            {
+              "version": 1, "tiles": [], "slicers": [],
+              "measures": [{ "id": "{{DocMeasureId}}", "name": "Doc Revenue",
+                             "table": "public.orders", "aggregation": "sum", "column": "order_total" }],
+              "pages": [{ "id": "p1", "name": "Main", "tiles": [] }]
+            }
+            """);
+        _executor.Rows = [[500m]];
+
+        var alert = AlertCiting(
+            $$"""
+            {"modelId":{{_modelId}},"dimensions":[],"measures":[{"measureId":"{{DocMeasureId}}"}],
+             "filters":[],"sort":[],
+             "definitions":[{"id":"{{DocMeasureId}}","name":"Doc Revenue","table":"public.orders",
+                             "aggregation":"count","column":null}]}
+            """,
+            _dashboardId);
+
+        var (value, error) = await EvaluateAsync(alert);
+
+        Assert.Null(error);
+        Assert.Equal(500m, value);
+        Assert.Contains("\"order_total\"", _executor.LastQuery!.Sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("COUNT(*)", _executor.LastQuery.Sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An alert with NO dashboard (built on an unsaved chart, or citing a
+    /// personal measure that has no dashboard home) still evaluates from the
+    /// definition the client snapshotted into its spec. That is a PINNED
+    /// formula, deliberately — and visibly — rather than a silently stale one.
+    /// </summary>
+    [Fact]
+    public async Task AlertWithoutADashboardFallsBackToTheDefinitionStoredInItsSpec()
+    {
+        _executor.Rows = [[42m]];
+
+        var alert = AlertCiting(
+            $$"""
+            {"modelId":{{_modelId}},"dimensions":[],"measures":[{"measureId":"{{DocMeasureId}}"}],
+             "filters":[],"sort":[],
+             "definitions":[{"id":"{{DocMeasureId}}","name":"Personal Revenue","table":"public.orders",
+                             "aggregation":"sum","column":"order_total"}]}
+            """,
+            dashboardId: null);
+
+        var (value, error) = await EvaluateAsync(alert);
+
+        Assert.Null(error);
+        Assert.Equal(42m, value);
+        Assert.Contains("\"order_total\"", _executor.LastQuery!.Sql, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// *** PER-MEASURE ISOLATION MUST NOT REACH ALERTS' SINGLE MEASURE. ***
+    ///
+    /// Alerts run through ChartQueryService.RunAsync, so they inherit the
+    /// tombstone path automatically. An alert spec has EXACTLY ONE measure
+    /// (enforced above), so tombstoning it would leave every measure blank —
+    /// which the isolation loop refuses by design, returning the original
+    /// failure. That refusal is what keeps this alert loud: a tombstoned alert
+    /// measure would evaluate to NULL, read as "no data", and silently stop
+    /// firing forever with nothing in the error column to explain it.
+    /// </summary>
+    [Fact]
+    public async Task AlertCitingAMeasureNoScopeProvidesStillFailsLoudly()
+    {
+        var alert = AlertCiting(
+            $$"""{"modelId":{{_modelId}},"dimensions":[],"measures":[{"measureId":"{{DocMeasureId}}"}],"filters":[],"sort":[]}""",
+            _dashboardId);
+
+        var (value, error) = await EvaluateAsync(alert);
+
+        Assert.Null(value);
+        Assert.NotNull(error);
+        Assert.Contains("no measure with id", error, StringComparison.OrdinalIgnoreCase);
+        // Nothing was executed: the query never compiled.
+        Assert.Equal(0, _executor.Count);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider

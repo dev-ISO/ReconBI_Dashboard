@@ -735,10 +735,12 @@ export function DashboardChartTile({
           (c) => c.role === 'measure' && c.name === column,
         );
         if (!target) return [];
-        const base = toWireSpec(inputs.drilledChart, modelId, [
-          ...inputs.filters,
-          ...others.clauses,
-        ]);
+        const base = toWireSpec(
+          inputs.drilledChart,
+          modelId,
+          [...inputs.filters, ...others.clauses],
+          runtime.dashboards.definitionsForChart(inputs.drilledChart),
+        );
         const spec = others.having.length > 0 ? { ...base, having: others.having } : base;
         const full = await runtime.queries.run(spec);
         const index = full.columns.findIndex((c) => c.name === column);
@@ -905,6 +907,7 @@ export function DashboardChartTile({
       },
       modelId,
       mergedFilters,
+      runtime.dashboards.definitionsForChart(drilledChart),
     );
   }, [
     isTable,
@@ -914,6 +917,7 @@ export function DashboardChartTile({
     drilledChart,
     mergedFilters,
     measureColumnMeta,
+    runtime,
   ]);
 
   const totalsKey = totalsSpec ? runtime.queries.keyFor(totalsSpec) : null;
@@ -960,9 +964,19 @@ export function DashboardChartTile({
       { ...drilledChart, query: { ...drilledChart.query, sort: [], limit: authoredLimit } },
       modelId,
       mergedFilters,
+      runtime.dashboards.definitionsForChart(drilledChart),
     );
     return tableHaving.length > 0 ? { ...base, having: tableHaving } : base;
-  }, [isTable, pageSize, modelId, drilledChart, mergedFilters, tableHaving, authoredLimit]);
+  }, [
+    isTable,
+    pageSize,
+    modelId,
+    drilledChart,
+    mergedFilters,
+    tableHaving,
+    authoredLimit,
+    runtime,
+  ]);
 
   const countKey = countSpec ? runtime.queries.keyFor(countSpec) : null;
   const countEntry = useQueryCacheState((state) =>
@@ -1340,6 +1354,13 @@ export function DashboardChartTile({
             // Renderer-side marking of THIS tile's own clicked datum/legend
             // value while it is the cross-filter source.
             selection={selection}
+            // D3: the per-measure failure notice offers a way to FIX the
+            // measure. This tile has no authoring surface of its own, so the
+            // shortcut opens the chart builder — which is where the measure
+            // manager lives, and where the notice repeats with a direct
+            // shortcut to that measure's editor. A viewer who cannot edit
+            // charts still gets the notice, just without the button.
+            onEditMeasure={editable ? () => onEdit() : undefined}
             onAxisRangeSelect={axisRangeEnabled ? handleAxisRangeSelect : undefined}
             onPointHover={hoverEnabled ? handlePointHover : undefined}
             highlightCategory={highlightCategory}

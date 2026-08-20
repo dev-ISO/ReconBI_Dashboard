@@ -1,5 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using ReconDashboards.Core.Modeling;
+using ReconDashboards.Core.Querying;
 using ReconDashboards.Core.Querying.Spec;
 
 namespace ReconDashboards.Core.Scheduling;
@@ -152,6 +154,7 @@ public static class LayoutSnapshotParser
         }
 
         var cards = doc.FilterCards ?? [];
+        var measures = ReadMeasures(doc.Measures);
         var pages = doc.Pages is { Count: > 0 }
             ? doc.Pages
             : [new PageDoc(null, "Page 1", doc.Tiles)];
@@ -162,7 +165,7 @@ public static class LayoutSnapshotParser
             var tiles = new List<SnapshotTile>();
             foreach (var tile in page.Tiles ?? [])
             {
-                if (BuildTile(tile, page, cards, modelId) is { } snapshot)
+                if (BuildTile(tile, page, cards, measures, modelId) is { } snapshot)
                 {
                     tiles.Add(snapshot);
                 }
@@ -174,7 +177,26 @@ public static class LayoutSnapshotParser
         return result;
     }
 
-    private static SnapshotTile? BuildTile(TileDoc tile, PageDoc page, List<FilterCardDoc> cards, int modelId)
+    /// <summary>
+    /// The dashboard-scoped measures a stored layout document declares (the
+    /// doc's top-level `measures`). The alert path needs them WITHOUT the
+    /// tiles: an alert stores its own ChartQuerySpec, so all it wants is the
+    /// definitions to overlay. A malformed/absent array is simply empty.
+    /// </summary>
+    public static IReadOnlyList<Measure> ParseMeasures(string layoutJson)
+    {
+        try
+        {
+            return ReadMeasures(JsonSerializer.Deserialize<LayoutDoc>(layoutJson, Options)?.Measures);
+        }
+        catch (JsonException)
+        {
+            return [];
+        }
+    }
+
+    private static SnapshotTile? BuildTile(
+        TileDoc tile, PageDoc page, List<FilterCardDoc> cards, List<Measure> docMeasures, int modelId)
     {
         if (tile.Kind is not (null or "chart") || tile.Chart?.Query is not { } query)
         {
@@ -220,8 +242,22 @@ public static class LayoutSnapshotParser
             }
         }
 
+        // Dashboard-scoped measures the tile CITES travel with its query as
+        // spec.Definitions (transitively — a calculated one may name others by
+        // [reference]). Only the cited ones: a dashboard may hold far more
+        // definitions than RcdLimits.MaxQueryMeasureDefinitions allows on one
+        // query, and the overlay is per-query, not per-dashboard. Resolution
+        // is LIVE — the doc is read at dispatch time, so an edited definition
+        // is picked up by the next send, which is what a reader expects from a
+        // "dashboard snapshot".
+        var definitions = docMeasures.Count == 0
+            ? null
+            : MeasureOverlay.CollectReferenced(
+                docMeasures, measures.Where(m => m.MeasureId is not null).Select(m => m.MeasureId!.Value));
+
         var spec = new ChartQuerySpec(
-            modelId, dimensions, measures, filters, query.Sort ?? [], TopN: null, query.Limit);
+            modelId, dimensions, measures, filters, query.Sort ?? [], TopN: null, query.Limit,
+            Definitions: definitions is { Count: > 0 } ? definitions : null);
 
         return new SnapshotTile(
             tile.Id ?? "", tile.Chart.Title ?? "Chart", tile.Chart.Type ?? "column", spec,
@@ -502,8 +538,54 @@ public static class LayoutSnapshotParser
         string? ConditionJoin,
         bool? Disabled);
 
+    /// <summary>
+    /// Measures is the DASHBOARD-SCOPED measure store (dashboard.ts
+    /// DashboardLayoutDoc.measures). It MUST be mapped here: JsonSerializer
+    /// silently skips unmapped members, so before this field existed every
+    /// scheduled email of a dashboard whose charts cite a dashboard measure
+    /// failed the tile with QRY_UNKNOWN_MEASURE — the doc was right there and
+    /// the parser threw it away. It is bound RAW (like ChartDoc.Format) and
+    /// read element by element so that one malformed measure degrades to "that
+    /// measure is missing" instead of failing the whole document, which a
+    /// typed List&lt;Measure&gt; inside Deserialize would.
+    /// </summary>
     private sealed record LayoutDoc(
         List<TileDoc>? Tiles,
         List<PageDoc>? Pages,
-        List<FilterCardDoc>? FilterCards);
+        List<FilterCardDoc>? FilterCards,
+        JsonElement? Measures);
+
+    /// <summary>Tolerant reader for the doc's measures array; see LayoutDoc.Measures.</summary>
+    private static List<Measure> ReadMeasures(JsonElement? measures)
+    {
+        var result = new List<Measure>();
+        if (measures is not { ValueKind: JsonValueKind.Array } array)
+        {
+            return result;
+        }
+
+        foreach (var item in array.EnumerateArray())
+        {
+            if (item.ValueKind is not JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            try
+            {
+                if (item.Deserialize<Measure>(Options) is { } measure)
+                {
+                    result.Add(measure);
+                }
+            }
+            catch (JsonException)
+            {
+                // A measure whose shape the engine cannot read is simply not
+                // available to overlay; the tile that cites it reports
+                // QRY_UNKNOWN_MEASURE, every other tile still renders.
+            }
+        }
+
+        return result;
+    }
 }

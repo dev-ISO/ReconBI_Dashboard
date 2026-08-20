@@ -53,6 +53,39 @@ export interface RcdMeta {
   userId?: string;
 }
 
+/**
+ * One user's PRIVATE preference document. Server-opaque: the backend parses and
+ * re-serializes it and validates nothing else, which is precisely what lets a
+ * later wave add a section without a migration or a server deploy.
+ *
+ * Two top-level sections are RESERVED now so those waves need no coordination:
+ * `measures` (personal measures) and `fieldList` (field-list organization).
+ * Both are deliberately loose here — this module owns the transport, not the
+ * meaning of a section; each owning feature narrows and sanitizes its own
+ * section on read, the way the tracker host's sanitizers do.
+ *
+ * Unknown sections MUST be preserved on write: an older client that dropped a
+ * newer client's section would silently destroy the other machine's settings —
+ * the whole document is replaced, so anything not carried forward is gone.
+ */
+export interface RcdUserSettingsDoc {
+  /** Document schema version. 1 today; bump only for a breaking reshape. */
+  version: number;
+  /** RESERVED — personal measures (Fields wave 2). */
+  measures?: unknown[];
+  /** RESERVED — field-list grouping/expansion/colour preferences (Fields wave 4). */
+  fieldList?: Record<string, unknown>;
+  /** Forward compatibility: sections written by a newer client are kept as-is. */
+  [section: string]: unknown;
+}
+
+/** GET/PUT user-settings response. */
+export interface RcdUserSettings {
+  settings: RcdUserSettingsDoc;
+  /** When the document was last saved; null for a caller who never has. */
+  updatedAtUtc: string | null;
+}
+
 export interface SaveModelBody {
   name: string;
   description?: string | null;
@@ -457,6 +490,34 @@ export class DashboardsApi {
    */
   getMeta(signal?: AbortSignal): Promise<RcdMeta> {
     return this.fetcher(this.url('/meta'), { signal });
+  }
+
+  /* ------------------------------------------------- per-user settings */
+
+  /**
+   * The caller's own private preference document. No id on the route: the
+   * server answers for whoever is signed in and there is no way to ask for
+   * anyone else's. A first-time caller gets the versioned empty document with
+   * `updatedAtUtc: null` — never a 404.
+   */
+  getUserSettings(signal?: AbortSignal): Promise<RcdUserSettings> {
+    return this.fetcher(this.url('/user-settings'), { signal });
+  }
+
+  /**
+   * Replaces the caller's whole document (last-write-wins). Pass the FULL
+   * document including any section this client does not understand.
+   * `keepalive` lets a teardown flush outlive the page.
+   */
+  putUserSettings(
+    settings: RcdUserSettingsDoc,
+    options?: { keepalive?: boolean },
+  ): Promise<RcdUserSettings> {
+    return this.fetcher(this.url('/user-settings'), {
+      method: 'PUT',
+      body: { settings },
+      ...(options?.keepalive ? { keepalive: true } : {}),
+    });
   }
 
   /* --------------------------------------------------- email subscriptions */

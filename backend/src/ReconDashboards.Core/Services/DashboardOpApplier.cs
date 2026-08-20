@@ -48,7 +48,8 @@ namespace ReconDashboards.Core.Services;
 ///                                              keep relative order at the end, so
 ///                                              a stale reorder never drops a page
 ///   docElementUpsert doc        element id     field: "filterCards" | "bookmarks"
-///                                              | "parameters"; element: object
+///                                              | "parameters" | "measures";
+///                                              element: object
 ///                                              (element.id == targetId)
 ///   docElementRemove doc        element id     field: as above (missing: no-op)
 ///   docSettingSet    doc        null           key: string (NOT "pages"/"tiles" —
@@ -88,7 +89,7 @@ internal static class DashboardOpApplier
     internal const string TargetDoc = "doc";
 
     /// <summary>Doc-level arrays whose elements are id-keyed (the differ's "settings" that merge per element).</summary>
-    private static readonly string[] ElementFields = ["filterCards", "bookmarks", "parameters"];
+    private static readonly string[] ElementFields = ["filterCards", "bookmarks", "parameters", "measures"];
 
     /// <summary>Structural keys docSettingSet must never write (dedicated ops own them).</summary>
     private static readonly string[] StructuralKeys = ["pages", "tiles"];

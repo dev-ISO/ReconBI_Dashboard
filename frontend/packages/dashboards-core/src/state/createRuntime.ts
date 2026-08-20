@@ -1,14 +1,24 @@
 import { DashboardsApi } from '../api/DashboardsApi';
 import type { RcdFetcher } from '../api/fetcher';
+import type { Measure } from '../types/model';
 import { DashboardStore, type DashboardCollabSenders } from './dashboardStore';
 import { ModelStore } from './modelStore';
 import { QueryCache, type QueryCacheOptions } from './queryCache';
+import { UserSettingsStore, type UserSettingsStoreOptions } from './userSettingsStore';
 
 export interface DashboardsRuntime {
   api: DashboardsApi;
   models: ModelStore;
   dashboards: DashboardStore;
   queries: QueryCache;
+  /**
+   * The signed-in user's private preferences, held server-side so they follow
+   * the user to any machine. Hydrates lazily on first use and costs nothing
+   * until something reads or writes a section; the host should call
+   * `userSettings.dispose()` on unmount/logout so a debounced write is flushed
+   * rather than lost.
+   */
+  userSettings: UserSettingsStore;
   /** Resolved host display options consumed by UI components. */
   options: {
     /** IANA zone id schedule times are entered/shown in (mirrors the backend's
@@ -24,6 +34,8 @@ export interface DashboardsRuntime {
 export interface DashboardsRuntimeOptions {
   /** Query cache tuning: TTLs, entry cap, request concurrency. */
   queryOptions?: QueryCacheOptions;
+  /** Per-user settings tuning (write debounce). Defaults suit every host. */
+  userSettingsOptions?: UserSettingsStoreOptions;
   /**
    * Zone in which subscription send times are interpreted — MUST match the
    * host backend's ReconDashboardsOptions.ScheduleTimeZoneId or the UI's
@@ -58,14 +70,34 @@ export const createDashboardsRuntime = (
   options?: DashboardsRuntimeOptions,
 ): DashboardsRuntime => {
   const api = new DashboardsApi(baseUrl.replace(/\/+$/, ''), fetcher);
+  const userSettings = new UserSettingsStore(api, options?.userSettingsOptions);
+  const dashboards = new DashboardStore(api, {
+    onSendCursor: options?.onSendCursor,
+    onSendSlicerValue: options?.onSendSlicerValue,
+    // PERSONAL-scope measures live in the per-user settings document; the
+    // dashboard store holds the working copy the builder reads. Writes go
+    // through the settings store's debounce, so a burst of edits is one PUT.
+    onPersistPersonalMeasures: (measures) => userSettings.setSection('measures', measures),
+  });
+
+  // Seed the working copy once, in the background. Deliberately fire-and-forget
+  // and deliberately NOT awaited by the runtime: a settings outage must not
+  // stop dashboards from opening — personal measures simply stay empty, and the
+  // store's own error state carries the reason. hydrate() is idempotent, so a
+  // later read by the field list joins this same request rather than racing it.
+  void userSettings
+    .hydrate()
+    .then(() => dashboards.hydratePersonalMeasures(userSettings.section<Measure[]>('measures', [])))
+    .catch(() => {
+      /* surfaced by userSettings.state.error; nothing to do here. */
+    });
+
   return {
     api,
     models: new ModelStore(api),
-    dashboards: new DashboardStore(api, {
-      onSendCursor: options?.onSendCursor,
-      onSendSlicerValue: options?.onSendSlicerValue,
-    }),
+    dashboards,
     queries: new QueryCache(api, options?.queryOptions),
+    userSettings,
     options: {
       scheduleTimeZoneId: options?.scheduleTimeZoneId ?? 'UTC',
       scheduleTimeLabel: options?.scheduleTimeLabel ?? 'UTC',

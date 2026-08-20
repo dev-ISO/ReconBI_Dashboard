@@ -165,6 +165,26 @@ and the next tick closes the orphaned dispatch as `failed`, honestly.
 - **Schema** — re-apply `db/rcd_schema.sql` (idempotent) on upgrade: it adds
   the four tables above.
 
+### Per-user settings
+
+`rcd_user_settings` stores ONE opaque JSON document per user (primary key is
+the host's own user id from `ICurrentUserProvider` — as everywhere else here,
+no foreign key ever points at a host table). It backs the chart builder's field
+organization and personal measures; the server parses and re-serializes it and
+validates nothing about its contents, so new preference sections ship without a
+migration.
+
+- **API** — `GET/PUT api/rcd/v1/user-settings`, View policy slot: settings are
+  self-service, and a caller can only ever reach their own row because the id
+  is taken from the identity seam and never from the route or the body.
+- **First read** returns an empty document rather than a 404 — "no preferences
+  yet" and "these preferences" are the same state to every consumer.
+- **Size** — `RcdLimits.MaxUserSettingsBytes` (128 KB by default), measured on
+  the stored bytes so formatting cannot cost a user their save.
+- **Schema** — re-apply `db/rcd_schema.sql` on upgrade; it adds this one table.
+  Hosts that keep their own copy of the file (the PSV tracker keeps one at
+  `Scripts/db/rcd_schema.sql`) must refresh it in the same change.
+
 ### Dashboard permissions (0.8.0+)
 
 Three distinct verbs (see SHARING-DESIGN.md for the full contract):
@@ -182,7 +202,20 @@ Three distinct verbs (see SHARING-DESIGN.md for the full contract):
 - **Built-in**: rows owned by `RcdOptions.SystemOwnerUserId` (default
   `"system"`) are read-only for everyone — update/delete/share return 403
   `rcd.dashboard.system_readonly` / `rcd.model.system_readonly`; duplicate
-  stays available to any viewer. Seed scripts (raw SQL) remain the only writer.
+  stays available to any viewer. Seed scripts (raw SQL) remain the only writer,
+  with ONE exception (see below).
+- **System MEASURE carve-out**: `PUT /models/{id}` on a system-owned model is
+  accepted from a caller with `CanManageShared` when the request changes ONLY
+  the definition's `measures`. Everything else on a seeded model stays
+  immutable: a request that also changes tables, column overrides,
+  relationships, date tables, the version, the name, the description, the data
+  source or the sharing flag is refused with 403
+  `rcd.model.system_measures_only`, and a save that changes no measure at all
+  is the unchanged 403 `rcd.model.system_readonly`. Callers without
+  `CanManageShared`, and `DELETE`, are unaffected. Existing measures are still
+  re-validated against the live catalog, so a broken formula cannot be saved.
+  This is what makes a System-scope measure authorable through the API instead
+  of only by editing the seed JSON and re-seeding.
 
 Visibility is owner OR published OR share row. `DELETE /dashboards/{id}` is
 contextual: owner/admin soft-delete; a grantee only removes their own share
@@ -255,6 +288,30 @@ All failures are ProblemDetails with a stable `errorCode` extension
 `rcd.limit.*`). Query compilation errors surface actionable messages
 ("add a relationship between X and Y on the model canvas"); SQL and database
 internals never leave the server.
+
+**Partial query results.** A compilation failure attributed to ONE measure no
+longer fails the whole query. `POST /query` (and summarized `POST
+/query/export`) replace that measure with a tombstone — a column that selects
+NULL under the SAME `meas{i}` name, label and position, so sort targets, having
+indexes and column-keyed format maps keep pointing where the caller aimed them
+— and return 200 with the remaining series. The response then carries:
+
+```jsonc
+"meta": {
+  "measureFailures": [
+    { "index": 1, "label": "Margin %", "code": "rcd.query.unknown_measure",
+      "message": "The model has no measure with id …" }
+  ]
+}
+```
+
+`index` is the wire index into the request's `measures`. The key is ABSENT on a
+fully successful query, so its presence alone means "this result is partial";
+a client that ignores it renders an unexplained empty series, which is the one
+outcome to avoid. Isolation is deliberately narrow: a dimension, filter or sort
+failure, a rejected `definitions` overlay, and a query whose measures ALL fail
+are still 4xx with the original error. Row-level export (`mode=underlying`) is
+excluded — its measures pick the anchor table, not result columns.
 
 ## 5. Upgrade runbook
 

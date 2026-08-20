@@ -60,6 +60,27 @@ const QUERY_ERROR_TEXT: Record<string, QueryErrorText> = {
   'rcd.query.denied_by_scope': {
     message: 'Your access does not allow querying this data.',
   },
+  // Scoped-measure overlay (dashboard / personal measures sent as definitions).
+  'rcd.query.too_many_definitions': {
+    message: 'This chart carries more dashboard measures than one query allows.',
+    hint: 'Simplify the measures it uses, or move some of them into the model.',
+  },
+  'rcd.query.definitions_too_large': {
+    message: 'This chart’s dashboard measures are too large to send with one query.',
+    hint: 'Simplify their formulas, or move some of them into the model.',
+  },
+  'rcd.query.duplicate_measure_id': {
+    message: 'A dashboard measure has the same id as one in the model.',
+    hint: 'Rename or re-create the dashboard measure so it has its own identity.',
+  },
+  'rcd.query.duplicate_measure_name': {
+    message: 'A dashboard measure has the same name as one in the model.',
+    hint: 'Rename the dashboard measure — the name would be ambiguous in formulas.',
+  },
+  'rcd.query.bad_definition': {
+    message: 'A dashboard measure this chart uses is incomplete.',
+    hint: 'Open it and give it a name, or remove it from the chart.',
+  },
 };
 
 /** All `rcd.query.too_many_*` limits share one message. */

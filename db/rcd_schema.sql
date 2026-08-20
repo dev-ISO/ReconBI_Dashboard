@@ -428,3 +428,26 @@ BEGIN
 END $EF$;
 COMMIT;
 
+START TRANSACTION;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260820161054_UserSettings') THEN
+    CREATE TABLE rcd_user_settings (
+        "UserId" character varying(128) NOT NULL,
+        "SettingsJson" jsonb NOT NULL,
+        "UpdatedAtUtc" timestamp without time zone NOT NULL,
+        CONSTRAINT "PK_rcd_user_settings" PRIMARY KEY ("UserId")
+    );
+    END IF;
+END $EF$;
+
+DO $EF$
+BEGIN
+    IF NOT EXISTS(SELECT 1 FROM "__RcdMigrationsHistory" WHERE "MigrationId" = '20260820161054_UserSettings') THEN
+    INSERT INTO "__RcdMigrationsHistory" ("MigrationId", "ProductVersion")
+    VALUES ('20260820161054_UserSettings', '10.0.8');
+    END IF;
+END $EF$;
+COMMIT;
+

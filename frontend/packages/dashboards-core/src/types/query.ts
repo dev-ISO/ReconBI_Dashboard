@@ -1,5 +1,5 @@
 // Wire mirror of POST /query and /query/values.
-import type { Aggregation } from './model';
+import type { Aggregation, Measure } from './model';
 import type { ColumnType } from './schema';
 
 export type DateBucket = 'year' | 'quarter' | 'month' | 'week' | 'day';
@@ -90,6 +90,22 @@ export interface ChartQuerySpec {
     operator: 'gt' | 'gte' | 'lt' | 'lte' | 'eq' | 'neq' | 'between' | 'in' | 'notIn';
     values: number[];
   }[];
+  /**
+   * Measure DEFINITIONS this query carries because they are not in the stored
+   * model — dashboard-scoped measures (layout doc `measures`) and personal
+   * ones. The server OVERLAYS them onto the model definition BEFORE compiling
+   * (MeasureOverlay.Merge), so they join-plan and row-filter exactly like
+   * model measures; references in `measures` stay `{ measureId }`.
+   *
+   * The overlay is rejected outright when a definition's id or NAME collides
+   * with a model measure (rcd.query.duplicate_measure_id /
+   * rcd.query.duplicate_measure_name) — a name collision would make every
+   * model expression that says [ThatName] ambiguous.
+   *
+   * Absent when the chart cites only model measures, so specs that predate
+   * dashboard measures serialize byte-identically (and keep their cache key).
+   */
+  definitions?: Measure[] | null;
 }
 
 export interface QueryColumn {
@@ -110,6 +126,28 @@ export interface QueryColumn {
 
 export type CellValue = string | number | boolean | null;
 
+/**
+ * ONE measure the engine could not compile and CONTAINED rather than failed
+ * on: its result column is kept (a tombstone selecting NULL under the original
+ * alias) so every other series, every positional sort target and every
+ * column-keyed format map still points where it did, and only THAT series
+ * renders empty.
+ *
+ * The client's job is to say so out loud — a blank series with no explanation
+ * is the outcome this exists to avoid — and to offer a way to fix the measure.
+ *
+ * `index` is the position in the request's `measures[]`, which is also what the
+ * result column name ("meas{index}") and the wire issue path ("measures[i]")
+ * address. Absent on older servers.
+ */
+export interface MeasureFailure {
+  index: number;
+  /** The measure's display label, as the result plan would have labeled it. */
+  label: string;
+  code: string;
+  message: string;
+}
+
 export interface QueryResult {
   columns: QueryColumn[];
   rows: CellValue[][];
@@ -119,6 +157,12 @@ export interface QueryResult {
     elapsedMs: number;
     warnings: { code: string; message: string }[];
     sql: string | null;
+    /**
+     * Per-measure compile failures the engine contained (see MeasureFailure).
+     * OPTIONAL: a server that predates per-measure isolation omits it, and a
+     * successful query omits it too — treat absent and empty identically.
+     */
+    measureFailures?: MeasureFailure[] | null;
   };
 }
 

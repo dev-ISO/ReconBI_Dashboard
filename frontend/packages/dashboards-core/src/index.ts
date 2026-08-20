@@ -23,6 +23,8 @@ export type {
   UnderlyingQueryBody,
   UnderlyingQueryResult,
   RcdMeta,
+  RcdUserSettings,
+  RcdUserSettingsDoc,
   SendDashboardOpBody,
   SendDashboardOpResult,
   DashboardTileLockResult,
@@ -54,7 +56,22 @@ export type {
   RemoteCursor,
   RemoteTileLock,
 } from './state/dashboardStore';
+export {
+  UserSettingsStore,
+  USER_SETTINGS_DEBOUNCE_MS,
+  USER_SETTINGS_VERSION,
+} from './state/userSettingsStore';
+export type { UserSettingsState, UserSettingsStoreOptions } from './state/userSettingsStore';
 export { applyOpToDoc, diffLayoutDocs, invertLocalOp } from './state/collabOps';
+export {
+  chartMeasureDefinitions,
+  chartMeasureIds,
+  collectMeasureDefinitions,
+  expressionReferenceNames,
+  mergeMeasureDefinitions,
+  nextMeasureCopyName,
+} from './state/measureScope';
+export type { MeasureMergeResult } from './state/measureScope';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
 

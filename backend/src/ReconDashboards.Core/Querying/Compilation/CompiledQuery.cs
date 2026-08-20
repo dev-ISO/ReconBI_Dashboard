@@ -26,6 +26,23 @@ public sealed record ResultColumnPlan(
 
 public sealed record EngineWarning(string Code, string Message);
 
+/// <summary>
+/// One measure that failed to compile and was replaced by a TOMBSTONE — a
+/// column that selects NULL under the same alias and keeps its
+/// <see cref="ResultColumnPlan"/>, so the surviving series still render and
+/// every positional reference (result column name "meas{Index}", sort targets,
+/// having indexes, the table's column-keyed format maps) still points where the
+/// caller aimed it.
+///
+/// <paramref name="Index"/> is the WIRE index into ChartQuerySpec.Measures, the
+/// same index space <see cref="QueryCompilationException.Path"/> uses
+/// ("measures[1]"). Label is the measure's name as the caller would recognize
+/// it (alias, else the definition's name, else "Measure n"). Code/Message are
+/// the compilation failure verbatim — the same rcd.query.* code and sentence the
+/// caller would have received had the whole query failed.
+/// </summary>
+public sealed record MeasureFailure(int Index, string Label, string Code, string Message);
+
 public sealed record CompiledQuery(
     string Sql,
     IReadOnlyList<QueryParameter> Parameters,
@@ -45,7 +62,18 @@ public sealed record CompiledQuery(
     /// work (Top-N + window calcs, whose base must hold EXACTLY n rows). The
     /// query service folds it into Truncated and strips the cell off every row.
     /// </summary>
-    bool HasTruncationProbe = false);
+    bool HasTruncationProbe = false,
+    /// <summary>
+    /// Measures that failed to compile and were tombstoned by
+    /// <see cref="Execution.ChartQueryService"/>'s per-measure isolation. Null
+    /// (the overwhelmingly common case) means every measure compiled; read it
+    /// through <see cref="FailedMeasures"/>.
+    /// </summary>
+    IReadOnlyList<MeasureFailure>? MeasureFailures = null)
+{
+    /// <summary>Tombstoned measures, empty when the whole query compiled.</summary>
+    public IReadOnlyList<MeasureFailure> FailedMeasures => MeasureFailures ?? [];
+}
 
 /// <summary>
 /// Compilation failure with a stable code (QRY_DISCONNECTED,

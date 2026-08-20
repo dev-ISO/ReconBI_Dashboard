@@ -254,6 +254,21 @@ public sealed record DashboardActivityResponse(IReadOnlyList<ActivityEntryRespon
 
 public sealed record RcdUserResponse(string Id, string DisplayName, string? Email);
 
+/// <summary>
+/// PUT user-settings body. The document travels as REAL JSON, not a string —
+/// same convention as SaveDashboardRequest.Layout — so the wire stays readable
+/// and the client never double-encodes. There is deliberately no user id field:
+/// the caller's own id is the only one this endpoint will ever write.
+/// </summary>
+public sealed record SaveUserSettingsRequest(JsonElement Settings);
+
+/// <summary>
+/// GET/PUT user-settings response: the stored document re-emitted verbatim,
+/// plus when it was last written (null for a caller who has never saved — the
+/// empty default, which is a normal 200, never a 404).
+/// </summary>
+public sealed record UserSettingsResponse(JsonElement Settings, DateTime? UpdatedAtUtc);
+
 /// <summary>POST /query/underlying body. MaxRows defaults to 1000 and clamps to [1, 10000].</summary>
 public sealed record UnderlyingRequest(ChartQuerySpec Spec, int? MaxRows = null);
 
@@ -269,12 +284,25 @@ public sealed record QueryColumnDto(
 
 public sealed record QueryWarningDto(string Code, string Message);
 
+/// <summary>
+/// One measure that failed to compile and was TOMBSTONED: its result column is
+/// still there (same "meas{index}" name, same label, same position) and selects
+/// NULL, so the chart's other series render normally. Index is the wire index
+/// into the request's measures, so the client can point at the exact field.
+/// </summary>
+public sealed record QueryMeasureFailureDto(int Index, string Label, string Code, string Message);
+
 public sealed record QueryMetaDto(
     int RowCount,
     bool Truncated,
     int ElapsedMs,
     IReadOnlyList<QueryWarningDto> Warnings,
-    string? Sql);
+    string? Sql,
+    /// <summary>
+    /// Empty on a fully successful query. Non-empty means the response is
+    /// PARTIAL: the named measures are blank, everything else is real data.
+    /// </summary>
+    IReadOnlyList<QueryMeasureFailureDto>? MeasureFailures = null);
 
 public sealed record QueryResponse(
     IReadOnlyList<QueryColumnDto> Columns,
@@ -353,6 +381,12 @@ public static class DtoMapping
             .Select(w => new QueryWarningDto(w.Code, w.Message))
             .ToArray();
 
+        var measureFailures = outcome.Compiled.FailedMeasures.Count == 0
+            ? null
+            : outcome.Compiled.FailedMeasures
+                .Select(f => new QueryMeasureFailureDto(f.Index, f.Label, f.Code, f.Message))
+                .ToArray();
+
         return new QueryResponse(
             columns,
             outcome.Rows,
@@ -361,6 +395,7 @@ public static class DtoMapping
                 outcome.Truncated,
                 outcome.ElapsedMs,
                 warnings,
-                includeSql ? outcome.Compiled.Sql : null));
+                includeSql ? outcome.Compiled.Sql : null,
+                measureFailures));
     }
 }

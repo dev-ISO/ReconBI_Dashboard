@@ -1,4 +1,5 @@
 using System.Text;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using ReconDashboards.Core.Abstractions;
 using ReconDashboards.Core.Modeling;
@@ -156,7 +157,12 @@ public sealed class DataModelService(
                 ServiceErrorKind.NotFound, "rcd.model.not_found", $"Model {id} does not exist or is not visible to you.");
         }
 
-        if (IsSystemOwner(record.OwnerUserId))
+        // A system-owned (seeded) model is read-only, with ONE carve-out: a
+        // caller who may manage shared content can edit its MEASURES. See
+        // SystemMeasureEditRefusal below — everything else about the model
+        // stays immutable, and everyone else still gets the flat refusal.
+        var systemModel = IsSystemOwner(record.OwnerUserId);
+        if (systemModel && !currentUser.CanManageShared)
         {
             return SystemReadOnly<SemanticModel>();
         }
@@ -185,6 +191,12 @@ public sealed class DataModelService(
         if (!prepared.Succeeded)
         {
             return ServiceResult<SemanticModel>.Fail(prepared.Error!);
+        }
+
+        if (systemModel
+            && SystemMeasureEditRefusal(record, request, prepared.Value!) is { } refusal)
+        {
+            return refusal;
         }
 
         if (await NameTakenAsync(record.OwnerUserId, request.Name, excludeId: id, ct))
@@ -403,6 +415,68 @@ public sealed class DataModelService(
                 && m.Name == trimmed
                 && (excludeId == null || m.Id != excludeId),
             ct);
+    }
+
+    /// <summary>
+    /// *** THE SYSTEM-SCOPE AUTHORING CARVE-OUT ***
+    ///
+    /// A seeded model is owned by SystemOwnerUserId and refuses every write, so
+    /// until now a System-scope measure could only be created by hand-editing
+    /// the seed JSON and re-seeding. This opens exactly one door and no other:
+    /// a caller with CanManageShared may change the model's MEASURES.
+    ///
+    /// The check is by construction rather than by enumeration — the incoming
+    /// definition and the stored one are normalized through
+    /// <see cref="ModelJson"/> with their measures blanked and compared as
+    /// text. Anything else that differs (tables, column overrides, hidden
+    /// flags, relationships, date tables, the version, and off the definition:
+    /// name, description, data source, sharing) fails, and it keeps failing if
+    /// someone later adds a field to ModelDefinition — a new field is covered
+    /// the day it is added, with no second place to remember.
+    ///
+    /// Returns null when the edit is allowed; otherwise the refusal:
+    ///  - rcd.model.system_measures_only — a non-measure part changed.
+    ///  - rcd.model.system_readonly — nothing about the measures changed, so
+    ///    this is not the carve-out's business and the model is what it has
+    ///    always been: read-only. (This is also what keeps the pinned
+    ///    DashboardSharingTests.SystemModel_UpdateAndDeleteReadOnly_ButDuplicateAllowed
+    ///    green: it re-saves a system model UNCHANGED as an admin.)
+    /// </summary>
+    private static ServiceResult<SemanticModel>? SystemMeasureEditRefusal(
+        DataModelRecord record, ModelSaveRequest request, ModelDefinition incoming)
+    {
+        var stored = ModelJson.TryDeserialize(record.DefinitionJson, out _);
+        if (stored is null)
+        {
+            // A corrupt seeded definition cannot be diffed, so nothing can be
+            // proven about what the request changes. Fail closed.
+            return SystemReadOnly<SemanticModel>();
+        }
+
+        var identityUnchanged =
+            string.Equals(record.Name, request.Name.Trim(), StringComparison.Ordinal)
+            && string.Equals(record.Description, request.Description, StringComparison.Ordinal)
+            && string.Equals(record.DataSourceName, request.DataSourceName, StringComparison.Ordinal)
+            && record.IsShared == request.IsShared;
+
+        var structureUnchanged = string.Equals(
+            ModelJson.Serialize(stored with { Measures = [] }),
+            ModelJson.Serialize(incoming with { Measures = [] }),
+            StringComparison.Ordinal);
+
+        if (!identityUnchanged || !structureUnchanged)
+        {
+            return ServiceResult<SemanticModel>.Fail(
+                ServiceErrorKind.Forbidden, "rcd.model.system_measures_only",
+                "This is a built-in model: only its measures can be edited. Tables, relationships, date tables, its name and its sharing are managed by the application — make a copy to change them.");
+        }
+
+        var measuresChanged = !string.Equals(
+            JsonSerializer.Serialize(stored.Measures, ModelJson.Options),
+            JsonSerializer.Serialize(incoming.Measures, ModelJson.Options),
+            StringComparison.Ordinal);
+
+        return measuresChanged ? null : SystemReadOnly<SemanticModel>();
     }
 
     private static ServiceResult<T> SystemReadOnly<T>() =>

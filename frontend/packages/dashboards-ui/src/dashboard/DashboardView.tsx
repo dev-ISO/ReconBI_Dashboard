@@ -980,7 +980,12 @@ export function DashboardView({
       // Table measure-column filters (HAVING) ride the exported spec too, so
       // the CSV matches exactly what the filtered table shows.
       const having = effective?.having ?? null;
-      const wire = toWireSpec(chart, state.current.modelId, clauses);
+      const wire = toWireSpec(
+        chart,
+        state.current.modelId,
+        clauses,
+        runtime.dashboards.definitionsForChart(chart),
+      );
       try {
         const { blob, truncated } = await runtime.api.exportQueryCsv({
           spec: having !== null && having.length > 0 ? { ...wire, having } : wire,
@@ -1147,7 +1152,12 @@ export function DashboardView({
       tileId,
       title: chart.title,
       contextLabel: label,
-      spec: toWireSpec(chart, state.current.modelId, clauses),
+      spec: toWireSpec(
+        chart,
+        state.current.modelId,
+        clauses,
+        runtime.dashboards.definitionsForChart(chart),
+      ),
     });
   }, [pointMenu, runtime]);
 
@@ -1517,7 +1527,15 @@ export function DashboardView({
         if (!tile || !isChartTile(tile) || !isRunnable(tile.chart)) continue;
         keys.push(
           runtime.queries.keyFor(
-            toWireSpec(tile.chart, inputs.modelId, inputs.filtersByTile.get(id) ?? NO_FILTERS),
+            // Must reproduce ChartTile's key EXACTLY — definitions included,
+            // or targeted refresh drops a slot nothing occupies and the tile
+            // never refetches.
+            toWireSpec(
+              tile.chart,
+              inputs.modelId,
+              inputs.filtersByTile.get(id) ?? NO_FILTERS,
+              runtime.dashboards.definitionsForChart(tile.chart),
+            ),
           ),
         );
       }

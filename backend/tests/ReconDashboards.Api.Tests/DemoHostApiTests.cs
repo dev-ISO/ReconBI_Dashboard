@@ -437,6 +437,81 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
         Assert.Contains("SELECT", sql, StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>
+    /// PER-MEASURE ISOLATION ON THE WIRE. A chart that cites a measure the
+    /// model no longer has is a 200 with a partial result, not a 400: the
+    /// healthy series render, the broken one is a blank column at its original
+    /// position, and meta.measureFailures names it so the client can say which
+    /// field to fix instead of showing an unexplained empty series.
+    /// </summary>
+    [Fact]
+    public async Task Query_WithOneBrokenMeasure_Returns200WithTheOtherSeriesAndNamesTheFailure()
+    {
+        var client = _factory.AsUser("alice");
+        var modelId = await CreateModelAsync(client, UniqueName("Partial Query Model"));
+
+        var response = await client.PostAsJsonAsync(Query, new
+        {
+            modelId,
+            dimensions = new object[] { new { table = "public.customers", column = "region" } },
+            measures = new object[]
+            {
+                new { table = "public.orders", column = "order_total", aggregation = "sum" },
+                new { measureId = Guid.NewGuid(), alias = "Margin %" },
+            },
+            filters = Array.Empty<object>(),
+            sort = Array.Empty<object>(),
+        });
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await ReadJsonAsync(response);
+
+        // Both measure columns are present, in their original positions.
+        var columns = json["columns"]!.AsArray();
+        Assert.Equal(3, columns.Count);
+        Assert.Equal("meas1", columns[2]!["name"]!.GetValue<string>());
+        Assert.Equal("Margin %", columns[2]!["label"]!.GetValue<string>());
+
+        var failure = Assert.Single(json["meta"]!["measureFailures"]!.AsArray());
+        Assert.Equal(1, failure!["index"]!.GetValue<int>());
+        Assert.Equal("Margin %", failure["label"]!.GetValue<string>());
+        Assert.Equal("rcd.query.unknown_measure", failure["code"]!.GetValue<string>());
+        Assert.False(string.IsNullOrWhiteSpace(failure["message"]!.GetValue<string>()));
+    }
+
+    [Fact]
+    public async Task Query_WithEveryMeasureBroken_IsStillA400()
+    {
+        var client = _factory.AsUser("alice");
+        var modelId = await CreateModelAsync(client, UniqueName("Fully Broken Query Model"));
+
+        var response = await client.PostAsJsonAsync(Query, new
+        {
+            modelId,
+            dimensions = new object[] { new { table = "public.customers", column = "region" } },
+            measures = new object[] { new { measureId = Guid.NewGuid(), alias = "Gone" } },
+            filters = Array.Empty<object>(),
+            sort = Array.Empty<object>(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        var json = await ReadJsonAsync(response);
+        Assert.Equal("rcd.query.unknown_measure", json["errorCode"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task Query_WithNothingBroken_OmitsMeasureFailuresEntirely()
+    {
+        var client = _factory.AsUser("alice");
+        var modelId = await CreateModelAsync(client, UniqueName("Clean Query Model"));
+
+        var response = await client.PostAsJsonAsync(Query, RegionTotalQuery(modelId));
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var json = await ReadJsonAsync(response);
+        Assert.True(json["meta"]!["measureFailures"] is null);
+    }
+
     [Fact]
     public async Task Query_AgainstAnotherUsersPrivateModel_Returns404()
     {

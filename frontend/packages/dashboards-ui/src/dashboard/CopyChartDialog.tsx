@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertTriangle, Check, CheckCircle2, LayoutDashboard } from 'lucide-react';
+import { AlertTriangle, Check, CheckCircle2, LayoutDashboard, Sigma } from 'lucide-react';
 import {
   dashboardAccessOf,
   rcdErrorMessage,
@@ -74,6 +74,13 @@ export function CopyChartDialog({
   );
   const selected = targets.find((t) => t.id === selectedId) ?? null;
   const modelMismatch = selected !== null && selected.modelId !== sourceModelId;
+  // Scoped (dashboard/personal) measures the chart cites travel WITH it — say
+  // how many, because they land in the target dashboard as its own measures
+  // and that is a real edit to somebody else's dashboard.
+  const measureCarryCount = useMemo(
+    () => (chart ? runtime.dashboards.measureCarryCount(chart) : 0),
+    [chart, runtime],
+  );
 
   const copy = async () => {
     if (!chart || selected === null) return;
@@ -179,6 +186,17 @@ export function CopyChartDialog({
               );
             })}
           </div>
+
+          {measureCarryCount > 0 && (
+            <p className="flex items-start gap-1.5 text-xs text-rcd-text-2">
+              <Sigma size={13} aria-hidden className="mt-[1px] shrink-0 text-rcd-muted" />
+              <span>
+                {measureCarryCount === 1
+                  ? '1 measure this chart uses belongs to this dashboard and will be copied across too.'
+                  : `${measureCarryCount} measures this chart uses belong to this dashboard and will be copied across too.`}
+              </span>
+            </p>
+          )}
 
           {modelMismatch && (
             <p className="flex items-start gap-1.5 text-xs text-[var(--rcd-status-warn)]" role="alert">

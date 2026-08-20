@@ -223,7 +223,12 @@ export function SeeDataDialog({
       try {
         if (request.kind === 'aggregated') {
           if (modelId === null) throw new Error('No model attached to this dashboard.');
-          const base = toWireSpec(request.chart, modelId, request.filters);
+          const base = toWireSpec(
+            request.chart,
+            modelId,
+            request.filters,
+            runtime.dashboards.definitionsForChart(request.chart),
+          );
           const spec =
             request.having !== null && request.having.length > 0
               ? { ...base, having: request.having }

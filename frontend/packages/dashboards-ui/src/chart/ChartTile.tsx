@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ComponentType } from 'react';
-import { AlertTriangle, BarChart3, RefreshCw } from 'lucide-react';
+import { AlertTriangle, BarChart3, RefreshCw, Sigma } from 'lucide-react';
 import {
+  chartMeasureDefinitions,
   isRunnable,
   toWireSpec,
   type CellValue,
@@ -8,9 +9,11 @@ import {
   type ChartQuerySpec,
   type ChartSpec,
   type FilterClause,
+  type Measure,
+  type MeasureFailure,
   type QueryResult,
 } from '@recon/dashboards-core';
-import { useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
+import { useDashboardState, useQueryCacheState, useRuntime } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
 import { ChartLoadingSkeleton, TileUpdatingBar } from '../dashboard/ChartLoadingSkeleton';
 import { queryErrorTextFor } from './queryErrorText';
@@ -186,6 +189,12 @@ export interface ChartTileProps {
    * column names onto wire dimension/measure indices and to derive page count.
    */
   onResult?: (result: QueryResult) => void;
+  /**
+   * Offered next to the per-measure failure notice (D3). Absent = the notice
+   * still names the broken measure, it just has no shortcut — a viewer with no
+   * authoring rights, or a surface with nowhere to open an editor.
+   */
+  onEditMeasure?: (failure: MeasureFailure) => void;
 }
 
 const EMPTY_FILTERS: FilterClause[] = [];
@@ -230,17 +239,24 @@ export function ChartTile({
   onTableFilterChange,
   onRequestColumnValues,
   onResult,
+  onEditMeasure,
 }: ChartTileProps) {
   const runtime = useRuntime();
   const runnable = isRunnable(spec);
+  // Scoped (dashboard/personal) measure definitions are part of the query, so
+  // they are subscribed to — editing a dashboard measure must change the cache
+  // key and refetch, exactly like editing a filter would.
+  const docMeasures = useDashboardState((state) => state.current?.layout.measures ?? null);
+  const personalMeasures = useDashboardState((state) => state.personalMeasures);
   const wireSpec = useMemo(() => {
     if (!runnable) return null;
-    const base = toWireSpec(spec, modelId, filters);
+    const scoped: Measure[] = [...(docMeasures ?? []), ...personalMeasures];
+    const base = toWireSpec(spec, modelId, filters, chartMeasureDefinitions(scoped, spec));
     // Offset and having ride the wire spec directly (ChartQuery carries
     // neither); both participate in the cache key like every other spec field.
     const withOffset = offset != null && offset > 0 ? { ...base, offset } : base;
     return having != null && having.length > 0 ? { ...withOffset, having } : withOffset;
-  }, [spec, modelId, filters, offset, having, runnable]);
+  }, [spec, modelId, filters, offset, having, runnable, docMeasures, personalMeasures]);
   const cacheKey = wireSpec ? runtime.queries.keyFor(wireSpec) : null;
   const entry = useQueryCacheState((state) => (cacheKey ? state.entries[cacheKey] : undefined));
   const [retryToken, setRetryToken] = useState(0);
@@ -317,10 +333,14 @@ export function ChartTile({
     result: QueryResult,
     updating: boolean,
   ) => (
-    <div className="relative h-full w-full min-w-0 overflow-hidden">
+    <div className="relative flex h-full w-full min-w-0 flex-col overflow-hidden">
       {updating && <TileUpdatingBar />}
+      <MeasureFailureNotice
+        failures={measureFailuresOf(result)}
+        onEditMeasure={onEditMeasure}
+      />
       <div
-        className={`h-full w-full transition-opacity duration-150 ${
+        className={`min-h-0 w-full flex-1 transition-opacity duration-150 ${
           updating ? 'opacity-60' : 'opacity-100'
         }`}
       >
@@ -395,11 +415,81 @@ export function ChartTile({
       spec.type === 'table' &&
       ((tableFilters?.length ?? 0) > 0 || (having?.length ?? 0) > 0);
     if (!tableFiltersActive) {
-      return <State icon={<BarChart3 size={22} className="text-rcd-muted" />}>No data for this selection.</State>;
+      const empty = (
+        <State icon={<BarChart3 size={22} className="text-rcd-muted" />}>
+          No data for this selection.
+        </State>
+      );
+      // A broken measure can leave a result with no rows at all. The empty
+      // state alone would then be a lie by omission — "no data" reads as "the
+      // filters matched nothing", not "the formula did not compile".
+      const failures = measureFailuresOf(result);
+      if (failures.length === 0) return empty;
+      return (
+        <div className="flex h-full min-h-0 w-full flex-col">
+          <MeasureFailureNotice failures={failures} onEditMeasure={onEditMeasure} />
+          <div className="min-h-0 flex-1">{empty}</div>
+        </div>
+      );
     }
   }
 
   return renderChart(spec, result, false);
+}
+
+/** Per-measure compile failures the server contained; [] when there are none. */
+const measureFailuresOf = (result: QueryResult): MeasureFailure[] =>
+  result.meta.measureFailures ?? [];
+
+/**
+ * D3 — THE BLANK SERIES GETS A NAME.
+ *
+ * When the engine cannot compile one measure it substitutes a tombstone: every
+ * other series renders, and the broken one comes back empty. Without this the
+ * user sees a chart that is quietly missing a line and has no way to learn
+ * which one, or why. The notice is non-modal and sits ABOVE the chart — the
+ * data that DID come back is still the point of the tile, so it is never
+ * covered or replaced.
+ */
+function MeasureFailureNotice({
+  failures,
+  onEditMeasure,
+}: {
+  failures: MeasureFailure[];
+  onEditMeasure?: (failure: MeasureFailure) => void;
+}) {
+  if (failures.length === 0) return null;
+  return (
+    <div
+      role="status"
+      aria-label="Measure errors"
+      data-testid="rcd-measure-failures"
+      className="mb-1 flex shrink-0 flex-col gap-0.5 rounded-md border border-[color-mix(in_srgb,var(--rcd-status-warn)_45%,transparent)] bg-[color-mix(in_srgb,var(--rcd-status-warn)_10%,transparent)] px-2 py-1"
+    >
+      {failures.map((failure) => (
+        <div key={failure.index} className="flex items-start gap-1.5 text-[11px] leading-snug">
+          <Sigma
+            size={11}
+            aria-hidden
+            className="mt-[2px] shrink-0 text-[var(--rcd-status-warn)]"
+          />
+          <span className="min-w-0 flex-1 break-words text-rcd-text-2">
+            <span className="font-medium text-rcd-text">{failure.label}</span> could not be
+            calculated, so it is empty here. {failure.message}
+          </span>
+          {onEditMeasure && (
+            <button
+              type="button"
+              onClick={() => onEditMeasure(failure)}
+              className="shrink-0 rounded px-1 py-0.5 text-[11px] font-medium text-rcd-accent hover:bg-black/5 dark:hover:bg-white/10"
+            >
+              Edit measure
+            </button>
+          )}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function State({ icon, children }: { icon: React.ReactNode; children: React.ReactNode }) {

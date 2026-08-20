@@ -12,9 +12,10 @@ import type {
   DashboardLayoutDoc,
   DashboardTile,
 } from '../types/dashboard';
+import type { Measure } from '../types/model';
 import type { DashboardOpEvent, DashboardOpPayload } from '../types/ops';
 import { OP_TARGET_MISSING_ERROR, TILE_LOCKED_ERROR } from '../types/ops';
-import { diffLayoutDocs } from './collabOps';
+import { applyOpToDoc, diffLayoutDocs, invertLocalOp } from './collabOps';
 import { DashboardStore } from './dashboardStore';
 
 const chartFor = (id = 'chart-1', title = 'Orders'): ChartSpec => ({
@@ -1159,5 +1160,79 @@ describe('quiesce + cursor toggle (Live menu)', () => {
     store.setShowLiveCursors(true);
     store.sendCursorThrottled('p1', 0.7, 0.7);
     expect(onSendCursor).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Dashboard-scoped measures ride the id-keyed doc-element vocabulary.
+ *
+ * *** WITHOUT 'measures' IN DocElementField / DOC_ELEMENT_FIELDS /
+ * DashboardOpApplier.ElementFields, diffLayoutDocs EMITS NOTHING FOR A MEASURE
+ * EDIT — live mode has no whole-doc save, so the edit is silently LOST. ***
+ * Per-element LWW, undo/redo and inversion then come free, exactly as they do
+ * for filter cards, because Measure already has the `id` DocElement requires.
+ */
+describe('dashboard measures in the op vocabulary', () => {
+  const measure = (id: string, name: string, column = 'total'): Measure => ({
+    id,
+    name,
+    table: 'public.orders',
+    aggregation: 'sum',
+    column,
+  });
+
+  it('emits a docElementUpsert when a measure is added', () => {
+    const before = layoutWith();
+    const after = layoutWith({ measures: [measure('m1', 'Revenue')] });
+
+    const ops = diffLayoutDocs(before, after);
+
+    expect(ops).toHaveLength(1);
+    expect(ops[0]!.payload).toEqual({
+      kind: 'docElementUpsert',
+      field: 'measures',
+      element: measure('m1', 'Revenue'),
+    });
+    expect(ops[0]!.targetId).toBe('m1');
+    // Same class as a filter-card edit: layout, never charts.
+    expect(ops[0]!.class).toBe('layout');
+  });
+
+  it('emits one op PER measure, so concurrent edits merge instead of stomping', () => {
+    const before = layoutWith({
+      measures: [measure('m1', 'Revenue'), measure('m2', 'Cost', 'cost')],
+    });
+    const after = layoutWith({
+      measures: [measure('m1', 'Revenue', 'quantity'), measure('m2', 'Cost', 'cost')],
+    });
+
+    const ops = diffLayoutDocs(before, after);
+
+    expect(ops).toHaveLength(1);
+    expect(ops[0]!.targetId).toBe('m1');
+  });
+
+  it('emits a docElementRemove when a measure is deleted', () => {
+    const before = layoutWith({ measures: [measure('m1', 'Revenue')] });
+    const after = layoutWith({ measures: [] });
+
+    const ops = diffLayoutDocs(before, after);
+
+    expect(ops[0]!.payload).toEqual({ kind: 'docElementRemove', field: 'measures' });
+    expect(ops[0]!.targetId).toBe('m1');
+  });
+
+  it('applies and inverts round-trip (undo/redo comes free)', () => {
+    const before = layoutWith({ measures: [measure('m1', 'Revenue')] });
+    const after = layoutWith({ measures: [measure('m1', 'Revenue', 'quantity')] });
+
+    const op = diffLayoutDocs(before, after)[0]!;
+    const applied = applyOpToDoc(before, op.targetId, op.payload);
+    expect(applied!.measures).toEqual(after.measures);
+
+    const inverse = invertLocalOp(before, op)!;
+    expect(applyOpToDoc(applied!, inverse.targetId, inverse.payload)!.measures).toEqual(
+      before.measures,
+    );
   });
 });

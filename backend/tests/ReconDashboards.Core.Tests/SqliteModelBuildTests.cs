@@ -88,6 +88,54 @@ public class SqliteModelBuildTests
         }
     }
 
+    // rcd_user_settings maps SettingsJson to jsonb ONLY on Npgsql. The whole
+    // point of the provider-conditional column type is that the model still
+    // builds — and round-trips — here, because the host test suites run on
+    // SQLite. A regression would surface as EnsureCreated throwing, which is
+    // exactly what these two pin.
+
+    [Fact]
+    public async Task UserSettingsRecordRoundTripsThroughSqlite()
+    {
+        var (connection, db) = CreateContext();
+        using (connection)
+        using (db)
+        {
+            var record = new UserSettingsRecord
+            {
+                UserId = "user-1",
+                SettingsJson = """{"version":1,"fieldList":{"grouping":"type"}}""",
+                UpdatedAtUtc = new DateTime(2026, 8, 20, 9, 30, 0, DateTimeKind.Utc),
+            };
+            db.UserSettings.Add(record);
+            await db.SaveChangesAsync();
+
+            using var freshContext = NewContext(connection);
+            var reloaded = await freshContext.UserSettings.AsNoTracking()
+                .SingleAsync(s => s.UserId == "user-1");
+
+            Assert.Equal(record.SettingsJson, reloaded.SettingsJson);
+            Assert.Equal(record.UpdatedAtUtc, reloaded.UpdatedAtUtc);
+        }
+    }
+
+    [Fact]
+    public async Task UserSettingsNaturalKeyRejectsASecondRowForTheSameUser()
+    {
+        var (connection, db) = CreateContext();
+        using (connection)
+        using (db)
+        {
+            db.UserSettings.Add(new UserSettingsRecord { UserId = "user-1", SettingsJson = "{}" });
+            await db.SaveChangesAsync();
+
+            using var secondContext = NewContext(connection);
+            secondContext.UserSettings.Add(new UserSettingsRecord { UserId = "user-1", SettingsJson = "{}" });
+
+            await Assert.ThrowsAsync<DbUpdateException>(() => secondContext.SaveChangesAsync());
+        }
+    }
+
     [Fact]
     public async Task FilteredUniqueIndexAllowsReusingNameOfSoftDeletedModel()
     {

@@ -26,7 +26,8 @@ public class DashboardOpServiceTests : IDisposable
             {"id":"t2","kind":"slicer","layout":{"x":4,"y":0,"w":2,"h":1},"slicer":{"table":"public.orders","column":"status"}}]},
           {"id":"p2","name":"Detail","tiles":[]}],
          "refreshSeconds":60,
-         "filterCards":[{"id":"f1","scope":"allPages"}]}
+         "filterCards":[{"id":"f1","scope":"allPages"}],
+         "measures":[{"id":"m1","name":"Revenue","table":"public.orders","aggregation":"sum","column":"order_total"}]}
         """;
 
     private static readonly DateTimeOffset Start = new(2026, 8, 19, 12, 0, 0, TimeSpan.Zero);
@@ -192,6 +193,20 @@ public class DashboardOpServiceTests : IDisposable
         {
             "FilterCardRemoved_LayoutOnly", "doc", "f1",
             """{"kind":"docElementRemove","field":"filterCards"}""",
+            "layout"
+        },
+        // Dashboard-scoped measures ride the SAME id-keyed element vocabulary
+        // as filter cards. Without "measures" in the applier's ElementFields
+        // (and the client's DOC_ELEMENT_FIELDS) a live-mode measure edit emits
+        // no op at all and is silently lost.
+        {
+            "DashboardMeasureEdited_LayoutOnly", "doc", "m1",
+            """{"kind":"docElementUpsert","field":"measures","element":{"id":"m1","name":"Revenue","table":"public.orders","aggregation":"sum","column":"order_total","formatString":"#,##0"}}""",
+            "layout"
+        },
+        {
+            "DashboardMeasureRemoved_LayoutOnly", "doc", "m1",
+            """{"kind":"docElementRemove","field":"measures"}""",
             "layout"
         },
     };

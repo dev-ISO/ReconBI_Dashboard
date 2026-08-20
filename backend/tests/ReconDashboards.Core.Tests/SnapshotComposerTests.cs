@@ -505,6 +505,93 @@ public sealed class SnapshotComposerTests : IDisposable
         Assert.Equal(3, composed.InlineImages.Select(i => i.ContentId).Distinct().Count());
     }
 
+    // ------------------------------------------- per-measure error isolation
+
+    /// <summary>
+    /// A chart tile with a healthy measure AND a reference to a measure the
+    /// model does not have — the shape a dashboard takes on the moment someone
+    /// deletes or breaks a formula that a saved chart still cites.
+    /// </summary>
+    private static string TwoMeasureTileWithOneBroken(string id, string title) => $$"""
+        { "id": "{{id}}", "kind": "chart", "chart": { "id": "c-{{id}}", "type": "table",
+          "title": "{{title}}", "query": {
+            "axis": { "table": "public.customers", "column": "region" },
+            "measures": [
+              { "table": "public.orders", "column": "order_total", "aggregation": "sum" },
+              { "measureId": "{{Guid.NewGuid()}}", "alias": "Margin %" }],
+            "filters": [] } } }
+        """;
+
+    /// <summary>A tile whose ONLY measure is broken: nothing left to render.</summary>
+    private static string OnlyBrokenMeasureTile(string id, string title) => $$"""
+        { "id": "{{id}}", "kind": "chart", "chart": { "id": "c-{{id}}", "type": "table",
+          "title": "{{title}}", "query": {
+            "axis": { "table": "public.customers", "column": "region" },
+            "measures": [{ "measureId": "{{Guid.NewGuid()}}", "alias": "Gone" }],
+            "filters": [] } } }
+        """;
+
+    /// <summary>
+    /// *** THE OWNER'S RULE AT THE EMAIL LAYER: "malformed measures should
+    /// degrade individually and never affect all tiles." ***
+    ///
+    /// Email goes through ChartQueryService.RunAsync (SnapshotComposer:100), so
+    /// it inherits per-measure isolation with no scheduling code of its own —
+    /// this test is what proves that inheritance is real and keeps it real. The
+    /// tile with the broken measure still renders its healthy series, and the
+    /// send is not disturbed.
+    /// </summary>
+    [Fact]
+    public async Task OneBrokenMeasureDoesNotBlankItsTileOrAnyOtherTileOfTheEmail()
+    {
+        var dashboard = Dashboard(Layout(
+            TwoMeasureTileWithOneBroken("t1", "Sales and margin"),
+            ChartTile("t2", "Sales by region", "table")));
+
+        var composed = await ComposeAsync(dashboard, content: null);
+
+        // Both tiles are present and NEITHER is an error tile (the composer
+        // renders a failed tile as the red note and nothing else).
+        Assert.Contains("Sales and margin", composed.Html, StringComparison.Ordinal);
+        Assert.Contains("Sales by region", composed.Html, StringComparison.Ordinal);
+        Assert.DoesNotContain("color:#b91c1c", composed.Html, StringComparison.Ordinal);
+
+        // The healthy tile's data is intact, and the degraded tile still shows
+        // its axis and its working measure.
+        Assert.Equal(2, _executor.Count);
+        Assert.Contains("<table", composed.Html, StringComparison.Ordinal);
+        Assert.Contains("Margin %", composed.Html, StringComparison.Ordinal); // the column is there, just empty
+    }
+
+    [Fact]
+    public async Task ATileWhoseEveryMeasureIsBrokenReportsItsErrorWithoutTakingTheEmailDown()
+    {
+        // The counterweight: isolation must not swallow a tile that has nothing
+        // left to show. That tile carries the error; every other tile sends.
+        var dashboard = Dashboard(Layout(
+            OnlyBrokenMeasureTile("t1", "Broken tile"),
+            ChartTile("t2", "Sales by region", "table")));
+
+        var composed = await ComposeAsync(dashboard, content: null);
+
+        Assert.Contains("color:#b91c1c", composed.Html, StringComparison.Ordinal);
+        Assert.Contains("Broken tile", composed.Html, StringComparison.Ordinal);
+        Assert.Contains("Sales by region", composed.Html, StringComparison.Ordinal);
+        Assert.Contains("<table", composed.Html, StringComparison.Ordinal); // the healthy tile still rendered
+    }
+
+    [Fact]
+    public async Task TheCsvAttachmentAlsoSurvivesABrokenMeasure()
+    {
+        var dashboard = Dashboard(Layout(TwoMeasureTileWithOneBroken("t1", "Sales and margin")));
+
+        var composed = await ComposeAsync(
+            dashboard, content: null, format: SubscriptionFormat.Csv);
+
+        Assert.NotNull(composed.Csv);
+        Assert.Contains("Sales and margin", composed.Csv, StringComparison.Ordinal);
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /// <summary>Runs the tiles the way the composer does, for the byte-comparison test.</summary>

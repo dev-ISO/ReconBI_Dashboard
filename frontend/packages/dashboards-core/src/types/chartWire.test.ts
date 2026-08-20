@@ -14,6 +14,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { DimensionRef, SortSpec } from './query';
+import type { Measure } from './model';
+import { stableStringify } from '../util/hash';
 import { isMatrixChart, toWireSpec, type ChartSpec, type ChartType } from './chart';
 
 const dim = (column: string): DimensionRef => ({ table: 'public.orders', column });
@@ -145,5 +147,38 @@ describe('toWireSpec matrix sort', () => {
     expect(wire.measures).toEqual(spec.query.measures);
     expect(wire.filters).toHaveLength(1);
     expect(wire.limit).toBe(25);
+  });
+});
+
+describe('toWireSpec measure definitions', () => {
+  const DEFINITION: Measure = {
+    id: 'm1',
+    name: 'Dashboard Revenue',
+    table: 'public.orders',
+    aggregation: 'sum',
+    column: 'total',
+  };
+
+  it('forwards definitions when the chart carries scoped measures', () => {
+    const wire = toWireSpec(specOf('column'), 1, [], [DEFINITION]);
+    expect(wire.definitions).toEqual([DEFINITION]);
+  });
+
+  it('omits the key entirely when there are none, so cache identity is unchanged', () => {
+    // stableStringify(spec) IS the query cache key, so an always-present
+    // `definitions: []` would silently invalidate every existing cache entry.
+    const spec = specOf('column');
+    expect('definitions' in toWireSpec(spec, 1)).toBe(false);
+    expect('definitions' in toWireSpec(spec, 1, [], [])).toBe(false);
+    expect('definitions' in toWireSpec(spec, 1, [], null)).toBe(false);
+    expect(stableStringify(toWireSpec(spec, 1, [], []))).toBe(stableStringify(toWireSpec(spec, 1)));
+  });
+
+  it('changes the cache key when a definition changes', () => {
+    const spec = specOf('column');
+    const edited: Measure = { ...DEFINITION, column: 'quantity' };
+    expect(stableStringify(toWireSpec(spec, 1, [], [DEFINITION]))).not.toBe(
+      stableStringify(toWireSpec(spec, 1, [], [edited])),
+    );
   });
 });

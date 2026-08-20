@@ -77,6 +77,13 @@ import type {
   FilterValue,
 } from '../types/query';
 import type { ColumnType } from '../types/schema';
+import type { Measure } from '../types/model';
+import {
+  chartMeasureDefinitions,
+  chartMeasureIds,
+  collectMeasureDefinitions,
+  mergeMeasureDefinitions,
+} from './measureScope';
 import { stableStringify } from '../util/hash';
 import { newId } from '../util/ids';
 import { sanitizeButtonCss } from '../util/buttonStyle';
@@ -314,7 +321,26 @@ export interface DashboardStoreState {
    * survives closing/opening dashboards within the session so a chart copied
    * on one dashboard can be pasted on another.
    */
-  chartClipboard: { chart: ChartSpec; sourceModelId: number | null } | null;
+  chartClipboard: {
+    chart: ChartSpec;
+    sourceModelId: number | null;
+    /**
+     * The scoped measure DEFINITIONS the copied chart cites, snapshotted at
+     * copy time (transitively — a calculated one may reference others by
+     * name). Without them a chart pasted onto another dashboard renders
+     * QRY_UNKNOWN_MEASURE: dashboard measures live in the SOURCE doc and
+     * nothing else carries them across.
+     */
+    definitions: Measure[];
+  } | null;
+  /**
+   * PERSONAL-scope measures (the per-user settings document's `measures`).
+   * Held here so the query wire can send them and so the promotion rule can be
+   * enforced when a chart is written into a dashboard; the store never loads
+   * or persists them itself — the owner of the per-user store calls
+   * setPersonalMeasures.
+   */
+  personalMeasures: Measure[];
 }
 
 /** The subset of FilterCard a viewer may tweak transiently in view mode. */
@@ -356,6 +382,13 @@ export interface RemoteTileLock {
 export interface DashboardCollabSenders {
   onSendCursor?: (cursor: { pageId: string; xFrac: number; yFrac: number }) => void;
   onSendSlicerValue?: (value: { tileId: string; valueJson: string }) => void;
+  /**
+   * Persists the PERSONAL-scope measure set. createRuntime points this at the
+   * per-user settings document; absent, personal measures stay session-local.
+   * Not a collab channel, but this is the store's one host-seam bag and a
+   * second one would be a distinction without a difference.
+   */
+  onPersistPersonalMeasures?: (measures: Measure[]) => void;
 }
 
 /**
@@ -678,6 +711,7 @@ const initialState: DashboardStoreState = {
   saveStatus: 'idle',
   error: null,
   chartClipboard: null,
+  personalMeasures: [],
 };
 
 /** localStorage key of the per-user "Show live cursors" preference. */
@@ -2312,6 +2346,8 @@ export class DashboardStore {
       // The clipboard outlives the open dashboard on purpose — copy on one
       // dashboard, paste on the next (still never persisted).
       chartClipboard: this.state.chartClipboard,
+      // Personal measures belong to the USER, not to the open dashboard.
+      personalMeasures: this.state.personalMeasures,
       // Per-user preference and any still-mounted overlay quiesce survive too.
       collabShowCursors: this.state.collabShowCursors,
       collabQuiesced: this.quiesceSources.size > 0,
@@ -2460,23 +2496,39 @@ export class DashboardStore {
   }
 
   addTile(chart: ChartSpec): void {
-    this.mutateActiveTiles((tiles) => {
-      const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
-      const tile: DashboardTile = {
-        id: newId(),
-        layout: { x: 0, y: maxY, w: 12, h: 8, minW: 4, minH: 4 },
-        chart,
-      };
-      return [...tiles, tile];
+    // The promotion rule fires HERE, where a chart enters the document; the
+    // promotion and the tile are one undo step.
+    this.groupHistory(() => {
+      const saved = this.promotePersonalMeasuresFor(chart);
+      this.mutateActiveTiles((tiles) => {
+        const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+        const tile: DashboardTile = {
+          id: newId(),
+          layout: { x: 0, y: maxY, w: 12, h: 8, minW: 4, minH: 4 },
+          chart: saved,
+        };
+        return [...tiles, tile];
+      });
     });
   }
 
   updateChart(tileId: string, chart: ChartSpec): void {
+    const write = (saved: ChartSpec, coalesce?: HistoryCoalesce): void =>
+      this.mutateActiveTiles(
+        (tiles) => tiles.map((t) => (t.id === tileId ? { ...t, chart: saved } : t)),
+        coalesce,
+      );
+
+    // A chart edited into citing a PERSONAL measure promotes it on the way in
+    // (the promotion rule). That is a one-off structural change, not a slider
+    // storm, so it groups with the chart write instead of coalescing.
+    if (this.citedPersonalMeasures(chart).length > 0) {
+      this.groupHistory(() => write(this.promotePersonalMeasuresFor(chart)));
+      return;
+    }
+
     // Same-tile bursts (FormatPanel slider storms) coalesce into one undo step.
-    this.mutateActiveTiles(
-      (tiles) => tiles.map((t) => (t.id === tileId ? { ...t, chart } : t)),
-      { tag: `updateChart:${tileId}`, windowMs: 800 },
-    );
+    write(chart, { tag: `updateChart:${tileId}`, windowMs: 800 });
   }
 
   removeTile(tileId: string): void {
@@ -3624,22 +3676,210 @@ export class DashboardStore {
     this.set({ parameterSelections: { ...this.state.parameterSelections, [id]: clamped } });
   }
 
+  /* ------------------------------------- scoped measures (dashboard scope) */
+
+  /** The open dashboard's own measures (dashboard scope); [] when none/closed. */
+  get dashboardMeasures(): Measure[] {
+    return this.state.current?.layout.measures ?? [];
+  }
+
+  /**
+   * Seeds the PERSONAL-scope measure set from the per-user settings document.
+   * Does NOT write back — this is the hydrate direction, and echoing what was
+   * just read would schedule a pointless PUT (and, if hydration raced a local
+   * edit, could overwrite it with the server's older copy).
+   */
+  hydratePersonalMeasures(measures: Measure[]): void {
+    this.set({ personalMeasures: [...measures] });
+  }
+
+  /**
+   * Replaces the PERSONAL-scope measure set and persists it, when the runtime
+   * wired a persister (createRuntime points this at the per-user settings
+   * document). Without one the set stays in-memory for the session — a host
+   * that never mounts the settings store still gets a working scratchpad.
+   */
+  setPersonalMeasures(measures: Measure[]): void {
+    const next = [...measures];
+    this.set({ personalMeasures: next });
+    this.collab.onPersistPersonalMeasures?.(next);
+  }
+
+  /**
+   * The measure DEFINITIONS a chart needs on the query wire: the
+   * dashboard-scoped and personal measures it cites, transitively (a
+   * calculated one may reference others by name). Model measures are absent —
+   * the server already has those. This is what every toWireSpec call site
+   * passes as `definitions`; the result is stable-ordered, so it does not
+   * churn query cache keys.
+   */
+  definitionsForChart(chart: ChartSpec): Measure[] {
+    const available = [...this.dashboardMeasures, ...this.state.personalMeasures];
+    return chartMeasureDefinitions(available, chart);
+  }
+
+  /** Replaces the open dashboard's measures[] through the normal doc seam. */
+  private mutateMeasures(mutate: (measures: Measure[]) => Measure[]): void {
+    this.mutateLayout((layout) => ({ ...layout, measures: mutate(layout.measures ?? []) }));
+  }
+
+  /*
+   * DASHBOARD-SCOPE CRUD. These go through mutateMeasures — the ordinary doc
+   * seam — so a measure edit is history-tracked, dirties the dashboard, and
+   * emits the same per-element op live mode already carries for filter cards
+   * and parameters. Nothing here validates: authoring validation is the
+   * dialog's round-trip against /models/validate, and the engine is the final
+   * word. No dashboard open = a no-op, never a throw.
+   */
+
+  /** Appends a measure to the open dashboard's scope; returns it with its id. */
+  addDashboardMeasure(measure: Omit<Measure, 'id'> & { id?: string }): Measure | null {
+    if (!this.state.current) return null;
+    const withId: Measure = { ...measure, id: measure.id ?? newId() };
+    this.mutateMeasures((measures) => [...measures, withId]);
+    return withId;
+  }
+
+  /** Patches one dashboard measure in place (id is never patchable). */
+  updateDashboardMeasure(id: string, patch: Partial<Omit<Measure, 'id'>>): void {
+    if (!this.dashboardMeasures.some((m) => m.id === id)) return;
+    this.mutateMeasures((measures) =>
+      measures.map((m) => (m.id === id ? { ...m, ...patch, id: m.id } : m)),
+    );
+  }
+
+  /**
+   * Removes a dashboard measure. Charts still citing it fail with
+   * QRY_UNKNOWN_MEASURE — deliberately NOT silently repaired here: the manager
+   * warns about usage before it calls this, and quietly rewriting other
+   * people's charts is worse than an explicit error.
+   */
+  removeDashboardMeasure(id: string): void {
+    if (!this.dashboardMeasures.some((m) => m.id === id)) return;
+    this.mutateMeasures((measures) => measures.filter((m) => m.id !== id));
+  }
+
+  /**
+   * Promotes measures INTO the open dashboard's scope, collision-safe (the
+   * same merge chart copy uses). Promotion COPIES — a personal original stays
+   * in its owner's store — and keeps the id and name wherever the dashboard
+   * has neither taken, so a chart citing the measure needs no rewrite.
+   * Returns the merge outcome, or null when no dashboard is open.
+   */
+  promoteMeasuresToDashboard(
+    measures: Measure[],
+    chart: ChartSpec,
+  ): { chart: ChartSpec; added: Measure[]; renamed: [string, string][] } | null {
+    if (!this.state.current || measures.length === 0) {
+      return this.state.current ? { chart, added: [], renamed: [] } : null;
+    }
+    const merged = mergeMeasureDefinitions(this.dashboardMeasures, measures, chart);
+    if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
+    return { chart: merged.chart ?? chart, added: merged.added, renamed: merged.renamed };
+  }
+
+  /**
+   * Promotes a dashboard measure to SYSTEM scope by appending it to the
+   * dashboard's model. Server-gated: a model the caller cannot write answers
+   * 403 (and a system-owned one always does), which surfaces as the store
+   * error and a rejected promise. The dashboard copy is deliberately LEFT in
+   * place — removing it would break every other dashboard-scoped expression
+   * that references it by name, and the model copy resolves first only if the
+   * dashboard copy is gone. Callers that want the move rather than the copy
+   * remove the dashboard measure afterwards.
+   */
+  async promoteMeasureToModel(measureId: string): Promise<Measure | null> {
+    const current = this.state.current;
+    const modelId = current?.modelId ?? null;
+    if (!current || modelId === null) return null;
+    const source = this.dashboardMeasures.find((m) => m.id === measureId);
+    if (!source) return null;
+
+    try {
+      const model = await this.api.getModel(modelId);
+      const merged = mergeMeasureDefinitions(
+        model.definition.measures,
+        // Transitively: a calculated measure is worthless in the model without
+        // the measures its expression names.
+        collectMeasureDefinitions([...this.dashboardMeasures], [measureId]),
+      );
+      if (merged.added.length === 0) return source;
+      await this.api.updateModel(modelId, {
+        name: model.name,
+        description: model.description,
+        dataSourceName: model.dataSourceName,
+        definition: { ...model.definition, measures: merged.measures },
+        isShared: model.isShared,
+        expectedUpdatedAtUtc: model.updatedAtUtc,
+      });
+      return merged.added.find((m) => m.name === source.name) ?? merged.added[0] ?? null;
+    } catch (error) {
+      this.set({ error: rcdErrorMessage(error) });
+      throw error;
+    }
+  }
+
+  /**
+   * THE PROMOTION RULE, enforced where a chart enters the document: a chart
+   * saved into a dashboard may not reference a PERSONAL measure. A personal
+   * measure is an exploration scratchpad — private to its author — so a chart
+   * citing one would render for nobody else (QRY_UNKNOWN_MEASURE for every
+   * grantee), would be unresolvable in the BACKGROUND context a scheduled
+   * email runs in, and would leave an alert depending on a private document
+   * months later. Every cited personal measure is therefore COPIED into the
+   * dashboard's own scope, keeping its id and name; the original stays in the
+   * user's store so the scratchpad keeps working.
+   */
+  private promotePersonalMeasuresFor(chart: ChartSpec): ChartSpec {
+    const cited = this.citedPersonalMeasures(chart);
+    if (cited.length === 0) return chart;
+    const merged = mergeMeasureDefinitions(this.dashboardMeasures, cited, chart);
+    if (merged.added.length === 0) return merged.chart ?? chart;
+    this.mutateMeasures(() => merged.measures);
+    return merged.chart ?? chart;
+  }
+
+  /** The personal measures a chart cites, transitively; [] is the common case. */
+  private citedPersonalMeasures(chart: ChartSpec): Measure[] {
+    return this.state.personalMeasures.length === 0
+      ? []
+      : collectMeasureDefinitions(this.state.personalMeasures, chartMeasureIds(chart));
+  }
+
   /* -------------------------------------- chart clipboard / copy (0.9.0) */
 
-  /** Puts a chart on the transient clipboard (never persisted). */
+  /**
+   * Puts a chart on the transient clipboard (never persisted), together with
+   * the scoped measure definitions it cites — the clipboard spans dashboards,
+   * so the definitions must travel with it or the paste lands broken.
+   */
   copyChart(chart: ChartSpec, sourceModelId: number | null): void {
-    this.set({ chartClipboard: { chart: structuredClone(chart), sourceModelId } });
+    this.set({
+      chartClipboard: {
+        chart: structuredClone(chart),
+        sourceModelId,
+        definitions: structuredClone(this.definitionsForChart(chart)),
+      },
+    });
   }
 
   /**
    * Pastes the clipboard chart as a new tile on the active page (edit mode
    * only), following duplicateTile's conventions: fresh tile/chart ids,
-   * "(copy)" title, placed below all content at maxY.
+   * "(copy)" title, placed below all content at maxY. The measure definitions
+   * captured at copy time are merged into THIS dashboard's measures first
+   * (id/name-collision safe), and the pasted chart's refs are re-pointed at
+   * whatever the merge decided — one undo step for the pair.
    */
   pasteChartTile(): void {
     const clip = this.state.chartClipboard;
     if (!clip || this.state.mode !== 'edit' || !this.state.current) return;
-    this.addTile(cloneChartForCopy(clip.chart, { suffix: true }));
+    const copy = cloneChartForCopy(clip.chart, { suffix: true });
+    this.groupHistory(() => {
+      const merged = mergeMeasureDefinitions(this.dashboardMeasures, clip.definitions, copy);
+      if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
+      this.addTile(merged.chart ?? copy);
+    });
   }
 
   /**
@@ -3655,19 +3895,36 @@ export class DashboardStore {
    * refetches and retries ONCE. Failures surface via the store error (and the
    * rejected promise). Model mismatch is the UI's concern — the dialog warns;
    * this method just copies.
+   *
+   * SCOPED MEASURES TRAVEL WITH THE CHART. A chart citing dashboard (or
+   * personal) measures used to land on the target as QRY_UNKNOWN_MEASURE: the
+   * definitions live in the SOURCE document and only `chart` was carried. Now
+   * the definitions it references — transitively, because a calculated measure
+   * may name others — are merged into the target's own measures[], and the
+   * copied chart's refs are re-pointed at whatever the merge decided. A
+   * personal measure is promoted into the target's dashboard scope by the same
+   * merge, per the promotion rule.
    */
   async copyChartToDashboard(
     targetId: number,
     chart: ChartSpec,
     _sourceModelId: number | null,
   ): Promise<void> {
+    const definitions = this.definitionsForChart(chart);
     const current = this.state.current;
     if (current && current.id === targetId) {
-      this.addTile(cloneChartForCopy(chart, { suffix: true }));
+      // Same dashboard: the definitions are already here — merge is a no-op
+      // for anything identical, and promotes a cited personal measure.
+      const copy = cloneChartForCopy(chart, { suffix: true });
+      this.groupHistory(() => {
+        const merged = mergeMeasureDefinitions(this.dashboardMeasures, definitions, copy);
+        if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
+        this.addTile(merged.chart ?? copy);
+      });
       return;
     }
     try {
-      await this.appendChartRemote(targetId, chart);
+      await this.appendChartRemote(targetId, chart, definitions);
     } catch (error) {
       const stale =
         error instanceof RcdApiError && error.errorCode === 'rcd.dashboard.stale';
@@ -3676,7 +3933,7 @@ export class DashboardStore {
         throw error;
       }
       try {
-        await this.appendChartRemote(targetId, chart);
+        await this.appendChartRemote(targetId, chart, definitions);
       } catch (retryError) {
         this.set({ error: messageOf(retryError) });
         throw retryError;
@@ -3684,10 +3941,28 @@ export class DashboardStore {
     }
   }
 
+  /**
+   * How many scoped measure definitions a "copy chart to…" would carry across
+   * — what the copy dialog tells the user before they commit. Counts the
+   * transitive set, i.e. exactly what appendChartRemote merges.
+   */
+  measureCarryCount(chart: ChartSpec): number {
+    return this.definitionsForChart(chart).length;
+  }
+
   /** One fetch → append → save round-trip (copyChartToDashboard's engine). */
-  private async appendChartRemote(targetId: number, chart: ChartSpec): Promise<void> {
+  private async appendChartRemote(
+    targetId: number,
+    chart: ChartSpec,
+    definitions: Measure[],
+  ): Promise<void> {
     const detail = await this.api.getDashboard(targetId);
     const layout = detail.layout?.tiles ? detail.layout : emptyLayout();
+    // Merge the carried definitions into the TARGET's measures first: the
+    // merge may re-point the chart's refs (same id, different definition) or
+    // dedupe a name, and the tile must be built from the rewritten chart.
+    const merged = mergeMeasureDefinitions(layout.measures ?? [], definitions, chart);
+    const carried = merged.chart ?? chart;
     const tileFor = (tiles: DashboardTile[]): DashboardTile => ({
       id: newId(),
       layout: {
@@ -3701,19 +3976,21 @@ export class DashboardStore {
       // No suffix (the name stays), but the clone still routes the inner
       // title through the retitle helper so title and inner title stay in
       // sync on the target dashboard.
-      chart: cloneChartForCopy(chart),
+      chart: cloneChartForCopy(carried),
     });
     const pages = layout.pages ?? [];
+    const withMeasures: DashboardLayoutDoc =
+      merged.added.length > 0 ? { ...layout, measures: merged.measures } : layout;
     const nextLayout: DashboardLayoutDoc =
       pages.length > 0
         ? {
-            ...layout,
+            ...withMeasures,
             pages: pages.map((page, index) =>
               index === 0 ? { ...page, tiles: [...page.tiles, tileFor(page.tiles)] } : page,
             ),
           }
         : // Legacy doc with no pages: append to the top-level tiles.
-          { ...layout, tiles: [...layout.tiles, tileFor(layout.tiles)] };
+          { ...withMeasures, tiles: [...withMeasures.tiles, tileFor(withMeasures.tiles)] };
     await this.api.updateDashboard(targetId, {
       name: detail.name,
       description: detail.description,

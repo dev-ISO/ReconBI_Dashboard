@@ -10,6 +10,7 @@ import type {
   MeasureRef,
   SortSpec,
 } from './query';
+import type { Measure } from './model';
 
 export type ChartType =
   | 'column'
@@ -638,11 +639,23 @@ export const isMatrixChart = (chart: ChartSpec): boolean =>
   (chart.query.drillLevels?.length ?? 0) > 0 &&
   chart.format.table?.matrix !== false;
 
-/** Dashboard slicer + per-chart filters are merged by the caller into extraFilters. */
+/**
+ * Dashboard slicer + per-chart filters are merged by the caller into
+ * extraFilters.
+ *
+ * `definitions` carries the measure definitions the chart cites that are NOT
+ * in the semantic model — dashboard-scoped and personal measures. Callers get
+ * them from `chartMeasureDefinitions` (or the store's `definitionsForChart`),
+ * which already resolves expression [references] transitively. An empty list
+ * is omitted from the spec entirely so a chart that only uses model measures
+ * produces the exact same object — and therefore the exact same
+ * stableStringify cache key — as before this argument existed.
+ */
 export const toWireSpec = (
   chart: ChartSpec,
   modelId: number,
   extraFilters: FilterClause[] = [],
+  definitions: Measure[] | null = null,
 ): ChartQuerySpec => {
   // Order matters downstream. Non-table charts KEEP the
   // [axis, legend?, smallMultiples?] guarantee — LayoutSnapshotParser and the
@@ -679,6 +692,7 @@ export const toWireSpec = (
     filters: [...chart.query.filters, ...extraFilters],
     sort,
     limit: chart.query.limit ?? null,
+    ...(definitions && definitions.length > 0 ? { definitions } : {}),
   };
 };
 

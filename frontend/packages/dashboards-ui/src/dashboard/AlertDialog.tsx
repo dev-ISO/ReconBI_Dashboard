@@ -94,23 +94,31 @@ export function AlertDialog({ open, dashboardId, modelId, source, onClose, onErr
     if (!source || measures.length === 0) return null;
     const measure = measures[Math.min(measureIndex, measures.length - 1)];
     if (!measure) return null;
-    return toWireSpec(
-      {
-        ...source.chart,
-        query: {
-          ...source.chart.query,
-          axis: null,
-          legend: null,
-          smallMultiples: null,
-          measures: [measure],
-          sort: [],
-          limit: null,
-        },
+    const watched: ChartSpec = {
+      ...source.chart,
+      query: {
+        ...source.chart.query,
+        axis: null,
+        legend: null,
+        smallMultiples: null,
+        measures: [measure],
+        sort: [],
+        limit: null,
       },
+    };
+    // The watched measure may be dashboard- or personal-scoped, i.e. absent
+    // from the model the server loads. Its definition is SNAPSHOTTED into the
+    // stored spec here so an alert whose dashboard is gone (or whose chart was
+    // never saved) still evaluates; when the alert does carry a dashboard id
+    // the server re-resolves LIVE from that dashboard's document and this copy
+    // is only the fallback.
+    return toWireSpec(
+      watched,
       modelId,
       source.filters,
+      runtime.dashboards.definitionsForChart(watched),
     );
-  }, [source, measures, measureIndex, modelId]);
+  }, [source, measures, measureIndex, modelId, runtime]);
 
   const recipients = parseRecipients(recipientsText);
   const invalidRecipients = recipients.filter((email) => !looksLikeEmail(email));

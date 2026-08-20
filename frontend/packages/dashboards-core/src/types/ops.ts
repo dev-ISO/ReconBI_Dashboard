@@ -44,6 +44,7 @@ import type {
   TileLayout,
   ViewFitMode,
 } from './dashboard';
+import type { Measure } from './model';
 
 /** The differ's three permission classes, resolved per-op by the server's
  * grantee gate. The client computes them faithfully (chart tiles → charts,
@@ -78,11 +79,16 @@ export interface DashboardOpEvent {
   resultUpdatedAtUtc: string;
 }
 
-/** The doc's id-keyed element collections doc.elementUpsert/Remove address. */
-export type DocElementField = 'filterCards' | 'bookmarks' | 'parameters';
+/** The doc's id-keyed element collections doc.elementUpsert/Remove address.
+ *  'measures' = the dashboard-scoped measure store; it is here (rather than
+ *  riding docSettingSet as one whole-array scalar) so a live-mode measure edit
+ *  merges PER MEASURE like a filter card, instead of last-writer-wins over
+ *  every measure at once. Without this entry diffLayoutDocs emits ZERO ops for
+ *  a measure edit and the edit is silently lost on save. */
+export type DocElementField = 'filterCards' | 'bookmarks' | 'parameters' | 'measures';
 
 /** An element of one of the doc's id-keyed collections. */
-export type DocElement = FilterCard | DashboardBookmark | DashboardParameter;
+export type DocElement = FilterCard | DashboardBookmark | DashboardParameter | Measure;
 
 /** The doc-level scalar keys docSettingSet writes (one key per op; the server
  * additionally refuses the structural keys "pages"/"tiles" for ANY caller). */

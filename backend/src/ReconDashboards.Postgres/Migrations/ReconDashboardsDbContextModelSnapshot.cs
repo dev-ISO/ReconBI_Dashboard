@@ -557,6 +557,24 @@ namespace ReconDashboards.Postgres.Migrations
                     b.ToTable("rcd_subscriptions", (string)null);
                 });
 
+            modelBuilder.Entity("ReconDashboards.Core.Persistence.UserSettingsRecord", b =>
+                {
+                    b.Property<string>("UserId")
+                        .HasMaxLength(128)
+                        .HasColumnType("character varying(128)");
+
+                    b.Property<string>("SettingsJson")
+                        .IsRequired()
+                        .HasColumnType("jsonb");
+
+                    b.Property<DateTime>("UpdatedAtUtc")
+                        .HasColumnType("timestamp without time zone");
+
+                    b.HasKey("UserId");
+
+                    b.ToTable("rcd_user_settings", (string)null);
+                });
+
             modelBuilder.Entity("ReconDashboards.Core.Persistence.DashboardActivityRecord", b =>
                 {
                     b.HasOne("ReconDashboards.Core.Persistence.DashboardRecord", null)

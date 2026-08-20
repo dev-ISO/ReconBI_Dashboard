@@ -3,6 +3,7 @@ import type { DashboardsApi, SaveDashboardBody } from '../api/DashboardsApi';
 import { RcdApiError } from '../api/fetcher';
 import type { ChartSpec } from '../types/chart';
 import type { DashboardDetail, DashboardLayoutDoc } from '../types/dashboard';
+import type { Measure } from '../types/model';
 import { cloneChartForCopy, DashboardStore } from './dashboardStore';
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -44,6 +45,8 @@ interface ApiStub {
   getDashboard: ReturnType<typeof vi.fn>;
   updateDashboard: ReturnType<typeof vi.fn>;
   patchDashboardMeta: ReturnType<typeof vi.fn>;
+  getModel: ReturnType<typeof vi.fn>;
+  updateModel: ReturnType<typeof vi.fn>;
 }
 
 const apiStub = (detail: DashboardDetail): ApiStub => {
@@ -62,16 +65,36 @@ const apiStub = (detail: DashboardDetail): ApiStub => {
     structuredClone({ ...detail, id, ...body, updatedAtUtc: 'stamp-2' }),
   );
   const listDashboards = vi.fn(async () => []);
+  const getModel = vi.fn(async (id: number) => ({
+    id,
+    name: 'Demo model',
+    description: null,
+    dataSourceName: 'demo',
+    isShared: true,
+    ownerIsMe: true,
+    createdAtUtc: '2026-01-01T00:00:00Z',
+    updatedAtUtc: 'model-stamp-1',
+    definition: { version: 1, tables: [], relationships: [], measures: [] },
+  }));
+  const updateModel = vi.fn(async (id: number, body: { definition: unknown }) => ({
+    id,
+    definition: body.definition,
+    updatedAtUtc: 'model-stamp-2',
+  }));
   return {
     api: {
       getDashboard,
       updateDashboard,
       patchDashboardMeta,
       listDashboards,
+      getModel,
+      updateModel,
     } as unknown as DashboardsApi,
     getDashboard,
     updateDashboard,
     patchDashboardMeta,
+    getModel,
+    updateModel,
   };
 };
 
@@ -308,6 +331,367 @@ describe('copyChartToDashboard', () => {
     expect(store.store.getState().error).toBe(
       'Your access to this dashboard does not allow that change.',
     );
+  });
+});
+
+/**
+ * BREAKAGE FIX: a chart citing DASHBOARD-scoped measures used to land on the
+ * target as QRY_UNKNOWN_MEASURE — the definitions live in the SOURCE document
+ * and only `chart` was carried. They now travel, transitively, through the
+ * same collision-safe merge the clipboard uses.
+ */
+describe('copy carries dashboard measure definitions', () => {
+  const measure = (id: string, name: string, column = 'total'): Measure => ({
+    id,
+    name,
+    table: 'public.orders',
+    aggregation: 'sum',
+    column,
+  });
+
+  const calcMeasure = (id: string, name: string, expression: string): Measure => ({
+    id,
+    name,
+    table: 'public.orders',
+    aggregation: 'sum',
+    expression,
+  });
+
+  const chartCiting = (measureId: string, title = 'Scoped'): ChartSpec => ({
+    id: 'chart-1',
+    type: 'column',
+    title,
+    query: { measures: [{ measureId }], filters: [] },
+    format: {},
+  });
+
+  const sourceDetail = (measures: Measure[]): DashboardDetail =>
+    detailFor(1, { layout: layoutWith({ measures }) });
+
+  it('definitionsForChart resolves the transitive set the wire needs', async () => {
+    const leaf = measure('m1', 'Leaf');
+    const top = calcMeasure('m2', 'Top', '[Leaf] + 1');
+    const { store } = await openStore(sourceDetail([leaf, top]));
+
+    expect(store.definitionsForChart(chartCiting('m2')).map((m) => m.id)).toEqual(['m1', 'm2']);
+    expect(store.measureCarryCount(chartCiting('m2'))).toBe(2);
+    expect(store.measureCarryCount(chartCiting('unknown'))).toBe(0);
+  });
+
+  it('carries the referenced definitions — transitively — onto the target doc', async () => {
+    const leaf = measure('m1', 'Leaf');
+    const top = calcMeasure('m2', 'Top', '[Leaf] + 1');
+    const stub = apiStub(sourceDetail([leaf, top]));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    // The TARGET fetch returns a doc with no measures of its own.
+    stub.getDashboard.mockResolvedValueOnce(
+      structuredClone({ ...detailFor(2), layout: layoutWith() }),
+    );
+
+    await store.copyChartToDashboard(2, chartCiting('m2'), 1);
+
+    const body = stub.updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    expect(body.layout.measures!.map((m) => m.id)).toEqual(['m1', 'm2']);
+    expect(body.layout.pages![0]!.tiles[0]!.chart!.query.measures[0]!.measureId).toBe('m2');
+  });
+
+  it('carries nothing for a chart that only uses model measures', async () => {
+    const stub = apiStub(sourceDetail([measure('m1', 'Leaf')]));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    stub.getDashboard.mockResolvedValueOnce(
+      structuredClone({ ...detailFor(2), layout: layoutWith() }),
+    );
+
+    await store.copyChartToDashboard(2, chartCiting('model-measure'), 1);
+
+    const body = stub.updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    expect(body.layout.measures ?? []).toHaveLength(0);
+  });
+
+  it('reuses an identical definition already on the target instead of duplicating it', async () => {
+    const shared = measure('m1', 'Leaf');
+    const stub = apiStub(sourceDetail([shared]));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    stub.getDashboard.mockResolvedValueOnce(
+      structuredClone({ ...detailFor(2), layout: layoutWith({ measures: [shared] }) }),
+    );
+
+    await store.copyChartToDashboard(2, chartCiting('m1'), 1);
+
+    const body = stub.updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    expect(body.layout.measures).toHaveLength(1);
+    expect(body.layout.pages![0]!.tiles[0]!.chart!.query.measures[0]!.measureId).toBe('m1');
+  });
+
+  it('mints a new id on an id collision and re-points the copied chart', async () => {
+    const carried = measure('m1', 'Source Leaf', 'total');
+    const targetsOwn = measure('m1', 'Target Leaf', 'quantity');
+    const stub = apiStub(sourceDetail([carried]));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    stub.getDashboard.mockResolvedValueOnce(
+      structuredClone({ ...detailFor(2), layout: layoutWith({ measures: [targetsOwn] }) }),
+    );
+
+    await store.copyChartToDashboard(2, chartCiting('m1'), 1);
+
+    const body = stub.updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    expect(body.layout.measures).toHaveLength(2);
+    // The target's own measure is untouched — its charts still depend on it.
+    expect(body.layout.measures![0]).toEqual(targetsOwn);
+    const minted = body.layout.measures![1]!;
+    expect(minted.id).not.toBe('m1');
+    expect(body.layout.pages![0]!.tiles[0]!.chart!.query.measures[0]!.measureId).toBe(minted.id);
+  });
+
+  it('dedupes a colliding NAME and rewrites the carried formula that referenced it', async () => {
+    const carriedLeaf = measure('src-leaf', 'Leaf', 'total');
+    const carriedTop = calcMeasure('src-top', 'Top', '[Leaf] + 1');
+    const targetsLeaf = measure('tgt-leaf', 'Leaf', 'quantity');
+    const stub = apiStub(sourceDetail([carriedLeaf, carriedTop]));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    stub.getDashboard.mockResolvedValueOnce(
+      structuredClone({ ...detailFor(2), layout: layoutWith({ measures: [targetsLeaf] }) }),
+    );
+
+    await store.copyChartToDashboard(2, chartCiting('src-top'), 1);
+
+    const body = stub.updateDashboard.mock.calls[0]![1] as SaveDashboardBody;
+    const names = body.layout.measures!.map((m) => m.name);
+    expect(names).toEqual(['Leaf', 'Leaf (copy)', 'Top']);
+    // The copied formula follows the rename — otherwise it would silently
+    // start computing the TARGET's "Leaf".
+    expect(body.layout.measures!.find((m) => m.name === 'Top')!.expression).toBe(
+      '[Leaf (copy)] + 1',
+    );
+  });
+
+  it('the cross-dashboard CLIPBOARD carries definitions too', async () => {
+    const leaf = measure('m1', 'Leaf');
+    const top = calcMeasure('m2', 'Top', '[Leaf] + 1');
+    const { store } = await openStore(sourceDetail([leaf, top]));
+
+    store.copyChart(chartCiting('m2'), 1);
+    const clipboard = store.store.getState().chartClipboard!;
+    expect(clipboard.definitions.map((m) => m.id)).toEqual(['m1', 'm2']);
+
+    // Paste onto a DIFFERENT dashboard whose own "Leaf" means something else.
+    const targetsLeaf = measure('m1', 'Leaf', 'quantity');
+    const targetStub = apiStub(detailFor(2, { layout: layoutWith({ measures: [targetsLeaf] }) }));
+    const target = new DashboardStore(targetStub.api);
+    await target.open(2);
+    target.store.setState({ chartClipboard: clipboard });
+
+    target.enterEdit();
+    target.pasteChartTile();
+
+    const measures = target.store.getState().current!.layout.measures!;
+    expect(measures.map((m) => m.name)).toEqual(['Leaf', 'Leaf (copy)', 'Top']);
+    const tile = target.store.getState().current!.layout.pages![0]!.tiles[0]!;
+    const pastedId = tile.chart!.query.measures[0]!.measureId;
+    expect(measures.find((m) => m.id === pastedId)!.name).toBe('Top');
+  });
+});
+
+/**
+ * THE PROMOTION RULE: a chart saved into a dashboard may not reference a
+ * PERSONAL measure — nobody else could resolve it, the background context a
+ * scheduled send runs in could not, and an alert would depend on a private
+ * document forever.
+ */
+describe('personal measure promotion', () => {
+  const personal: Measure = {
+    id: 'p1',
+    name: 'My Revenue',
+    table: 'public.orders',
+    aggregation: 'sum',
+    column: 'total',
+  };
+
+  const chartCitingPersonal = (): ChartSpec => ({
+    id: 'chart-1',
+    type: 'column',
+    title: 'Personal',
+    query: { measures: [{ measureId: 'p1' }], filters: [] },
+    format: {},
+  });
+
+  it('addTile promotes a cited personal measure into the dashboard scope', async () => {
+    const { store } = await openStore();
+    store.setPersonalMeasures([personal]);
+    store.enterEdit();
+
+    store.addTile(chartCitingPersonal());
+
+    const layout = store.store.getState().current!.layout;
+    expect(layout.measures!.map((m) => m.id)).toEqual(['p1']);
+    // COPIES: the personal original stays, so the scratchpad keeps working.
+    expect(store.store.getState().personalMeasures).toEqual([personal]);
+    // Same id and name, so the chart itself needs no rewrite.
+    expect(layout.pages![0]!.tiles[0]!.chart!.query.measures[0]!.measureId).toBe('p1');
+  });
+
+  it('promotion and the tile are ONE undo step', async () => {
+    const { store } = await openStore();
+    store.setPersonalMeasures([personal]);
+    store.enterEdit();
+
+    store.addTile(chartCitingPersonal());
+    store.undo();
+
+    const layout = store.store.getState().current!.layout;
+    expect(layout.pages![0]!.tiles).toHaveLength(0);
+    expect(layout.measures ?? []).toHaveLength(0);
+  });
+
+  it('does nothing when the chart cites no personal measure', async () => {
+    const { store } = await openStore();
+    store.setPersonalMeasures([personal]);
+    store.enterEdit();
+
+    store.addTile(chartFor('Model measures only'));
+
+    expect(store.store.getState().current!.layout.measures ?? []).toHaveLength(0);
+  });
+
+  it('personal measures survive close(): they belong to the user, not the dashboard', async () => {
+    const { store } = await openStore();
+    store.setPersonalMeasures([personal]);
+    store.close();
+    expect(store.store.getState().personalMeasures).toEqual([personal]);
+  });
+
+  it('promoteMeasureToModel appends the measure — and its dependencies — to the model', async () => {
+    const leaf: Measure = {
+      id: 'd1',
+      name: 'Leaf',
+      table: 'public.orders',
+      aggregation: 'sum',
+      column: 'total',
+    };
+    const top: Measure = {
+      id: 'd2',
+      name: 'Top',
+      table: 'public.orders',
+      aggregation: 'sum',
+      expression: '[Leaf] + 1',
+    };
+    const stub = apiStub(detailFor(1, { layout: layoutWith({ measures: [leaf, top] }) }));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+
+    const promoted = await store.promoteMeasureToModel('d2');
+
+    expect(promoted!.name).toBe('Top');
+    const [modelId, body] = stub.updateModel.mock.calls[0]! as [number, { definition: { measures: Measure[] } }];
+    expect(modelId).toBe(1);
+    // A calculated measure is worthless in the model without what it names.
+    expect(body.definition.measures.map((m) => m.name)).toEqual(['Leaf', 'Top']);
+    // The dashboard copy stays: other dashboard formulas still name it.
+    expect(store.store.getState().current!.layout.measures).toHaveLength(2);
+  });
+
+  it('promoteMeasureToModel surfaces a server refusal (a system model is read-only)', async () => {
+    const dashboardMeasure: Measure = {
+      id: 'd1',
+      name: 'Leaf',
+      table: 'public.orders',
+      aggregation: 'sum',
+      column: 'total',
+    };
+    const stub = apiStub(detailFor(1, { layout: layoutWith({ measures: [dashboardMeasure] }) }));
+    const store = new DashboardStore(stub.api);
+    await store.open(1);
+    stub.updateModel.mockRejectedValueOnce(
+      new RcdApiError('403 Forbidden', 403, 'rcd.model.system_readonly'),
+    );
+
+    await expect(store.promoteMeasureToModel('d1')).rejects.toBeInstanceOf(RcdApiError);
+    expect(store.store.getState().error).not.toBeNull();
+  });
+});
+
+/**
+ * W3 — dashboard-scope measure CRUD. The promotion actions could ADD a measure
+ * to a dashboard; nothing could edit or remove one, so the manager had no way
+ * to be a manager. These go through the ordinary doc seam, which is what buys
+ * them history, dirty-tracking and (in a live session) per-element ops.
+ */
+describe('dashboard-scope measure CRUD', () => {
+  const seed = (): Measure => ({
+    id: 'd1',
+    name: 'Revenue',
+    table: 'public.orders',
+    aggregation: 'sum',
+    column: 'total',
+  });
+
+  const openWithMeasure = async () => {
+    const detail = detailFor(1, { layout: layoutWith({ measures: [seed()] }) });
+    return openStore(detail);
+  };
+
+  it('addDashboardMeasure appends with a fresh id and dirties the dashboard', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+
+    const added = store.addDashboardMeasure({
+      name: 'Units',
+      table: 'public.orders',
+      aggregation: 'sum',
+      column: 'quantity',
+    });
+
+    expect(added).not.toBeNull();
+    expect(added!.id).toMatch(/.+/);
+    expect(store.dashboardMeasures.map((m) => m.name)).toEqual(['Units']);
+    expect(store.store.getState().dirty).toBe(true);
+  });
+
+  it('addDashboardMeasure is a no-op with no dashboard open', () => {
+    const stub = apiStub(detailFor(1));
+    const store = new DashboardStore(stub.api);
+    expect(
+      store.addDashboardMeasure({ name: 'X', table: 'public.orders', aggregation: 'count' }),
+    ).toBeNull();
+  });
+
+  it('updateDashboardMeasure patches in place and never lets the id change', async () => {
+    const { store } = await openWithMeasure();
+    store.enterEdit();
+
+    store.updateDashboardMeasure('d1', {
+      name: 'Net revenue',
+      expression: '[Revenue] * 0.9',
+      column: null,
+    } as Partial<Measure>);
+
+    const [updated] = store.dashboardMeasures;
+    expect(updated!.id).toBe('d1');
+    expect(updated!.name).toBe('Net revenue');
+    expect(updated!.expression).toBe('[Revenue] * 0.9');
+  });
+
+  it('updateDashboardMeasure ignores an unknown id (no phantom row, no dirty)', async () => {
+    const { store } = await openWithMeasure();
+    store.updateDashboardMeasure('nope', { name: 'Ghost' });
+    expect(store.dashboardMeasures.map((m) => m.name)).toEqual(['Revenue']);
+    expect(store.store.getState().dirty).toBe(false);
+  });
+
+  it('removeDashboardMeasure drops it, and undo brings it back (one doc seam)', async () => {
+    const { store } = await openWithMeasure();
+    store.enterEdit();
+
+    store.removeDashboardMeasure('d1');
+    expect(store.dashboardMeasures).toHaveLength(0);
+
+    store.undo();
+    expect(store.dashboardMeasures.map((m) => m.id)).toEqual(['d1']);
   });
 });
 

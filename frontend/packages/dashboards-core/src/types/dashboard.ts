@@ -1,5 +1,6 @@
 // Dashboard layout document (rcd_dashboards.LayoutJson) + API envelopes.
 import type { ChartSpec, ContainerStyle } from './chart';
+import type { Measure } from './model';
 import type {
   ChartQuerySpec,
   DimensionRef,
@@ -551,6 +552,20 @@ export interface DashboardLayoutDoc {
    * click emphasis naturally only renders on its own page.
    */
   crossFilterScope?: CrossFilterScope | null;
+  /**
+   * DASHBOARD-SCOPED measures (v1-compatible evolution; the wire version stays
+   * 1). Absent on older docs = none; readers treat null/absent as empty.
+   *
+   * A measure here belongs to THIS dashboard: it travels with duplicate and
+   * share for free (the server stores and materializes LayoutJson verbatim),
+   * and it is NOT in the semantic model, so every query that cites one must
+   * carry its definition on the wire — see `toWireSpec`'s `definitions`
+   * argument and `chartMeasureDefinitions`. Copying a chart to another
+   * dashboard carries the definitions it references (dashboardStore's
+   * copy/clipboard paths); scheduled email and alerts resolve them from this
+   * array server-side.
+   */
+  measures?: Measure[] | null;
   /**
    * Default view-mode sizing (v1-compatible evolution; absent = 'actual').
    * 'fitPage' scales the page's grid DOWN (never up past 1:1) so its full

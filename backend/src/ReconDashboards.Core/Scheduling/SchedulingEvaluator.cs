@@ -5,8 +5,10 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using ReconDashboards.Core.Abstractions;
+using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
 using ReconDashboards.Core.Persistence;
+using ReconDashboards.Core.Querying;
 using ReconDashboards.Core.Querying.Spec;
 
 namespace ReconDashboards.Core.Scheduling;
@@ -194,6 +196,8 @@ public sealed class SchedulingEvaluator(
             return (null, "The alert's stored query must have no dimensions and exactly one measure.");
         }
 
+        spec = await WithDashboardDefinitionsAsync(scopeServices, alert, spec, ct);
+
         var queryService = ImpersonatedQuery.Create(scopeServices, alert.OwnerUserId);
         var principal = ImpersonatedQuery.PrincipalFor(alert.OwnerUserId);
 
@@ -217,6 +221,69 @@ public sealed class SchedulingEvaluator(
         {
             return (null, "The alert query did not produce a numeric value.");
         }
+    }
+
+    /// <summary>
+    /// Resolves the DASHBOARD-scoped measure definitions an alert's stored spec
+    /// needs. AlertRecord DOES carry a dashboard id, so the live path applies
+    /// (the same one scheduled email takes): the dashboard's document is read
+    /// at evaluation time and the definitions the spec's measure references
+    /// need — transitively — are overlaid. An edited formula is therefore
+    /// picked up by the next evaluation instead of firing on a stale copy.
+    ///
+    /// The definitions the spec ALREADY carries (snapshotted client-side at
+    /// save time by toWireSpec) are kept as a FALLBACK for anything the doc no
+    /// longer holds — an alert built on an unsaved chart, or one citing a
+    /// personal measure, which has no dashboard home to resolve from. Live
+    /// definitions win by id, and a stored one whose NAME the live set already
+    /// uses is dropped rather than merged: MeasureOverlay rejects a duplicate
+    /// name outright, and failing the whole alert to preserve a shadowed copy
+    /// would be the worse trade.
+    /// </summary>
+    private static async Task<ChartQuerySpec> WithDashboardDefinitionsAsync(
+        IServiceProvider scopeServices, AlertRecord alert, ChartQuerySpec spec, CancellationToken ct)
+    {
+        if (alert.DashboardId is not { } dashboardId)
+        {
+            return spec;
+        }
+
+        var db = scopeServices.GetRequiredService<ReconDashboardsDbContext>();
+        var layoutJson = await db.Dashboards
+            .AsNoTracking()
+            .Where(d => d.Id == dashboardId && !d.IsDeleted)
+            .Select(d => d.LayoutJson)
+            .FirstOrDefaultAsync(ct);
+        if (layoutJson is null)
+        {
+            return spec;
+        }
+
+        var docMeasures = LayoutSnapshotParser.ParseMeasures(layoutJson);
+        if (docMeasures.Count == 0)
+        {
+            return spec;
+        }
+
+        var live = MeasureOverlay.CollectReferenced(
+            docMeasures, spec.Measures.Where(m => m.MeasureId is not null).Select(m => m.MeasureId!.Value));
+        if (live.Count == 0)
+        {
+            return spec;
+        }
+
+        var ids = new HashSet<Guid>(live.Select(m => m.Id));
+        var names = new HashSet<string>(live.Select(m => m.Name), StringComparer.OrdinalIgnoreCase);
+        var merged = new List<Measure>(live);
+        foreach (var stored in spec.Definitions ?? [])
+        {
+            if (ids.Add(stored.Id) && names.Add(stored.Name))
+            {
+                merged.Add(stored);
+            }
+        }
+
+        return spec with { Definitions = merged };
     }
 
     private static RcdEmailMessage BuildAlertEmail(

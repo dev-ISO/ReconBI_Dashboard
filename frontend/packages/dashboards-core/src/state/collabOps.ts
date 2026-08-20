@@ -36,7 +36,12 @@ import type {
 } from '../types/ops';
 import { stableStringify } from '../util/hash';
 
-const DOC_ELEMENT_FIELDS: DocElementField[] = ['filterCards', 'bookmarks', 'parameters'];
+const DOC_ELEMENT_FIELDS: DocElementField[] = [
+  'filterCards',
+  'bookmarks',
+  'parameters',
+  'measures',
+];
 const DOC_SETTING_KEYS: DocSettingKey[] = [
   'refreshSeconds',
   'filterIndicator',

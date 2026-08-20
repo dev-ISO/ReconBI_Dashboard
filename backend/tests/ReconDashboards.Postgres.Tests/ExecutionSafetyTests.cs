@@ -4,6 +4,7 @@ using Npgsql;
 using ReconDashboards.Core.Abstractions;
 using ReconDashboards.Core.Modeling;
 using ReconDashboards.Core.Options;
+using ReconDashboards.Core.Querying;
 using ReconDashboards.Core.Querying.Compilation;
 using ReconDashboards.Core.Querying.Spec;
 
@@ -366,6 +367,81 @@ public sealed class ExecutionSafetyTests
         var row = Assert.Single(result.Rows);
         Assert.Equal("West", row[0]);
         Assert.Equal(expectedOrders, row[1]);
+    }
+
+    /// <summary>
+    /// *** THE ROW-LEVEL-SECURITY REGRESSION FOR THE MEASURE-DEFINITIONS WIRE.
+    /// DO NOT "FIX" THIS BY RELAXING IT — A FAILURE HERE IS AN RLS BYPASS,
+    /// NEVER A COSMETIC ONE. ***
+    ///
+    /// A query carries a caller-supplied measure DEFINITION (a dashboard- or
+    /// personal-scoped measure) whose EXPRESSION names public.customers, while
+    /// nothing else in the spec does: no dimension, no filter, and the
+    /// measure's own home table is public.orders. The host contributes a row
+    /// filter for public.customers.
+    ///
+    /// The overlay must be merged into the ModelDefinition BEFORE
+    /// QueryCompiler.Prepare (MeasureOverlay.Merge in ChartQueryService), which
+    /// is the ONLY thing that puts public.customers into `involved` →
+    /// JoinPathResolver → PreparedQuery.Plan.Tables → the row-filter collection
+    /// → AppendRowFilterPredicates. Resolving caller definitions later —
+    /// inside ResolveMeasure, say — compiles and returns plausible numbers
+    /// while SILENTLY reading customers with no row filter at all.
+    ///
+    /// So: the predicate must be in the SQL, and the number must be the
+    /// restricted one.
+    /// </summary>
+    [Fact]
+    public async Task OverlayExpressionTable_StillReceivesItsRowFilters()
+    {
+        var overlay = new Measure(
+            Guid.NewGuid(), "Overlay Credit", "public.orders", Aggregation.Sum,
+            Column: null, FormatHint: null, Filters: null,
+            Expression: "SUM(public.customers.credit_limit)");
+
+        // No dimensions, no filters: public.customers is reachable ONLY through
+        // the overlay expression.
+        var spec = new ChartQuerySpec(
+            ModelId: 1, Dimensions: [], Measures: [new MeasureSpec(overlay.Id, null, null, null, null)],
+            Filters: [], Sort: [], TopN: null, Limit: null, Offset: null, Having: null,
+            Definitions: [overlay]);
+
+        var rowFilters = new Dictionary<string, IReadOnlyList<RowFilter>>
+        {
+            ["public.customers"] = [new RowFilter("region", RowFilterOperator.Equals, ["West"])],
+        };
+
+        var limits = new RcdLimits();
+        var effective = MeasureOverlay.Merge(Model, spec.Definitions, limits);
+        var prepared = Compiler.Prepare(spec, effective, _fixture.RawSchema, limits);
+
+        // The join plan is what row filters attach to — prove customers is in it.
+        Assert.Contains("public.customers", prepared.Plan.Tables);
+
+        var filtered = Compiler.Emit(prepared, spec, rowFilters, limits, new DataSourceOptions());
+        var unfiltered = Compiler.Emit(prepared, spec, NoRowFilters, limits, new DataSourceOptions());
+
+        // The predicate reached the SQL, bound as a parameter (never inlined).
+        Assert.Contains("\"region\"", filtered.Sql, StringComparison.Ordinal);
+        Assert.Contains(filtered.Parameters, p => Equals(p.Value, "West"));
+        Assert.DoesNotContain("\"region\"", unfiltered.Sql, StringComparison.Ordinal);
+
+        var filteredRow = Assert.Single((await ExecuteAsync(filtered)).Rows);
+        var unfilteredRow = Assert.Single((await ExecuteAsync(unfiltered)).Rows);
+
+        await using var command = _fixture.DataSource.CreateCommand("""
+            SELECT sum(c.credit_limit)
+            FROM orders o
+            LEFT JOIN customers c ON o.customer_id = c.id
+            WHERE c.region = 'West'
+            """);
+        var expected = (decimal)(await command.ExecuteScalarAsync())!;
+
+        Assert.Equal(expected, Convert.ToDecimal(filteredRow[0]));
+        // And it genuinely restricted: without the filter the number is bigger.
+        Assert.True(
+            Convert.ToDecimal(unfilteredRow[0]) > expected,
+            "The row filter must actually change the result, or this test proves nothing.");
     }
 
     private sealed class NullServices : IServiceProvider

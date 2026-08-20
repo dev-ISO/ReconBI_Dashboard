@@ -339,6 +339,31 @@ public sealed class GlobalOptOutRecord
     public DateTime OptedOutUtc { get; set; }
 }
 
+/// <summary>
+/// rcd_user_settings — ONE row per user holding that user's private preference
+/// document. Deliberately generic: a single server-opaque JSON blob (parsed and
+/// re-serialized, never schema-validated) so later preference waves add a
+/// top-level section instead of a migration. Mirrors the tracker host's
+/// AppUser.UiSettingsJson mechanism, which the library cannot reuse — that is a
+/// different DbContext on a possibly different database.
+///
+/// Natural key, no surrogate id (GlobalOptOutRecord precedent): UserId is the
+/// opaque host-supplied id at the established 128-char width shared by every
+/// owner/user column here, and no foreign key ever points at a host user table.
+/// The key IS the authorization boundary — the service only ever reads and
+/// writes the row for ICurrentUserProvider.GetUserId(), and no user id is
+/// accepted from the wire.
+/// </summary>
+public sealed class UserSettingsRecord
+{
+    public string UserId { get; set; } = "";
+
+    /// <summary>Whole document, last-write-wins. Never interpreted by the server.</summary>
+    public string SettingsJson { get; set; } = "";
+
+    public DateTime UpdatedAtUtc { get; set; }
+}
+
 /// <summary>rcd_query_audit — written only when EnableQueryAudit; retention is host-driven.</summary>
 public sealed class QueryAuditRecord
 {
