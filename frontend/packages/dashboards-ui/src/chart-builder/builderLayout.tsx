@@ -22,11 +22,12 @@ import {
  * space above the mins — so a size remembered from a large dialog gracefully
  * compresses in a smaller one instead of overflowing.
  *
- * Persistence: localStorage under one builder-layout key (the RcdDialog
- * geometry memory is session-scoped and keyed by title; pane sizes are a
- * layout preference worth keeping across sessions, so they get their own
- * single key — the builder is hosted by both the "Add chart" and "Edit chart"
- * titles and should share one layout).
+ * Persistence: localStorage under one builder-layout key. Pane sizes are a
+ * layout preference worth keeping across sessions and belong to the BUILDER,
+ * not to a dialog title — the builder is hosted by both the "Add chart" and
+ * "Edit chart" titles and shares one layout. (RcdDialog's own geometry follows
+ * the same rule from 0.14.1 under its `rcd.dialog.geometry` store, keyed by
+ * the geometryKey the builder's dialog passes.)
  */
 
 export type PaneId = 'fields' | 'middle';

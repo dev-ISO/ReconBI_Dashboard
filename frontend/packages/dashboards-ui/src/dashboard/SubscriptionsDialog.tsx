@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ChevronDown, ChevronRight, Mail, Pencil, Plus, Settings2, Trash2 } from 'lucide-react';
 import type {
+  ChartType,
   DashboardLayoutDoc,
   DashboardSubscription,
+  RcdUser,
   SaveSubscriptionBody,
   SubscriptionContentBody,
   SubscriptionContentConfig,
@@ -11,8 +13,10 @@ import type {
 } from '@recon/dashboards-core';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+import { chartTypeLabel } from '../chart-builder/chartTypeMeta';
 import { DeliveryBadge, EnabledToggle } from './deliveryBadge';
 import { SubscriptionPreviewDialog, type SubscriptionPreviewRequest } from './SubscriptionPreviewDialog';
+import { UserPicker, type UserPickerChip } from './UserPicker';
 
 export interface SubscriptionsDialogProps {
   open: boolean;
@@ -43,6 +47,27 @@ export const parseRecipients = (raw: string): string[] => {
 
 /** Validation-lite: something@something.tld. */
 export const looksLikeEmail = (email: string): boolean => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+
+/**
+ * The ';'-joined recipients string is stored in a varchar(2048) column
+ * (ReconDashboardsDbContext: Recipients.HasMaxLength(2048)) — roughly 60-70
+ * addresses. Free typing made that hard to reach; a picker makes bulk-add one
+ * click each, so the form says so BEFORE the server truncates or rejects.
+ */
+export const RECIPIENTS_MAX_CHARS = 2048;
+
+/**
+ * Server cap on the excluded-tile list (SubscriptionContent.MaxExcludedTiles).
+ * Exceeding it is a 400 (rcd.subscription.bad_content), so a dashboard with
+ * hundreds of chart tiles must not be allowed to "Deselect all" in silence.
+ */
+export const MAX_EXCLUDED_TILES = 200;
+
+/** Recipients are picked BY ADDRESS; rows with no email cannot be picked at all. */
+const recipientKeyOf = (user: RcdUser): string | null => {
+  const email = user.email?.trim();
+  return email === undefined || email === '' ? null : email.toLowerCase();
+};
 
 const INTERVAL_OPTIONS = [15, 30, 60, 240, 480, 1440];
 
@@ -433,18 +458,111 @@ export function SubscriptionsDialog({
   );
 }
 
-/** All chart tiles across the doc's pages (legacy single-page docs fall back to `tiles`). */
-export const chartTilesOf = (layout: DashboardLayoutDoc): { id: string; title: string }[] => {
+/** One emailable chart tile in the include checklist. */
+export interface SubscriptionTileEntry {
+  id: string;
+  title: string;
+  type: ChartType;
+}
+
+/** The checklist's chart tiles for ONE dashboard page. */
+export interface SubscriptionTilePage {
+  pageId: string;
+  pageName: string;
+  tiles: SubscriptionTileEntry[];
+}
+
+/** Legacy flat docs email as one page; the backend synthesizes the same name. */
+const LEGACY_PAGE_ID = '__page1';
+
+/** Stable empty set for "no page sections known yet" (a literal would churn memos). */
+const NO_PAGES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * The doc's emailable chart tiles, GROUPED BY PAGE — the shape the email
+ * itself has (SnapshotComposer renders one section per page), so the checklist
+ * mirrors the output instead of presenting one flat list.
+ *
+ * The three filters match LayoutSnapshotParser exactly, so this never offers a
+ * tile the email would skip: kind absent-or-'chart', a `chart` spec, and a
+ * non-null `chart.query` (a chart with no query has nothing to render). Pages
+ * left with no emailable tile are dropped rather than shown empty. Legacy flat
+ * docs (no `pages`) synthesize the parser's own "Page 1"; a page with a blank
+ * name falls back to the parser's "Page".
+ */
+export const chartTilesOf = (layout: DashboardLayoutDoc): SubscriptionTilePage[] => {
   const pages = layout.pages ?? [];
-  const tiles = pages.length > 0 ? pages.flatMap((page) => page.tiles) : layout.tiles;
-  const out: { id: string; title: string }[] = [];
-  for (const tile of tiles) {
-    if ((tile.kind ?? 'chart') !== 'chart' || tile.chart === undefined) continue;
-    const title = tile.chart.title.trim();
-    out.push({ id: tile.id, title: title === '' ? 'Untitled chart' : title });
+  const source =
+    pages.length > 0
+      ? pages.map((page) => ({
+          pageId: page.id,
+          pageName: (page.name ?? '').trim() === '' ? 'Page' : page.name.trim(),
+          tiles: page.tiles,
+        }))
+      : [{ pageId: LEGACY_PAGE_ID, pageName: 'Page 1', tiles: layout.tiles }];
+
+  const out: SubscriptionTilePage[] = [];
+  for (const page of source) {
+    const tiles: SubscriptionTileEntry[] = [];
+    for (const tile of page.tiles) {
+      if ((tile.kind ?? 'chart') !== 'chart') continue;
+      const chart = tile.chart;
+      if (chart === undefined || chart.query === undefined || chart.query === null) continue;
+      const title = chart.title.trim();
+      tiles.push({
+        id: tile.id,
+        title: title === '' ? 'Untitled chart' : title,
+        type: chart.type,
+      });
+    }
+    if (tiles.length > 0) out.push({ ...page, tiles });
   }
   return out;
 };
+
+/**
+ * The checklist's Select all / Deselect all pair (the slicer checklist's
+ * vocabulary). Each button disables when it would be a no-op, so the pair also
+ * reads as a status: both dead = the scope is already exactly as asked.
+ */
+function TileSelectAll({
+  title,
+  deselectTitle,
+  canSelect,
+  canDeselect,
+  onSelect,
+  onDeselect,
+}: {
+  title: string;
+  deselectTitle: string;
+  canSelect: boolean;
+  canDeselect: boolean;
+  onSelect: () => void;
+  onDeselect: () => void;
+}) {
+  return (
+    <span className="flex shrink-0 items-center gap-1">
+      <RcdButton
+        variant="ghost"
+        className="!px-1.5 !py-0.5 !text-[11px]"
+        disabled={!canSelect}
+        title={title}
+        onClick={onSelect}
+      >
+        Select all
+      </RcdButton>
+      <RcdButton
+        variant="ghost"
+        className="!px-1.5 !py-0.5 !text-[11px]"
+        disabled={!canDeselect}
+        title={deselectTitle}
+        onClick={onDeselect}
+      >
+        Deselect all
+      </RcdButton>
+    </span>
+  );
+}
 
 /**
  * The subscription create/edit form, extracted so the Subscriptions & alerts
@@ -492,10 +610,33 @@ export function SubscriptionForm({
   }, [runtime, dashboardId, loadedLayout]);
 
   const layout = loadedLayout ?? (fetchedLayout === 'unavailable' ? null : fetchedLayout);
-  const tiles = layout === null ? null : chartTilesOf(layout);
+  const tilePages = useMemo(() => (layout === null ? null : chartTilesOf(layout)), [layout]);
   const tileListUnavailable = loadedLayout === null && fetchedLayout === 'unavailable';
+  const allTiles = useMemo(
+    () => (tilePages === null ? [] : tilePages.flatMap((page) => page.tiles)),
+    [tilePages],
+  );
   const excluded = new Set(draft.excludedTileIds);
-  const includedCount = tiles === null ? 0 : tiles.filter((tile) => !excluded.has(tile.id)).length;
+  const includedCount = allTiles.filter((tile) => !excluded.has(tile.id)).length;
+
+  /**
+   * Which page sections are open. `null` = untouched, so the default posture
+   * (FieldList's: all open when there are few, otherwise only the first) can be
+   * derived once the doc actually arrives rather than seeded from nothing.
+   */
+  const [expandedPages, setExpandedPages] = useState<ReadonlySet<string> | null>(null);
+  const defaultExpanded = useMemo(() => {
+    if (tilePages === null) return null;
+    const keys = tilePages.map((page) => page.pageId);
+    return new Set<string>(keys.length <= 3 ? keys : keys.slice(0, 1));
+  }, [tilePages]);
+  const openPages = expandedPages ?? defaultExpanded ?? NO_PAGES;
+  const togglePage = (pageId: string) => {
+    const next = new Set(openPages);
+    if (next.has(pageId)) next.delete(pageId);
+    else next.add(pageId);
+    setExpandedPages(next);
+  };
 
   // Only the toggled id moves — ids the doc no longer knows (deleted tiles)
   // stay excluded rather than being silently dropped.
@@ -507,8 +648,90 @@ export function SubscriptionForm({
         : [...draft.excludedTileIds, tileId],
     });
 
-  const recipients = parseRecipients(draft.recipientsText);
+  /**
+   * Bulk include: removes ONLY the ids passed in — the same rule toggleTile
+   * follows, applied N at a time. An id the doc no longer knows is not
+   * "listed", so it survives untouched. excludedTileIds is NEVER reset to [],
+   * which would silently re-include tiles this subscription deliberately drops.
+   */
+  const includeTiles = (list: SubscriptionTileEntry[]) => {
+    const listed = new Set(list.map((tile) => tile.id));
+    setDraft({
+      ...draft,
+      excludedTileIds: draft.excludedTileIds.filter((id) => !listed.has(id)),
+    });
+  };
+
+  /** Bulk exclude: APPENDS the listed ids, leaving every other id exactly where it is. */
+  const excludeTiles = (list: SubscriptionTileEntry[]) => {
+    const next = [...draft.excludedTileIds];
+    const have = new Set(next);
+    for (const tile of list) {
+      if (have.has(tile.id)) continue;
+      have.add(tile.id);
+      next.push(tile.id);
+    }
+    setDraft({ ...draft, excludedTileIds: next });
+  };
+
+  const overTileCap = draft.excludedTileIds.length > MAX_EXCLUDED_TILES;
+
+  /* ------------------------------------------------------------ recipients */
+  const recipients = useMemo(() => parseRecipients(draft.recipientsText), [draft.recipientsText]);
+  const recipientKeys = useMemo(
+    () => new Set(recipients.map((email) => email.toLowerCase())),
+    [recipients],
+  );
   const invalidRecipients = recipients.filter((email) => !looksLikeEmail(email));
+
+  /**
+   * Every address the directory has shown this session, lowercased -> display
+   * name. Saved subscriptions predate the picker and can hold addresses no user
+   * owns (contractors, distribution lists): those are FLAGGED here, never
+   * dropped — silently discarding a recipient on edit is the one outcome this
+   * form must not produce. Empty until the directory answers, so an
+   * unconfigured or still-loading directory flags nothing.
+   */
+  const [knownEmails, setKnownEmails] = useState<ReadonlyMap<string, string>>(() => new Map());
+  const rememberDirectory = useCallback((users: RcdUser[]) => {
+    setKnownEmails((prev) => {
+      let next: Map<string, string> | null = null;
+      for (const user of users) {
+        const key = recipientKeyOf(user);
+        if (key === null || prev.has(key)) continue;
+        next ??= new Map(prev);
+        next.set(key, user.displayName);
+      }
+      // The SAME map when nothing is new — allocating a fresh one per response
+      // would re-render the whole form on every keystroke of the picker.
+      return next ?? prev;
+    });
+  }, []);
+
+  const directoryAnswered = knownEmails.size > 0;
+  const recipientChips: UserPickerChip[] = recipients.map((email) => {
+    const key = email.toLowerCase();
+    const displayName = knownEmails.get(key);
+    if (displayName !== undefined) return { key, label: email, title: displayName };
+    return {
+      key,
+      label: email,
+      unknown: directoryAnswered,
+      title: directoryAnswered
+        ? 'Not in the user directory — kept from the saved subscription and still emailed. Remove it if it should not receive this report.'
+        : email,
+    };
+  });
+  const unknownCount = recipientChips.filter((chip) => chip.unknown === true).length;
+
+  const setRecipients = (list: string[]) =>
+    setDraft({ ...draft, recipientsText: list.join(', ') });
+
+  /** Length the ';' join will actually occupy in the varchar(2048) column. */
+  const recipientsWireLength = recipients.join(';').length;
+  const overRecipientCap = recipientsWireLength > RECIPIENTS_MAX_CHARS;
+  const nearRecipientCap = !overRecipientCap && recipientsWireLength > RECIPIENTS_MAX_CHARS * 0.9;
+
   return (
     <div className="flex flex-col gap-3">
       <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
@@ -573,29 +796,46 @@ export function SubscriptionForm({
         </div>
       </div>
 
-      <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
-        Recipients
-        <textarea
-          value={draft.recipientsText}
-          onChange={(event) => setDraft({ ...draft, recipientsText: event.target.value })}
-          placeholder="one@example.com, two@example.com"
-          rows={3}
-          className="rounded-lg border border-rcd-border bg-rcd-surface px-3 py-1.5 text-sm text-rcd-text shadow-[var(--rcd-shadow-1)] outline-none transition-[border-color,box-shadow] placeholder:text-rcd-muted focus:border-[var(--rcd-accent-interactive)] focus:ring-2 focus:ring-[color-mix(in_srgb,var(--rcd-accent-interactive)_20%,transparent)]"
+      {/* Recipients are picked from the host user directory — free typing is
+          deliberately not offered, so a report can never be scheduled to an
+          address nobody in the system owns. */}
+      <div className="flex flex-col gap-1">
+        <UserPicker
+          label={`Recipients${recipients.length === 0 ? '' : ` (${recipients.length})`}`}
+          searchAriaLabel="Search people to email"
+          placeholder="Search by username or email"
+          emptyDirectoryNote={
+            <p className="rounded-lg border border-rcd-border bg-rcd-bg px-3 py-2 text-xs text-rcd-muted">
+              User directory not configured — recipients cannot be added here. The saved list is
+              kept as-is.
+            </p>
+          }
+          takenKeys={recipientKeys}
+          keyOf={recipientKeyOf}
+          disabledRowHint="No email address"
+          onPick={(user) => {
+            const email = user.email?.trim();
+            if (email !== undefined && email !== '') setRecipients([...recipients, email]);
+          }}
+          chips={recipientChips}
+          onRemoveChip={(chip) =>
+            setRecipients(recipients.filter((email) => email.toLowerCase() !== chip.key))
+          }
+          removeChipLabel={(chip) => `Remove ${chip.label} from the recipients`}
+          noMatchNote="No people match — recipients must be users in the system."
+          onDirectory={rememberDirectory}
         />
-        {recipients.length > 0 && (
-          <span className="flex flex-wrap gap-1">
-            {recipients.map((email) => (
-              <span
-                key={email}
-                className={`inline-flex items-center rounded-md border px-2 py-0.5 text-[11px] font-medium ${
-                  looksLikeEmail(email)
-                    ? 'border-rcd-border text-rcd-text-2'
-                    : 'border-[var(--rcd-status-critical)] text-[var(--rcd-status-critical)]'
-                }`}
-              >
-                {email}
-              </span>
-            ))}
+        {recipients.length === 0 && (
+          <span className="text-xs text-rcd-muted">
+            Pick at least one person — the email only goes to users in the system.
+          </span>
+        )}
+        {unknownCount > 0 && (
+          <span className="text-xs text-rcd-muted">
+            {unknownCount === 1
+              ? '1 address is not in the user directory'
+              : `${unknownCount} addresses are not in the user directory`}{' '}
+            (dashed chips) — kept from the saved subscription and still emailed.
           </span>
         )}
         {invalidRecipients.length > 0 && (
@@ -603,7 +843,21 @@ export function SubscriptionForm({
             These don&apos;t look like email addresses: {invalidRecipients.join(', ')}
           </span>
         )}
-      </label>
+        {(nearRecipientCap || overRecipientCap) && (
+          <span
+            className={
+              overRecipientCap
+                ? 'text-xs text-[var(--rcd-status-critical)]'
+                : 'text-xs text-[var(--rcd-status-warn)]'
+            }
+          >
+            {recipientsWireLength} of {RECIPIENTS_MAX_CHARS} characters of recipients
+            {overRecipientCap
+              ? ' — too long to save. Remove some addresses or split this into two subscriptions.'
+              : ' — close to the limit. Consider a distribution list.'}
+          </span>
+        )}
+      </div>
 
       <div className="flex items-center gap-4">
         <label className="flex items-center gap-1.5 text-sm text-rcd-text-2">
@@ -687,33 +941,110 @@ export function SubscriptionForm({
           <span className="text-xs text-rcd-muted">
             Tile list unavailable — the saved tile selection is kept as-is.
           </span>
-        ) : tiles !== null && tiles.length > 0 ? (
+        ) : tilePages !== null && allTiles.length > 0 ? (
           <div className="flex flex-col gap-1">
-            <button
-              type="button"
-              className="flex cursor-pointer items-center gap-1 text-xs text-rcd-text-2 hover:text-rcd-text"
-              onClick={() => setTilesOpen(!tilesOpen)}
-            >
-              {tilesOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-              Tiles to include ({includedCount}/{tiles.length})
-            </button>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-expanded={tilesOpen}
+                className="flex min-w-0 flex-1 cursor-pointer items-center gap-1 text-left text-xs text-rcd-text-2 hover:text-rcd-text"
+                onClick={() => setTilesOpen(!tilesOpen)}
+              >
+                {tilesOpen ? (
+                  <ChevronDown size={12} className="shrink-0" />
+                ) : (
+                  <ChevronRight size={12} className="shrink-0" />
+                )}
+                Tiles to include ({includedCount}/{allTiles.length})
+              </button>
+              <TileSelectAll
+                title="Include every tile in this dashboard"
+                deselectTitle="Exclude every tile in this dashboard"
+                canSelect={includedCount < allTiles.length}
+                canDeselect={includedCount > 0}
+                onSelect={() => includeTiles(allTiles)}
+                onDeselect={() => excludeTiles(allTiles)}
+              />
+            </div>
             {tilesOpen && (
-              <div className="flex max-h-40 flex-col gap-1 overflow-y-auto pl-4">
-                {tiles.map((tile) => (
-                  <label
-                    key={tile.id}
-                    className="flex cursor-pointer items-center gap-1.5 text-xs text-rcd-text"
-                  >
-                    <input
-                      type="checkbox"
-                      className="accent-[var(--rcd-accent)]"
-                      checked={!excluded.has(tile.id)}
-                      onChange={(event) => toggleTile(tile.id, event.target.checked)}
-                    />
-                    {tile.title}
-                  </label>
-                ))}
+              <div className="flex max-h-40 flex-col overflow-y-auto pl-4">
+                {/* One collapsible section per dashboard page — the same
+                    grouping the email itself renders (SnapshotComposer emits a
+                    section per page), so what is checked here maps 1:1 to what
+                    arrives in the inbox. */}
+                {tilePages.map((page) => {
+                  const pageOpen = openPages.has(page.pageId);
+                  const pageIncluded = page.tiles.filter((tile) => !excluded.has(tile.id)).length;
+                  return (
+                    <div key={page.pageId} className="flex flex-col">
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          aria-expanded={pageOpen}
+                          onClick={() => togglePage(page.pageId)}
+                          className="flex min-w-0 flex-1 items-center gap-1 pb-1 pt-2 text-left text-xs font-medium uppercase tracking-wide text-rcd-muted hover:text-rcd-text"
+                        >
+                          {pageOpen ? (
+                            <ChevronDown size={12} className="shrink-0" />
+                          ) : (
+                            <ChevronRight size={12} className="shrink-0" />
+                          )}
+                          <span className="truncate" title={page.pageName}>
+                            {page.pageName}
+                          </span>
+                          <span className="shrink-0 normal-case tracking-normal">
+                            ({pageIncluded}/{page.tiles.length})
+                          </span>
+                        </button>
+                        <TileSelectAll
+                          title={`Include every tile on ${page.pageName}`}
+                          deselectTitle={`Exclude every tile on ${page.pageName}`}
+                          canSelect={pageIncluded < page.tiles.length}
+                          canDeselect={pageIncluded > 0}
+                          onSelect={() => includeTiles(page.tiles)}
+                          onDeselect={() => excludeTiles(page.tiles)}
+                        />
+                      </div>
+                      {pageOpen && (
+                        <div className="flex flex-col gap-1 pl-4">
+                          {page.tiles.map((tile) => {
+                            const typeLabel = chartTypeLabel(tile.type);
+                            return (
+                              // The NAME absorbs truncation (min-w-0 + truncate)
+                              // and the TYPE never is: a long chart title must
+                              // not push "Stacked column" out of the row.
+                              <label
+                                key={tile.id}
+                                title={`${tile.title} — ${typeLabel}`}
+                                className="flex min-w-0 cursor-pointer items-center gap-1.5 text-xs text-rcd-text"
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="shrink-0 accent-[var(--rcd-accent)]"
+                                  checked={!excluded.has(tile.id)}
+                                  onChange={(event) => toggleTile(tile.id, event.target.checked)}
+                                />
+                                <span className="min-w-0 flex-1 truncate">{tile.title}</span>
+                                <span className="shrink-0 text-[11px] text-rcd-muted">
+                                  {typeLabel}
+                                </span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
+            )}
+            {overTileCap && (
+              <span className="text-xs text-[var(--rcd-status-critical)]">
+                {draft.excludedTileIds.length} tiles are excluded — the server accepts at most{' '}
+                {MAX_EXCLUDED_TILES}. Include at least{' '}
+                {draft.excludedTileIds.length - MAX_EXCLUDED_TILES} more, or this subscription will
+                be rejected when you save it.
+              </span>
             )}
           </div>
         ) : null}

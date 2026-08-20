@@ -19,6 +19,15 @@ export const defaultMobileHeight = (tile: DashboardTile): number | null => {
   if (isChartTile(tile)) return tile.chart.type === 'kpi' ? 120 : 260;
   if (tile.kind === 'image') return 200;
   if (tile.kind === 'button') return 56;
+  // A button GROUP had no default at all (auto), so a column of buttons
+  // collapsed on a phone. Size it to what it holds: one row per button when
+  // stacked, plus the header bar when the group shows its container.
+  if (tile.kind === 'buttonGroup' && tile.buttonGroup) {
+    const group = tile.buttonGroup;
+    const rows = group.direction === 'column' ? Math.max(1, group.buttons.length) : 1;
+    const framed = group.container != null && group.container.hideHeader !== true;
+    return (framed ? 32 : 0) + 16 + rows * 36 + Math.max(0, rows - 1) * (group.gap ?? 8);
+  }
   return null; // slicer / text: auto
 };
 
@@ -148,7 +157,8 @@ export function MobileLayoutEditor({ tiles, layout, onChange, renderTile }: Mobi
     if (tile.kind === 'image') return 'Image';
     // Plain-text of the rich button label; generic fallback for empty labels.
     if (tile.kind === 'button' && tile.button) return buttonLabelText(tile.button) || 'Button';
-    if (tile.kind === 'buttonGroup') return 'Button group';
+    // Author-given group name (0.14.1); generic label when unset.
+    if (tile.kind === 'buttonGroup') return tile.buttonGroup?.title?.trim() || 'Button group';
     return tile.id;
   };
 

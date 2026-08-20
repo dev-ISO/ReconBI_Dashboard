@@ -63,7 +63,7 @@ const HEADER_DEFAULT = 64;
 /* ----------------------------------------------------- printable-kind filter */
 
 describe('computePrintLayout printable-kind filter', () => {
-  it('excludes slicer and button tiles (interactive chrome) but keeps text/image', () => {
+  it('excludes slicer tiles (pure interaction) but keeps text/image/button', () => {
     const tiles: DashboardTile[] = [
       tile('chart-1', 0, 0, 12, 4),
       {
@@ -84,13 +84,26 @@ describe('computePrintLayout printable-kind filter', () => {
         kind: 'slicer',
         slicer: { table: 't', column: 'c', label: 'Status', variant: 'checklist' },
       },
-      // Buttons are page NAVIGATION — meaningless on paper, so they neither
-      // render nor reserve space (same rule as slicers).
+      // 0.14.1 (A7): a button tile is a visible design element as well as a
+      // navigation control, so it PRINTS (inert) and reserves its space —
+      // leaving a hole where the author put a toolbar was the worse failure.
       {
         id: 'button-1',
         layout: { x: 6, y: 4, w: 4, h: 2 },
         kind: 'button',
         button: { html: '<p>Go</p>', targetPageId: 'p2' },
+      },
+      {
+        id: 'group-1',
+        layout: { x: 10, y: 4, w: 6, h: 2 },
+        kind: 'buttonGroup',
+        buttonGroup: {
+          buttons: [{ id: 'b1', html: '<p>Go</p>', targetPageId: 'p2' }],
+          direction: 'row',
+          wrap: true,
+          gap: 8,
+          align: 'center',
+        },
       },
     ];
 
@@ -101,7 +114,7 @@ describe('computePrintLayout printable-kind filter', () => {
       .map((placed) => placed.tile.id)
       .sort();
 
-    expect(printedIds).toEqual(['chart-1', 'image-1', 'text-1']);
+    expect(printedIds).toEqual(['button-1', 'chart-1', 'group-1', 'image-1', 'text-1']);
   });
 });
 

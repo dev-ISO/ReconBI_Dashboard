@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
-import { sanitizeRichHtml, type ButtonTileSpec } from '@recon/dashboards-core';
+import { AlertTriangle } from 'lucide-react';
+import { buttonStyleFromCss, sanitizeRichHtml, type ButtonTileSpec } from '@recon/dashboards-core';
 import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 import { RichTextEditingSurface } from '../richtext/RichTextEditingSurface';
 import { RICH_TEXT_CLASSES } from '../richtext/richTextClasses';
 import { parseHexInput } from '../richtext/useRichTextMenu';
+import type { ButtonScale, ButtonVariant } from './buttonLayout';
 import { ButtonVisual } from './ButtonVisual';
 
 export interface ButtonTileDialogProps {
@@ -33,7 +35,7 @@ export const DEFAULT_LABEL_HTML = '<p>Button</p>';
 const BUTTON_RECENT_COLORS_KEY = 'rcd-button-recent-colors';
 const MAX_RECENT_COLORS = 10;
 
-const readButtonRecentColors = (): string[] => {
+export const readButtonRecentColors = (): string[] => {
   try {
     const raw = window.localStorage.getItem(BUTTON_RECENT_COLORS_KEY);
     const parsed: unknown = raw === null ? null : JSON.parse(raw);
@@ -46,7 +48,7 @@ const readButtonRecentColors = (): string[] => {
   }
 };
 
-const rememberButtonRecentColor = (hex: string): string[] => {
+export const rememberButtonRecentColor = (hex: string): string[] => {
   const canonical = parseHexInput(hex);
   if (!canonical) return readButtonRecentColors();
   const next = [canonical, ...readButtonRecentColors().filter((entry) => entry !== canonical)].slice(
@@ -137,22 +139,38 @@ const CSS_HINT =
   'position, margin, …) is dropped — the preview shows exactly what ships.';
 
 /**
+ * True when the sanitized advanced CSS carries a background declaration.
+ * Detection rides buttonStyleFromCss — the SAME parse the renderer applies —
+ * so the warning appears exactly when the override really lands (A4 ii).
+ */
+export const cssOverridesBackground = (customCss: string): boolean =>
+  Object.keys(buttonStyleFromCss(customCss ?? '')).some((key) => key.startsWith('background'));
+
+/**
  * One custom color control (B1): native picker + typable hex field + Default,
  * with the shared per-user recent swatches underneath. Committing a color
  * lands it in the recents (the rich-text menu's pattern).
+ *
+ * Exported for the group dialog's "apply to all buttons" control.
  */
-function ButtonColorField({
+export function ButtonColorField({
   label,
   value,
   onChange,
   recents,
   onRemember,
+  hint,
+  warning,
 }: {
   label: string;
   value: string | null;
   onChange: (hex: string | null) => void;
   recents: string[];
   onRemember: (hex: string) => void;
+  /** Small caption under the label (what this color paints). */
+  hint?: string;
+  /** Shown as a chip beside the controls when something outranks this color. */
+  warning?: string | null;
 }) {
   const canonical = value ? (parseHexInput(value) ?? null) : null;
   const [text, setText] = useState(canonical ?? '');
@@ -180,7 +198,8 @@ function ButtonColorField({
   return (
     <div className="flex min-w-0 flex-1 flex-col gap-1">
       <span className="text-xs font-medium text-rcd-text-2">{label}</span>
-      <div className="flex items-center gap-1.5">
+      {hint !== undefined && <span className="text-[10px] leading-snug text-rcd-muted">{hint}</span>}
+      <div className="flex flex-wrap items-center gap-1.5">
         <input
           type="color"
           value={canonical ?? '#3b82f6'}
@@ -208,7 +227,20 @@ function ButtonColorField({
           spellCheck={false}
           aria-label={`${label} color hex value`}
           onFocus={(event) => event.currentTarget.select()}
-          onChange={(event) => setText(event.target.value)}
+          // A4(iii): COMMIT AS SOON AS THE VALUE PARSES. Committing only on
+          // Enter/blur is the "finicky" report — typing #ff0000 and then
+          // clicking Cancel, or a field that never blurs, silently discarded
+          // it. Partial input ("#ff0") keeps the old commit-on-Enter/blur
+          // behavior, so typing a full hex one character at a time still works.
+          onChange={(event) => {
+            const next = event.target.value;
+            setText(next);
+            const parsed = parseHexInput(next);
+            if (parsed) {
+              onChange(parsed);
+              onRemember(parsed);
+            }
+          }}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
               event.preventDefault();
@@ -232,6 +264,15 @@ function ButtonColorField({
         >
           Default
         </button>
+        {warning != null && warning !== '' && (
+          <span
+            className="inline-flex items-center gap-1 rounded-md border border-[var(--rcd-status-warn)] px-1.5 py-0.5 text-[10px] font-medium leading-4 text-[var(--rcd-status-warn)]"
+            title={warning}
+          >
+            <AlertTriangle size={10} aria-hidden />
+            {warning}
+          </span>
+        )}
       </div>
       {recents.length > 0 && (
         <div className="flex flex-wrap items-center gap-1">
@@ -267,10 +308,15 @@ export function ButtonFieldsEditor({
   draft,
   onChange,
   pages,
+  previewSize = null,
+  previewVariant = 'default',
 }: {
   draft: ButtonFieldsDraft;
   onChange: (patch: Partial<ButtonFieldsDraft>) => void;
   pages: { id: string; name: string }[];
+  /** Group hosts pass their size/variant so the preview stays the truth. */
+  previewSize?: ButtonScale | null;
+  previewVariant?: ButtonVariant;
 }) {
   // Recents are shared by both color fields so a color committed on one is
   // immediately offered on the other.
@@ -283,6 +329,11 @@ export function ButtonFieldsEditor({
   const targetMissing =
     draft.targetPageId !== '' && !pages.some((page) => page.id === draft.targetPageId);
 
+  // customCss is the full-control layer and WINS over the fill picker by
+  // design (buttonTiles.test.tsx pins it). Rather than break that contract,
+  // say so where the author is looking (A4 ii).
+  const cssBackground = cssOverridesBackground(draft.customCss);
+
   return (
     <div className="flex flex-col gap-3">
       <div className="flex flex-col gap-1.5">
@@ -291,13 +342,17 @@ export function ButtonFieldsEditor({
             expands, so the mount-only seed always shows the CURRENT html.
             A button LABEL is a single line without list structure:
             multiline off (Enter is consumed) and lists off (no list
-            toolbar/menu/Tab-indent — Tab still inserts spaces). */}
+            toolbar/menu/Tab-indent — Tab still inserts spaces).
+            COLOR OFF (D2 "the dialog owns color"): the rich-text color control
+            wrote spans INSIDE the label that always beat the dialog's Text
+            picker, so the two controls disagreed three centimetres apart.
+            Existing color spans keep rendering — only the control is gone. */}
         <RichTextEditingSurface
           seedHtml={draft.html}
           onChange={(html) => onChange({ html })}
           inDialog
           multiline={false}
-          features={{ lists: false }}
+          features={{ lists: false, color: false }}
           ariaLabel="Button label rich text"
           className={`${RICH_TEXT_CLASSES} min-h-[3rem] rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 outline-none focus:border-rcd-accent`}
         />
@@ -323,15 +378,22 @@ export function ButtonFieldsEditor({
       </label>
 
       <div className="flex flex-wrap items-start gap-4">
+        {/* A4(i): "Background" meant the CONTAINER fill on the group's config
+            card and the BUTTON fill here — the same word for two different
+            surfaces was the likeliest cause of "it doesn't change the button".
+            This one is the button's own fill. */}
         <ButtonColorField
-          label="Background"
+          label="Button fill"
+          hint="This button's own color."
           value={draft.background}
           onChange={(background) => onChange({ background })}
           recents={recents}
           onRemember={remember}
+          warning={cssBackground ? 'Advanced CSS is overriding this fill' : null}
         />
         <ButtonColorField
           label="Text"
+          hint="Label color for the whole button."
           value={draft.textColor}
           onChange={(textColor) => onChange({ textColor })}
           recents={recents}
@@ -362,10 +424,19 @@ export function ButtonFieldsEditor({
           onChange={(event) => onChange({ customCss: event.target.value })}
           spellCheck={false}
           rows={3}
-          placeholder={'background-image: linear-gradient(90deg, #2563eb, #7c3aed);\nfont-weight: 600;'}
+          // A4(ii): the old placeholder SUGGESTED a background gradient, which
+          // then silently outranked the fill picker above. The example is a
+          // non-background declaration now.
+          placeholder={'font-weight: 600;\nletter-spacing: 0.02em;'}
           aria-label="Advanced CSS declarations for the button"
           className="rounded-md border border-rcd-border bg-rcd-surface px-2.5 py-1.5 font-mono text-[11px] leading-snug text-rcd-text outline-none focus:border-rcd-accent"
         />
+        {cssBackground && (
+          <p className="text-[10px] leading-snug text-[var(--rcd-status-warn)]">
+            A background declaration here overrides the Button fill picker above — remove it to use
+            the picker.
+          </p>
+        )}
         <p className="text-[10px] leading-snug text-rcd-muted">{CSS_HINT}</p>
       </div>
 
@@ -383,6 +454,8 @@ export function ButtonFieldsEditor({
               radius: clampButtonRadius(draft.radiusDraft),
               customCss: draft.customCss,
             }}
+            size={previewSize}
+            variant={previewVariant}
           />
         </div>
       </div>

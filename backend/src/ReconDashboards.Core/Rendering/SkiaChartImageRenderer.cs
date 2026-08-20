@@ -72,15 +72,14 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
         foreach (var area in layout.Areas)
         {
             using var paint = FillPaint(area.Fill, area.Opacity);
-            using var path = new SKPath();
-            path.AddPoly(area.Points.Select(p => new SKPoint((float)p.X, (float)p.Y)).ToArray());
+            using var path = BuildPath(area.Points, area.CurvePoints);
+            path.Close();
             canvas.DrawPath(path, paint);
         }
 
         foreach (var bar in layout.Bars)
         {
-            using var paint = FillPaint(bar.Fill, bar.Opacity);
-            canvas.DrawRect((float)bar.X, (float)bar.Y, (float)bar.Width, (float)bar.Height, paint);
+            DrawBar(canvas, bar);
         }
 
         foreach (var arc in layout.Arcs)
@@ -90,6 +89,7 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
 
         foreach (var polyline in layout.Lines)
         {
+            using var dash = DashEffect(polyline.Dash);
             using var paint = new SKPaint
             {
                 Color = ParseColor(polyline.Stroke),
@@ -98,14 +98,9 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
                 StrokeWidth = (float)polyline.StrokeWidth,
                 StrokeJoin = SKStrokeJoin.Round,
                 StrokeCap = SKStrokeCap.Round,
+                PathEffect = dash,
             };
-            using var path = new SKPath();
-            path.MoveTo((float)polyline.Points[0].X, (float)polyline.Points[0].Y);
-            foreach (var point in polyline.Points.Skip(1))
-            {
-                path.LineTo((float)point.X, (float)point.Y);
-            }
-
+            using var path = BuildPath(polyline.Points, polyline.Curve ? polyline.Points.Count : 0);
             canvas.DrawPath(path, paint);
         }
 
@@ -118,6 +113,11 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
         foreach (var line in layout.AxisLines)
         {
             DrawLine(canvas, line);
+        }
+
+        foreach (var guide in layout.Guides)
+        {
+            DrawLine(canvas, guide);
         }
 
         foreach (var swatch in layout.Swatches)
@@ -139,22 +139,69 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
 
     private static void DrawLine(SKCanvas canvas, LayoutLine line)
     {
+        using var dash = DashEffect(line.Dash);
         using var paint = new SKPaint
         {
             Color = ParseColor(line.Stroke),
             IsAntialias = true,
             Style = SKPaintStyle.Stroke,
             StrokeWidth = (float)line.StrokeWidth,
+            PathEffect = dash,
         };
         canvas.DrawLine((float)line.X1, (float)line.Y1, (float)line.X2, (float)line.Y2, paint);
+    }
+
+    private static void DrawBar(SKCanvas canvas, LayoutRect bar)
+    {
+        using var paint = FillPaint(bar.Fill, bar.Opacity);
+        var rect = SKRect.Create((float)bar.X, (float)bar.Y, (float)bar.Width, (float)bar.Height);
+        if (bar.CornerRadius > 0 && bar.Corners != RectCorners.None)
+        {
+            // Radii larger than half the short side pinch the rect into a lens.
+            var r = (float)Math.Min(bar.CornerRadius, Math.Min(bar.Width, bar.Height) / 2);
+            var zero = new SKPoint(0, 0);
+            var round = new SKPoint(r, r);
+            var (topLeft, topRight, bottomRight, bottomLeft) = bar.Corners switch
+            {
+                RectCorners.All => (round, round, round, round),
+                RectCorners.Top => (round, round, zero, zero),
+                RectCorners.Bottom => (zero, zero, round, round),
+                RectCorners.Left => (round, zero, zero, round),
+                _ => (zero, round, round, zero), // Right
+            };
+            using var rounded = new SKRoundRect();
+            rounded.SetRectRadii(rect, [topLeft, topRight, bottomRight, bottomLeft]);
+            canvas.DrawRoundRect(rounded, paint);
+            if (bar.Stroke is not null && bar.StrokeWidth > 0)
+            {
+                using var stroke = StrokePaint(bar.Stroke, bar.StrokeWidth);
+                canvas.DrawRoundRect(rounded, stroke);
+            }
+
+            return;
+        }
+
+        canvas.DrawRect(rect, paint);
+        if (bar.Stroke is not null && bar.StrokeWidth > 0)
+        {
+            using var stroke = StrokePaint(bar.Stroke, bar.StrokeWidth);
+            canvas.DrawRect(rect, stroke);
+        }
     }
 
     private static void DrawArc(SKCanvas canvas, LayoutArc arc)
     {
         // Layout angles: 0° at 12 o'clock, clockwise. Skia arc angles: 0° at
-        // 3 o'clock, clockwise — shift by -90°.
-        var start = (float)(arc.StartDegrees - 90);
-        var sweep = (float)arc.SweepDegrees;
+        // 3 o'clock, clockwise — shift by -90°. The pad is taken out of the
+        // slice symmetrically, which is what recharts' paddingAngle looks like.
+        var pad = Math.Min(arc.PadDegrees, Math.Max(0, arc.SweepDegrees - 0.5));
+        var start = (float)(arc.StartDegrees - 90 + (pad / 2));
+        var sweep = (float)(arc.SweepDegrees - pad);
+        if (sweep <= 0)
+        {
+            return;
+        }
+
         var cx = (float)arc.CenterX;
         var cy = (float)arc.CenterY;
         var outer = SKRect.Create(
@@ -180,7 +227,108 @@ public sealed class SkiaChartImageRenderer : IChartImageRenderer
         }
 
         canvas.DrawPath(path, paint);
+        if (arc.Stroke is not null && arc.StrokeWidth > 0)
+        {
+            using var stroke = StrokePaint(arc.Stroke, arc.StrokeWidth);
+            canvas.DrawPath(path, stroke);
+        }
     }
+
+    /// <summary>
+    /// A path through <paramref name="points"/> whose first
+    /// <paramref name="curvePoints"/> members join with the MONOTONE cubic the
+    /// browser draws (recharts type="monotone" = Fritsch–Carlson tangents, which
+    /// never overshoot the data); the rest join with straight segments.
+    /// </summary>
+    private static SKPath BuildPath(IReadOnlyList<LayoutPoint> points, int curvePoints)
+    {
+        var path = new SKPath();
+        if (points.Count == 0)
+        {
+            return path;
+        }
+
+        path.MoveTo((float)points[0].X, (float)points[0].Y);
+        var smooth = Math.Min(curvePoints, points.Count);
+        if (smooth >= 3)
+        {
+            var tangents = MonotoneTangents(points, smooth);
+            for (var i = 1; i < smooth; i++)
+            {
+                var dx = points[i].X - points[i - 1].X;
+                path.CubicTo(
+                    (float)(points[i - 1].X + (dx / 3)), (float)(points[i - 1].Y + (tangents[i - 1] * dx / 3)),
+                    (float)(points[i].X - (dx / 3)), (float)(points[i].Y - (tangents[i] * dx / 3)),
+                    (float)points[i].X, (float)points[i].Y);
+            }
+        }
+        else
+        {
+            smooth = 1;
+        }
+
+        for (var i = Math.Max(1, smooth); i < points.Count; i++)
+        {
+            path.LineTo((float)points[i].X, (float)points[i].Y);
+        }
+
+        return path;
+    }
+
+    /// <summary>Fritsch–Carlson slopes: shape-preserving, so a smoothed line never invents a peak.</summary>
+    private static double[] MonotoneTangents(IReadOnlyList<LayoutPoint> points, int count)
+    {
+        var secants = new double[count - 1];
+        for (var i = 0; i < count - 1; i++)
+        {
+            var dx = points[i + 1].X - points[i].X;
+            secants[i] = Math.Abs(dx) < 1e-9 ? 0 : (points[i + 1].Y - points[i].Y) / dx;
+        }
+
+        var tangents = new double[count];
+        tangents[0] = secants[0];
+        tangents[count - 1] = secants[count - 2];
+        for (var i = 1; i < count - 1; i++)
+        {
+            tangents[i] = secants[i - 1] * secants[i] <= 0
+                ? 0 // a local extremum: flatten so the curve cannot overshoot
+                : (secants[i - 1] + secants[i]) / 2;
+        }
+
+        for (var i = 0; i < count - 1; i++)
+        {
+            if (Math.Abs(secants[i]) < 1e-12)
+            {
+                tangents[i] = 0;
+                tangents[i + 1] = 0;
+                continue;
+            }
+
+            var alpha = tangents[i] / secants[i];
+            var beta = tangents[i + 1] / secants[i];
+            var norm = Math.Sqrt((alpha * alpha) + (beta * beta));
+            if (norm > 3)
+            {
+                tangents[i] = 3 * alpha / norm * secants[i];
+                tangents[i + 1] = 3 * beta / norm * secants[i];
+            }
+        }
+
+        return tangents;
+    }
+
+    private static SKPathEffect? DashEffect(IReadOnlyList<double>? dash) =>
+        dash is { Count: > 1 }
+            ? SKPathEffect.CreateDash([.. dash.Select(d => (float)d)], 0)
+            : null;
+
+    private static SKPaint StrokePaint(string color, double width) => new()
+    {
+        Color = ParseColor(color),
+        IsAntialias = true,
+        Style = SKPaintStyle.Stroke,
+        StrokeWidth = (float)width,
+    };
 
     private static void DrawText(SKCanvas canvas, LayoutText text)
     {

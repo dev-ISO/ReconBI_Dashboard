@@ -1,6 +1,6 @@
 import './styles/rcd.css';
 
-export const RCD_UI_VERSION = '0.14.0';
+export const RCD_UI_VERSION = '0.15.0';
 
 export {
   DashboardsProvider,

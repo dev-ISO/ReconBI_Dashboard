@@ -20,6 +20,22 @@ export interface DashboardGridItem {
    * their stored constraints untouched.
    */
   kind?: string;
+  /**
+   * What the tile actually CONTAINS, for the content-aware floors (0.14.1/A3
+   * — "the minimum size of the container doesn't take into account the
+   * elements inside"). Absent falls back to the kind's smallest floor.
+   */
+  content?: GridItemContent;
+}
+
+/** The content facts a floor can depend on (button groups today). */
+export interface GridItemContent {
+  /** Buttons in a button-group tile. */
+  buttonCount?: number;
+  /** The group's main axis — a column stacks, so it needs no extra width. */
+  direction?: 'row' | 'column';
+  /** The group shows the standard tile frame (header bar costs a row). */
+  framed?: boolean;
 }
 
 /* ------------------------------------------------------ grid drag tracker
@@ -55,25 +71,56 @@ export const clickFollowsGridDrag = (): boolean =>
 
 /* -------------------------------------------------------- per-kind minima
  * BUTTON-TILES B4: react-grid-layout supports per-item minW/minH; these
- * floors guarantee a default button/group is never clipped by an undersized
- * tile. Applied in the layout-item mapping on EVERY render (never a doc
- * migration): existing undersized tiles render at the floor, and the raised
- * geometry only persists if the author later rearranges the page.
+ * floors guarantee a button/group is never clipped by an undersized tile.
+ * Applied in the layout-item mapping on EVERY render (never a doc migration):
+ * existing undersized tiles render at the floor, and the raised geometry only
+ * persists if the author later rearranges the page.
+ *
+ * 0.14.1 (A3) — the floors were FIXED at button 3x2 / group 4x2, which on a
+ * 1920px canvas made a two-button group's minimum ~1.7x its own content ("the
+ * min width of the container is stopping me from resizing it to fit"). They
+ * are CONTENT-AWARE now, and the store no longer seeds minW/minH into new
+ * tiles at all, AND the computed floor is authoritative over any minW/minH
+ * already in the doc (0.14.0 seeded 4x2 into every group it created — honoring
+ * that would pin every existing tile at the old floor forever, and nothing in
+ * the UI ever authors these constraints: applyLayout persists x/y/w/h only).
  */
-const KIND_MIN_SIZES: Record<string, { minW: number; minH: number }> = {
-  button: { minW: 3, minH: 2 },
-  buttonGroup: { minW: 4, minH: 2 },
+const MIN_GROUP_COLS = 2;
+const MAX_GROUP_COLS = 8;
+
+/**
+ * The minimum grid box for one item, or null when its kind has no floor.
+ * A row of N buttons needs roughly 1.2 columns per button (a 24-col grid at
+ * ~68px/col on a 1920px canvas — two default buttons measure ~175px, which is
+ * 3 columns); a column group stacks, so its width floor is the smallest
+ * usable box. The height floor is 1 row frameless (the content bleeds to the
+ * tile edge there) and 2 rows framed (the header bar alone is ~28px).
+ */
+export const kindMinSize = (
+  item: Pick<DashboardGridItem, 'kind' | 'content'>,
+): { minW: number; minH: number } | null => {
+  if (item.kind === 'button') return { minW: 2, minH: 1 };
+  if (item.kind !== 'buttonGroup') return null;
+  const framed = item.content?.framed === true;
+  const minH = framed ? 2 : 1;
+  if (item.content?.direction === 'column') return { minW: MIN_GROUP_COLS, minH };
+  const buttons = item.content?.buttonCount ?? 1;
+  const minW = Math.min(Math.max(Math.ceil(buttons * 1.2), MIN_GROUP_COLS), MAX_GROUP_COLS);
+  return { minW, minH };
 };
 
-/** Floors an item's constraints AND geometry to its kind's minimum (exported
- *  for tests; identity for kinds without a floor). */
+/**
+ * Sets an item's constraints to its kind's content-aware minimum and floors
+ * its geometry to them (exported for tests; identity for kinds without a
+ * floor). The computed floor REPLACES any stored minW/minH — see above.
+ */
 export const withKindMinima = (item: DashboardGridItem): DashboardGridItem => {
-  const min = item.kind !== undefined ? KIND_MIN_SIZES[item.kind] : undefined;
+  const min = kindMinSize(item);
   if (!min) return item;
   return {
     ...item,
-    minW: Math.max(item.minW ?? 1, min.minW),
-    minH: Math.max(item.minH ?? 1, min.minH),
+    minW: min.minW,
+    minH: min.minH,
     w: Math.max(item.w, min.minW),
     h: Math.max(item.h, min.minH),
   };

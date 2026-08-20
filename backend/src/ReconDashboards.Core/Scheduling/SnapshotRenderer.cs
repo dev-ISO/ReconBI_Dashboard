@@ -1,7 +1,9 @@
 using System.Globalization;
 using System.Net;
 using System.Text;
+using System.Text.RegularExpressions;
 using ReconDashboards.Core.Querying.Compilation;
+using ReconDashboards.Core.Rendering;
 
 namespace ReconDashboards.Core.Scheduling;
 
@@ -80,9 +82,8 @@ public static class SnapshotRenderer
             for (var tileIndex = 0; tileIndex < page.Tiles.Count; tileIndex++)
             {
                 var tile = page.Tiles[tileIndex];
-                html.Append("<div style=\"margin:16px 0;padding:12px 16px;border:1px solid #e5e7eb;border-radius:8px;\">");
-                html.Append("<div style=\"font-size:13px;font-weight:600;margin-bottom:8px;\">")
-                    .Append(Encode(tile.Tile.Title)).Append("</div>");
+                html.Append("<div style=\"").Append(TileWrapperStyle(tile.Tile.Format?.Container)).Append("\">");
+                AppendTileTitle(html, tile);
                 appendTileBody(html, tile, pageIndex, tileIndex);
                 html.Append("</div>");
             }
@@ -94,6 +95,130 @@ public static class SnapshotRenderer
         html.Append("</div>");
         return html.ToString();
     }
+
+    // ------------------------------------------------------------ tile chrome
+
+    /// <summary>Hex colors only — an authored value goes straight into inline CSS.</summary>
+    private static readonly Regex HexColor = new("^#[0-9a-fA-F]{3,8}$", RegexOptions.Compiled);
+
+    /// <summary>A sanitized inner title that is ONE paragraph, for unwrapping.</summary>
+    private static readonly Regex SingleParagraph = new(
+        @"^<p(?:\s[^>]*)?>((?:(?!</?p[\s>]).)*)</p>$", RegexOptions.Compiled | RegexOptions.Singleline);
+
+    private const string DefaultTileWrapperStyle =
+        "margin:16px 0;padding:12px 16px;border:1px solid #e5e7eb;border-radius:8px;";
+
+    /// <summary>
+    /// The tile card's inline CSS, with format.container's background, border
+    /// and shadow applied over the standard look. Unset fields keep the card the
+    /// email has always drawn, byte for byte.
+    /// </summary>
+    private static string TileWrapperStyle(ContainerStyleDoc? container)
+    {
+        if (container is null
+            || (container.Background is null && container.BorderColor is null
+                && container.BorderWidth is null && container.BorderRadius is null
+                && container.Shadow is null))
+        {
+            return DefaultTileWrapperStyle;
+        }
+
+        var borderColor = HexColor.IsMatch(container.BorderColor ?? "") ? container.BorderColor! : "#e5e7eb";
+        var borderWidth = Math.Clamp(container.BorderWidth ?? 1, 0, 8);
+        var radius = Math.Clamp(container.BorderRadius ?? 8, 0, 40);
+        var style = new StringBuilder("margin:16px 0;padding:12px 16px;");
+        style.Append("border:").Append(Number(borderWidth)).Append("px solid ").Append(borderColor).Append(';');
+        style.Append("border-radius:").Append(Number(radius)).Append("px;");
+        if (HexColor.IsMatch(container.Background ?? ""))
+        {
+            style.Append("background:").Append(container.Background).Append(';');
+        }
+
+        var shadow = container.Shadow switch
+        {
+            "sm" => "0 1px 2px rgba(0,0,0,0.06)",
+            "md" => "0 2px 6px rgba(0,0,0,0.08)",
+            "lg" => "0 6px 16px rgba(0,0,0,0.12)",
+            _ => null,
+        };
+        if (shadow is not null)
+        {
+            style.Append("box-shadow:").Append(shadow).Append(';');
+        }
+
+        return style.ToString();
+    }
+
+    /// <summary>
+    /// The tile's heading. A FRAMELESS tile (container.hideHeader) shows its
+    /// rich inner title INSTEAD of the header text — that is what the dashboard
+    /// shows, and dropping it cost every tile on a seeded dashboard its
+    /// explanatory subtitle. A framed tile keeps its plain title and gains the
+    /// inner title as a subtitle underneath.
+    /// </summary>
+    private static void AppendTileTitle(StringBuilder html, RenderedTile tile)
+    {
+        var format = tile.Tile.Format;
+        var inner = UnwrapParagraph(RichTextHtml.Sanitize(format?.Container?.InnerTitleHtml));
+        var titleStyle = TextStyleCss(format?.TitleStyle);
+        if (format?.Container?.HideHeader == true && inner.Length > 0)
+        {
+            html.Append("<div style=\"font-size:13px;font-weight:600;margin-bottom:8px;").Append(titleStyle)
+                .Append("\">").Append(inner).Append("</div>");
+            return;
+        }
+
+        html.Append("<div style=\"font-size:13px;font-weight:600;margin-bottom:8px;").Append(titleStyle)
+            .Append("\">").Append(Encode(tile.Tile.Title)).Append("</div>");
+        if (inner.Length > 0)
+        {
+            html.Append("<div style=\"font-size:12px;color:#6b7280;margin:-4px 0 8px;\">")
+                .Append(inner).Append("</div>");
+        }
+    }
+
+    /// <summary>
+    /// Drops the wrapping paragraph of a one-paragraph inner title: a &lt;p&gt;
+    /// inside the heading picks up a mail client's 1em default margins, which
+    /// reads as a gap the dashboard does not have.
+    /// </summary>
+    private static string UnwrapParagraph(string html) =>
+        SingleParagraph.Match(html) is { Success: true } match ? match.Groups[1].Value : html;
+
+    /// <summary>format.titleStyle / kpiValueStyle as inline CSS; unset adds nothing.</summary>
+    private static string TextStyleCss(ChartTextStyleDoc? style)
+    {
+        if (style is null)
+        {
+            return "";
+        }
+
+        var css = new StringBuilder();
+        if (style.FontSize is > 0 and <= 200)
+        {
+            css.Append("font-size:").Append(Number(style.FontSize.Value)).Append("px;");
+        }
+
+        if (HexColor.IsMatch(style.Color ?? ""))
+        {
+            css.Append("color:").Append(style.Color).Append(';');
+        }
+
+        if (style.Bold is { } bold)
+        {
+            css.Append("font-weight:").Append(bold ? "700" : "400").Append(';');
+        }
+
+        if (style.Italic == true)
+        {
+            css.Append("font-style:italic;");
+        }
+
+        return css.ToString();
+    }
+
+    private static string Number(double value) =>
+        value.ToString("0.###", CultureInfo.InvariantCulture);
 
     /// <summary>The legacy per-tile body: error note, KPI shape, else the table.</summary>
     public static void AppendTileBody(StringBuilder html, RenderedTile tile, int maxTableRows = HtmlRowsPerTile)
@@ -121,22 +246,48 @@ public static class SnapshotRenderer
     public static bool HasKpiShape(RenderedTile tile) =>
         tile.Columns.Count(c => c.Role == ResultColumnRole.Dimension) == 0 && tile.Rows.Count <= 1;
 
+    /// <summary>
+    /// The KPI card: the FIRST measure big, every later one demoted to a small
+    /// delta row underneath (the browser's shape). Values go through the chart's
+    /// value precedence — format.valueFormat, then the measure's own pattern —
+    /// so an emailed KPI reads exactly like the tile, and labels honor
+    /// format.seriesLabels renames.
+    /// </summary>
     public static void AppendKpiBlock(StringBuilder html, RenderedTile tile)
     {
         var row = tile.Rows.Count == 1 ? tile.Rows[0] : null;
+        var format = tile.Tile.Format;
         html.Append("<div>");
         for (var i = 0; i < tile.Columns.Count; i++)
         {
             var column = tile.Columns[i];
-            html.Append("<div style=\"display:inline-block;margin-right:28px;\">");
-            html.Append("<div style=\"font-size:26px;font-weight:700;color:#111827;\">")
-                .Append(Encode(FormatValue(row?[i]))).Append("</div>");
-            html.Append("<div style=\"font-size:11px;color:#6b7280;\">").Append(Encode(column.Label)).Append("</div>");
-            html.Append("</div>");
+            var value = Encode(KpiValueText(row is not null && i < row.Length ? row[i] : null, column, format));
+            var label = Encode(
+                format?.SeriesLabels is { } labels && labels.TryGetValue(column.Label, out var renamed)
+                    ? renamed
+                    : column.Label);
+            if (i == 0)
+            {
+                html.Append("<div style=\"font-size:26px;font-weight:700;color:#111827;")
+                    .Append(TextStyleCss(format?.KpiValueStyle)).Append("\">").Append(value).Append("</div>");
+                html.Append("<div style=\"font-size:11px;color:#6b7280;\">").Append(label).Append("</div>");
+                continue;
+            }
+
+            html.Append("<div style=\"margin-top:4px;font-size:13px;\">")
+                .Append("<span style=\"font-weight:500;color:#374151;\">").Append(value).Append("</span> ")
+                .Append("<span style=\"font-size:11px;color:#9ca3af;\">").Append(label).Append("</span>")
+                .Append("</div>");
         }
 
         html.Append("</div>");
     }
+
+    /// <summary>Numbers follow the chart's measure formatting; anything else is a plain cell.</summary>
+    private static string KpiValueText(object? value, ResultColumnPlan column, ChartFormatDoc? format) =>
+        ChartValueFormats.TryToNumber(value, out var number)
+            ? ChartValueFormats.FormatMeasureValue(number, column, format?.ValueFormat)
+            : FormatValue(value);
 
     public static void AppendTable(StringBuilder html, RenderedTile tile, int maxTableRows)
     {

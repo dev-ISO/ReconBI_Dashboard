@@ -3,12 +3,15 @@ import {
   DndContext,
   DragOverlay,
   PointerSensor,
+  pointerWithin,
+  rectIntersection,
   useSensor,
   useSensors,
+  type CollisionDetection,
   type DragEndEvent,
   type DragStartEvent,
 } from '@dnd-kit/core';
-import { AlertTriangle, Sigma, Variable, XCircle } from 'lucide-react';
+import { AlertTriangle, Filter, Sigma, Variable, XCircle } from 'lucide-react';
 import {
   boldRunText,
   isRunnable,
@@ -37,15 +40,24 @@ import { FilterEditor } from './FilterEditor';
 import { Wells, type ManualOrderInputs } from './Wells';
 import {
   applyDrop,
+  chipColumnOf,
   columnLabelOf,
   columnTypeOf,
   defaultWellFor,
+  filterSummary,
   measureLabel,
+  moveChip,
   normalizeQueryForType,
+  remapIndexedRefs,
+  removeChip,
   supportsDrill,
   supportsSmallMultiples,
   valuesMaxFor,
+  wellsFor,
   type BuilderParameter,
+  type ChipDragData,
+  type ChipDropTarget,
+  type ChipOrigin,
   type FieldDragData,
   type WellId,
 } from './wellConfig';
@@ -89,7 +101,41 @@ interface FilterEditorTarget {
   index: number | null;
   table: string;
   column: string;
+  /**
+   * Set when a CHIP was dragged into the Filters well. A chip becomes a filter
+   * only once the editor has collected an operator, so the source chip is not
+   * removed on the drop — only when the editor applies. Cancelling leaves the
+   * chart exactly as it was.
+   */
+  source?: ChipOrigin;
 }
+
+/** A filter chip dragged out of the Filters well, awaiting confirmation. */
+interface FilterMove {
+  data: ChipDragData;
+  to: ChipDropTarget;
+}
+
+/**
+ * Wells CONTAIN their chips, so a drag is inside both at once. pointerWithin
+ * ranks the droppables the pointer is in by distance to their centers, which
+ * puts the small chip ahead of the big well around it — the drop lands at the
+ * position the user is pointing at rather than at the end of the list.
+ * rectIntersection stays as the fallback for the frames where the pointer is
+ * outside every droppable but the dragged rect still overlaps one: that is
+ * exactly the (default) behavior field-list drops had before chips became
+ * targets, so no existing drag gets harder to land.
+ */
+const wellCollisionDetection: CollisionDetection = (args) => {
+  const pointed = pointerWithin(args);
+  return pointed.length > 0 ? pointed : rectIntersection(args);
+};
+
+/** The label of the well a chip is being moved into (confirmation copy). */
+const wellLabelFor = (type: ChartType, to: ChipDropTarget): string =>
+  wellsFor(type).find(
+    (well) => well.id === to.well && (to.slot === undefined || well.slot === to.slot),
+  )?.label ?? 'another well';
 
 type BuilderTab = 'fields' | 'format';
 
@@ -158,6 +204,7 @@ export function ChartBuilder({
   const [activeDrag, setActiveDrag] = useState<FieldDragData | null>(null);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [filterTarget, setFilterTarget] = useState<FilterEditorTarget | null>(null);
+  const [filterMove, setFilterMove] = useState<FilterMove | null>(null);
   const lastDragEndAt = useRef(0);
 
   // Manual pane sizing (drag the hairline dividers); fluid grid until touched.
@@ -189,6 +236,21 @@ export function ChartBuilder({
     [issues],
   );
 
+  /**
+   * The single seam every well edit goes through. `remapIndexedRefs` re-points
+   * whatever addressed a field BY POSITION — sort targets, and the table
+   * layout maps keyed by result column name ("meas0"/"dim1") — because adding,
+   * removing or reordering ONE field silently slides every field after it. The
+   * drag mechanics of moving a chip are visible; an index that moved one place
+   * is not, which is why this wraps the whole surface and not just the move.
+   */
+  const applyQuery = (next: (current: ChartSpec) => ChartSpec['query'] | null) =>
+    setDraft((current) => {
+      const query = next(current);
+      if (query === null || query === current.query) return current;
+      return remapIndexedRefs(current, { ...current, query });
+    });
+
   const addToWell = (well: WellId, data: FieldDragData, slot?: number) => {
     if (well === 'filters') {
       if (data.kind === 'column') {
@@ -196,10 +258,39 @@ export function ChartBuilder({
       }
       return;
     }
-    setDraft((current) => ({
-      ...current,
-      query: applyDrop(current.type, current.query, well, data, slot),
-    }));
+    applyQuery((current) => applyDrop(current.type, current.query, well, data, slot));
+  };
+
+  /** Commits a chip move (the confirmed path for filters, direct otherwise). */
+  const applyChipMove = (data: ChipDragData, to: ChipDropTarget) =>
+    applyQuery((current) =>
+      moveChip(current.type, current.query, data, to, (table, column) =>
+        columnTypeOf(catalog ?? null, table, column),
+      ),
+    );
+
+  const moveChipTo = (data: ChipDragData, to: ChipDropTarget) => {
+    if (to.well === 'filters') {
+      // A field becomes a filter only once the editor has an operator, so the
+      // chip stays in its well until Apply (see applyFilter).
+      if (data.from.well === 'filters') return;
+      const column = chipColumnOf(data.ref);
+      if (!column) return;
+      setFilterTarget({
+        index: null,
+        table: column.table,
+        column: column.column,
+        source: data.from,
+      });
+      return;
+    }
+    if (data.from.well === 'filters') {
+      // Leaving the Filters well drops the operator and values with it — no
+      // other well has anywhere to keep them — so ask before spending them.
+      setFilterMove({ data, to });
+      return;
+    }
+    applyChipMove(data, to);
   };
 
   const handleDragStart = (event: DragStartEvent) =>
@@ -209,8 +300,17 @@ export function ChartBuilder({
     setActiveDrag(null);
     lastDragEndAt.current = Date.now();
     const data = event.active.data.current as FieldDragData | undefined;
-    const over = event.over?.data.current as { wellId?: WellId; slot?: number } | undefined;
-    if (data && over?.wellId) addToWell(over.wellId, data, over.slot);
+    // Wells and chips speak the same droppable shape; a chip additionally
+    // carries the position it occupies, which is where the drop lands.
+    const over = event.over?.data.current as
+      | { wellId?: WellId; slot?: number; index?: number }
+      | undefined;
+    if (!data || !over?.wellId) return;
+    if (data.kind === 'chip') {
+      moveChipTo(data, { well: over.wellId, slot: over.slot, index: over.index });
+      return;
+    }
+    addToWell(over.wellId, data, over.slot);
   };
 
   const handleDragCancel = () => {
@@ -275,7 +375,10 @@ export function ChartBuilder({
       query = { ...query, smallMultiples: stash.smallMultiples };
       stash.smallMultiples = null;
     }
-    setDraft((current) => ({ ...current, type, query }));
+    // A type switch prunes measures past the new capacity and can splice the
+    // drill levels into (or out of) the wire dimensions, so it shifts indexes
+    // exactly like a chip move does — same seam, same repair.
+    setDraft((current) => remapIndexedRefs(current, { ...current, type, query }));
   };
 
   const handleCancel = () => {
@@ -300,16 +403,20 @@ export function ChartBuilder({
     const target = filterTarget;
     setFilterTarget(null);
     if (!target) return;
-    setDraft((current) => ({
-      ...current,
-      query: {
+    applyQuery((current) => {
+      const withClause: ChartSpec['query'] = {
         ...current.query,
         filters:
           target.index === null
             ? [...current.query.filters, clause]
             : current.query.filters.map((existing, i) => (i === target.index ? clause : existing)),
-      },
-    }));
+      };
+      // The other half of the ->Filters detour: the dragged chip leaves its
+      // well now that the clause it became actually exists.
+      return target.source
+        ? removeChip(current.type, withClause, target.source)
+        : withClause;
+    });
   };
 
   /**
@@ -433,6 +540,7 @@ export function ChartBuilder({
     <div className="flex h-full min-h-[26rem] flex-col gap-3">
       <DndContext
         sensors={sensors}
+        collisionDetection={wellCollisionDetection}
         onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
         onDragCancel={handleDragCancel}
@@ -538,7 +646,7 @@ export function ChartBuilder({
                   parameters={parameters}
                   ordering={ordering}
                   issues={allIssues}
-                  onChange={(query) => setDraft((current) => ({ ...current, query }))}
+                  onChange={(query) => applyQuery(() => query)}
                   onEditFilter={(index) => {
                     const clause = draft.query.filters[index];
                     if (clause) {
@@ -611,9 +719,17 @@ export function ChartBuilder({
               {activeDrag.kind === 'parameter' && (
                 <Variable size={12} className="text-rcd-accent" />
               )}
+              {activeDrag.kind === 'chip' && activeDrag.ref.kind === 'filter' && (
+                <Filter size={12} className="text-rcd-muted" />
+              )}
+              {activeDrag.kind === 'chip' && activeDrag.ref.kind === 'measure' && (
+                <Sigma size={12} className="text-rcd-muted" />
+              )}
               {activeDrag.kind === 'column'
                 ? columnLabelOf(model, activeDrag.table, activeDrag.column)
-                : activeDrag.name}
+                : activeDrag.kind === 'chip'
+                  ? activeDrag.label
+                  : activeDrag.name}
             </div>
           )}
         </DragOverlay>
@@ -629,7 +745,10 @@ export function ChartBuilder({
               ? validationErrors.map((issue) => issue.message).join('\n')
               : isRunnable(draft)
                 ? undefined
-                : 'Add at least one field to a values well'
+                : // A table runs on Rows alone; everything else needs a value.
+                  draft.type === 'table'
+                  ? 'Add at least one field to the Rows well'
+                  : 'Add at least one field to a values well'
           }
           onClick={() => onSave(withRetitledInnerTitle(draft, initial))}
         >
@@ -650,6 +769,26 @@ export function ChartBuilder({
           onCancel={() => setFilterTarget(null)}
         />
       )}
+
+      <ConfirmDialog
+        title="Move this filter?"
+        message={
+          filterMove
+            ? `“${filterMove.data.label}” will move to ${wellLabelFor(
+                draft.type,
+                filterMove.to,
+              )}. The filter condition on it (${filterMove.data.ref.kind === 'filter' ? filterSummary(filterMove.data.ref.clause) : ''}) is removed — no other well can hold one.`
+            : ''
+        }
+        confirmLabel="Move field"
+        open={filterMove !== null}
+        onConfirm={() => {
+          const pending = filterMove;
+          setFilterMove(null);
+          if (pending) applyChipMove(pending.data, pending.to);
+        }}
+        onCancel={() => setFilterMove(null)}
+      />
 
       <ConfirmDialog
         title="Discard chart changes"

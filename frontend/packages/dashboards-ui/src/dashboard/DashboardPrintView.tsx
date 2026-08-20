@@ -2,6 +2,8 @@ import { memo, useEffect, useMemo, useState, type CSSProperties, type ReactNode 
 import { createPortal } from 'react-dom';
 import { Printer, X } from 'lucide-react';
 import {
+  isButtonGroupTile,
+  isButtonTile,
   isChartTile,
   isImageTile,
   isTextTile,
@@ -13,6 +15,13 @@ import { ChartTile } from '../chart/ChartTile';
 import { INNER_TITLE_CLASSES } from './TileFrame';
 import { TextTileContent } from './TextTile';
 import { ImageTileContent } from './ImageTile';
+import { ButtonVisual } from './ButtonVisual';
+import {
+  ButtonGroupContent,
+  buttonGroupFramed,
+  buttonGroupTitle,
+  groupContainerStyle,
+} from './ButtonGroupTile';
 import { useDashboardState } from '../provider/DashboardsProvider';
 import { RcdButton } from '../primitives';
 import type { PrintOptions } from './PrintConfigDialog';
@@ -154,6 +163,41 @@ export const PrintSheets = memo(function PrintSheets({
       return (
         <div className="h-full w-full overflow-hidden">
           <ImageTileContent spec={tile.image} />
+        </div>
+      );
+    }
+    // A7: button tiles printed NOTHING before 0.14.1 — a hole wherever the
+    // author put one. They render statically now: no callbacks (so every
+    // button is inert, untabbable and free of hover/focus affordances) and no
+    // clipper (paper cannot be resized, so hiding overflow buttons would only
+    // lose content) — otherwise the exact same visuals as the screen.
+    if (isButtonTile(tile)) {
+      const fullSize = tile.button.fullSize === true;
+      return (
+        <div
+          className={`flex h-full w-full items-center justify-center overflow-hidden ${
+            fullSize ? '' : 'p-1'
+          }`}
+        >
+          <ButtonVisual spec={tile.button} fullSize={fullSize} />
+        </div>
+      );
+    }
+    if (isButtonGroupTile(tile)) {
+      const group = tile.buttonGroup;
+      const container = groupContainerStyle(group);
+      // A framed group prints its frame + title like a chart tile; a frameless
+      // one prints bare, carrying only its own container fill.
+      return buttonGroupFramed(group) ? (
+        <PrintTileBox title={buttonGroupTitle(group)} container={container}>
+          <ButtonGroupContent spec={group} />
+        </PrintTileBox>
+      ) : (
+        <div
+          className="h-full w-full overflow-hidden"
+          style={container.background ? { backgroundColor: container.background } : undefined}
+        >
+          <ButtonGroupContent spec={group} />
         </div>
       );
     }

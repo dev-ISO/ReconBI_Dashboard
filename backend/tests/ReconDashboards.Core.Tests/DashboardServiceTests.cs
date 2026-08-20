@@ -102,6 +102,12 @@ public class DashboardServiceTests : IDisposable
         Assert.True(created.Succeeded);
         var id = created.Value!.Id;
 
+        // The staleness check tolerates a 1 ms delta (storage round-trips can
+        // lose sub-millisecond precision), so the two writes must be more than
+        // that apart or a genuinely stale stamp is legitimately accepted and
+        // this test fails on timing alone — it did, roughly one run in three.
+        await Task.Delay(5, CancellationToken.None);
+
         // Another session saves first (with the fresh stamp)…
         var first = await _service.UpdateAsync(
             id,

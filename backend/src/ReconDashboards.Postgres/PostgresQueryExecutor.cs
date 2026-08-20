@@ -67,19 +67,26 @@ public sealed class PostgresQueryExecutor(NpgsqlDataSource dataSource) : IQueryE
 
     /// <summary>
     /// A Postgres <c>numeric</c> holds far more range and scale than
-    /// System.Decimal, so Npgsql's default materialization can throw
-    /// OverflowException on a perfectly legal value — a division measure
-    /// (CAST(x AS decimal) / y) or a wide SUM is the usual source. That used
-    /// to fail the ENTIRE query, turning one unlucky cell into a 502 for the
-    /// whole chart. Such a cell is re-read as a double instead: ~15
-    /// significant digits is far beyond charting precision, and JSON carries
-    /// double and decimal identically. Only a value that isn't finite even as
-    /// a double (or that no conversion can produce) degrades to null, so one
-    /// bad cell can never cost the row or the result.
+    /// System.Decimal, so materializing a perfectly legal value can throw —
+    /// a division measure (CAST(x AS decimal) / y) or a very wide SUM is the
+    /// usual source. That used to fail the ENTIRE query, turning one unlucky
+    /// cell into a 502 for the whole chart. Here the cell degrades to NULL and
+    /// the row, and every other row, survives.
     ///
-    /// The compiler additionally bounds the scale it generates for division
-    /// (see QueryCompiler's ROUND wrapping) — that keeps ordinary ratios in
-    /// decimal; this guard is what makes the executor unable to crash at all.
+    /// THE VALUE CANNOT BE RECOVERED, and that is a property of the driver,
+    /// not a shortcut: Npgsql routes EVERY read of a numeric field through
+    /// decimal, so GetFieldValue&lt;double&gt;, GetDouble and
+    /// GetProviderSpecificValue all raise the same OverflowException, and
+    /// reading it as a string is refused outright ("Reading as 'System.String'
+    /// is not supported for fields having DataTypeName 'numeric'"). Verified
+    /// against the real driver, not assumed — the wider-read attempt below is
+    /// kept only because it costs nothing and would succeed on a provider that
+    /// does offer a wider CLR target.
+    ///
+    /// The real mitigation is upstream: the compiler bounds the SCALE of every
+    /// division it generates (QueryCompiler's ROUND wrapping), so ordinary
+    /// ratios stay inside decimal and never reach this path. This guard is
+    /// what makes the executor unable to crash when something still does.
     /// </summary>
     private static object? ReadCell(System.Data.Common.DbDataReader reader, int ordinal)
     {
@@ -90,8 +97,8 @@ public sealed class PostgresQueryExecutor(NpgsqlDataSource dataSource) : IQueryE
         }
         catch (Exception ex) when (ex is OverflowException or InvalidCastException)
         {
-            // OverflowException = out of decimal's range; InvalidCastException =
-            // a numeric decimal cannot express at all (NaN / +-Infinity).
+            // OverflowException = outside decimal's range; InvalidCastException =
+            // a value decimal cannot express at all (NaN / +-Infinity).
             try
             {
                 var wide = reader.GetFieldValue<double>(ordinal);

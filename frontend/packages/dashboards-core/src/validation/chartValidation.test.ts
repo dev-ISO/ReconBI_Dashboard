@@ -251,6 +251,42 @@ describe('validateChartSpec', () => {
     expect(codes(errors(validateChartSpec(spec, model, catalog)))).toContain('no_measures');
   });
 
+  // 0.14.1: a TABLE is a passthrough column list, so Rows alone is a complete
+  // spec (the engine emits a GROUP BY over the dimensions = SELECT DISTINCT).
+  // Mirrors isRunnable — the two must agree or Save enables a chart the tile
+  // then refuses to render.
+  it('allows a measure-less table with rows, but not a measure-less chart or a bare table', () => {
+    const passthrough = baseSpec();
+    passthrough.type = 'table';
+    passthrough.query.measures = [];
+    expect(codes(errors(validateChartSpec(passthrough, model, catalog)))).not.toContain(
+      'no_measures',
+    );
+
+    const bareTable = baseSpec();
+    bareTable.type = 'table';
+    bareTable.query.measures = [];
+    bareTable.query.axis = null;
+    expect(codes(errors(validateChartSpec(bareTable, model, catalog)))).toContain('no_measures');
+
+    const measurelessColumn = baseSpec();
+    measurelessColumn.query.measures = [];
+    expect(codes(errors(validateChartSpec(measurelessColumn, model, catalog)))).toContain(
+      'no_measures',
+    );
+  });
+
+  // 0.14.1 mirror of the engine's IsAggregationCompatible: Min/Max are legal
+  // on TEXT, which is what a passthrough table column ("Min of Client",
+  // aliased to "Client") relies on. The builder now offers it too.
+  it('allows min/max on text', () => {
+    const spec = baseSpec();
+    spec.query.measures = [
+      { table: 'public.orders', column: 'status', aggregation: 'min', alias: 'Status' },
+    ];
+    expect(validateChartSpec(spec, model, catalog)).toEqual([]);
+  });
+
   it('validates date-table references', () => {
     const spec = baseSpec();
     spec.query.axis = { table: '#date.Calendar', column: 'year' };

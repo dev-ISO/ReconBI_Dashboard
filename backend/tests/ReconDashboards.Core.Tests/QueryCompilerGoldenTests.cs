@@ -98,6 +98,52 @@ LIMIT @p0
         AssertParam(limitParam, "p0", 5001L, NormalizedType.Integer); // min(10000, 5000) + 1
     }
 
+    /// <summary>
+    /// The MIRROR of the KPI shape below: zero MEASURES with dimensions. A
+    /// table chart with Rows and no Values compiles to this — a GROUP BY over
+    /// the dimensions alone, which is exactly SELECT DISTINCT — and the join
+    /// plan anchors on the first DIMENSION's table because there is no measure
+    /// to anchor on. Both must stay legal; only an empty SELECT list is not.
+    /// </summary>
+    [Fact]
+    public void MeasurelessQueryGroupsByItsDimensionsAlone()
+    {
+        var compiled = Compile(Spec(
+            dimensions: [CustomerRegion(), new DimensionSpec("public.customers", "name", null)],
+            measures: []));
+
+        AssertSql("""
+SELECT "t0"."region" AS "dim0",
+       "t0"."name" AS "dim1"
+FROM "public"."customers" AS "t0"
+GROUP BY "t0"."region", "t0"."name"
+ORDER BY "t0"."region" ASC NULLS LAST, "t0"."name" ASC NULLS LAST
+LIMIT @p0
+""", compiled);
+
+        Assert.All(compiled.Columns, plan => Assert.Equal(ResultColumnRole.Dimension, plan.Role));
+    }
+
+    [Fact]
+    public void MeasurelessQueryStillJoinsForItsOtherDimensions()
+    {
+        // Anchor = dimensions[0].Table (orders); customers joins on exactly
+        // like it would behind a measure.
+        var compiled = Compile(Spec(
+            dimensions: [new DimensionSpec("public.orders", "status", null), CustomerRegion()],
+            measures: []));
+
+        AssertSql("""
+SELECT "t0"."status" AS "dim0",
+       "t1"."region" AS "dim1"
+FROM "public"."orders" AS "t0"
+LEFT JOIN "public"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id"
+GROUP BY "t0"."status", "t1"."region"
+ORDER BY "t0"."status" ASC NULLS LAST, "t1"."region" ASC NULLS LAST
+LIMIT @p0
+""", compiled);
+    }
+
     [Fact]
     public void KpiWithoutDimensionsHasNoGroupByOrOrderBy()
     {
@@ -400,9 +446,14 @@ LIMIT @p1
 
     // ---------- rejection ----------
 
+    /// <summary>
+    /// Zero measures is fine on its own (see
+    /// <see cref="MeasurelessQueryGroupsByItsDimensionsAlone"/>); zero of BOTH
+    /// is an empty SELECT list, which is the one genuinely invalid shape.
+    /// </summary>
     [Fact]
-    public void ZeroMeasuresIsRejected() =>
-        AssertCompilationError("QRY_NO_MEASURES", Spec(measures: []));
+    public void ZeroMeasuresAndZeroDimensionsIsRejected() =>
+        AssertCompilationError("QRY_NO_MEASURES", Spec(dimensions: [], measures: []));
 
     [Fact]
     public void UnknownColumnIsRejected() =>

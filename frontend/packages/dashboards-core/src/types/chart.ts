@@ -682,5 +682,20 @@ export const toWireSpec = (
   };
 };
 
-/** A chart is runnable once it has at least one measure. */
-export const isRunnable = (chart: ChartSpec): boolean => chart.query.measures.length > 0;
+/**
+ * A chart is runnable once it has something to SELECT.
+ *
+ * For everything with an axis to plot that means at least one measure. A
+ * TABLE is the exception: it may be a pure passthrough column list (Rows
+ * only, zero measures) — the engine emits SELECT dim… GROUP BY dim…, which is
+ * exactly SELECT DISTINCT, and the renderer, the pager's count companion and
+ * the email table are all result-column driven. Only an empty SELECT list
+ * (no measures AND no dimensions) is invalid, and the compiler still rejects
+ * that outright.
+ *
+ * NOTE: "See records" (PrepareUnderlying) genuinely needs a measure to anchor
+ * its table, so that ONE menu item is gated on measures.length separately —
+ * do not fold it back into this predicate.
+ */
+export const isRunnable = (chart: ChartSpec): boolean =>
+  chart.query.measures.length > 0 || (chart.type === 'table' && chart.query.axis != null);

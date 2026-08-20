@@ -4,6 +4,7 @@ import {
   DndContext,
   PointerSensor,
   closestCenter,
+  useDraggable,
   useDroppable,
   useSensor,
   useSensors,
@@ -23,6 +24,7 @@ import {
   ChevronRight,
   Filter,
   GripVertical,
+  Pencil,
   Sigma,
   TrendingUp,
   Variable,
@@ -48,6 +50,8 @@ import { RcdInput, RcdSelect } from '../primitives';
 import {
   aggregationOptionsFor,
   canAccept,
+  canDropChip,
+  chipColumnOf,
   clearParamBinding,
   columnLabelOf,
   columnTypeOf,
@@ -57,8 +61,11 @@ import {
   measureLabel,
   wellsFor,
   type BuilderParameter,
+  type ChipDragData,
+  type ChipShape,
   type FieldDragData,
   type WellDef,
+  type WellId,
 } from './wellConfig';
 
 export interface WellsProps {
@@ -121,7 +128,17 @@ export interface ManualOrderInputs {
   ) => void;
 }
 
-const DATE_BUCKETS: { value: DateBucket; label: string }[] = [
+/**
+ * Date grains offered on a temporal chip. `null` = "Exact date": no bucketing
+ * at all — DimensionRef.dateBucket has always been nullable on the wire, but
+ * until 0.14.1 the drop forced 'month' and the select offered no way back, so
+ * "Latest Week Ending" in a table's Rows could only ever read as a month.
+ * The empty string is its option value (a <select> value is always a string).
+ */
+const EXACT_DATE = '';
+
+const DATE_BUCKETS: { value: DateBucket | null; label: string }[] = [
+  { value: null, label: 'Exact date' },
   { value: 'year', label: 'Year' },
   { value: 'quarter', label: 'Quarter' },
   { value: 'month', label: 'Month' },
@@ -140,6 +157,113 @@ const AGG_LABELS: Record<Aggregation, string> = {
   count: 'Count',
   countDistinct: 'Distinct count',
 };
+
+// ---------------------------------------------------------------------------
+// Chip drags (moving a field between wells)
+// ---------------------------------------------------------------------------
+
+/**
+ * A chip's registration in the BUILDER's drag context — ChartBuilder's
+ * DndContext, the same one the field list drags into. That placement is the
+ * whole trick: dnd-kit only ever collides a draggable with droppables from the
+ * SAME provider, so the table Rows list (which used to run its own nested
+ * DndContext purely to be sortable) had to give that up to reach the Values
+ * well at all. Reordering did not regress — it moved up into the one context
+ * with the grip handle still driving it.
+ *
+ * Chips in a LIST well register as sortables: dnd-kit gives one id both a
+ * draggable and a droppable, which is what lets a chip be dropped ON another
+ * chip and land in that exact position rather than at the end of the well.
+ * Chips in a one-chip well are plain draggables — their well is the only drop
+ * position there is.
+ */
+interface ChipDrag {
+  setNodeRef: (node: HTMLElement | null) => void;
+  attributes: ReturnType<typeof useDraggable>['attributes'];
+  listeners: ReturnType<typeof useDraggable>['listeners'];
+  style?: React.CSSProperties;
+  isDragging: boolean;
+}
+
+/**
+ * Droppable data every drop target speaks: `wellId`/`slot` say WHICH well, and
+ * `index` (chips only) says where in it. One shape for wells and chips alike
+ * keeps ChartBuilder's drag-end handler from having to tell them apart.
+ */
+type ChipDropData = ChipDragData & { wellId: WellId; index: number };
+
+function SortableChip({
+  id,
+  data,
+  children,
+}: {
+  id: string;
+  data: ChipDropData;
+  children: (drag: ChipDrag) => React.ReactNode;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id,
+    data,
+  });
+  return (
+    <>
+      {children({
+        setNodeRef,
+        attributes,
+        listeners,
+        isDragging,
+        style: { transform: CSS.Translate.toString(transform), transition },
+      })}
+    </>
+  );
+}
+
+function DraggableChip({
+  id,
+  data,
+  children,
+}: {
+  id: string;
+  data: ChipDropData;
+  children: (drag: ChipDrag) => React.ReactNode;
+}) {
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({ id, data });
+  return <>{children({ setNodeRef, attributes, listeners, isDragging })}</>;
+}
+
+/**
+ * The same drag MINUS the node registration, for a chip whose surrounding row
+ * element is the registered node (numbered rows translate as one unit, chip
+ * plus its "1."). The chip still carries the body listeners.
+ */
+const bodyDragOnly = (drag: ChipDrag): ChipDrag => ({
+  ...drag,
+  setNodeRef: () => {},
+  style: undefined,
+  // The row already dims and lifts; dimming the chip again would compound it.
+  isDragging: false,
+});
+
+/**
+ * The grip on a chip in a list well. It drives the SAME drag the chip body
+ * does — dragging within the well reorders, dragging out moves — so the
+ * familiar handle keeps working exactly as it did while quietly gaining the
+ * second gesture.
+ */
+function ChipGrip({ drag, label }: { drag: ChipDrag; label: string }) {
+  return (
+    <button
+      type="button"
+      aria-label={`Reorder ${label}`}
+      title="Drag to reorder, or into another well"
+      {...drag.attributes}
+      {...drag.listeners}
+      className="-ml-0.5 shrink-0 cursor-grab touch-none rounded p-0.5 text-rcd-muted hover:text-rcd-text"
+    >
+      <GripVertical size={11} />
+    </button>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Quick calculations (MeasureRef.calc)
@@ -265,6 +389,24 @@ export function Wells({
       measures: query.measures.map((m, i) => (i === index ? { ...m, aggregation } : m)),
     });
 
+  /**
+   * Inline rename (MeasureRef.alias). Undefined DELETES the key so a cleared
+   * box round-trips to exactly the spec the user started from — the composed
+   * server label — rather than persisting an empty alias.
+   */
+  const setAlias = (index: number, alias: string | undefined) =>
+    onChange({
+      ...query,
+      measures: query.measures.map((m, i) => {
+        if (i !== index) return m;
+        if (alias === undefined) {
+          const { alias: _dropped, ...rest } = m;
+          return rest;
+        }
+        return { ...m, alias };
+      }),
+    });
+
   const setCalc = (index: number, calc: MeasureCalc | null) =>
     onChange({
       ...query,
@@ -284,19 +426,73 @@ export function Wells({
   const parameterName = (id: string) =>
     parameters?.find((parameter) => parameter.id === id)?.name ?? id;
 
-  const valueChip = (measure: MeasureRef, index: number) => (
-    <ValueChip
-      key={`${measure.measureId ?? `${measure.table ?? ''}.${measure.column ?? ''}.${measure.aggregation ?? ''}`}-${index}`}
-      measure={measure}
-      model={model}
-      catalog={catalog}
-      hasAxis={hasAxis}
-      axisBucket={axisBucket}
-      onAggregation={(aggregation) => setAggregation(index, aggregation)}
-      onCalc={(calc) => setCalc(index, calc)}
-      onRemove={() => removeMeasure(index)}
-    />
-  );
+  /**
+   * The payload a chip drag carries. `type` is resolved HERE, while the
+   * catalog is in hand: neither a DimensionRef nor a FilterClause records one,
+   * and the receiving well needs it to pick an aggregation (a table's Values
+   * takes text as Min) or decide whether a date bucket applies.
+   */
+  const chipData = (well: WellId, index: number, ref: ChipShape, label: string): ChipDropData => {
+    const column = chipColumnOf(ref);
+    return {
+      kind: 'chip',
+      from: { well, index },
+      ref,
+      type: column ? columnTypeOf(catalog, column.table, column.column) : null,
+      label,
+      wellId: well,
+      index,
+    };
+  };
+
+  /** Mirrors ValueChip's own display label, for the drag payload/overlay. */
+  const measureChipLabel = (measure: MeasureRef): string =>
+    measure.measureId != null
+      ? measureLabel(model, measure)
+      : (measure.alias ?? columnLabelOf(model, measure.table ?? '', measure.column ?? ''));
+
+  /**
+   * Whether a well would honor this drag — the same predicate the drop itself
+   * runs, so a well never lights up for a move that would then do nothing.
+   */
+  const acceptsInto = (well: WellId, slot?: number) => (data: FieldDragData) =>
+    data.kind === 'chip'
+      ? canDropChip(chartType, query, data, { well, slot })
+      : canAccept(well, data);
+
+  const valueChip = (measure: MeasureRef, index: number, sortable: boolean) => {
+    const key = `${measure.measureId ?? `${measure.table ?? ''}.${measure.column ?? ''}.${measure.aggregation ?? ''}`}-${index}`;
+    const label = measureChipLabel(measure);
+    const data = chipData('values', index, { kind: 'measure', measure }, label);
+    const render = (drag: ChipDrag) => (
+      <ValueChip
+        measure={measure}
+        model={model}
+        catalog={catalog}
+        hasAxis={hasAxis}
+        axisBucket={axisBucket}
+        drag={drag}
+        leading={
+          sortable && query.measures.length > 1 ? (
+            <ChipGrip drag={drag} label={label} />
+          ) : undefined
+        }
+        onAggregation={(aggregation) => setAggregation(index, aggregation)}
+        onAlias={(alias) => setAlias(index, alias)}
+        onCalc={(calc) => setCalc(index, calc)}
+        onRemove={() => removeMeasure(index)}
+      />
+    );
+    return sortable ? (
+      <SortableChip key={key} id={`chip-values-${index}`} data={data}>
+        {render}
+      </SortableChip>
+    ) : (
+      <DraggableChip key={key} id={`chip-values-${index}`} data={data}>
+        {render}
+      </DraggableChip>
+    );
+  };
 
   /** True for the first values well only — the binding chip renders once. */
   const firstValuesKey = wellsFor(chartType).find((w) => w.id === 'values')?.key;
@@ -309,7 +505,13 @@ export function Wells({
       if (measuresBinding != null) {
         if (def.key !== firstValuesKey) return null;
         return (
-          <Well key={def.key} def={def} empty={false} issues={wellIssues}>
+          <Well
+            key={def.key}
+            def={def}
+            empty={false}
+            issues={wellIssues}
+            accepts={acceptsInto(def.id, def.slot)}
+          >
             <ParamBindingChip
               name={parameterName(measuresBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'measures'))}
@@ -341,6 +543,7 @@ export function Wells({
             def={def}
             empty={measure === undefined}
             issues={wellIssues}
+            accepts={acceptsInto(def.id, def.slot)}
             footer={
               typeHint !== null ? (
                 <p className="pt-1 text-[11px] leading-snug text-[var(--rcd-status-warn)]">
@@ -349,13 +552,29 @@ export function Wells({
               ) : undefined
             }
           >
-            {measure !== undefined && valueChip(measure, def.slot)}
+            {/* Slot wells present one FIXED measure index, so their chip is a
+                plain draggable — dropping one on another slot swaps them. */}
+            {measure !== undefined && valueChip(measure, def.slot, false)}
           </Well>
         );
       }
       return (
-        <Well key={def.key} def={def} empty={query.measures.length === 0} issues={wellIssues}>
-          {query.measures.map(valueChip)}
+        <Well
+          key={def.key}
+          def={def}
+          empty={query.measures.length === 0}
+          issues={wellIssues}
+          accepts={acceptsInto(def.id)}
+        >
+          {/* Measure order IS column order in a table, so the open-ended
+              Values well is sortable — the same drag that moves a chip to
+              another well reorders it here. */}
+          <SortableContext
+            items={query.measures.map((_, index) => `chip-values-${index}`)}
+            strategy={verticalListSortingStrategy}
+          >
+            {query.measures.map((measure, index) => valueChip(measure, index, true))}
+          </SortableContext>
         </Well>
       );
     }
@@ -365,7 +584,13 @@ export function Wells({
       // drill-levels UI); removing it clears only the binding, not the axis.
       if (axisBinding != null) {
         return (
-          <Well key={def.key} def={def} empty={false} issues={wellIssues}>
+          <Well
+            key={def.key}
+            def={def}
+            empty={false}
+            issues={wellIssues}
+            accepts={acceptsInto(def.id)}
+          >
             <ParamBindingChip
               name={parameterName(axisBinding)}
               onRemove={() => onChange(clearParamBinding(query, 'axis'))}
@@ -377,13 +602,21 @@ export function Wells({
         // Table "Rows": ordered multi-field list (row 1, 2, 3, …) — stored as
         // [axis, ...drillLevels] on the wire, no drill framing in the UI.
         return (
-          <Well key={def.key} def={def} empty={!query.axis} issues={wellIssues}>
+          <Well
+            key={def.key}
+            def={def}
+            empty={!query.axis}
+            issues={wellIssues}
+            accepts={acceptsInto(def.id)}
+          >
             {query.axis && (
               <OrderedDimensionList
                 idPrefix="row"
+                well="axis"
                 levels={[query.axis, ...(query.drillLevels ?? [])]}
                 model={model}
                 catalog={catalog}
+                chipData={chipData}
                 onLevels={(next) =>
                   onChange({
                     ...query,
@@ -404,12 +637,15 @@ export function Wells({
           def={def}
           empty={!query.axis}
           issues={wellIssues}
+          accepts={acceptsInto(def.id)}
           footer={
             hasDrillSubArea(chartType) ? (
               <DrillSection
                 query={query}
                 model={model}
                 catalog={catalog}
+                chipData={chipData}
+                accepts={acceptsInto('drill')}
                 onChange={onChange}
                 issues={(issues ?? [])
                   .filter((issue) => issue.well === 'drill')
@@ -419,10 +655,12 @@ export function Wells({
           }
         >
           {query.axis && (
-            <DimensionChip
+            <SingleDimensionChip
+              well="axis"
               dimension={query.axis}
               model={model}
               catalog={catalog}
+              chipData={chipData}
               showBucket
               onBucket={(dateBucket) => onChange({ ...query, axis: { ...query.axis!, dateBucket } })}
               onRemove={() => onChange({ ...query, axis: null })}
@@ -439,12 +677,20 @@ export function Wells({
       );
 
     return (
-      <Well key={def.key} def={def} empty={!dimension} issues={wellIssues}>
+      <Well
+        key={def.key}
+        def={def}
+        empty={!dimension}
+        issues={wellIssues}
+        accepts={acceptsInto(def.id)}
+      >
         {dimension && (
-          <DimensionChip
+          <SingleDimensionChip
+            well={def.id}
             dimension={dimension}
             model={model}
             catalog={catalog}
+            chipData={chipData}
             showBucket={def.id === 'smallMultiples'}
             onBucket={(dateBucket) => setDimension({ ...dimension, dateBucket })}
             onRemove={() => setDimension(null)}
@@ -462,16 +708,28 @@ export function Wells({
         def={FILTERS_WELL}
         empty={query.filters.length === 0}
         issues={issueMessagesFor(FILTERS_WELL, issues)}
+        accepts={acceptsInto('filters')}
       >
-        {query.filters.map((clause, index) => (
-          <FilterChip
-            key={`${clause.table}.${clause.column}.${clause.operator}-${index}`}
-            clause={clause}
-            model={model}
-            onEdit={() => onEditFilter(index)}
-            onRemove={() => removeFilter(index)}
-          />
-        ))}
+        {query.filters.map((clause, index) => {
+          const label = columnLabelOf(model, clause.table, clause.column);
+          return (
+            <DraggableChip
+              key={`${clause.table}.${clause.column}.${clause.operator}-${index}`}
+              id={`chip-filters-${index}`}
+              data={chipData('filters', index, { kind: 'filter', clause }, label)}
+            >
+              {(drag) => (
+                <FilterChip
+                  clause={clause}
+                  model={model}
+                  drag={drag}
+                  onEdit={() => onEditFilter(index)}
+                  onRemove={() => removeFilter(index)}
+                />
+              )}
+            </DraggableChip>
+          );
+        })}
       </Well>
 
       <SortLimitSection
@@ -492,6 +750,7 @@ function Well({
   empty,
   children,
   footer,
+  accepts,
   issues = [],
 }: {
   def: WellDef;
@@ -499,6 +758,12 @@ function Well({
   children: React.ReactNode;
   /** Rendered under the drop box, inside the well group (drill sub-area). */
   footer?: React.ReactNode;
+  /**
+   * Would a drop here be honored? Chip moves need the query to answer that (a
+   * full one-chip well can only take a chip it can SWAP with), so the caller
+   * owns the predicate and the not-allowed styling below never lies.
+   */
+  accepts: (data: FieldDragData) => boolean;
   /** Validation messages badging THIS well: red ring + tooltip + label icon. */
   issues?: string[];
 }) {
@@ -508,7 +773,7 @@ function Well({
   });
 
   const dragData = (active?.data.current as FieldDragData | undefined) ?? null;
-  const validTarget = dragData ? canAccept(def.id, dragData) : null;
+  const validTarget = dragData ? accepts(dragData) : null;
   const flagged = issues.length > 0;
 
   const borderClass =
@@ -574,12 +839,16 @@ function DrillSection({
   query,
   model,
   catalog,
+  chipData,
+  accepts,
   onChange,
   issues = [],
 }: {
   query: ChartQuery;
   model: ModelDefinition;
   catalog: Catalog | null;
+  chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
+  accepts: (data: FieldDragData) => boolean;
   onChange: (query: ChartQuery) => void;
   /** Validation messages badging the drill levels (red ring + tooltip). */
   issues?: string[];
@@ -602,7 +871,7 @@ function DrillSection({
   });
 
   const dragData = (active?.data.current as FieldDragData | undefined) ?? null;
-  const validTarget = dragData ? canAccept('drill', dragData) : null;
+  const validTarget = dragData ? accepts(dragData) : null;
   const dropClass =
     isOver && validTarget === true
       ? 'border-rcd-accent bg-[color-mix(in_srgb,var(--rcd-accent)_12%,transparent)]'
@@ -650,9 +919,11 @@ function DrillSection({
             <div className="pb-1 pl-4">
               <OrderedDimensionList
                 idPrefix="drill"
+                well="drill"
                 levels={levels}
                 model={model}
                 catalog={catalog}
+                chipData={chipData}
                 onLevels={setLevels}
               />
             </div>
@@ -695,25 +966,36 @@ function DrillSection({
 // ---------------------------------------------------------------------------
 
 /**
- * Numbered, reorderable dimension rows (1, 2, 3, …). A nested DndContext
- * (isolated from the builder's field-drag context) makes the rows sortable
- * via their grip handles.
+ * Numbered, reorderable dimension rows (1, 2, 3, …) — a table's "Rows" well
+ * and a cartesian axis's drill levels.
+ *
+ * These rows used to run their OWN nested DndContext so the grips could sort
+ * them in isolation from the builder's field-drag context. That isolation was
+ * exactly what made "drag a row into Values" impossible: dnd-kit collides a
+ * draggable only with droppables registered in the SAME provider, so a row
+ * could never see a well. The list now sorts inside the BUILDER's context
+ * instead — same grips, same numbering, same behavior — and ChartBuilder's
+ * drag-end handler tells a reorder (dropped inside this well) from a move
+ * (dropped on another well) by where the drag landed.
  */
 function OrderedDimensionList({
   idPrefix,
+  well,
   levels,
   model,
   catalog,
+  chipData,
   onLevels,
 }: {
   idPrefix: string;
+  /** Which well these rows ARE — 'axis' for a table's Rows, 'drill' below an axis. */
+  well: WellId;
   levels: DimensionRef[];
   model: ModelDefinition;
   catalog: Catalog | null;
+  chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
   onLevels: (levels: DimensionRef[]) => void;
 }) {
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
-
   const setLevel = (index: number, dimension: DimensionRef) =>
     onLevels(levels.map((level, i) => (i === index ? dimension : level)));
 
@@ -721,33 +1003,30 @@ function OrderedDimensionList({
 
   const ids = levels.map((_, index) => `${idPrefix}-${index}`);
 
-  const handleDragEnd = (event: DragEndEvent) => {
-    const from = ids.indexOf(String(event.active.id));
-    const to = event.over ? ids.indexOf(String(event.over.id)) : -1;
-    if (from < 0 || to < 0 || from === to) return;
-    onLevels(arrayMove(levels, from, to));
-  };
-
   return (
-    <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-      <SortableContext items={ids} strategy={verticalListSortingStrategy}>
-        <div className="flex flex-col gap-1">
-          {levels.map((level, index) => (
-            <SortableLevelRow
-              key={`${idPrefix}-${index}`}
-              id={`${idPrefix}-${index}`}
-              index={index}
-              sortable={levels.length > 1}
-              dimension={level}
-              model={model}
-              catalog={catalog}
-              onBucket={(dateBucket) => setLevel(index, { ...level, dateBucket })}
-              onRemove={() => removeLevel(index)}
-            />
-          ))}
-        </div>
-      </SortableContext>
-    </DndContext>
+    <SortableContext items={ids} strategy={verticalListSortingStrategy}>
+      <div className="flex flex-col gap-1">
+        {levels.map((level, index) => (
+          <SortableLevelRow
+            key={`${idPrefix}-${index}`}
+            id={`${idPrefix}-${index}`}
+            index={index}
+            sortable={levels.length > 1}
+            dimension={level}
+            model={model}
+            catalog={catalog}
+            data={chipData(
+              well,
+              index,
+              { kind: 'dimension', dimension: level },
+              columnLabelOf(model, level.table, level.column),
+            )}
+            onBucket={(dateBucket) => setLevel(index, { ...level, dateBucket })}
+            onRemove={() => removeLevel(index)}
+          />
+        ))}
+      </div>
+    </SortableContext>
   );
 }
 
@@ -758,6 +1037,7 @@ function SortableLevelRow({
   dimension,
   model,
   catalog,
+  data,
   onBucket,
   onRemove,
 }: {
@@ -767,50 +1047,44 @@ function SortableLevelRow({
   dimension: DimensionRef;
   model: ModelDefinition;
   catalog: Catalog | null;
-  onBucket: (bucket: DateBucket) => void;
+  data: ChipDropData;
+  onBucket: (bucket: DateBucket | null) => void;
   onRemove: () => void;
 }) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
-    id,
-  });
-
+  const label = columnLabelOf(model, dimension.table, dimension.column);
   return (
-    <div
-      ref={setNodeRef}
-      style={{ transform: CSS.Translate.toString(transform), transition }}
-      className={`flex min-w-0 max-w-full items-center gap-1 ${isDragging ? 'relative z-10 opacity-80' : ''}`}
-    >
-      <span
-        aria-hidden
-        className="w-3.5 shrink-0 text-center text-[10px] font-semibold tabular-nums text-rcd-muted"
-      >
-        {index + 1}
-      </span>
-      <div className="min-w-0 flex-1">
-        <DimensionChip
-          dimension={dimension}
-          model={model}
-          catalog={catalog}
-          showBucket
-          onBucket={onBucket}
-          onRemove={onRemove}
-          leading={
-            sortable ? (
-              <button
-                type="button"
-                aria-label={`Reorder level ${index + 1}`}
-                title="Drag to reorder"
-                {...attributes}
-                {...listeners}
-                className="-ml-0.5 shrink-0 cursor-grab touch-none rounded p-0.5 text-rcd-muted hover:text-rcd-text"
-              >
-                <GripVertical size={11} />
-              </button>
-            ) : undefined
-          }
-        />
-      </div>
-    </div>
+    <SortableChip id={id} data={data}>
+      {(drag) => (
+        // The ROW (number + chip) is the registered node, so the whole row
+        // translates as one unit while the list re-sorts.
+        <div
+          ref={drag.setNodeRef}
+          style={drag.style}
+          className={`flex min-w-0 max-w-full items-center gap-1 ${
+            drag.isDragging ? 'relative z-10 opacity-80' : ''
+          }`}
+        >
+          <span
+            aria-hidden
+            className="w-3.5 shrink-0 text-center text-[10px] font-semibold tabular-nums text-rcd-muted"
+          >
+            {index + 1}
+          </span>
+          <div className="min-w-0 flex-1">
+            <DimensionChip
+              dimension={dimension}
+              model={model}
+              catalog={catalog}
+              showBucket
+              drag={bodyDragOnly(drag)}
+              onBucket={onBucket}
+              onRemove={onRemove}
+              leading={sortable ? <ChipGrip drag={drag} label={label} /> : undefined}
+            />
+          </div>
+        </div>
+      )}
+    </SortableChip>
   );
 }
 
@@ -878,6 +1152,12 @@ function SortLimitSection({
   const dimLabel = firstDimension
     ? columnLabelOf(model, firstDimension.table, firstDimension.column)
     : null;
+  /**
+   * A measure-less passthrough table has nothing to rank BY, so the "Highest
+   * … first" options are absent (the measure loop below emits none) and the
+   * limit stops being a Top N — it is a plain row cap, and says so.
+   */
+  const measureless = query.measures.length === 0;
   const hasManual =
     (ordering?.categoryOrder?.length ?? 0) > 0 || (ordering?.seriesOrder?.length ?? 0) > 0;
   // Keeps "Custom order…" selected (lists open) before the first drag has
@@ -959,7 +1239,9 @@ function SortLimitSection({
       )}
 
       <label className="flex flex-col gap-1">
-        <span className="text-xs font-medium text-rcd-text">Top N</span>
+        <span className="text-xs font-medium text-rcd-text">
+          {measureless ? 'Row limit' : 'Top N'}
+        </span>
         <div className="flex items-center gap-2">
           <RcdInput
             type="number"
@@ -968,10 +1250,12 @@ function SortLimitSection({
             onChange={(event) => applyLimit(event.target.value)}
             placeholder="All rows"
             className="w-24"
-            aria-label="Top N row limit"
+            aria-label={measureless ? 'Row limit' : 'Top N row limit'}
           />
           <span className="text-[11px] leading-snug text-rcd-muted">
-            Keep only the first N rows — pick “Highest … first” above for a true Top N.
+            {measureless
+              ? 'Keep only the first N rows, in the sort order above.'
+              : 'Keep only the first N rows — pick “Highest … first” above for a true Top N.'}
           </span>
         </div>
       </label>
@@ -1119,23 +1403,55 @@ function Chip({
   icon,
   leading,
   label,
+  labelContent,
   controls,
+  drag,
   onRemove,
 }: {
   icon?: React.ReactNode;
   /** Rendered before the icon/label (e.g. a sortable drag handle). */
   leading?: React.ReactNode;
   label: string;
+  /**
+   * Replaces the label span while keeping `label` as the accessible/tooltip
+   * text — the value chip swaps in its inline alias input here.
+   */
+  labelContent?: React.ReactNode;
   controls?: React.ReactNode;
+  /**
+   * Makes the chip's LABEL a drag handle so the field can be moved to another
+   * well without being deleted and hunted for in the field list again. Only
+   * the label carries the listeners — the aggregation select, the bucket
+   * select, rename and ✕ stay ordinary controls, and the 4px activation
+   * distance means a plain click on the label is still just a click.
+   */
+  drag?: ChipDrag;
   onRemove: () => void;
 }) {
   return (
-    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs font-medium text-rcd-text">
+    <div
+      ref={drag?.setNodeRef}
+      style={drag?.style}
+      className={`flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs font-medium text-rcd-text ${
+        drag?.isDragging ? 'relative z-10 opacity-80' : ''
+      }`}
+    >
       {leading}
       {icon && <span className="shrink-0 text-rcd-muted">{icon}</span>}
-      <span className="min-w-0 flex-1 truncate" title={label}>
-        {label}
-      </span>
+      {labelContent ??
+        (drag ? (
+          <span
+            {...drag.listeners}
+            className="min-w-0 flex-1 cursor-grab touch-none truncate"
+            title={`${label} — drag onto another well to move it`}
+          >
+            {label}
+          </span>
+        ) : (
+          <span className="min-w-0 flex-1 truncate" title={label}>
+            {label}
+          </span>
+        ))}
       {controls}
       <button
         type="button"
@@ -1178,24 +1494,40 @@ function ParamBindingChip({ name, onRemove }: { name: string; onRemove: () => vo
 function FilterChip({
   clause,
   model,
+  drag,
   onEdit,
   onRemove,
 }: {
   clause: FilterClause;
   model: ModelDefinition;
+  /**
+   * The label button doubles as the drag handle (4px activation, so a click
+   * still opens the editor). Dragging a filter onto another well moves the
+   * FIELD there; the operator and values have no home outside this well, so
+   * ChartBuilder confirms before letting them go.
+   */
+  drag?: ChipDrag;
   onEdit: () => void;
   onRemove: () => void;
 }) {
   const text = `${columnLabelOf(model, clause.table, clause.column)} · ${filterSummary(clause)}`;
 
   return (
-    <div className="flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text">
+    <div
+      ref={drag?.setNodeRef}
+      className={`flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-rcd-border bg-rcd-bg px-2 py-1 text-xs text-rcd-text ${
+        drag?.isDragging ? 'relative z-10 opacity-80' : ''
+      }`}
+    >
       <Filter size={12} className="shrink-0 text-rcd-muted" />
       <button
         type="button"
         onClick={onEdit}
+        {...drag?.listeners}
         title={`Edit filter: ${text}`}
-        className="min-w-0 flex-1 truncate text-left font-medium hover:text-rcd-accent"
+        className={`min-w-0 flex-1 truncate text-left font-medium hover:text-rcd-accent ${
+          drag ? 'cursor-grab touch-none' : ''
+        }`}
       >
         {text}
       </button>
@@ -1211,12 +1543,58 @@ function FilterChip({
   );
 }
 
+/**
+ * A dimension chip in a well that holds exactly ONE (a cartesian axis, the
+ * legend, small multiples): a plain draggable, because its well is the only
+ * position it can occupy. Dropping it on an occupied one-chip well swaps.
+ */
+function SingleDimensionChip({
+  well,
+  dimension,
+  model,
+  catalog,
+  chipData,
+  showBucket,
+  onBucket,
+  onRemove,
+}: {
+  well: WellId;
+  dimension: DimensionRef;
+  model: ModelDefinition;
+  catalog: Catalog | null;
+  chipData: (well: WellId, index: number, ref: ChipShape, label: string) => ChipDropData;
+  showBucket: boolean;
+  onBucket: (bucket: DateBucket | null) => void;
+  onRemove: () => void;
+}) {
+  const label = columnLabelOf(model, dimension.table, dimension.column);
+  return (
+    <DraggableChip
+      id={`chip-${well}-0`}
+      data={chipData(well, 0, { kind: 'dimension', dimension }, label)}
+    >
+      {(drag) => (
+        <DimensionChip
+          dimension={dimension}
+          model={model}
+          catalog={catalog}
+          showBucket={showBucket}
+          drag={drag}
+          onBucket={onBucket}
+          onRemove={onRemove}
+        />
+      )}
+    </DraggableChip>
+  );
+}
+
 function DimensionChip({
   dimension,
   model,
   catalog,
   showBucket,
   leading,
+  drag,
   onBucket,
   onRemove,
 }: {
@@ -1225,10 +1603,14 @@ function DimensionChip({
   catalog: Catalog | null;
   showBucket: boolean;
   leading?: React.ReactNode;
-  onBucket: (bucket: DateBucket) => void;
+  drag?: ChipDrag;
+  onBucket: (bucket: DateBucket | null) => void;
   onRemove: () => void;
 }) {
   const type = columnTypeOf(catalog, dimension.table, dimension.column);
+  // With no catalog the chip can only infer "temporal" from an existing
+  // bucket; an unbucketed date then hides the select, so keep it visible
+  // whenever the column type IS known to be temporal.
   const temporal = type !== null ? isTemporalType(type) : dimension.dateBucket != null;
   const label = columnLabelOf(model, dimension.table, dimension.column);
 
@@ -1236,16 +1618,19 @@ function DimensionChip({
     <Chip
       label={label}
       leading={leading}
+      drag={drag}
       onRemove={onRemove}
       controls={
         showBucket && temporal ? (
           <RcdSelect
             aria-label={`Date bucket for ${label}`}
-            value={dimension.dateBucket ?? 'month'}
-            onChange={(event) => onBucket(event.target.value as DateBucket)}
+            value={dimension.dateBucket ?? EXACT_DATE}
+            onChange={(event) =>
+              onBucket(event.target.value === EXACT_DATE ? null : (event.target.value as DateBucket))
+            }
           >
             {DATE_BUCKETS.map((bucket) => (
-              <option key={bucket.value} value={bucket.value}>
+              <option key={bucket.value ?? 'exact'} value={bucket.value ?? EXACT_DATE}>
                 {bucket.label}
               </option>
             ))}
@@ -1377,13 +1762,29 @@ function CalcMenu({
   );
 }
 
+/**
+ * A value chip, with an INLINE RENAME. The rename writes MeasureRef.alias,
+ * which the engine has always honored — QueryCompiler composes
+ * "{Aggregation} of {Column}" only when alias is absent — but until 0.14.1
+ * the only writer was FieldParameterDialog, so a builder user could not turn
+ * "Min of Client" into "Client" without hand-editing JSON. That is precisely
+ * what makes the library's own seeded passthrough tables read as
+ * "Status"/"Description"/"Last Updated", and why they were unbuildable in the
+ * GUI. Nothing on the wire changes.
+ *
+ * Clearing the box removes the alias, so the chip falls back to the composed
+ * label (and the server keeps owning the real header text).
+ */
 function ValueChip({
   measure,
   model,
   catalog,
   hasAxis,
   axisBucket,
+  leading,
+  drag,
   onAggregation,
+  onAlias,
   onCalc,
   onRemove,
 }: {
@@ -1392,22 +1793,101 @@ function ValueChip({
   catalog: Catalog | null;
   hasAxis: boolean;
   axisBucket: DateBucket | null;
+  /** Reorder grip (the open-ended Values well only). */
+  leading?: React.ReactNode;
+  drag?: ChipDrag;
   onAggregation: (aggregation: Aggregation) => void;
+  onAlias: (alias: string | undefined) => void;
   onCalc: (calc: MeasureCalc | null) => void;
   onRemove: () => void;
 }) {
+  /** null = not editing; a string = the in-progress alias. */
+  const [aliasDraft, setAliasDraft] = useState<string | null>(null);
+  const isModelMeasure = measure.measureId != null;
+  const table = measure.table ?? '';
+  const column = measure.column ?? '';
+  /**
+   * What the chip shows: the alias when set, otherwise the model measure's
+   * name (model chips) or the bare column label (inline chips — whose
+   * aggregation is its own control right beside the label).
+   */
+  const displayLabel = isModelMeasure
+    ? measureLabel(model, measure)
+    : (measure.alias ?? columnLabelOf(model, table, column));
+
+  const commitAlias = () => {
+    setAliasDraft((draft) => {
+      if (draft !== null) {
+        const next = draft.trim();
+        onAlias(next === '' ? undefined : next);
+      }
+      return null;
+    });
+  };
+
+  const renameButton = (
+    <button
+      type="button"
+      aria-label={`Rename ${displayLabel}`}
+      title="Rename this column — the header the chart, table and email show"
+      onClick={() => setAliasDraft(measure.alias ?? '')}
+      className={`shrink-0 rounded-sm p-0.5 transition-colors hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10 ${
+        measure.alias ? 'text-rcd-accent' : 'text-rcd-muted'
+      }`}
+    >
+      <Pencil size={11} />
+    </button>
+  );
+
+  const aliasInput =
+    aliasDraft === null ? undefined : (
+      <input
+        autoFocus
+        aria-label={`Name for ${displayLabel}`}
+        value={aliasDraft}
+        placeholder={displayLabel}
+        onChange={(event) => setAliasDraft(event.target.value)}
+        onBlur={commitAlias}
+        onKeyDown={(event) => {
+          // Enter/Escape must not reach the hosting dialog (Escape closes it).
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            event.stopPropagation();
+            commitAlias();
+          } else if (event.key === 'Escape') {
+            event.preventDefault();
+            event.stopPropagation();
+            setAliasDraft(null);
+          }
+        }}
+        className="min-w-0 flex-1 rounded-sm border border-rcd-accent bg-rcd-surface px-1 py-0.5 text-xs font-medium text-rcd-text outline-none"
+      />
+    );
+
   const calcMenu = (
     <CalcMenu measure={measure} hasAxis={hasAxis} axisBucket={axisBucket} onCalc={onCalc} />
   );
 
-  if (measure.measureId != null) {
-    const name = measureLabel(model, measure);
-    return <Chip icon={<Sigma size={12} />} label={name} controls={calcMenu} onRemove={onRemove} />;
+  if (isModelMeasure) {
+    return (
+      <Chip
+        icon={<Sigma size={12} />}
+        label={displayLabel}
+        labelContent={aliasInput}
+        leading={leading}
+        drag={drag}
+        controls={
+          <>
+            {renameButton}
+            {calcMenu}
+          </>
+        }
+        onRemove={onRemove}
+      />
+    );
   }
 
-  const table = measure.table ?? '';
-  const column = measure.column ?? '';
-  const label = columnLabelOf(model, table, column);
+  const label = displayLabel;
   const type = columnTypeOf(catalog, table, column);
   const value = measure.aggregation ?? 'sum';
   const base = aggregationOptionsFor(type);
@@ -1416,6 +1896,9 @@ function ValueChip({
   return (
     <Chip
       label={label}
+      labelContent={aliasInput}
+      leading={leading}
+      drag={drag}
       onRemove={onRemove}
       controls={
         <>
@@ -1430,6 +1913,7 @@ function ValueChip({
               </option>
             ))}
           </RcdSelect>
+          {renameButton}
           {calcMenu}
         </>
       }

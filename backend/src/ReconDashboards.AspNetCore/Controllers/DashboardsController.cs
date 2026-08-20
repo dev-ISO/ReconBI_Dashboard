@@ -250,8 +250,8 @@ public sealed class DashboardsController(
     private static DashboardResponse ToResponse(DashboardDetail detail) =>
         new(detail.Id, detail.Name, detail.Description, detail.ModelId, detail.IsShared,
             detail.OwnerIsMe, detail.CreatedAtUtc, detail.UpdatedAtUtc,
-            detail.IsSystem, detail.OwnerDisplayName, ToAccessResponse(detail.MyAccess),
-            detail.ShareCount, detail.Layout);
+            detail.IsSystem, detail.OwnerDisplayName, detail.OwnerUserId,
+            ToAccessResponse(detail.MyAccess), detail.ShareCount, detail.Layout);
 
     private static DashboardAccessResponse ToAccessResponse(DashboardAccess access) =>
         new(access.IsOwner, access.CanEdit, access.CanEditLayout, access.CanManagePages,

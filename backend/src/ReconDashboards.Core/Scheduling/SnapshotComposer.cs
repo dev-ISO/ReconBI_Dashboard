@@ -204,6 +204,17 @@ public sealed class SnapshotComposer(
             .Append("\" style=\"width:100%;max-width:").Append(imageWidth)
             .Append("px;height:auto;display:block\">");
 
+        // A panel grid cannot be read at this width, so the panels are combined
+        // into one chart — and the reader is TOLD, rather than shown a chart
+        // that silently collapsed rows on top of each other.
+        if (ChartLayoutEngine.DescribeSmallMultiples(tile) is { } note)
+        {
+            html.Append("<div style=\"font-size:11px;color:#6b7280;margin-top:4px;\">Small multiples (")
+                .Append(note.PanelCount).Append(" panels by ")
+                .Append(WebUtility.HtmlEncode(note.Dimension))
+                .Append(") are combined in this email.</div>");
+        }
+
         if (includeTables && !SnapshotRenderer.HasKpiShape(tile))
         {
             html.Append("<div style=\"height:8px;\"></div>");

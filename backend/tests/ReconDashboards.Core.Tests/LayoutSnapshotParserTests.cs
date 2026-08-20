@@ -101,6 +101,42 @@ public class LayoutSnapshotParserTests
         Assert.Empty(tile.Spec.Dimensions);
     }
 
+    /// <summary>
+    /// The one exception to the measure-less skip, in lockstep with the GUI's
+    /// isRunnable (0.14.1): a TABLE with Rows and no Values is a passthrough
+    /// column list the engine compiles fine, so it must reach the email —
+    /// silently dropping it would lose a tile from every scheduled send with
+    /// no error anywhere. A measure-less table with no Rows is still skipped
+    /// (empty SELECT list), as is a measure-less chart of any other type.
+    /// </summary>
+    [Fact]
+    public void MeasurelessTableWithRowsIsKept()
+    {
+        const string layout = """
+        {
+          "version": 1, "tiles": [], "slicers": [],
+          "pages": [{
+            "id": "p1", "name": "Page 1",
+            "tiles": [
+              { "id": "t1", "kind": "chart", "layout": {}, "chart": { "id": "c1", "type": "table", "title": "Register",
+                "query": { "axis": { "table": "public.customers", "column": "region" }, "measures": [], "filters": [] } } },
+              { "id": "t2", "kind": "chart", "layout": {}, "chart": { "id": "c2", "type": "table", "title": "Nothing",
+                "query": { "measures": [], "filters": [] } } },
+              { "id": "t3", "kind": "chart", "layout": {}, "chart": { "id": "c3", "type": "column", "title": "Also nothing",
+                "query": { "axis": { "table": "public.customers", "column": "region" }, "measures": [], "filters": [] } } }
+            ]
+          }]
+        }
+        """;
+
+        var tile = Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(layout, ModelId)).Tiles);
+        Assert.Equal("t1", tile.TileId);
+        Assert.Equal("table", tile.ChartType);
+        Assert.Empty(tile.Spec.Measures);
+        var dimension = Assert.Single(tile.Spec.Dimensions);
+        Assert.Equal("region", dimension.Column);
+    }
+
     [Fact]
     public void LegacySinglePageDocsUseRootTiles()
     {
@@ -353,20 +389,192 @@ public class LayoutSnapshotParserTests
     }
 
     [Fact]
-    public void FormatKeysExcludedInV1AreCarriedNowhereAndBreakNothing()
+    public void FormatKeysStillExcludedAreCarriedNowhereAndBreakNothing()
     {
-        // referenceLines / trendlines / conditionalFormats are NOT drawn server
-        // side yet; their presence must be inert, not an error.
+        // conditionalFormats, the secondary axis and the interaction blocks are
+        // NOT drawn server side; their presence must be inert, not an error.
         var format = ParseFormat("""
             {
               "theme": "forest",
-              "referenceLines": [{ "value": 100, "label": "Target" }],
-              "trendlines": [{ "series": "Total", "kind": "linear" }],
-              "conditionalFormats": [{ "when": "gt", "value": 5, "color": "#f00" }]
+              "conditionalFormats": [{ "when": "gt", "value": 5, "color": "#f00" }],
+              "secondaryAxisKeys": ["Target"],
+              "y2AxisFormat": { "kind": "compact" },
+              "yAxisScale": { "range": "auto", "log": true },
+              "zoom": { "brush": true },
+              "tooltip": { "accentBorder": true }
             }
             """);
 
         Assert.NotNull(format);
         Assert.Equal("forest", format.Theme);
+    }
+
+    // ------------------------------------------------- the 0.14.1 format fields
+
+    [Fact]
+    public void TheChartFidelityFormatFieldsSurviveParsing()
+    {
+        // Every field below is set by the seeded showcase dashboard whose email
+        // the owner reviewed; each one was silently discarded before.
+        var format = ParseFormat("""
+            {
+              "colorByCategory": true,
+              "xLabelFit": { "mode": "angled", "wrapLines": 3 },
+              "xAxisFormat": { "kind": "compact" },
+              "yAxisFormat": { "kind": "custom", "pattern": "#,##0.0", "decimals": 1 },
+              "xAxisLabelHtml": "<b>Initial package delivered</b>",
+              "yAxisLabelHtml": "<b>Systems</b>",
+              "trimEmptyEdges": true,
+              "excludeBlankDates": false,
+              "lineStyles": { "Systems": { "dash": "solid", "width": 2 } },
+              "referenceLines": [{
+                "id": "r1", "kind": "average", "measureKey": "Systems", "label": "Monthly average",
+                "color": "#eb6834", "dash": "dashed", "width": 2, "showLabel": true
+              }],
+              "trendlines": [{
+                "id": "t1", "kind": "movingAverage", "window": 3, "seriesKey": "Systems",
+                "color": "#8b5cf6", "dash": "dotted", "width": 2
+              }],
+              "titleStyle": { "fontSize": 14, "bold": true, "color": "#111827" },
+              "axisTitleStyle": { "italic": true },
+              "legendStyle": { "bold": true },
+              "kpiValueStyle": { "fontSize": 32 },
+              "container": {
+                "hideHeader": true, "background": "#ffffff", "borderColor": "#2a78d6",
+                "borderWidth": 1, "borderRadius": 12, "shadow": "sm",
+                "innerTitleHtml": "<p><b>Systems Tracked</b></p>"
+              },
+              "gantt": {
+                "barSize": 14, "cornerRadius": 4, "showToday": true, "todayColor": "#dc2626",
+                "rowBanding": true, "singleColor": true, "color": "#2a78d6", "taskLabels": "axis"
+              }
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.True(format.ColorByCategory);
+        Assert.Equal("angled", format.XLabelFit!.Mode);
+        Assert.Equal(3, format.XLabelFit.WrapLines);
+        Assert.Equal("compact", format.XAxisFormat!.Kind);
+        Assert.Equal("#,##0.0", format.YAxisFormat!.Pattern);
+        Assert.Equal(1, format.YAxisFormat.Decimals);
+        Assert.Equal("<b>Initial package delivered</b>", format.XAxisLabelHtml);
+        Assert.Equal("<b>Systems</b>", format.YAxisLabelHtml);
+        Assert.True(format.TrimEmptyEdges);
+        Assert.False(format.ExcludeBlankDates);
+        Assert.Equal(2, format.LineStyles!["Systems"].Width);
+
+        var reference = Assert.Single(format.ReferenceLines!);
+        Assert.Equal("average", reference.Kind);
+        Assert.Equal("Systems", reference.MeasureKey);
+        Assert.Equal("Monthly average", reference.Label);
+        Assert.Equal("#eb6834", reference.Color);
+        Assert.Equal("dashed", reference.Dash);
+        Assert.True(reference.ShowLabel);
+
+        var trendline = Assert.Single(format.Trendlines!);
+        Assert.Equal("movingAverage", trendline.Kind);
+        Assert.Equal(3, trendline.Window);
+        Assert.Equal("#8b5cf6", trendline.Color);
+
+        Assert.Equal(14, format.TitleStyle!.FontSize);
+        Assert.True(format.TitleStyle.Bold);
+        Assert.True(format.AxisTitleStyle!.Italic);
+        Assert.True(format.LegendStyle!.Bold);
+        Assert.Equal(32, format.KpiValueStyle!.FontSize);
+
+        Assert.True(format.Container!.HideHeader);
+        Assert.Equal("#2a78d6", format.Container.BorderColor);
+        Assert.Equal(12, format.Container.BorderRadius);
+        Assert.Equal("sm", format.Container.Shadow);
+        Assert.Equal("<p><b>Systems Tracked</b></p>", format.Container.InnerTitleHtml);
+
+        Assert.Equal(14, format.Gantt!.BarSize);
+        Assert.Equal(4, format.Gantt.CornerRadius);
+        Assert.True(format.Gantt.ShowToday);
+        Assert.True(format.Gantt.SingleColor);
+        Assert.Equal("#2a78d6", format.Gantt.Color);
+    }
+
+    [Fact]
+    public void WrongTypedNestedFormatFieldsDegradeToUnsetToo()
+    {
+        var format = ParseFormat("""
+            {
+              "colorByCategory": "yes",
+              "xLabelFit": "angled",
+              "yAxisFormat": [],
+              "referenceLines": { "kind": "average" },
+              "trendlines": ["linear"],
+              "lineStyles": { "Systems": "dashed" },
+              "container": 7,
+              "theme": "ocean"
+            }
+            """);
+
+        Assert.NotNull(format);
+        Assert.Null(format.ColorByCategory);
+        Assert.Null(format.XLabelFit);
+        Assert.Null(format.YAxisFormat);
+        Assert.Null(format.ReferenceLines);
+        Assert.Empty(format.Trendlines!);   // an array of non-objects yields no entries
+        Assert.Empty(format.LineStyles!);
+        Assert.Null(format.Container);
+        Assert.Equal("ocean", format.Theme); // one bad key is never fatal
+    }
+
+    // ------------------------------------------------- wells and tile geometry
+
+    [Fact]
+    public void TheDimensionWELLSAreRecordedNotJustTheirCompactedOrder()
+    {
+        // A legend-only chart's single dimension sits at ordinal 0; without the
+        // wells the renderer cannot tell it from an axis.
+        const string layout = """
+        {
+          "version": 1, "tiles": [], "slicers": [],
+          "pages": [{ "id": "p1", "name": "One", "tiles": [{
+            "id": "t1", "kind": "chart",
+            "layout": { "x": 0, "y": 8, "w": 14, "h": 9 },
+            "chart": { "id": "c1", "type": "donut", "title": "Mix", "query": {
+              "legend": { "table": "public.customers", "column": "region" },
+              "measures": [{ "table": "public.orders", "aggregation": "count" }],
+              "filters": [] } }
+          }]}]
+        }
+        """;
+
+        var tile = Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(layout, ModelId)).Tiles);
+
+        Assert.NotNull(tile.Wells);
+        Assert.False(tile.Wells.HasAxis);
+        Assert.True(tile.Wells.HasLegend);
+        Assert.False(tile.Wells.HasSmallMultiples);
+        Assert.Equal((-1, 0, -1), tile.Wells.Ordinals());
+        Assert.Equal(new TileGridSize(14, 9), tile.GridSize);
+    }
+
+    [Fact]
+    public void AllThreeWellsMapToTheirCompactedOrdinalsInOrder()
+    {
+        Assert.Equal((0, 1, 2), new DimensionWells(true, true, true).Ordinals());
+        Assert.Equal((0, -1, 1), new DimensionWells(true, false, true).Ordinals());
+        Assert.Equal((-1, -1, -1), new DimensionWells(false, false, false).Ordinals());
+    }
+
+    [Fact]
+    public void ATileWithNoLayoutBlockSimplyHasNoGridSize()
+    {
+        const string layout = """
+        {
+          "version": 1, "tiles": [], "slicers": [],
+          "pages": [{ "id": "p1", "name": "One", "tiles": [
+            { "id": "t1", "chart": { "id": "c1", "type": "column", "title": "A", "query": {
+              "measures": [{ "table": "public.orders", "aggregation": "count" }], "filters": [] } } }
+          ]}]
+        }
+        """;
+
+        Assert.Null(Assert.Single(Assert.Single(LayoutSnapshotParser.Parse(layout, ModelId)).Tiles).GridSize);
     }
 }

@@ -4,11 +4,18 @@ using System.Data.Common;
 namespace ReconDashboards.Postgres.Tests;
 
 /// <summary>
-/// The executor's per-cell overflow guard, pinned against a stub reader so it
-/// runs without Docker. <see cref="NumericOverflowExecutionTests"/> proves the
-/// same behavior end-to-end against a real server (and is what verifies the
-/// ASSUMPTION that Npgsql throws here at all); these pin the fallback logic
-/// itself — which value survives, and what a second failure degrades to.
+/// The executor's per-cell guard, pinned against a stub reader so it runs
+/// without Docker.
+///
+/// READ THIS BEFORE TRUSTING THE "wider read" CASES: against real Npgsql the
+/// successful-fallback path below is UNREACHABLE for a Postgres numeric —
+/// every read of that type goes through decimal, so the retry raises the same
+/// OverflowException and the cell becomes null (proved end-to-end by
+/// <see cref="NumericOverflowExecutionTests"/>). These cases document what the
+/// guard does when a reader DOES offer a wider CLR target; the null cases are
+/// the ones that describe production today. The split exists because an
+/// earlier version of this suite asserted a fallback the driver never performs
+/// and therefore looked green while the real behavior differed.
 /// </summary>
 public sealed class ReadRowOverflowTests
 {

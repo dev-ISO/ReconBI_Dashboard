@@ -318,7 +318,13 @@ export function validateChartSpec(
     }
   };
 
-  if (query.measures.length === 0) {
+  // A TABLE with Rows and no Values is a legitimate passthrough column list
+  // (mirror of isRunnable): the engine emits a GROUP BY over the dimensions
+  // alone, which is exactly SELECT DISTINCT. Every other chart type has an
+  // axis to plot and needs a value; and with NO dimensions either the SELECT
+  // list would be empty, which the compiler rejects for all types.
+  const passthroughTable = spec.type === 'table' && query.axis != null;
+  if (query.measures.length === 0 && !passthroughTable) {
     error('no_measures', 'A chart query needs at least one measure.', 'values');
   }
   query.measures.forEach((measure, index) => checkMeasure(measure, index));

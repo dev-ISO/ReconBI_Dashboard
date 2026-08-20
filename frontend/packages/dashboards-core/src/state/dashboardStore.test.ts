@@ -386,7 +386,8 @@ describe('button tiles (0.11.1)', () => {
     expect(tile.button!.targetPageId).toBe('p1');
     expect(tile.button!.radius).toBe(12);
     expect(tile.button!.fullSize).toBe(true);
-    expect(tile.layout).toMatchObject({ w: 4, h: 2, minW: 2, minH: 1 });
+    // A3 (0.14.1): no minW/minH seeded — the grid owns the floor.
+    expect(tile.layout).toEqual({ x: 0, y: 0, w: 4, h: 2 });
   });
 
   it('updateButtonTile patches the spec and re-sanitizes html', async () => {

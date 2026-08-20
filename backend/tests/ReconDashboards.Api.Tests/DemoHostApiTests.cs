@@ -53,6 +53,11 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
         Assert.Equal(8, json["maxDimensions"]!.GetValue<int>());
         Assert.Equal(16, json["maxMeasures"]!.GetValue<int>());
         Assert.Equal(32, json["maxFilters"]!.GetValue<int>());
+        // The caller's own id (0.14.1). This endpoint is the ONLY way the
+        // frontend learns who it is — the share picker excludes the signed-in
+        // user with it, and the value must be the SAME string the share
+        // validator compares against (ICurrentUserProvider.GetUserId()).
+        Assert.Equal("bob", json["userId"]!.GetValue<string>());
     }
 
     [Fact]
@@ -516,6 +521,24 @@ public sealed class DemoHostApiTests : IClassFixture<DemoApiFactory>
     }
 
     // ---------- dashboards ----------
+
+    [Fact]
+    public async Task Dashboard_CarriesTheOwnerUserId_SoTheSharePickerCanExcludeThem()
+    {
+        var carol = _factory.AsUser("carol");
+        var id = await CreateDashboardAsync(carol, UniqueName("Owned By Carol"), isShared: true);
+
+        // ownerIsMe answers "is this mine?" but never yields an id — and the
+        // share validator refuses an OWNER grant, failing the whole save. An
+        // admin editing someone else's shares needs the id itself.
+        var asOwner = await ReadJsonAsync(await carol.GetAsync($"{Dashboards}/{id}"));
+        Assert.Equal("carol", asOwner["ownerUserId"]!.GetValue<string>());
+        Assert.True(asOwner["ownerIsMe"]!.GetValue<bool>());
+
+        var asOther = await ReadJsonAsync(await _factory.AsUser("bob").GetAsync($"{Dashboards}/{id}"));
+        Assert.Equal("carol", asOther["ownerUserId"]!.GetValue<string>());
+        Assert.False(asOther["ownerIsMe"]!.GetValue<bool>());
+    }
 
     [Fact]
     public async Task Dashboards_Shared_VisibleToOthers_AndDuplicableByAuthorsOnly()

@@ -48,17 +48,30 @@ const subscription = (overrides: Partial<DashboardSubscription> = {}): Dashboard
   ...overrides,
 });
 
+/** LEGACY FLAT doc (tiles[], no pages) — the checklist's synthetic "Page 1" path. */
 const DASHBOARD_DETAIL = {
   id: 7,
   name: 'Ops board',
   layout: {
     version: 1,
     tiles: [
-      { id: 't1', layout: { x: 0, y: 0, w: 6, h: 4 }, chart: { id: 'c1', type: 'column', title: 'Sales' } },
+      {
+        id: 't1',
+        layout: { x: 0, y: 0, w: 6, h: 4 },
+        chart: {
+          id: 'c1',
+          type: 'column',
+          title: 'Sales',
+          query: { measures: [], filters: [] },
+        },
+      },
     ],
     slicers: [],
   },
 } as unknown as DashboardDetail;
+
+/** The recipient picker's directory (one member is enough — these tests only preview). */
+const DIRECTORY = [{ id: 'u1', displayName: 'ann', email: 'a@example.com' }];
 
 interface RecordedCall {
   path: string;
@@ -77,6 +90,8 @@ const makeFetcher = (
       return previewError ? Promise.reject(previewError) : Promise.resolve(PREVIEW_RESULT as T);
     if (path === '/api/rcd/v1/meta') return Promise.resolve({ canManageShared: false } as T);
     if (path === '/api/rcd/v1/dashboards') return Promise.resolve([] as T);
+    // Without this the recipient picker would receive the subscription array.
+    if (path.includes('/users')) return Promise.resolve(DIRECTORY as T);
     if (path.includes('/dashboards/')) return Promise.resolve(DASHBOARD_DETAIL as T);
     if (path.startsWith('/api/rcd/v1/alerts')) return Promise.resolve([] as T);
     return Promise.resolve(list as T);

@@ -134,9 +134,17 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
 
     public PreparedQuery Prepare(ChartQuerySpec spec, ModelDefinition model, DatabaseSchema schema, RcdLimits limits)
     {
-        if (spec.Measures.Count == 0)
+        // An EMPTY SELECT LIST is the only universally invalid shape. Zero
+        // measures with at least one dimension is a passthrough list: the
+        // emitted "SELECT dimExpr AS dim0 … GROUP BY dimExpr …" is exactly
+        // SELECT DISTINCT, and it is what a table chart with Rows and no
+        // Values compiles to (the GUI's isRunnable allows it for tables).
+        // Zero dimensions with measures stays valid too — that is the KPI /
+        // single-aggregate shape.
+        if (spec.Measures.Count == 0 && spec.Dimensions.Count == 0)
         {
-            throw new QueryCompilationException("QRY_NO_MEASURES", "A chart query needs at least one measure.");
+            throw new QueryCompilationException(
+                "QRY_NO_MEASURES", "A chart query needs at least one measure or dimension.");
         }
 
         if (spec.Dimensions.Count > limits.MaxDimensions)
@@ -206,7 +214,10 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             involved.Add(f.Table.Key);
         }
 
-        var baseTable = measures[0].Table.Key;
+        // The join plan anchors on the first measure's table; a measure-less
+        // passthrough query anchors on its first dimension instead. The guard
+        // above guarantees one of the two lists is non-empty.
+        var baseTable = measures.Length > 0 ? measures[0].Table.Key : dimensions[0].Table.Key;
         var active = model.Relationships.Where(r => r.IsActive).ToArray();
         var plan = JoinPathResolver.Resolve(baseTable, involved, active, limits.MaxJoins);
 

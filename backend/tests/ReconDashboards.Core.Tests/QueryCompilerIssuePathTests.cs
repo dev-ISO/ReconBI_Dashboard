@@ -110,11 +110,14 @@ public class QueryCompilerIssuePathTests
     /// <summary>
     /// A fault that belongs to the request as a whole carries NO path — the
     /// builder shows it in the summary rather than badging an innocent well.
+    /// The example is the empty SELECT list (no measures AND no dimensions);
+    /// measure-less-but-dimensioned queries compile, so both lists must be
+    /// empty for this to fire.
     /// </summary>
     [Fact]
     public void A_whole_query_fault_carries_no_path()
     {
-        var failure = Failure(Spec(measures: []));
+        var failure = Failure(Spec(dimensions: [], measures: []));
 
         Assert.Equal("QRY_NO_MEASURES", failure.Code);
         Assert.Null(failure.Path);

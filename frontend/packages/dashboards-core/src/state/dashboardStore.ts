@@ -27,7 +27,7 @@ import {
   type DashboardRemoteSlicerValueEvent,
   type DashboardTileLockEvent,
 } from '../types/ops';
-import type { ChartSpec } from '../types/chart';
+import type { ChartSpec, ContainerStyle } from '../types/chart';
 import { inclusiveDateUpperBound } from '../util/dateBounds';
 import {
   dashboardAccessOf,
@@ -94,6 +94,12 @@ export interface OpenDashboard {
   isSystem: boolean;
   /** Owner's directory display name (null when unresolvable / pre-0.8 server). */
   ownerDisplayName: string | null;
+  /**
+   * Owner's opaque host id (null on a pre-0.14.1 server). The ONE identity the
+   * store does carry: ownerIsMe cannot tell the share dialog WHICH id to keep
+   * out of its picker, and the server refuses an owner grant outright.
+   */
+  ownerUserId: string | null;
   /** Caller's resolved rights (defaulted via dashboardAccessOf on pre-0.8 servers). */
   myAccess: DashboardAccess;
   /** Per-user grant count; 0 unless the caller is owner/admin. */
@@ -2715,7 +2721,10 @@ export class DashboardStore {
       const tile: DashboardTile = {
         id: newId(),
         kind: 'button',
-        layout: { x: 0, y: maxY, w: 4, h: 2, minW: 2, minH: 1 },
+        // NO minW/minH seeded (0.14.1/A3): withKindMinima takes Math.max with
+        // the STORED constraints, so a seeded floor could never be lowered
+        // again by a later release — the grid owns the content-aware floor.
+        layout: { x: 0, y: maxY, w: 4, h: 2 },
         button: sanitizeButtonFields(spec),
       };
       return [...tiles, tile];
@@ -2740,7 +2749,8 @@ export class DashboardStore {
       const tile: DashboardTile = {
         id: newId(),
         kind: 'buttonGroup',
-        layout: { x: 0, y: maxY, w: 8, h: 2, minW: 4, minH: 2 },
+        // NO minW/minH seeded — see addButtonTile (0.14.1/A3).
+        layout: { x: 0, y: maxY, w: 8, h: 2 },
         buttonGroup: sanitizeButtonGroupSpec(spec),
       };
       return [...tiles, tile];
@@ -2752,10 +2762,11 @@ export class DashboardStore {
    *  the same mutateActiveTiles seam as updateButtonTile, so live-mode op
    *  emission is automatic (the seam-diff decorator). */
   updateButtonGroupTile(tileId: string, patch: Partial<ButtonGroupTileSpec>): void {
-    const safe =
+    const safe = sanitizeButtonGroupContainer(
       patch.buttons === undefined
         ? patch
-        : { ...patch, buttons: patch.buttons.map(sanitizeButtonFields) };
+        : { ...patch, buttons: patch.buttons.map(sanitizeButtonFields) },
+    );
     this.mutateActiveTiles((tiles) =>
       tiles.map((t) =>
         t.id === tileId && t.buttonGroup
@@ -4022,6 +4033,7 @@ const toOpen = (detail: DashboardDetail): OpenDashboard => ({
   ownerIsMe: detail.ownerIsMe,
   isSystem: detail.isSystem ?? false,
   ownerDisplayName: detail.ownerDisplayName ?? null,
+  ownerUserId: detail.ownerUserId ?? null,
   // Pre-0.8 servers omit myAccess — owner gets full rights, others view-only.
   myAccess: dashboardAccessOf(detail),
   shareCount: detail.shareCount ?? 0,
@@ -4125,11 +4137,31 @@ const sanitizeButtonFieldsPatch = <T extends { html?: string; customCss?: string
   ...(patch.customCss !== undefined ? { customCss: sanitizeButtonCss(patch.customCss) } : {}),
 });
 
+/**
+ * The group's container carries ONE html-bearing field (innerTitleHtml), which
+ * must pass sanitizeRichHtml on every write like every other rich field —
+ * plain fields ride the spread untouched. null container is preserved as null
+ * (an explicit "no container"); absent stays absent.
+ */
+const sanitizeButtonGroupContainer = <T extends { container?: ContainerStyle | null }>(
+  spec: T,
+): T =>
+  spec.container == null || spec.container.innerTitleHtml == null
+    ? spec
+    : {
+        ...spec,
+        container: {
+          ...spec.container,
+          innerTitleHtml: sanitizeRichHtml(spec.container.innerTitleHtml),
+        },
+      };
+
 /** Full-spec sanitize for button-group writes (every button in the list). */
-const sanitizeButtonGroupSpec = (spec: ButtonGroupTileSpec): ButtonGroupTileSpec => ({
-  ...spec,
-  buttons: spec.buttons.map((button): ButtonGroupButton => sanitizeButtonFields(button)),
-});
+const sanitizeButtonGroupSpec = (spec: ButtonGroupTileSpec): ButtonGroupTileSpec =>
+  sanitizeButtonGroupContainer({
+    ...spec,
+    buttons: spec.buttons.map((button): ButtonGroupButton => sanitizeButtonFields(button)),
+  });
 
 /** Error text for store state: RcdApiError-aware (friendly code fallbacks). */
 const messageOf = (error: unknown): string => rcdErrorMessage(error);

@@ -3129,11 +3129,17 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               </p>
             </>
           )}
-          <CheckboxRow
-            label="Totals row"
-            checked={format.table?.totals ?? false}
-            onChange={(checked) => setTable({ totals: checked || undefined })}
-          />
+          {/* A measure-less passthrough table has nothing to total — the
+              renderer already suppresses the row (TableChart's totalsActive)
+              and the tile skips the companion query, so offering the toggle
+              would be a switch that visibly does nothing. */}
+          {spec.query.measures.length > 0 && (
+            <CheckboxRow
+              label="Totals row"
+              checked={format.table?.totals ?? false}
+              onChange={(checked) => setTable({ totals: checked || undefined })}
+            />
+          )}
           {dateAggregationColumns.length > 0 && (
             <>
               {dateAggregationColumns.map(({ key, label }) => (

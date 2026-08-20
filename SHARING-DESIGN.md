@@ -127,6 +127,11 @@ New:
   visibility rule (owner OR publish OR share row) has no admin bypass, so
   admins manage published/shared content, not private drafts.
 - `GET  users?query=` → `RcdUser[]` — the share-picker directory (View policy).
+- `GET  meta` gains `userId` (0.14.1) — the caller's own opaque id, from the
+  SAME `ICurrentUserProvider.GetUserId()` the grant validator compares against,
+  so the picker's self-exclusion cannot drift from the server's rule. Optional
+  on the wire and in `RcdMeta`: absent (older server, or a host that cannot
+  identify the caller) = no self filter, i.e. the pre-0.14.1 behavior.
 
 ## Wire types (dashboards-core `types/`, camelCase JSON)
 
@@ -139,6 +144,11 @@ interface DashboardAccess {
 // DashboardSummary & DashboardDetail gain:
 //   isSystem: boolean; ownerDisplayName: string | null;
 //   myAccess: DashboardAccess; shareCount: number;   // shareCount 0 unless owner/admin
+// DashboardDetail also gains (0.14.1):
+//   ownerUserId?: string   // the owner's opaque id — ownerIsMe answers "mine?"
+//   but never yields an id, and the share picker must exclude the OWNER too
+//   (an owner target fails the whole PUT, so an admin editing someone else's
+//   shares would lose every other pick with it). Optional: absent = no filter.
 interface DashboardShare {
   userId: string; displayName: string | null;
   canEditLayout: boolean; canManagePages: boolean; canEditCharts: boolean;

@@ -26,6 +26,7 @@ import { DashboardsProvider, useRuntime } from '../src/provider/DashboardsProvid
 import { ButtonTile } from '../src/dashboard/ButtonTile';
 import { ButtonGroupTile } from '../src/dashboard/ButtonGroupTile';
 import { ButtonGroupTileDialog } from '../src/dashboard/ButtonGroupTileDialog';
+import { ButtonTileDialog } from '../src/dashboard/ButtonTileDialog';
 import { ButtonVisual } from '../src/dashboard/ButtonVisual';
 import {
   markGridDragEnd,
@@ -73,6 +74,18 @@ const mount = (children: React.ReactNode) =>
   );
 
 const click = (el: HTMLElement) => act(() => el.click());
+
+/** Controlled-input edit: native setter + an input event (React's path). */
+const typeInto = (element: HTMLInputElement | HTMLTextAreaElement, value: string) => {
+  const proto =
+    element instanceof HTMLTextAreaElement
+      ? window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement.prototype;
+  Object.getOwnPropertyDescriptor(proto, 'value')!.set!.call(element, value);
+  act(() => {
+    element.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+};
 
 const rightClick = (el: HTMLElement) =>
   act(() => {
@@ -186,30 +199,94 @@ describe('click vs drag vs right-click (B5)', () => {
 
 /* ------------------------------------------------------------------ B4 */
 
-describe('per-kind minimum sizes on layout items (B4)', () => {
-  it('floors button tiles (stored mins AND geometry raised on render)', () => {
-    expect(withKindMinima({ id: 't', kind: 'button', x: 0, y: 0, w: 2, h: 1, minW: 2, minH: 1 })).toEqual(
-      { id: 't', kind: 'button', x: 0, y: 0, w: 3, h: 2, minW: 3, minH: 2 },
-    );
-  });
-
-  it('floors buttonGroup tiles', () => {
-    expect(withKindMinima({ id: 'g', kind: 'buttonGroup', x: 1, y: 2, w: 3, h: 1 })).toEqual({
-      id: 'g',
-      kind: 'buttonGroup',
-      x: 1,
-      y: 2,
-      w: 4,
-      h: 2,
-      minW: 4,
-      minH: 2,
+describe('per-kind minimum sizes on layout items (B4 / A3 content-aware)', () => {
+  it('floors a single button tile at 2x1 (was 3x2)', () => {
+    expect(withKindMinima({ id: 't', kind: 'button', x: 0, y: 0, w: 1, h: 1 })).toEqual({
+      id: 't',
+      kind: 'button',
+      x: 0,
+      y: 0,
+      w: 2,
+      h: 1,
+      minW: 2,
+      minH: 1,
     });
   });
 
-  it('keeps LARGER stored constraints and geometry untouched', () => {
+  it('derives a ROW group floor from its button count (~1.2 cols each)', () => {
+    // A3: two buttons — the owner's case — now floor at 3x1 instead of 4x2.
     expect(
-      withKindMinima({ id: 't', kind: 'button', x: 0, y: 0, w: 6, h: 4, minW: 5, minH: 3 }),
-    ).toEqual({ id: 't', kind: 'button', x: 0, y: 0, w: 6, h: 4, minW: 5, minH: 3 });
+      withKindMinima({
+        id: 'g',
+        kind: 'buttonGroup',
+        x: 1,
+        y: 2,
+        w: 1,
+        h: 1,
+        content: { buttonCount: 2, direction: 'row', framed: false },
+      }),
+    ).toMatchObject({ w: 3, h: 1, minW: 3, minH: 1 });
+
+    const colsFor = (buttonCount: number) =>
+      withKindMinima({
+        id: 'g',
+        kind: 'buttonGroup',
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+        content: { buttonCount, direction: 'row' },
+      }).minW;
+    expect(colsFor(1)).toBe(2); // clamped up to the smallest usable box
+    expect(colsFor(3)).toBe(4);
+    expect(colsFor(5)).toBe(6);
+    expect(colsFor(20)).toBe(8); // clamped down: a third of the canvas is enough
+  });
+
+  it('a COLUMN group floors at the minimum width whatever it holds', () => {
+    expect(
+      withKindMinima({
+        id: 'g',
+        kind: 'buttonGroup',
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+        content: { buttonCount: 6, direction: 'column' },
+      }),
+    ).toMatchObject({ minW: 2, minH: 1 });
+  });
+
+  it('a FRAMED group needs a second row for its header bar', () => {
+    expect(
+      withKindMinima({
+        id: 'g',
+        kind: 'buttonGroup',
+        x: 0,
+        y: 0,
+        w: 1,
+        h: 1,
+        content: { buttonCount: 2, direction: 'row', framed: true },
+      }),
+    ).toMatchObject({ minW: 3, minH: 2 });
+  });
+
+  it('the computed floor REPLACES stale stored constraints (0.14.0 seeded 4x2)', () => {
+    // Honoring the stored minima would pin every group created by 0.14.0 at
+    // the old floor forever — the whole point of A3.
+    expect(
+      withKindMinima({
+        id: 'g',
+        kind: 'buttonGroup',
+        x: 0,
+        y: 0,
+        w: 8,
+        h: 2,
+        minW: 4,
+        minH: 2,
+        content: { buttonCount: 2, direction: 'row' },
+      }),
+    ).toMatchObject({ w: 8, h: 2, minW: 3, minH: 1 });
   });
 
   it('is identity for kinds without a floor (charts keep their own mins)', () => {
@@ -359,5 +436,208 @@ describe('ButtonGroupTileDialog list management (B3)', () => {
     apply();
 
     expect(saved!.buttons.map((b) => b.id)).toEqual(['b']);
+  });
+});
+
+/* ------------------------------------------------------- 0.14.1 SECTION A */
+
+describe('group dialog emits EVERY field (A-MANDATORY)', () => {
+  const mountDialog = (
+    initial: ButtonGroupTileSpec,
+    onSave: (spec: ButtonGroupTileSpec) => void,
+  ) =>
+    act(() =>
+      root.render(
+        <ButtonGroupTileDialog
+          open
+          title="Edit button group"
+          initial={initial}
+          pages={PAGES}
+          onClose={() => {}}
+          onSave={onSave}
+        />,
+      ),
+    );
+
+  const apply = () => {
+    const applyButton = Array.from(document.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Apply',
+    )!;
+    click(applyButton);
+  };
+
+  const legacy: ButtonGroupTileSpec = {
+    buttons: [{ id: 'a', html: '<p>A</p>', targetPageId: 'p1' }],
+    direction: 'row',
+    wrap: true,
+    gap: 8,
+    align: 'center',
+  };
+
+  it('writes null/false/empty fields explicitly — the shallow merge can never keep a stale one', () => {
+    let saved: ButtonGroupTileSpec | null = null;
+    mountDialog(legacy, (spec) => {
+      saved = spec;
+    });
+    apply();
+
+    // Every key the dialog owns is present, including the falsy ones.
+    expect(Object.keys(saved!).sort()).toEqual(
+      [
+        'align',
+        'background',
+        'buttons',
+        'container',
+        'direction',
+        'equalWidth',
+        'gap',
+        'justify',
+        'size',
+        'title',
+        'variant',
+        'wrap',
+      ].sort(),
+    );
+    expect(saved!).toMatchObject({
+      justify: 'left',
+      size: 'md',
+      variant: 'default',
+      equalWidth: false,
+      title: '',
+      background: null,
+      // A legacy group stays frameless unless the author opts in.
+      container: { hideHeader: true },
+    });
+  });
+
+  it('opting into the container emits the WHOLE object, keeping fields it does not author', () => {
+    let saved: ButtonGroupTileSpec | null = null;
+    mountDialog(
+      { ...legacy, container: { hideHeader: true, innerTitleHtml: '<p>Lead-in</p>' } },
+      (spec) => {
+        saved = spec;
+      },
+    );
+
+    const showContainer = Array.from(document.querySelectorAll('label')).find((l) =>
+      l.textContent?.includes('Show tile container'),
+    )!;
+    click(showContainer.querySelector('input')!);
+    apply();
+
+    expect(saved!.container).toEqual({ hideHeader: false, innerTitleHtml: '<p>Lead-in</p>' });
+  });
+
+  it('"Apply fill to all buttons" colors every row at once (A4)', () => {
+    let saved: ButtonGroupTileSpec | null = null;
+    mountDialog(
+      {
+        ...legacy,
+        buttons: [
+          { id: 'a', html: '<p>A</p>', targetPageId: 'p1' },
+          { id: 'b', html: '<p>B</p>', targetPageId: 'p2' },
+        ],
+      },
+      (spec) => {
+        saved = spec;
+      },
+    );
+
+    const hex = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Apply fill to all buttons color hex value"]',
+    )!;
+    typeInto(hex, '#00ff00');
+    apply();
+
+    expect(saved!.buttons.map((b) => b.background)).toEqual(['#00ff00', '#00ff00']);
+  });
+});
+
+describe('button fill controls (A4/A5)', () => {
+  const mountButtonDialog = (
+    initial: ButtonTileSpec,
+    onSave: (spec: ButtonTileSpec) => void,
+  ) =>
+    act(() =>
+      root.render(
+        <ButtonTileDialog
+          open
+          title="Edit button"
+          initial={initial}
+          pages={PAGES}
+          onClose={() => {}}
+          onSave={onSave}
+        />,
+      ),
+    );
+
+  const apply = () => {
+    const applyButton = Array.from(document.querySelectorAll('button')).find(
+      (b) => b.textContent === 'Apply',
+    )!;
+    click(applyButton);
+  };
+
+  it('commits a typed hex AS SOON AS IT PARSES (no blur needed)', () => {
+    let saved: ButtonTileSpec | null = null;
+    mountButtonDialog({ html: '<p>Go</p>', targetPageId: 'p1' }, (spec) => {
+      saved = spec;
+    });
+
+    const hex = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Button fill color hex value"]',
+    )!;
+    // No blur, no Enter — exactly the "finicky, sometimes it doesn't change"
+    // path the owner reported.
+    typeInto(hex, '#ff0000');
+    apply();
+
+    expect(saved!.background).toBe('#ff0000');
+  });
+
+  it('partial input is NOT committed until Enter/blur', () => {
+    let saved: ButtonTileSpec | null = null;
+    mountButtonDialog({ html: '<p>Go</p>', targetPageId: 'p1', background: '#123456' }, (spec) => {
+      saved = spec;
+    });
+
+    const hex = document.querySelector<HTMLInputElement>(
+      'input[aria-label="Button fill color hex value"]',
+    )!;
+    typeInto(hex, '#ff');
+    apply();
+
+    expect(saved!.background).toBe('#123456');
+  });
+
+  it('warns when advanced CSS is overriding the fill (the contract is kept, not broken)', () => {
+    mountButtonDialog({ html: '<p>Go</p>', targetPageId: 'p1', background: '#123456' }, () => {});
+    expect(document.body.textContent).not.toContain('Advanced CSS is overriding this fill');
+
+    // customCss still WINS at render time (that contract is pinned above) —
+    // the dialog just stops pretending the fill picker is in charge.
+    typeInto(
+      document.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Advanced CSS declarations for the button"]',
+      )!,
+      'background-color: #ff0000;',
+    );
+    expect(document.body.textContent).toContain('Advanced CSS is overriding this fill');
+
+    // A non-background declaration says nothing.
+    typeInto(
+      document.querySelector<HTMLTextAreaElement>(
+        'textarea[aria-label="Advanced CSS declarations for the button"]',
+      )!,
+      'font-weight: 600;',
+    );
+    expect(document.body.textContent).not.toContain('Advanced CSS is overriding this fill');
+  });
+
+  it('the label editor offers NO color control — the dialog owns color (D2)', () => {
+    mountButtonDialog({ html: '<p>Go</p>', targetPageId: 'p1' }, () => {});
+    expect(document.querySelector('[aria-label="Text color"]')).toBeNull();
+    // The dialog's own picker is still there.
+    expect(document.querySelector('[aria-label="Text color picker"]')).not.toBeNull();
   });
 });

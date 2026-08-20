@@ -8,8 +8,12 @@ namespace ReconDashboards.Postgres.Tests;
 /// than System.Decimal, and the reader's default materialization throws
 /// OverflowException on such a value — which used to fail the WHOLE query, so
 /// one unlucky aggregate (an unbounded division measure being the usual source)
-/// turned into a dead chart. These run the real Npgsql path deliberately: a
-/// stubbed DbDataReader would only re-assert the assumption under test.
+/// turned into a dead chart. The contract is that the CELL degrades to null and
+/// everything around it survives; the value itself is unrecoverable because
+/// Npgsql routes every numeric read through decimal (see ReadCell's remarks).
+/// These run the real Npgsql path deliberately: a stubbed DbDataReader would
+/// only re-assert the assumption under test — and an earlier version of these
+/// tests asserted a double fallback that the real driver never performs.
 /// </summary>
 [Collection("postgres")]
 public sealed class NumericOverflowExecutionTests(PostgresContainerFixture fixture)
@@ -22,12 +26,11 @@ public sealed class NumericOverflowExecutionTests(PostgresContainerFixture fixtu
             .ExecuteAsync(Raw(sql), new ExecutionOptions(1000, TimeoutSeconds: 30), CancellationToken.None);
 
     [Fact]
-    public async Task Numeric_wider_than_decimal_comes_back_as_a_double()
+    public async Task Numeric_wider_than_decimal_degrades_to_null_instead_of_failing()
     {
         var result = await ExecuteAsync("SELECT 1e40::numeric AS wide");
 
-        var value = Assert.Single(result.Rows)[0];
-        Assert.Equal(1e40, Assert.IsType<double>(value), precision: 10);
+        Assert.Null(Assert.Single(result.Rows)[0]);
     }
 
     [Fact]
@@ -37,7 +40,7 @@ public sealed class NumericOverflowExecutionTests(PostgresContainerFixture fixtu
 
         var row = Assert.Single(result.Rows);
         Assert.Equal(7, row[0]);
-        Assert.IsType<double>(row[1]);
+        Assert.Null(row[1]);          // the unreadable cell, and ONLY that cell
         Assert.Equal("label", row[2]);
     }
 
@@ -49,7 +52,7 @@ public sealed class NumericOverflowExecutionTests(PostgresContainerFixture fixtu
 
         Assert.Equal(3, result.Rows.Count);
         Assert.Contains(result.Rows, r => r[0] is decimal d && d == 1m);
-        Assert.Contains(result.Rows, r => r[0] is double);
+        Assert.Contains(result.Rows, r => r[0] is null);
         Assert.Contains(result.Rows, r => r[0] is decimal d && d == 2m);
     }
 

@@ -1,6 +1,7 @@
 using ReconDashboards.Core.Querying.Compilation;
 using ReconDashboards.Core.Querying.Spec;
 using ReconDashboards.Core.Rendering;
+using ReconDashboards.Core.Scheduling;
 using ReconDashboards.Core.Schema;
 
 namespace ReconDashboards.Core.Tests;
@@ -317,5 +318,99 @@ public class ChartFormatPortTests
     {
         var text = Column(NormalizedType.Text, bucket: null, role: ResultColumnRole.Dimension);
         Assert.Equal("West", ChartValueFormats.FormatCategoryLabel("West", text, "isoDate", "yyyy"));
+    }
+
+    // ------------------------------------------------------- axis tick formats
+    // Ported from util/format.ts formatAxisValue (AxisValueFormat), which the
+    // browser applies to axis TICKS only.
+
+    [Theory]
+    [InlineData(1200, "1.2K")]
+    [InlineData(1000, "1K")]
+    [InlineData(999, "999")]
+    [InlineData(0, "0")]
+    [InlineData(-2500, "-2.5K")]
+    [InlineData(1_500_000, "1.5M")]
+    [InlineData(1_234_567_890, "1.2B")]
+    [InlineData(2_500_000_000_000, "2.5T")]
+    public void CompactTicksReadLikeIntlCompactNotation(double value, string expected) =>
+        Assert.Equal(expected, ChartAxisFormats.FormatAxisValue(value, new AxisValueFormatDoc("compact")));
+
+    [Fact]
+    public void CompactRoundingNeverProducesAThousandOfItsOwnUnit()
+    {
+        // 999,950 rounds to 1000.0K at one decimal — which must step up to 1M.
+        Assert.Equal("1M", ChartAxisFormats.FormatAxisValue(999_950, new AxisValueFormatDoc("compact")));
+        Assert.Equal("999.9K", ChartAxisFormats.FormatAxisValue(999_940, new AxisValueFormatDoc("compact", 1)));
+    }
+
+    [Theory]
+    [InlineData("number", null, 1234.56, "1,235")]
+    [InlineData("number", 2, 1234.5, "1,234.50")]
+    [InlineData("currency", null, 1234.5, "$1,235")]
+    [InlineData("currency", 2, 1234.5, "$1,234.50")]
+    [InlineData("percent", null, 0.2567, "25.7%")]
+    [InlineData("percent", 0, 0.2567, "26%")]
+    [InlineData("compact", 0, 1200, "1K")]
+    public void EachAxisFormatKindRendersItsIntlEquivalent(
+        string kind, int? decimals, double value, string expected) =>
+        Assert.Equal(expected, ChartAxisFormats.FormatAxisValue(value, new AxisValueFormatDoc(kind, decimals)));
+
+    [Fact]
+    public void CustomAxisTicksUseTheirExcelPatternAndDegradeWithoutOne()
+    {
+        Assert.Equal(
+            "$1,235", ChartAxisFormats.FormatAxisValue(1234.5, new AxisValueFormatDoc("custom", Pattern: "$#,##0")));
+        // Kind switched but no pattern typed yet: the default number formatting.
+        Assert.Equal("1,234.5", ChartAxisFormats.FormatAxisValue(1234.5, new AxisValueFormatDoc("custom")));
+    }
+
+    [Fact]
+    public void AnUnsetOrAutoAxisFormatIsInertSoTheEngineKeepsItsOwnTicks()
+    {
+        Assert.False(ChartAxisFormats.IsActive(null));
+        Assert.False(ChartAxisFormats.IsActive(new AxisValueFormatDoc()));
+        Assert.False(ChartAxisFormats.IsActive(new AxisValueFormatDoc("auto")));
+        Assert.True(ChartAxisFormats.IsActive(new AxisValueFormatDoc("compact")));
+        Assert.Equal("1,234.5", ChartAxisFormats.FormatAxisValue(1234.5, null));
+    }
+
+    // ---------------------------------------------------------- chart analytics
+    // Ported from chart/analytics.ts (referenceLineValue, linearFitValues,
+    // movingAverageValues).
+
+    [Theory]
+    [InlineData("average", 20d)]
+    [InlineData("median", 20d)]
+    [InlineData("min", 10d)]
+    [InlineData("max", 30d)]
+    public void ReferenceStatisticsReadTheWholePlottedSeries(string kind, double expected) =>
+        Assert.Equal(expected, ChartAnalytics.ReferenceValue(kind, null, [10d, null, 20d, 30d]));
+
+    [Fact]
+    public void AnEvenMedianAveragesTheMiddlePairAndAConstantIgnoresTheData()
+    {
+        Assert.Equal(15, ChartAnalytics.ReferenceValue("median", null, [10d, 20d, 30d, 0d]));
+        Assert.Equal(42, ChartAnalytics.ReferenceValue("constant", 42, [10d, 20d]));
+        // Nothing to state honestly: no value, or no numbers at all.
+        Assert.Null(ChartAnalytics.ReferenceValue("constant", null, [10d]));
+        Assert.Null(ChartAnalytics.ReferenceValue("average", null, [null, null]));
+        Assert.Null(ChartAnalytics.ReferenceValue("someFutureKind", null, [10d]));
+    }
+
+    [Fact]
+    public void ALinearFitSpansEveryIndexEvenWhereTheDataHasHoles()
+    {
+        Assert.Equal([10d, 20d, 30d], ChartAnalytics.LinearFit([10d, null, 30d]));
+        // Fewer than two points cannot define a line — all null, never a guess.
+        Assert.All(ChartAnalytics.LinearFit([null, 5d, null]), v => Assert.Null(v));
+    }
+
+    [Fact]
+    public void AMovingAverageIsTrailingAndPartialWindowsStayBlank()
+    {
+        Assert.Equal([null, null, 20d, 30d], ChartAnalytics.MovingAverage([10d, 20d, 30d, 40d], 3));
+        // A null inside the window blanks that index rather than under-counting.
+        Assert.Equal([null, null, null, null], ChartAnalytics.MovingAverage([10d, null, 30d, 40d], 3));
     }
 }

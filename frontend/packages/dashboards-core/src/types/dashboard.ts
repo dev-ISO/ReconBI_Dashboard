@@ -1,5 +1,5 @@
 // Dashboard layout document (rcd_dashboards.LayoutJson) + API envelopes.
-import type { ChartSpec } from './chart';
+import type { ChartSpec, ContainerStyle } from './chart';
 import type {
   ChartQuerySpec,
   DimensionRef,
@@ -256,10 +256,42 @@ export interface ButtonGroupTileSpec {
   wrap: boolean;
   /** Gap between buttons in px (default 8 — tight). */
   gap: number;
-  /** Cross-axis alignment; 'stretch' fills buttons across the cross axis. */
+  /** Cross-axis alignment ("Align (down)" for a row); 'stretch' fills buttons
+   *  across the cross axis. */
   align: 'start' | 'center' | 'end' | 'stretch';
-  /** Container fill behind the buttons; null/absent = transparent. */
+  /**
+   * MAIN-axis placement ("Position (across)" for a row) — 0.14.1. Absent =
+   * 'left', which is what every pre-0.14.1 group rendered as (justifyContent
+   * was never set, so the browser default left-packed every row).
+   */
+  justify?: 'left' | 'center' | 'right' | 'between';
+  /**
+   * Container fill behind the buttons; null/absent = transparent. This is the
+   * ONE writer for the group's fill — `container.background` means the same
+   * thing and is never authored (the tile's config card writes here, and the
+   * frame receives this value).
+   */
   background?: string | null;
+  /**
+   * Tile-frame customization (0.14.1, A1) — the same ContainerStyle every
+   * chart tile has. ABSENT = the legacy frameless look: no header bar AND no
+   * card chrome, exactly what groups rendered before 0.14.1. Opting into the
+   * standard container writes { hideHeader: false }. `background` above wins
+   * over container.background.
+   */
+  container?: ContainerStyle | null;
+  /** Frame title (header bar, print, phone-editor row); trimmed-empty or
+   *  absent falls back to "Button group" (mirrors TextTileSpec.title). */
+  title?: string;
+  /** Uniform button size — the shared button scale (default 'md'). */
+  size?: 'sm' | 'md' | 'lg';
+  /** True: buttons share one width (auto-fill grid) instead of hugging their
+   *  labels; false/absent = natural widths. */
+  equalWidth?: boolean;
+  /** Preset chrome for every button of the group, applied BELOW a button's own
+   *  `background` (a custom fill always overrides the preset). Absent =
+   *  'default', today's outline pill. */
+  variant?: 'default' | 'primary' | 'ghost';
 }
 
 export interface DashboardTile {
@@ -742,6 +774,13 @@ export interface DashboardDetail {
   isSystem?: boolean;
   /** Owner's directory display name (0.8.0+; null when unresolvable). */
   ownerDisplayName?: string | null;
+  /**
+   * Owner's opaque host id (0.14.1+; absent on older servers). ownerIsMe
+   * answers "is this mine?" but never yields an id — the share dialog needs
+   * the id itself to keep the owner out of its picker (the server refuses an
+   * owner grant and fails the entire save).
+   */
+  ownerUserId?: string;
   /** The caller's computed rights (0.8.0+; use dashboardAccessOf when absent). */
   myAccess?: DashboardAccess;
   /** Per-user grant count; 0 unless the caller is owner/admin (0.8.0+). */

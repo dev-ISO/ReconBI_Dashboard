@@ -305,7 +305,9 @@ export function ChartTile({
   if (!runnable) {
     return (
       <State icon={<BarChart3 size={22} className="text-rcd-muted" />}>
-        Add a measure to get started.
+        {/* A table runs on Rows alone (measure-less passthrough list), so it
+            asks for a row field instead of a measure. */}
+        {spec.type === 'table' ? 'Add a row field to get started.' : 'Add a measure to get started.'}
       </State>
     );
   }

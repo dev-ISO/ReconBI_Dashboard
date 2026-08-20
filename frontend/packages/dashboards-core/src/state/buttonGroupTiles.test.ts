@@ -97,7 +97,7 @@ const groupSpec = (over: Partial<ButtonGroupTileSpec> = {}): ButtonGroupTileSpec
 });
 
 describe('button-group tiles: insert + round-trip', () => {
-  it('addButtonGroupTile lands a kind buttonGroup tile with the min-size floor and the full spec', async () => {
+  it('addButtonGroupTile lands a kind buttonGroup tile with NO seeded minima and the full spec', async () => {
     const { store } = await openStore();
     store.enterEdit();
 
@@ -108,7 +108,9 @@ describe('button-group tiles: insert + round-trip', () => {
     const tile = tiles[0]!;
     expect(tile.kind).toBe('buttonGroup');
     expect(isButtonGroupTile(tile)).toBe(true);
-    expect(tile.layout).toMatchObject({ w: 8, h: 2, minW: 4, minH: 2 });
+    // A3: NO minW/minH seeded any more — the grid owns the (content-aware)
+    // floor, and a seeded constraint could never be lowered by a later release.
+    expect(tile.layout).toEqual({ x: 0, y: 0, w: 8, h: 2 });
     expect(tile.buttonGroup).toMatchObject({
       direction: 'row',
       wrap: true,
@@ -146,6 +148,45 @@ describe('button-group tiles: insert + round-trip', () => {
     const button = tile.buttonGroup!.buttons[0]!;
     expect(button.html).toBe('<p>Go now</p>');
     expect(button.customCss).toBe('color: red;');
+  });
+
+  it('sanitizes the container rich inner title on write and on patch (0.14.1/A1)', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+
+    store.addButtonGroupTile(
+      groupSpec({
+        title: 'Navigation',
+        container: { hideHeader: false, innerTitleHtml: '<p>Jump <script>alert(1)</script>to</p>' },
+      }),
+    );
+    const tileId = firstPageTiles(store)[0]!.id;
+    expect(firstPageTiles(store)[0]!.buttonGroup!.container!.innerTitleHtml).toBe(
+      '<p>Jump to</p>',
+    );
+    // Plain new fields ride the spread untouched.
+    expect(firstPageTiles(store)[0]!.buttonGroup!.title).toBe('Navigation');
+
+    store.updateButtonGroupTile(tileId, {
+      container: { hideHeader: true, innerTitleHtml: '<p onclick="x()">Patched</p>' },
+    });
+    const container = firstPageTiles(store)[0]!.buttonGroup!.container!;
+    expect(container.hideHeader).toBe(true);
+    expect(container.innerTitleHtml).toBe('<p>Patched</p>');
+  });
+
+  it('round-trips the 0.14.1 packing/look fields verbatim', async () => {
+    const { store } = await openStore();
+    store.enterEdit();
+    store.addButtonGroupTile(
+      groupSpec({ justify: 'between', size: 'lg', variant: 'primary', equalWidth: true }),
+    );
+    expect(firstPageTiles(store)[0]!.buttonGroup).toMatchObject({
+      justify: 'between',
+      size: 'lg',
+      variant: 'primary',
+      equalWidth: true,
+    });
   });
 
   it('updateButtonGroupTile patches settings and re-sanitizes a replaced buttons list', async () => {

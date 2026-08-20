@@ -43,6 +43,14 @@ export interface RcdMeta {
   maxDashboardLayoutBytes: number;
   /** True when the caller may manage shared resources (admin scope switch). */
   canManageShared: boolean;
+  /**
+   * The caller's own opaque host id (0.14.1+; absent on older servers, and
+   * absent when the host cannot identify the caller). OPTIONAL on purpose:
+   * RcdMeta is public API, and this is the ONE place the frontend can learn
+   * who it is — the store deliberately never receives an identity. Consumers
+   * must treat "absent" as "unknown", never as a match.
+   */
+  userId?: string;
 }
 
 export interface SaveModelBody {

@@ -7,14 +7,14 @@ namespace ReconDashboards.Core.Rendering;
 /// <summary>
 /// Pure geometry: an executed snapshot tile + its parsed ChartFormatDoc →
 /// <see cref="ChartLayout"/> primitives, no drawing dependency
-/// (EMAIL-CONTENT-DESIGN). Shaping mirrors the frontend's chartData.ts with
-/// the pinned deterministic pivot (spec §13): dimension column 0 is the
-/// category axis, column 1 the series split when two or more dimensions
-/// exist. A third (small-multiples) dimension is IGNORED in v1 — rows sharing
-/// (category, series) collapse last-write-wins; a panel grid inside one email
-/// image would be unreadable at 600px anyway. Text widths are estimated at
-/// 0.55×fontSize per char (spec §14); the painter draws exactly this layout
-/// and never re-measures.
+/// (EMAIL-CONTENT-DESIGN). Shaping mirrors the frontend's chartData.ts: the
+/// category axis and the series split are resolved from the tile's dimension
+/// WELLS (a legend-only chart has its legend at ordinal 0), not from ordinal
+/// position. A third (small-multiples) dimension is still IGNORED — rows
+/// sharing (category, series) collapse last-write-wins; a panel grid inside one
+/// email image would be unreadable at 600px, so the email says so in a caption
+/// instead (SnapshotComposer). Text widths are estimated at 0.55×fontSize per
+/// char (spec §14); the painter draws exactly this layout and never re-measures.
 /// </summary>
 public static class ChartLayoutEngine
 {
@@ -33,6 +33,27 @@ public static class ChartLayoutEngine
     private const double GanttRowHeight = 28;
     private const int GanttMaxHeight = 900;
 
+    /// <summary>Rounded corners on the VALUE END of a bar (browser barEndRadius).</summary>
+    private const double BarCornerRadius = 4;
+
+    /// <summary>Surface-colored hairline between stack members (browser strokeWidth 2).</summary>
+    private const double StackSeparatorWidth = 2;
+
+    /// <summary>Slice gap in degrees (browser paddingAngle) + its surface hairline.</summary>
+    private const double PieSliceGapDegrees = 1.5;
+
+    // The dashboard grid the tile was laid out on (DashboardGrid.tsx: 24
+    // columns, 32px rows, 12px gutters) measured at a reference desktop width —
+    // enough to recover the tile's real ASPECT, which is all the email needs.
+    private const double GridColumns = 24;
+    private const double GridRowHeight = 32;
+    private const double GridMargin = 12;
+    private const double ReferenceGridWidth = 1440;
+
+    /// <summary>Image height floor/ceiling once the tile's own aspect drives it.</summary>
+    private const int MinTileHeight = 200;
+    private const int MaxTileHeight = 900;
+
     public static ChartLayout Build(RenderedTile tile, int logicalWidth)
     {
         var type = tile.Tile.ChartType;
@@ -48,11 +69,54 @@ public static class ChartLayoutEngine
     /// <summary>Default logical size is 5:3 (600×360 at the standard width).</summary>
     private static int DefaultHeight(int width) => (int)Math.Round(width * 3.0 / 5.0);
 
+    /// <summary>
+    /// Image height from the TILE's proportions, so a wide KPI strip and a tall
+    /// chart no longer arrive in the same box. Falls back to the 5:3 default
+    /// when the layout doc carried no size.
+    /// </summary>
+    private static int TileHeight(RenderedTile tile, int width)
+    {
+        if (tile.Tile.GridSize is not { Width: > 0, Height: > 0 } size)
+        {
+            return DefaultHeight(width);
+        }
+
+        var columnWidth = (ReferenceGridWidth - (GridMargin * (GridColumns + 1))) / GridColumns;
+        var tileWidth = (size.Width * columnWidth) + ((size.Width - 1) * GridMargin);
+        var tileHeight = (size.Height * GridRowHeight) + ((size.Height - 1) * GridMargin);
+        return (int)Math.Clamp(
+            Math.Round(width * tileHeight / tileWidth), MinTileHeight, MaxTileHeight);
+    }
+
     private static double Estimate(string text, double fontSize) => text.Length * 0.55 * fontSize;
 
-    private static bool ShowLegend(ChartFormatDoc? format) => format?.ShowLegend != false;
+    /// <summary>Pixels per character at the tick font — the label fitter's measure.</summary>
+    private const double TickCharWidth = 0.55 * TickFontSize;
 
-    private static bool LegendRight(ChartFormatDoc? format) => format?.LegendPosition == "right";
+    /// <summary>'right' | 'top' | 'bottom' (anything else reads as bottom).</summary>
+    private static string LegendPlacement(ChartFormatDoc? format) =>
+        format?.LegendPosition is "right" or "top" ? format.LegendPosition : "bottom";
+
+    /// <summary>
+    /// The browser's legend default (ChartRenderer:1859-1861): an explicit
+    /// showLegend always wins; otherwise a LEGEND-DIMENSION chart legends itself
+    /// whenever it has any series (a cross-filter can leave one standing, and
+    /// that survivor's only label is the legend), while measure series keep the
+    /// old "more than one" rule.
+    /// </summary>
+    private static bool ShowLegendFor(ChartFormatDoc? format, bool hasLegendDimension, int seriesCount) =>
+        format?.ShowLegend ?? (hasLegendDimension ? seriesCount > 0 : seriesCount > 1);
+
+    /// <summary>Font/colour overrides for one piece of chart text; unset keeps the default.</summary>
+    private static LayoutText Styled(LayoutText text, ChartTextStyleDoc? style) =>
+        style is null
+            ? text
+            : text with
+            {
+                FontSize = style.FontSize is > 0 ? style.FontSize.Value : text.FontSize,
+                Color = string.IsNullOrWhiteSpace(style.Color) ? text.Color : style.Color,
+                Bold = style.Bold ?? text.Bold,
+            };
 
     // ------------------------------------------------------------- shaping
 
@@ -63,7 +127,10 @@ public static class ChartLayoutEngine
         IReadOnlyList<string> Categories,
         IReadOnlyList<Series> Series,
         ResultColumnPlan? AxisColumn,
-        ResultColumnPlan? ValueColumn);
+        ResultColumnPlan? ValueColumn,
+        bool HasLegendDimension = false,
+        /* Per-CATEGORY fills for format.colorByCategory; null = the series' own hue. */
+        IReadOnlyList<string>? CategoryFills = null);
 
     private static string DisplayLabel(string defaultLabel, ChartFormatDoc? format) =>
         format?.SeriesLabels is { } labels && labels.TryGetValue(defaultLabel, out var renamed)
@@ -94,7 +161,8 @@ public static class ChartLayoutEngine
             ? "\u0000null"
             : value.GetType().Name + "\u0000" + Convert.ToString(value, CultureInfo.InvariantCulture);
 
-    private static CartesianData ShapeCartesian(RenderedTile tile, ChartFormatDoc? format, bool comboCapable)
+    private static CartesianData ShapeCartesian(
+        RenderedTile tile, ChartFormatDoc? format, bool comboCapable, bool singleSeriesBarFamily)
     {
         var format0 = format;
         var dimIdx = new List<int>();
@@ -104,15 +172,18 @@ public static class ChartLayoutEngine
             (tile.Columns[i].Role == ResultColumnRole.Dimension ? dimIdx : measIdx).Add(i);
         }
 
-        var axisIdx = dimIdx.Count > 0 ? dimIdx[0] : -1;
+        // The wire dimensions are the COMPACTED [axis?, legend?, smallMultiples?],
+        // so which ordinal is the category axis depends on which WELLS were set.
+        var (axisOrdinal, legendOrdinal, _) = (tile.Tile.Wells ?? DimensionWells.Positional).Ordinals();
+        var axisIdx = axisOrdinal >= 0 && axisOrdinal < dimIdx.Count ? dimIdx[axisOrdinal] : -1;
         var axisColumn = axisIdx >= 0 ? tile.Columns[axisIdx] : null;
-        var legendIdx = dimIdx.Count >= 2 ? dimIdx[1] : -1;
+        var legendIdx = legendOrdinal >= 0 && legendOrdinal < dimIdx.Count ? dimIdx[legendOrdinal] : -1;
 
         // Blank DATE buckets are dropped by default, matching the frontend's
         // excludeBlankDates=TRUE doctrine (a "(Blank)" time bucket skews the
-        // series); the opt-out flag is not among the consumed format fields.
+        // series); excludeBlankDates:false keeps the explicit blank category.
         IEnumerable<object?[]> source = tile.Rows;
-        if (axisColumn?.DateBucket is not null)
+        if (axisColumn?.DateBucket is not null && format?.ExcludeBlankDates != false)
         {
             source = source.Where(row => axisIdx < row.Length && row[axisIdx] is not null);
         }
@@ -140,8 +211,23 @@ public static class ChartLayoutEngine
                     rows.Select(row => ToNumber(columnIndex < row.Length ? row[columnIndex] : null)).ToArray());
             }).ToList();
 
+            (categories, series) = TrimEmptyEdges(categories, series, format);
+
+            // colorByCategory: a SINGLE-series column/bar gives every category
+            // its own palette slot, and colorOverrides are keyed by the CATEGORY
+            // label rather than the measure. The fills are resolved HERE, before
+            // ApplyManualOrder permutes the rows, so a categoryOrder reorder can
+            // never re-hue a category (the frontend's __colorIndex contract).
+            var categoryFills = singleSeriesBarFamily && format?.ColorByCategory == true && series.Count == 1
+                ? categories
+                    .Select((c, i) => ChartPalette.SeriesColor(i, c, format.ColorOverrides, format.Theme))
+                    .ToArray()
+                : null;
+
             return ApplyManualOrder(categories, series, axisColumn, format,
-                valueColumn: measIdx.Count > 0 ? tile.Columns[measIdx[0]] : null);
+                valueColumn: measIdx.Count > 0 ? tile.Columns[measIdx[0]] : null,
+                hasLegendDimension: false,
+                categoryFills: categoryFills);
         }
 
         // Legend pivot: one series per legend value over the FIRST measure —
@@ -220,18 +306,68 @@ public static class ChartLayoutEngine
             }
         }
 
+        var (pivotCategories, trimmedSeries) = TrimEmptyEdges(
+            byAxis.Select(item => item.Label).ToList(), pivotSeries, format);
         return ApplyManualOrder(
-            byAxis.Select(item => item.Label).ToList(), pivotSeries, axisColumn, format,
-            valueColumn: pivotMeasures.Count > 0 ? tile.Columns[pivotMeasures[0]] : null);
+            pivotCategories, trimmedSeries, axisColumn, format,
+            valueColumn: pivotMeasures.Count > 0 ? tile.Columns[pivotMeasures[0]] : null,
+            hasLegendDimension: true,
+            categoryFills: null);
+    }
+
+    /// <summary>
+    /// format.trimEmptyEdges: drops LEADING and TRAILING categories where every
+    /// series is null (the warm-up of a period-change calc). Interior all-null
+    /// categories stay — a mid-series gap is data, an empty edge is noise; an
+    /// all-empty result is left alone (trimming everything blanks the axis too).
+    /// </summary>
+    private static (List<string> Categories, List<Series> Series) TrimEmptyEdges(
+        List<string> categories, List<Series> series, ChartFormatDoc? format)
+    {
+        if (format?.TrimEmptyEdges != true || categories.Count == 0)
+        {
+            return (categories, series);
+        }
+
+        bool IsEmpty(int c) => series.All(s => s.Values[c] is not { } v || !double.IsFinite(v));
+
+        var first = 0;
+        while (first < categories.Count && IsEmpty(first))
+        {
+            first++;
+        }
+
+        if (first == categories.Count)
+        {
+            return (categories, series);
+        }
+
+        var last = categories.Count - 1;
+        while (last > first && IsEmpty(last))
+        {
+            last--;
+        }
+
+        if (first == 0 && last == categories.Count - 1)
+        {
+            return (categories, series);
+        }
+
+        var count = last - first + 1;
+        return (
+            categories.GetRange(first, count),
+            [.. series.Select(s => s with { Values = s.Values[first..(last + 1)] })]);
     }
 
     /// <summary>
     /// categoryOrder / seriesOrder at the very END of shaping — after colors
     /// are assigned, so a reorder never re-hues (chartData.ts applyManualOrder).
+    /// The per-category fills permute with the SAME row indices for that reason.
     /// </summary>
     private static CartesianData ApplyManualOrder(
         IReadOnlyList<string> categories, IReadOnlyList<Series> series,
-        ResultColumnPlan? axisColumn, ChartFormatDoc? format, ResultColumnPlan? valueColumn)
+        ResultColumnPlan? axisColumn, ChartFormatDoc? format, ResultColumnPlan? valueColumn,
+        bool hasLegendDimension, IReadOnlyList<string>? categoryFills)
     {
         var rowIndices = ChartOrdering.ReconcileOrderBy(
             format?.CategoryOrder, Enumerable.Range(0, categories.Count).ToArray(), i => categories[i]);
@@ -239,7 +375,11 @@ public static class ChartLayoutEngine
         var orderedSeries = ChartOrdering.ReconcileOrderBy(format?.SeriesOrder, series, s => s.StyleKey)
             .Select(s => s with { Values = rowIndices.Select(i => s.Values[i]).ToArray() })
             .ToList();
-        return new CartesianData(orderedCategories, orderedSeries, axisColumn, valueColumn);
+        var orderedFills = categoryFills is null
+            ? null
+            : rowIndices.Select(i => categoryFills[i]).ToArray();
+        return new CartesianData(
+            orderedCategories, orderedSeries, axisColumn, valueColumn, hasLegendDimension, orderedFills);
     }
 
     // -------------------------------------------------------------- builder
@@ -257,10 +397,11 @@ public static class ChartLayoutEngine
         public List<LayoutCircle> Dots { get; } = [];
         public List<LayoutRect> Swatches { get; } = [];
         public List<LayoutText> Texts { get; } = [];
+        public List<LayoutLine> Guides { get; } = [];
 
         public ChartLayout ToLayout() => new(
             Width, Height, ChartPalette.Background,
-            GridLines, AxisLines, Bars, Areas, Lines, Arcs, Dots, Swatches, Texts);
+            GridLines, AxisLines, Bars, Areas, Lines, Arcs, Dots, Swatches, Texts, Guides);
     }
 
     // --------------------------------------------------------------- legend
@@ -293,7 +434,8 @@ public static class ChartLayoutEngine
     }
 
     private static void EmitBottomLegend(
-        LayoutBuilder b, IReadOnlyList<LegendItem> items, double startX, double topY)
+        LayoutBuilder b, IReadOnlyList<LegendItem> items, double startX, double topY,
+        ChartTextStyleDoc? style = null)
     {
         var x = startX;
         var y = topY;
@@ -307,7 +449,8 @@ public static class ChartLayoutEngine
             }
 
             b.Swatches.Add(new LayoutRect(x, y + 2, 10, 10, item.Color));
-            b.Texts.Add(new LayoutText(x + 15, y + 11, item.Label, LegendFontSize, ChartPalette.Text2));
+            b.Texts.Add(Styled(
+                new LayoutText(x + 15, y + 11, item.Label, LegendFontSize, ChartPalette.Text2), style));
             x += itemWidth;
         }
     }
@@ -318,7 +461,8 @@ public static class ChartLayoutEngine
             : Math.Min(items.Max(i => Estimate(i.Label, LegendFontSize)) + 26, width * 0.32);
 
     private static void EmitRightLegend(
-        LayoutBuilder b, IReadOnlyList<LegendItem> items, double x, double topY, double maxHeight)
+        LayoutBuilder b, IReadOnlyList<LegendItem> items, double x, double topY, double maxHeight,
+        ChartTextStyleDoc? style = null)
     {
         var capacity = Math.Max(1, (int)(maxHeight / 17));
         var shown = items.Count <= capacity ? items.Count : capacity - 1;
@@ -326,7 +470,8 @@ public static class ChartLayoutEngine
         for (var i = 0; i < shown; i++)
         {
             b.Swatches.Add(new LayoutRect(x, y + 2, 10, 10, items[i].Color));
-            b.Texts.Add(new LayoutText(x + 15, y + 11, items[i].Label, LegendFontSize, ChartPalette.Text2));
+            b.Texts.Add(Styled(
+                new LayoutText(x + 15, y + 11, items[i].Label, LegendFontSize, ChartPalette.Text2), style));
             y += 17;
         }
 
@@ -423,59 +568,89 @@ public static class ChartLayoutEngine
         var isArea = type == "area";
         var showDataLabels = format?.ShowDataLabels == true && !isLine && !isArea;
 
-        var data = ShapeCartesian(tile, format, comboCapable: isLine || isArea);
-        var height = DefaultHeight(width);
+        var data = ShapeCartesian(
+            tile, format, comboCapable: isLine || isArea, singleSeriesBarFamily: type is "column" or "bar");
+        var height = TileHeight(tile, width);
         var b = new LayoutBuilder(width, height);
 
-        var (dataMin, dataMax) = ValueDomain(data, stacked);
-        var (niceMin, niceMax, step) = NiceScale(dataMin, dataMax);
-        var valueTicks = Ticks(niceMin, niceMax, step);
         string FormatValue(double v) =>
             ChartValueFormats.FormatMeasureValue(v, data.ValueColumn, format?.ValueFormat);
-        var valueTickLabels = valueTicks.Select(FormatValue).ToList();
 
-        var legendItems = ShowLegend(format) && data.Series.Count > 1
-            ? data.Series.Select(s => new LegendItem(s.Label, s.Color)).ToList()
-            : [];
-        var legendRight = legendItems.Count > 0 && LegendRight(format);
-        var legendBottomHeight = legendRight ? 0 : BottomLegendHeight(legendItems, width);
-        var legendRightWidth = legendRight ? RightLegendWidth(legendItems, width) : 0;
+        // Axis TICKS honor xAxisFormat/yAxisFormat (browser: axisTickFormatter).
+        // An unset/'auto' axis format keeps the measure-formatted ticks the
+        // email has always drawn — the browser's 'auto' drops to a plain number
+        // there, which would silently strip currency/percent from an emailed axis.
+        var axisValueFormat = horizontal ? format?.XAxisFormat : format?.YAxisFormat;
+        string FormatTick(double v) => ChartAxisFormats.IsActive(axisValueFormat)
+            ? ChartAxisFormats.FormatAxisValue(v, axisValueFormat)
+            : FormatValue(v);
 
-        // Axis titles come from the format else the column labels (spec §14).
-        var categoryTitle = format?.XAxisLabel is { Length: > 0 } xl ? xl : data.AxisColumn?.Label;
-        var valueTitle = format?.YAxisLabel is { Length: > 0 } yl ? yl : data.ValueColumn?.Label;
-        if (horizontal)
+        // Overlays take part in the value domain, exactly as they do in recharts
+        // (reference lines carry ifOverflow="extendDomain"; trendline values ride
+        // along in the plotted rows).
+        var guides = ResolveReferenceLines(data, format, FormatTick);
+        var trendlines = ResolveTrendlines(data, format);
+        var (dataMin, dataMax) = ValueDomain(data, stacked);
+        foreach (var value in guides.Select(g => g.Value)
+                     .Concat(trendlines.SelectMany(t => t.Values).Where(v => v.HasValue).Select(v => v!.Value)))
         {
-            // Horizontal family: x is the VALUE axis, y the category axis —
-            // xAxisLabel/yAxisLabel still name the x/y screen axes.
-            (categoryTitle, valueTitle) =
-                (format?.YAxisLabel is { Length: > 0 } cyl ? cyl : data.AxisColumn?.Label,
-                 format?.XAxisLabel is { Length: > 0 } cxl ? cxl : data.ValueColumn?.Label);
+            dataMin = Math.Min(dataMin, value);
+            dataMax = Math.Max(dataMax, value);
         }
 
-        var top = showDataLabels && !stacked && !horizontal ? 18d : 14d;
+        var (niceMin, niceMax, step) = NiceScale(dataMin, dataMax);
+        var valueTicks = Ticks(niceMin, niceMax, step);
+        var valueTickLabels = valueTicks.Select(FormatTick).ToList();
+
+        var legendItems = ShowLegendFor(format, data.HasLegendDimension, data.Series.Count)
+            ? data.Series.Select(s => new LegendItem(s.Label, s.Color)).ToList()
+            : [];
+        var placement = LegendPlacement(format);
+        var legendRight = legendItems.Count > 0 && placement == "right";
+        var legendTop = legendItems.Count > 0 && placement == "top";
+        var legendStrip = legendItems.Count > 0 && !legendRight ? BottomLegendHeight(legendItems, width) : 0;
+        var legendBottomHeight = legendTop ? 0 : legendStrip;
+        var legendTopHeight = legendTop ? legendStrip : 0;
+        var legendRightWidth = legendRight ? RightLegendWidth(legendItems, width) : 0;
+
+        // Axis titles: the rich-HTML forms REPLACE the plain ones (the browser
+        // renders them outside the plot instead of the SVG label), and only then
+        // do the column labels stand in.
+        var xTitle = RichTextHtml.ToPlainText(format?.XAxisLabelHtml)
+            ?? (format?.XAxisLabel is { Length: > 0 } xl ? xl : null);
+        var yTitle = RichTextHtml.ToPlainText(format?.YAxisLabelHtml)
+            ?? (format?.YAxisLabel is { Length: > 0 } yl ? yl : null);
+        // Horizontal family: x is the VALUE axis, y the category axis —
+        // xAxisLabel/yAxisLabel still name the x/y SCREEN axes.
+        var categoryTitle = (horizontal ? yTitle : xTitle) ?? data.AxisColumn?.Label;
+        var valueTitle = (horizontal ? xTitle : yTitle) ?? data.ValueColumn?.Label;
+
+        var top = (showDataLabels && !stacked && !horizontal ? 18d : 14d) + legendTopHeight;
         double left, bottom, right = 12 + legendRightWidth;
-        var rotateCategoryTicks = false;
+        ResolvedLabelFit? labelFit = null;
+        var categoryRail = 0d;
         var maxCategoryWidth = data.Categories.Count == 0
             ? 0
             : data.Categories.Max(c => Estimate(c, TickFontSize));
 
         if (horizontal)
         {
-            var rail = Math.Min(maxCategoryWidth + 10, width * 0.35);
-            left = rail + (categoryTitle is not null ? 18 : 0);
+            // Category rail port of axisFit.resolveCategoryAxisWidth: the widest
+            // label plus padding, floored at 40 (a sliver rail reads as broken)
+            // and capped so a narrow tile never loses its plot to labels.
+            var cap = Math.Max(40, Math.Min(224, width * 0.4));
+            categoryRail = Math.Clamp(Math.Ceiling(maxCategoryWidth) + 16, 40, cap);
+            left = categoryRail + (categoryTitle is not null ? 18 : 0);
             bottom = 20 + (valueTitle is not null ? 18 : 0) + legendBottomHeight;
         }
         else
         {
             var maxValueTickWidth = valueTickLabels.Max(l => Estimate(l, TickFontSize));
             left = maxValueTickWidth + 8 + (valueTitle is not null ? 18 : 0);
-            var bandEstimate = (width - left - right) / Math.Max(1, data.Categories.Count);
-            rotateCategoryTicks = maxCategoryWidth > bandEstimate - 6;
-            var tickZone = rotateCategoryTicks
-                ? Math.Min(60, maxCategoryWidth * 0.5 + 12) // sin(30°) ≈ 0.5
-                : 16;
-            bottom = tickZone + 4 + (categoryTitle is not null ? 18 : 0) + legendBottomHeight;
+            var slotWidth = (width - left - right) / Math.Max(1, data.Categories.Count);
+            labelFit = ChartLabelFit.Resolve(
+                data.Categories, slotWidth, format?.XLabelFit, label => Estimate(label, TickFontSize));
+            bottom = labelFit.Height + 4 + (categoryTitle is not null ? 18 : 0) + legendBottomHeight;
         }
 
         var plotLeft = left;
@@ -488,10 +663,12 @@ public static class ChartLayoutEngine
         double YOf(double v) => plotBottom - (v - niceMin) / (niceMax - niceMin) * plotHeight;
         double XOf(double v) => plotLeft + (v - niceMin) / (niceMax - niceMin) * plotWidth;
 
-        // Grid per the literal x/y semantics: gridY = horizontal lines from
-        // y-axis ticks (default ON), gridX = vertical lines from x-axis ticks.
-        var gridY = format?.GridY != false;
-        var gridX = format?.GridX == true;
+        // Grid defaults are ORIENTATION-dependent, like the browser's
+        // CartesianGrid: lines come from the VALUE axis (horizontal rules on a
+        // column chart, vertical rules on a horizontal bar chart) and the
+        // category axis stays clear.
+        var gridY = format?.GridY ?? !horizontal;
+        var gridX = format?.GridX ?? horizontal;
         var categoryCount = data.Categories.Count;
         var band = (horizontal ? plotHeight : plotWidth) / Math.Max(1, categoryCount);
 
@@ -549,13 +726,22 @@ public static class ChartLayoutEngine
                     ChartPalette.Text2, TextAnchor.Middle));
             }
 
-            var maxChars = Math.Max(3, (int)((plotLeft - 10) / (0.55 * TickFontSize)));
+            // Every row keeps its name while a row band can carry a text line;
+            // below that the rail thins instead of overprinting (the browser's
+            // categoryAxisInterval).
+            var rowStep = band >= 13 ? 1 : Math.Max(1, (int)Math.Ceiling(13 / Math.Max(band, 0.5)));
             for (var c = 0; c < categoryCount; c++)
             {
+                if (c % rowStep != 0 && c != categoryCount - 1)
+                {
+                    continue;
+                }
+
                 b.Texts.Add(new LayoutText(
                     plotLeft - 6, plotTop + c * band + band / 2 + 4,
-                    Truncate(data.Categories[c], maxChars), TickFontSize,
-                    ChartPalette.Text2, TextAnchor.End));
+                    ChartLabelFit.TruncateToWidth(
+                        data.Categories[c], Math.Max(24, categoryRail - 16), TickCharWidth),
+                    TickFontSize, ChartPalette.Text2, TextAnchor.End));
             }
         }
         else
@@ -567,16 +753,37 @@ public static class ChartLayoutEngine
                     ChartPalette.Text2, TextAnchor.End));
             }
 
+            var fit = labelFit!;
             for (var c = 0; c < categoryCount; c++)
             {
+                if (!fit.Labels(c, categoryCount))
+                {
+                    continue;
+                }
+
                 var x = plotLeft + c * band + band / 2;
-                b.Texts.Add(rotateCategoryTicks
-                    ? new LayoutText(
-                        x, plotBottom + 12, Truncate(data.Categories[c], 24), TickFontSize,
-                        ChartPalette.Text2, TextAnchor.End, RotationDegrees: -30)
-                    : new LayoutText(
-                        x, plotBottom + 14, data.Categories[c], TickFontSize,
-                        ChartPalette.Text2, TextAnchor.Middle));
+                var label = data.Categories[c];
+                b.Texts.Add(fit.Mode switch
+                {
+                    LabelFitMode.Angled => new LayoutText(
+                        x, plotBottom + 12,
+                        ChartLabelFit.TruncateToWidth(label, ChartLabelFit.AngleMaxPixels, TickCharWidth),
+                        TickFontSize, ChartPalette.Text2, TextAnchor.End, RotationDegrees: -35),
+                    LabelFitMode.Vertical => new LayoutText(
+                        x, plotBottom + 14,
+                        ChartLabelFit.TruncateToWidth(label, ChartLabelFit.VerticalMaxPixels, TickCharWidth),
+                        TickFontSize, ChartPalette.Text2, TextAnchor.End, RotationDegrees: -90),
+                    // Thinned ticks stay upright: they own their step's slots.
+                    LabelFitMode.Thin => new LayoutText(
+                        x, plotBottom + 14,
+                        ChartLabelFit.TruncateToWidth(
+                            label, Math.Max(24, (fit.SlotWidth * fit.Step) - 2), TickCharWidth),
+                        TickFontSize, ChartPalette.Text2, TextAnchor.Middle),
+                    _ => new LayoutText(
+                        x, plotBottom + 14,
+                        ChartLabelFit.TruncateToWidth(label, Math.Max(24, fit.SlotWidth - 2), TickCharWidth),
+                        TickFontSize, ChartPalette.Text2, TextAnchor.Middle),
+                });
             }
         }
 
@@ -586,22 +793,27 @@ public static class ChartLayoutEngine
         var leftTitle = horizontal ? categoryTitle : valueTitle;
         if (bottomTitle is not null)
         {
-            b.Texts.Add(new LayoutText(
-                plotLeft + plotWidth / 2, titleBaseline, bottomTitle, TitleFontSize,
-                ChartPalette.Text2, TextAnchor.Middle));
+            b.Texts.Add(Styled(
+                new LayoutText(
+                    plotLeft + plotWidth / 2, titleBaseline, bottomTitle, TitleFontSize,
+                    ChartPalette.Text2, TextAnchor.Middle),
+                format?.AxisTitleStyle));
         }
 
         if (leftTitle is not null)
         {
-            b.Texts.Add(new LayoutText(
-                12, plotTop + plotHeight / 2, leftTitle, TitleFontSize,
-                ChartPalette.Text2, TextAnchor.Middle, RotationDegrees: -90));
+            b.Texts.Add(Styled(
+                new LayoutText(
+                    12, plotTop + plotHeight / 2, leftTitle, TitleFontSize,
+                    ChartPalette.Text2, TextAnchor.Middle, RotationDegrees: -90),
+                format?.AxisTitleStyle));
         }
 
         // Marks.
+        double BandCenter(int c) => (horizontal ? plotTop : plotLeft) + c * band + band / 2;
         if (isLine || isArea)
         {
-            EmitLinesAndAreas(b, data, isArea, horizontalBandCenter: c => plotLeft + c * band + band / 2, YOf);
+            EmitLinesAndAreas(b, data, format, isArea, BandCenter, YOf);
         }
         else if (stacked)
         {
@@ -612,26 +824,187 @@ public static class ChartLayoutEngine
             EmitGroupedBars(b, data, format, horizontal, band, plotLeft, plotTop, YOf, XOf, FormatValue, showDataLabels);
         }
 
+        // Fitted overlays ride the same band centres as the series they follow.
+        foreach (var trendline in trendlines)
+        {
+            EmitOverlay(
+                b, trendline.Values, horizontal, BandCenter, XOf, YOf,
+                trendline.Color, trendline.Width, trendline.Dash);
+        }
+
+        foreach (var guide in guides)
+        {
+            EmitReferenceLine(b, guide, horizontal, plotLeft, plotTop, plotRight, plotBottom, XOf, YOf);
+        }
+
         // Legend.
         if (legendRight)
         {
-            EmitRightLegend(b, legendItems, plotRight + 8, plotTop, plotHeight);
+            EmitRightLegend(b, legendItems, plotRight + 8, plotTop, plotHeight, format?.LegendStyle);
         }
         else if (legendItems.Count > 0)
         {
-            EmitBottomLegend(b, legendItems, plotLeft, height - legendBottomHeight + 4);
+            EmitBottomLegend(
+                b, legendItems, plotLeft,
+                legendTop ? 4 : height - legendBottomHeight + 4, format?.LegendStyle);
         }
 
         return b.ToLayout();
     }
 
+    // ------------------------------------------------------ guides + overlays
+
+    private sealed record ReferenceGuide(
+        double Value, string Color, IReadOnlyList<double>? Dash, double Width, string? Label);
+
+    private sealed record TrendlineOverlay(
+        double?[] Values, string Color, IReadOnlyList<double>? Dash, double Width);
+
+    /// <summary>
+    /// format.referenceLines resolved against the plotted series. Guides bound
+    /// to the SECONDARY axis are skipped rather than drawn against the wrong
+    /// scale — the server has no y2 (mirrors the browser's own hasSecondary guard).
+    /// </summary>
+    private static List<ReferenceGuide> ResolveReferenceLines(
+        CartesianData data, ChartFormatDoc? format, Func<double, string> formatTick)
+    {
+        var guides = new List<ReferenceGuide>();
+        foreach (var spec in format?.ReferenceLines ?? [])
+        {
+            if (spec.Secondary == true)
+            {
+                continue;
+            }
+
+            var target = (spec.MeasureKey is { Length: > 0 } key
+                ? data.Series.FirstOrDefault(s => s.StyleKey == key)
+                : null) ?? data.Series.FirstOrDefault();
+            if (ChartAnalytics.ReferenceValue(spec.Kind, spec.Value, target?.Values ?? []) is not { } value
+                || !double.IsFinite(value))
+            {
+                continue;
+            }
+
+            // The AUTHORED label wins when present; otherwise the browser's
+            // "<kind> <value>" caption ('constant 42' would read like a bug).
+            var caption = spec.ShowLabel == false
+                ? null
+                : spec.Label is { Length: > 0 } label
+                    ? label
+                    : (spec.Kind is null or "constant" ? "" : spec.Kind + " ") + formatTick(value);
+            guides.Add(new ReferenceGuide(
+                value, spec.Color is { Length: > 0 } c ? c : ChartPalette.Muted,
+                LayoutDash.Guide(spec.Dash), spec.Width ?? 1, caption));
+        }
+
+        return guides;
+    }
+
+    /// <summary>format.trendlines fitted per (spec × target series), like buildTrendlines.</summary>
+    private static List<TrendlineOverlay> ResolveTrendlines(CartesianData data, ChartFormatDoc? format)
+    {
+        var overlays = new List<TrendlineOverlay>();
+        foreach (var spec in format?.Trendlines ?? [])
+        {
+            var targets = spec.SeriesKey is { Length: > 0 } key
+                ? data.Series.Where(s => s.StyleKey == key)
+                : data.Series;
+            foreach (var series in targets)
+            {
+                var fitted = spec.Kind == "linear"
+                    ? ChartAnalytics.LinearFit(series.Values)
+                    : ChartAnalytics.MovingAverage(series.Values, spec.Window ?? 3);
+                if (!fitted.Any(v => v.HasValue))
+                {
+                    continue;
+                }
+
+                overlays.Add(new TrendlineOverlay(
+                    fitted, spec.Color is { Length: > 0 } c ? c : series.Color,
+                    LayoutDash.Guide(spec.Dash), spec.Width ?? 2));
+            }
+        }
+
+        return overlays;
+    }
+
+    /// <summary>A fitted overlay as dashed polyline segments; nulls break it, like the data.</summary>
+    private static void EmitOverlay(
+        LayoutBuilder b, double?[] values, bool horizontal, Func<int, double> bandCenter,
+        Func<double, double> xOf, Func<double, double> yOf,
+        string color, double width, IReadOnlyList<double>? dash)
+    {
+        var segment = new List<LayoutPoint>();
+        void Flush()
+        {
+            if (segment.Count > 1)
+            {
+                b.Lines.Add(new LayoutPolyline([.. segment], color, width, dash));
+            }
+
+            segment = [];
+        }
+
+        for (var c = 0; c < values.Length; c++)
+        {
+            if (values[c] is { } value && double.IsFinite(value))
+            {
+                segment.Add(horizontal
+                    ? new LayoutPoint(xOf(value), bandCenter(c))
+                    : new LayoutPoint(bandCenter(c), yOf(value)));
+            }
+            else
+            {
+                Flush();
+            }
+        }
+
+        Flush();
+    }
+
+    /// <summary>One reference line across the plot, captioned at its far end.</summary>
+    private static void EmitReferenceLine(
+        LayoutBuilder b, ReferenceGuide guide, bool horizontal,
+        double plotLeft, double plotTop, double plotRight, double plotBottom,
+        Func<double, double> xOf, Func<double, double> yOf)
+    {
+        if (horizontal)
+        {
+            var x = xOf(guide.Value);
+            b.Guides.Add(new LayoutLine(x, plotTop, x, plotBottom, guide.Color, guide.Width, guide.Dash));
+            if (guide.Label is not null)
+            {
+                b.Texts.Add(new LayoutText(
+                    x, plotTop + 10, guide.Label, DataLabelFontSize, guide.Color, TextAnchor.Middle));
+            }
+
+            return;
+        }
+
+        var y = yOf(guide.Value);
+        b.Guides.Add(new LayoutLine(plotLeft, y, plotRight, y, guide.Color, guide.Width, guide.Dash));
+        if (guide.Label is not null)
+        {
+            b.Texts.Add(new LayoutText(
+                plotRight - 4, y - 4, guide.Label, DataLabelFontSize, guide.Color, TextAnchor.End));
+        }
+    }
+
     private static void EmitLinesAndAreas(
-        LayoutBuilder b, CartesianData data, bool area,
+        LayoutBuilder b, CartesianData data, ChartFormatDoc? format, bool area,
         Func<int, double> horizontalBandCenter, Func<double, double> yOf)
     {
         var zeroY = yOf(0);
         foreach (var series in data.Series)
         {
+            // Curve + dash + width come from format.lineStyles, keyed by the
+            // series' style key; the browser's type="monotone" is the default.
+            var style = format?.LineStyles is { } styles && styles.TryGetValue(series.StyleKey, out var s)
+                ? s
+                : null;
+            var dash = LayoutDash.Series(style?.Dash);
+            var strokeWidth = style?.Width is > 0 ? style.Width.Value : 2;
+
             // Null values break the series into segments (recharts
             // connectNulls default false).
             var segment = new List<LayoutPoint>();
@@ -649,12 +1022,14 @@ public static class ChartLayoutEngine
                         new(segment[^1].X, zeroY),
                         new(segment[0].X, zeroY),
                     };
-                    b.Areas.Add(new LayoutPolygon(polygon, series.Color, Opacity: 0.12));
+                    b.Areas.Add(new LayoutPolygon(
+                        polygon, series.Color, Opacity: 0.12, CurvePoints: segment.Count));
                 }
 
                 if (segment.Count > 1)
                 {
-                    b.Lines.Add(new LayoutPolyline([.. segment], series.Color));
+                    b.Lines.Add(new LayoutPolyline(
+                        [.. segment], series.Color, strokeWidth, dash, Curve: true));
                 }
 
                 if (!area)
@@ -709,13 +1084,19 @@ public static class ChartLayoutEngine
                     continue;
                 }
 
+                // colorByCategory paints per CATEGORY; every other mode keeps
+                // the series' own hue.
+                var fill = data.CategoryFills is { } fills && c < fills.Count ? fills[c] : series.Color;
                 var along = (horizontal ? plotTop : plotLeft) + c * band + (band - group) / 2 + s * barSize;
                 if (horizontal)
                 {
                     var x = xOf(value);
                     var barX = Math.Min(zeroX, x);
                     var barWidth = Math.Abs(x - zeroX);
-                    b.Bars.Add(new LayoutRect(barX, along, barWidth, barSize, series.Color));
+                    b.Bars.Add(new LayoutRect(
+                        barX, along, barWidth, barSize, fill,
+                        CornerRadius: BarCornerRadius,
+                        Corners: value >= 0 ? RectCorners.Right : RectCorners.Left));
                     if (showDataLabels)
                     {
                         var text = ChartDataLabels.Compose(
@@ -732,7 +1113,10 @@ public static class ChartLayoutEngine
                     var y = yOf(value);
                     var barY = Math.Min(zeroY, y);
                     var barHeight = Math.Abs(y - zeroY);
-                    b.Bars.Add(new LayoutRect(along, barY, barSize, barHeight, series.Color));
+                    b.Bars.Add(new LayoutRect(
+                        along, barY, barSize, barHeight, fill,
+                        CornerRadius: BarCornerRadius,
+                        Corners: value >= 0 ? RectCorners.Top : RectCorners.Bottom));
                     if (showDataLabels)
                     {
                         var text = ChartDataLabels.Compose(
@@ -765,6 +1149,10 @@ public static class ChartLayoutEngine
                 .Where(v => v.HasValue)
                 .Sum(v => v!.Value);
             var along = (horizontal ? plotTop : plotLeft) + c * band + (band - barSize) / 2;
+            // Only the OUTERMOST segment rounds — the stack renders in series
+            // order, so the last member carrying a value is the value end.
+            var outermost = data.Series
+                .LastOrDefault(s => s.Values[c] is { } v && double.IsFinite(v) && v != 0);
 
             foreach (var series in data.Series)
             {
@@ -772,6 +1160,8 @@ public static class ChartLayoutEngine
                 {
                     continue;
                 }
+
+                var rounds = ReferenceEquals(series, outermost);
 
                 double from, to;
                 if (value > 0)
@@ -791,7 +1181,11 @@ public static class ChartLayoutEngine
                 {
                     var x1 = xOf(from);
                     var x2 = xOf(to);
-                    var rect = new LayoutRect(Math.Min(x1, x2), along, Math.Abs(x2 - x1), barSize, series.Color);
+                    var rect = new LayoutRect(
+                        Math.Min(x1, x2), along, Math.Abs(x2 - x1), barSize, series.Color,
+                        CornerRadius: rounds ? BarCornerRadius : 0,
+                        Corners: !rounds ? RectCorners.None : value >= 0 ? RectCorners.Right : RectCorners.Left,
+                        Stroke: ChartPalette.Background, StrokeWidth: StackSeparatorWidth);
                     b.Bars.Add(rect);
                     if (showDataLabels)
                     {
@@ -809,7 +1203,11 @@ public static class ChartLayoutEngine
                 {
                     var y1 = yOf(from);
                     var y2 = yOf(to);
-                    var rect = new LayoutRect(along, Math.Min(y1, y2), barSize, Math.Abs(y2 - y1), series.Color);
+                    var rect = new LayoutRect(
+                        along, Math.Min(y1, y2), barSize, Math.Abs(y2 - y1), series.Color,
+                        CornerRadius: rounds ? BarCornerRadius : 0,
+                        Corners: !rounds ? RectCorners.None : value >= 0 ? RectCorners.Top : RectCorners.Bottom,
+                        Stroke: ChartPalette.Background, StrokeWidth: StackSeparatorWidth);
                     b.Bars.Add(rect);
                     if (showDataLabels && rect.Height >= 12)
                     {
@@ -829,7 +1227,7 @@ public static class ChartLayoutEngine
     private static ChartLayout BuildPie(RenderedTile tile, int width, bool donut)
     {
         var format = tile.Tile.Format;
-        var height = DefaultHeight(width);
+        var height = TileHeight(tile, width);
         var b = new LayoutBuilder(width, height);
 
         var labelColumn = tile.Columns.FirstOrDefault(c => c.Role == ResultColumnRole.Dimension);
@@ -842,8 +1240,11 @@ public static class ChartLayoutEngine
         {
             foreach (var row in tile.Rows)
             {
-                // Non-positive slices carry no drawable share of a pie.
-                if (ToNumber(valueIdx < row.Length ? row[valueIdx] : null) is not { } value || value <= 0)
+                // Only NON-NUMERIC cells are skipped, like the frontend's slice
+                // shaping: a zero-value category still owns a colour and a legend
+                // entry, it simply has no wedge to draw.
+                if (ToNumber(valueIdx < row.Length ? row[valueIdx] : null) is not { } value
+                    || !double.IsFinite(value))
                 {
                     continue;
                 }
@@ -861,31 +1262,43 @@ public static class ChartLayoutEngine
         }
 
         var ordered = ChartOrdering.ReconcileOrderBy(format?.CategoryOrder, slices, s => s.Label);
-        var legendItems = ShowLegend(format) && ordered.Count > 1
+        var legendItems = ShowLegendFor(format, hasLegendDimension: labelColumn is not null, ordered.Count)
             ? ordered.Select(s => new LegendItem(s.Label, s.Color)).ToList()
             : [];
-        var legendRight = legendItems.Count > 0 && LegendRight(format);
-        var legendBottomHeight = legendRight ? 0 : BottomLegendHeight(legendItems, width);
+        var placement = LegendPlacement(format);
+        var legendRight = legendItems.Count > 0 && placement == "right";
+        var legendTop = legendItems.Count > 0 && placement == "top";
+        var legendStrip = legendItems.Count > 0 && !legendRight ? BottomLegendHeight(legendItems, width) : 0;
+        var legendBottomHeight = legendTop ? 0 : legendStrip;
+        var legendTopHeight = legendTop ? legendStrip : 0;
         var legendRightWidth = legendRight ? RightLegendWidth(legendItems, width) : 0;
         var showDataLabels = format?.ShowDataLabels == true;
         var labelPad = showDataLabels ? 26 : 8;
 
         var plotWidth = width - 16 - legendRightWidth;
-        var plotHeight = height - 16 - legendBottomHeight;
+        var plotHeight = height - 16 - legendBottomHeight - legendTopHeight;
         var maxRadius = Math.Max(10, Math.Min(plotWidth, plotHeight) / 2 - labelPad);
         // recharts Pie defaults: outerRadius 85%, donut innerRadius 55% — the
         // donut hole keeps the same 55:85 proportion of the drawn radius.
         var outer = maxRadius;
         var inner = donut ? maxRadius * (0.55 / 0.85) : 0;
         var cx = 8 + plotWidth / 2;
-        var cy = 8 + plotHeight / 2;
+        var cy = 8 + legendTopHeight + plotHeight / 2;
 
-        var total = ordered.Sum(s => s.Value);
+        // Only positive values carry a drawable share, so they alone denominate.
+        var total = ordered.Where(s => s.Value > 0).Sum(s => s.Value);
         var angle = 0d;
         foreach (var slice in ordered)
         {
-            var sweep = total > 0 ? slice.Value / total * 360 : 0;
-            b.Arcs.Add(new LayoutArc(cx, cy, outer, inner, angle, sweep, slice.Color));
+            var sweep = total > 0 && slice.Value > 0 ? slice.Value / total * 360 : 0;
+            if (sweep > 0)
+            {
+                b.Arcs.Add(new LayoutArc(
+                    cx, cy, outer, inner, angle, sweep, slice.Color,
+                    PadDegrees: PieSliceGapDegrees,
+                    Stroke: ChartPalette.Background, StrokeWidth: 1));
+            }
+
             if (showDataLabels && sweep > 0)
             {
                 var mid = (angle + sweep / 2) * Math.PI / 180;
@@ -902,13 +1315,28 @@ public static class ChartLayoutEngine
             angle += sweep;
         }
 
+        // Donut-hole total — the browser mounts it for donut ONLY, and hides it
+        // when the hole is too small to read (DonutCenterTotal).
+        if (donut && inner >= 32)
+        {
+            var text = ChartValueFormats.FormatMeasureValue(total, valueColumn, format?.ValueFormat);
+            // Shrink the value to fit the hole before giving up on it.
+            var fontSize = Math.Max(
+                11, Math.Min(Math.Min(20, inner * 0.32), inner * 1.7 / Math.Max(1, text.Length * 0.55)));
+            b.Texts.Add(new LayoutText(
+                cx, cy - fontSize * 0.55, "Total", 10, ChartPalette.Muted, TextAnchor.Middle));
+            b.Texts.Add(new LayoutText(
+                cx, cy + fontSize * 0.72, text, fontSize, ChartPalette.Text, TextAnchor.Middle, Bold: true));
+        }
+
         if (legendRight)
         {
-            EmitRightLegend(b, legendItems, width - 8 - legendRightWidth + 8, 12, height - 24);
+            EmitRightLegend(b, legendItems, width - 8 - legendRightWidth + 8, 12, height - 24, format?.LegendStyle);
         }
         else if (legendItems.Count > 0)
         {
-            EmitBottomLegend(b, legendItems, 16, height - legendBottomHeight + 4);
+            EmitBottomLegend(
+                b, legendItems, 16, legendTop ? 4 : height - legendBottomHeight + 4, format?.LegendStyle);
         }
 
         return b.ToLayout();
@@ -921,7 +1349,7 @@ public static class ChartLayoutEngine
         const int SeriesCap = 3; // frontend SCATTER_SERIES_CAP
 
         var format = tile.Tile.Format;
-        var height = DefaultHeight(width);
+        var height = TileHeight(tile, width);
         var b = new LayoutBuilder(width, height);
 
         var dimIdx = new List<int>();
@@ -980,18 +1408,24 @@ public static class ChartLayoutEngine
             allPoints.Count == 0 ? 1 : allPoints.Max(p => p.Y));
         var xTicks = Ticks(xMin, xMax, xStep);
         var yTicks = Ticks(yMin, yMax, yStep);
-        string FormatX(double v) => ChartValueFormats.FormatMeasureValue(v, xColumn, format?.ValueFormat);
-        string FormatY(double v) => ChartValueFormats.FormatMeasureValue(v, yColumn, format?.ValueFormat);
+        string FormatX(double v) => ChartAxisFormats.IsActive(format?.XAxisFormat)
+            ? ChartAxisFormats.FormatAxisValue(v, format!.XAxisFormat)
+            : ChartValueFormats.FormatMeasureValue(v, xColumn, format?.ValueFormat);
+        string FormatY(double v) => ChartAxisFormats.IsActive(format?.YAxisFormat)
+            ? ChartAxisFormats.FormatAxisValue(v, format!.YAxisFormat)
+            : ChartValueFormats.FormatMeasureValue(v, yColumn, format?.ValueFormat);
 
-        var legendItems = ShowLegend(format) && bySeries.Count > 1
+        var legendItems = ShowLegendFor(format, hasLegendDimension: splitColumn is not null, bySeries.Count)
             ? bySeries.Select(s => new LegendItem(DisplayLabel(s.Label, format), s.Color)).ToList()
             : [];
-        var legendRight = legendItems.Count > 0 && LegendRight(format);
+        var legendRight = legendItems.Count > 0 && LegendPlacement(format) == "right";
         var legendBottomHeight = legendRight ? 0 : BottomLegendHeight(legendItems, width);
         var legendRightWidth = legendRight ? RightLegendWidth(legendItems, width) : 0;
 
-        var xTitle = format?.XAxisLabel is { Length: > 0 } xl ? xl : xColumn?.Label;
-        var yTitle = format?.YAxisLabel is { Length: > 0 } yl ? yl : yColumn?.Label;
+        var xTitle = RichTextHtml.ToPlainText(format?.XAxisLabelHtml)
+            ?? (format?.XAxisLabel is { Length: > 0 } xl ? xl : xColumn?.Label);
+        var yTitle = RichTextHtml.ToPlainText(format?.YAxisLabelHtml)
+            ?? (format?.YAxisLabel is { Length: > 0 } yl ? yl : yColumn?.Label);
 
         var left = yTicks.Select(FormatY).Max(l => Estimate(l, TickFontSize)) + 8
             + (yTitle is not null ? 18 : 0);
@@ -1145,7 +1579,11 @@ public static class ChartLayoutEngine
             tasks = tasks.OrderBy(t => t.Start).ToList();
         }
 
-        var legendItems = ShowLegend(format) && groups.Count > 1
+        var gantt = format?.Gantt;
+        // singleColor paints every bar one hue, which would leave the group
+        // legend showing swatches no bar uses — so the legend goes with it.
+        var singleColor = gantt?.SingleColor == true;
+        var legendItems = !singleColor && ShowLegendFor(format, hasLegendDimension: true, groups.Count)
             ? groups.Select(g => new LegendItem(g.Label, g.Color)).ToList()
             : [];
         var legendBottomHeight = BottomLegendHeight(legendItems, width);
@@ -1204,30 +1642,59 @@ public static class ChartLayoutEngine
         var visibleRows = (int)Math.Max(
             0, Math.Min(tasks.Count, Math.Floor((plotBottom - plotTop) / GanttRowHeight)));
         var railChars = Math.Max(3, (int)((rail - 10) / (0.55 * TickFontSize)));
+        var barHeight = gantt?.BarSize is > 0
+            ? Math.Clamp(gantt.BarSize.Value, 2, GanttRowHeight)
+            : GanttRowHeight * 0.5;
+        var cornerRadius = Math.Max(0, gantt?.CornerRadius ?? 3);
+        var singleBarColor = gantt?.Color is { Length: > 0 } configured
+            ? configured
+            : ChartPalette.SeriesColor(0, seriesKey: null, format?.ColorOverrides, format?.Theme);
+
         for (var i = 0; i < visibleRows; i++)
         {
             var task = tasks[i];
             var rowTop = plotTop + i * GanttRowHeight;
-            var barY = rowTop + GanttRowHeight * 0.25;
-            var barHeight = GanttRowHeight * 0.5;
+            var barY = rowTop + (GanttRowHeight - barHeight) / 2;
             var x1 = XOf(task.Start);
             var x2 = XOf(task.End);
             var barWidth = Math.Max(2, x2 - x1); // zero-duration milestone: 2px sliver
-            var color = task.Group is not null
+            var color = !singleColor && task.Group is not null
                 ? groups.First(g => g.Label == task.Group).Color
-                : ChartPalette.SeriesColor(0, seriesKey: null, format?.ColorOverrides, format?.Theme);
+                : singleBarColor;
 
-            b.Bars.Add(new LayoutRect(x1, barY, barWidth, barHeight, color));
+            if (gantt?.RowBanding == true && i % 2 == 1)
+            {
+                // Zebra wash behind alternating rows, theme-neutral like the chart's.
+                b.Bars.Add(new LayoutRect(
+                    plotLeft, rowTop, plotWidth, GanttRowHeight, ChartPalette.Text, Opacity: 0.04));
+            }
+
+            b.Bars.Add(new LayoutRect(
+                x1, barY, barWidth, barHeight, color,
+                CornerRadius: cornerRadius,
+                Corners: cornerRadius > 0 ? RectCorners.All : RectCorners.None));
             if (task.Progress is { } progress and > 0)
             {
                 // Theme-neutral completion overlay: the text token at low alpha.
                 b.Bars.Add(new LayoutRect(
-                    x1, barY, barWidth * progress, barHeight, ChartPalette.Text, Opacity: 0.18));
+                    x1, barY, barWidth * progress, barHeight, ChartPalette.Text, Opacity: 0.18,
+                    CornerRadius: cornerRadius,
+                    Corners: cornerRadius > 0 ? RectCorners.Left : RectCorners.None));
             }
 
             b.Texts.Add(new LayoutText(
                 rail - 6, rowTop + GanttRowHeight / 2 + 4, Truncate(task.Label, railChars),
                 TickFontSize, ChartPalette.Text2, TextAnchor.End));
+        }
+
+        // Today marker: only when it actually falls inside the plotted window.
+        var todayMs = (DateTime.UtcNow - DateTime.UnixEpoch).TotalMilliseconds;
+        if (gantt?.ShowToday == true && todayMs >= minStart && todayMs <= maxEnd)
+        {
+            var x = XOf(todayMs);
+            b.Guides.Add(new LayoutLine(
+                x, plotTop, x, plotBottom,
+                gantt.TodayColor is { Length: > 0 } todayColor ? todayColor : "#dc2626", 1.5));
         }
 
         if (visibleRows < tasks.Count)
@@ -1247,4 +1714,46 @@ public static class ChartLayoutEngine
 
     private static string Truncate(string text, int maxChars) =>
         text.Length <= maxChars ? text : text[..Math.Max(1, maxChars - 1)] + "…";
+
+    // -------------------------------------------------- honest compromises
+
+    /// <summary>How many panels a small-multiples tile has, and by which dimension.</summary>
+    public sealed record SmallMultiplesNote(int PanelCount, string Dimension);
+
+    /// <summary>
+    /// A small-multiples tile renders as ONE combined chart here — a panel grid
+    /// inside a 600px email image would be unreadable — so the reader is told
+    /// what was folded together rather than shown a silently collapsed chart.
+    /// Null when the tile has no small-multiples well or only one panel.
+    /// </summary>
+    public static SmallMultiplesNote? DescribeSmallMultiples(RenderedTile tile)
+    {
+        var (_, _, ordinal) = (tile.Tile.Wells ?? DimensionWells.Positional).Ordinals();
+        if (ordinal < 0 || tile.Tile.Wells is null)
+        {
+            return null;
+        }
+
+        var dimIdx = new List<int>();
+        for (var i = 0; i < tile.Columns.Count; i++)
+        {
+            if (tile.Columns[i].Role == ResultColumnRole.Dimension)
+            {
+                dimIdx.Add(i);
+            }
+        }
+
+        if (ordinal >= dimIdx.Count)
+        {
+            return null;
+        }
+
+        var column = tile.Columns[dimIdx[ordinal]];
+        var index = dimIdx[ordinal];
+        var panels = tile.Rows
+            .Select(row => RawKeyOf(index < row.Length ? row[index] : null))
+            .Distinct(StringComparer.Ordinal)
+            .Count();
+        return panels > 1 ? new SmallMultiplesNote(panels, column.Label) : null;
+    }
 }

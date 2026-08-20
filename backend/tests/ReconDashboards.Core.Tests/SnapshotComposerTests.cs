@@ -327,6 +327,34 @@ public sealed class SnapshotComposerTests : IDisposable
         Assert.Contains("<table", composed.Html, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task ASmallMultiplesTileSaysItsPanelsWereCombinedRatherThanCollapsingSilently()
+    {
+        // A panel grid is unreadable at email width, so the panels fold into one
+        // chart — and the reader is told, instead of quietly seeing rows that
+        // overwrote each other.
+        var dashboard = Dashboard(Layout(
+            """
+            { "id": "t1", "kind": "chart", "chart": { "id": "c-t1", "type": "column",
+              "title": "Sales by region", "query": {
+                "axis": { "table": "public.customers", "column": "region" },
+                "smallMultiples": { "table": "public.orders", "column": "status" },
+                "measures": [{ "table": "public.orders", "column": "order_total", "aggregation": "sum" }],
+                "filters": [] } } }
+            """,
+            ChartTile("t2", "Trend", "line")));
+        _executor.Rows = [["West", "open", 10m], ["East", "closed", 20m]];
+
+        var composed = await ComposeAsync(dashboard, Content(SubscriptionContentBody.Charts));
+
+        Assert.Contains(
+            "Small multiples (2 panels by status) are combined in this email.",
+            composed.Html,
+            StringComparison.Ordinal);
+        // ...and only that tile discloses it: the plain chart says nothing.
+        Assert.Equal(1, composed.Html.Split("Small multiples").Length - 1);
+    }
+
     // ----------------------------------------------------------- excluded tiles
 
     [Fact]

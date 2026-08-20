@@ -23,7 +23,12 @@ public sealed record MetaResponse(
     int MaxDistinctValues,
     int MaxModelDefinitionBytes,
     int MaxDashboardLayoutBytes,
-    bool CanManageShared);
+    bool CanManageShared,
+    // The caller's own opaque host id, straight from ICurrentUserProvider — the
+    // SAME value the share validator compares with StringComparison.Ordinal, so
+    // a client-side filter built on it cannot drift from the server's rule.
+    // Null when the host cannot identify the caller (anonymous meta reads).
+    string? UserId);
 
 public sealed record ConnectionResponse(string Name, string? Description, string Provider);
 
@@ -160,6 +165,11 @@ public sealed record DashboardResponse(
     DateTime UpdatedAtUtc,
     bool IsSystem,
     string? OwnerDisplayName,
+    // The owner's opaque host id. The share dialog needs it to keep the owner
+    // out of the picker: ValidateGrantTargets rejects the owner as a grant
+    // target and fails the WHOLE save, so an admin editing someone else's
+    // shares would otherwise lose every other pick along with it.
+    string OwnerUserId,
     DashboardAccessResponse MyAccess,
     int ShareCount,
     JsonElement Layout);

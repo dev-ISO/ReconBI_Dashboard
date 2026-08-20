@@ -103,6 +103,22 @@ export interface RcdDialogProps {
   /** Bottom-right corner handle resizes the panel. */
   resizable?: boolean;
   /**
+   * OPT-IN persistence for the dragged/resized geometry, and the identity it
+   * is stored under. Two jobs:
+   *
+   *  - it survives a reload (the plain title-keyed memory below is session
+   *    scoped), and
+   *  - dialogs that are the SAME surface under different titles share one
+   *    geometry — the chart builder is hosted as both "Add chart" and "Edit
+   *    chart" and must not make the author re-size each of them (the same
+   *    reason builderLayout keeps ONE pane-size key).
+   *
+   * Omitted = today's behavior exactly: session-only memory keyed by title,
+   * so SeeDataDialog/PrintConfigDialog/RelationshipDialog do not silently
+   * start remembering across sessions.
+   */
+  geometryKey?: string;
+  /**
    * Panel always takes its full height (85vh, or the user-resized height)
    * instead of hugging its content, giving the body a definite height so
    * flexible content (the chart builder) can reflow with the dialog.
@@ -138,13 +154,97 @@ const clampDialogPos = (x: number, y: number, w: number, h: number): DialogPoint
   y: clamp(y, 0, window.innerHeight - h),
 });
 
+interface DialogGeometry {
+  pos: DialogPoint | null;
+  size: DialogSize | null;
+}
+
 /**
- * Session-scoped memory for draggable/resizable dialogs: reopening restores the
- * last size/position (no persistence). Keyed by dialog title so different
- * opted-in dialogs (chart builder, relationship editor, …) don't inherit each
- * other's geometry.
+ * Memory for draggable/resizable dialogs: reopening restores the last
+ * size/position. Keyed by `geometryKey ?? title` so different opted-in dialogs
+ * (chart builder, relationship editor, …) don't inherit each other's geometry.
+ * Session-scoped on its own; dialogs that pass a geometryKey ALSO persist
+ * through the store below, and this Map is their in-memory cache.
  */
-const lastDialogGeometries = new Map<string, { pos: DialogPoint | null; size: DialogSize | null }>();
+const lastDialogGeometries = new Map<string, DialogGeometry>();
+
+/**
+ * Persisted geometry for geometryKey dialogs: ONE dotted key holding
+ * { [geometryKey]: {x,y,w,h} } — the sibling convention of
+ * rcd.chartBuilder.panes, the other stored preference of this very dialog.
+ *
+ * Validated on READ, per field (builderLayout's discipline): a corrupted
+ * {x: NaN} would otherwise flow through clamp() — Math.min/max propagate NaN —
+ * and position the panel into the void, and unlike the old session memory a
+ * bad value would come back after every reload instead of dying with the tab.
+ */
+const GEOMETRY_STORAGE_KEY = 'rcd.dialog.geometry';
+
+/** Anything beyond this (px) is corruption, not a 4K monitor. */
+const GEOMETRY_SANITY_LIMIT = 100_000;
+
+const readStoredGeometries = (): Record<string, unknown> => {
+  try {
+    const raw = localStorage.getItem(GEOMETRY_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+};
+
+/** Finite, in-range number or null — the single gate every stored field passes. */
+const saneNumber = (value: unknown): number | null =>
+  typeof value === 'number' && Number.isFinite(value) && Math.abs(value) <= GEOMETRY_SANITY_LIMIT
+    ? value
+    : null;
+
+/** One stored entry → geometry, dropping any half that fails validation. */
+const parseStoredGeometry = (value: unknown): DialogGeometry | null => {
+  if (typeof value !== 'object' || value === null) return null;
+  const entry = value as Record<string, unknown>;
+  const x = saneNumber(entry.x);
+  const y = saneNumber(entry.y);
+  const w = saneNumber(entry.w);
+  const h = saneNumber(entry.h);
+  const pos = x !== null && y !== null ? { x, y } : null;
+  const size = w !== null && h !== null && w > 0 && h > 0 ? { w, h } : null;
+  return pos || size ? { pos, size } : null;
+};
+
+/** Session cache first, storage second (and cached once parsed). */
+const loadDialogGeometry = (key: string, persist: boolean): DialogGeometry | null => {
+  const cached = lastDialogGeometries.get(key);
+  if (cached) return cached;
+  if (!persist) return null;
+  const stored = parseStoredGeometry(readStoredGeometries()[key]);
+  if (stored) lastDialogGeometries.set(key, stored);
+  return stored;
+};
+
+const storeDialogGeometry = (key: string, geometry: DialogGeometry): void => {
+  try {
+    const all = readStoredGeometries();
+    const entry: Record<string, number> = {};
+    if (geometry.pos) {
+      entry.x = Math.round(geometry.pos.x);
+      entry.y = Math.round(geometry.pos.y);
+    }
+    if (geometry.size) {
+      entry.w = Math.round(geometry.size.w);
+      entry.h = Math.round(geometry.size.h);
+    }
+    if (Object.keys(entry).length === 0) delete all[key];
+    else all[key] = entry;
+    if (Object.keys(all).length === 0) localStorage.removeItem(GEOMETRY_STORAGE_KEY);
+    else localStorage.setItem(GEOMETRY_STORAGE_KEY, JSON.stringify(all));
+  } catch {
+    // Storage unavailable (private mode / quota) — geometry stays session-only.
+  }
+};
 
 /**
  * Module-level stack of OPEN RcdDialogs, pushed on open in mount order (a
@@ -181,6 +281,7 @@ export function RcdDialog({
   draggable,
   resizable,
   fillHeight,
+  geometryKey,
   backdropClassName,
 }: RcdDialogProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -189,10 +290,13 @@ export function RcdDialog({
   // resizes, the panel switches to absolute positioning at the tracked x/y.
   const [pos, setPos] = useState<DialogPoint | null>(null);
   const [size, setSize] = useState<DialogSize | null>(null);
-  const geometryRef = useRef<{ pos: DialogPoint | null; size: DialogSize | null }>({ pos: null, size: null });
+  const geometryRef = useRef<DialogGeometry>({ pos: null, size: null });
   const dragState = useRef<{ dx: number; dy: number } | null>(null);
   const resizeState = useRef<{ startX: number; startY: number; startW: number; startH: number } | null>(null);
   const floating = Boolean(draggable || resizable);
+  /** One identity for the same surface under different titles (see geometryKey). */
+  const memoryKey = geometryKey ?? title;
+  const persistGeometry = geometryKey !== undefined;
 
   const applyPos = (next: DialogPoint) => {
     geometryRef.current.pos = next;
@@ -203,14 +307,27 @@ export function RcdDialog({
     setSize(next);
   };
   const rememberGeometry = () => {
-    if (floating) lastDialogGeometries.set(title, { ...geometryRef.current });
+    if (!floating) return;
+    const geometry: DialogGeometry = { ...geometryRef.current };
+    lastDialogGeometries.set(memoryKey, geometry);
+    if (persistGeometry) storeDialogGeometry(memoryKey, geometry);
   };
 
-  // Restore the session's last geometry on each open (re-clamped to the viewport).
+  // Restore the remembered geometry on each open (re-clamped to the viewport).
   useEffect(() => {
     if (!open || !floating) return;
-    const remembered = lastDialogGeometries.get(title);
-    if (!remembered) return;
+    const remembered = loadDialogGeometry(memoryKey, persistGeometry);
+    if (!remembered) {
+      // EXPLICIT RESET. This component stays mounted across opens (consumers
+      // pass open={x !== null}), so without it a key with no memory of its own
+      // silently inherits the previous key's geometry through React state —
+      // move "Add chart", then open "Edit chart" and it arrives pre-moved from
+      // a geometry nothing ever stored for it.
+      geometryRef.current = { pos: null, size: null };
+      setPos(null);
+      setSize(null);
+      return;
+    }
     let w: number | null = null;
     let h: number | null = null;
     if (remembered.size) {
@@ -218,8 +335,19 @@ export function RcdDialog({
       h = clamp(remembered.size.h, DIALOG_MIN_H, dialogMaxH());
       applySize({ w, h });
     }
-    if (remembered.pos) applyPos(clampDialogPos(remembered.pos.x, remembered.pos.y, w ?? DIALOG_MIN_W, h ?? DIALOG_MIN_H));
-  }, [open, floating, title]);
+    if (remembered.pos) {
+      // MEASURE, don't guess. A dialog that was dragged but never resized has
+      // no remembered size, and clamping against DIALOG_MIN_W/H (480x360)
+      // instead of the panel's real width (a `wide` panel is 56rem = 896px)
+      // let the right/bottom edge restore off-screen. The panel is already in
+      // the DOM at its class-driven size when this effect runs — and once the
+      // geometry PERSISTS, a bad clamp stops self-healing on reload.
+      const rect = panelRef.current?.getBoundingClientRect();
+      const width = w ?? (rect && rect.width > 0 ? rect.width : DIALOG_MIN_W);
+      const height = h ?? (rect && rect.height > 0 ? rect.height : DIALOG_MIN_H);
+      applyPos(clampDialogPos(remembered.pos.x, remembered.pos.y, width, height));
+    }
+  }, [open, floating, memoryKey, persistGeometry]);
 
   const onTitlePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
     if (!draggable) return;

@@ -28,6 +28,7 @@ import type {
 import { DashboardsProvider } from '../src/provider/DashboardsProvider';
 import {
   SubscriptionsDialog,
+  chartTilesOf,
   draftFrom,
   draftToWire,
   lastSentText,
@@ -75,10 +76,14 @@ const flatSubscription = (overrides: Partial<DashboardSubscription> = {}): Dashb
   ...overrides,
 });
 
+const query = { measures: [], filters: [] };
+
 /**
- * Dashboard doc served to the form's tile checklist: two chart tiles and a
- * text tile (which must NEVER appear in the checklist — only chart tiles ship
- * in the email body).
+ * Dashboard doc served to the form's tile checklist: TWO PAGES so the grouped
+ * checklist has something to group, three chart tiles and a text tile (which
+ * must NEVER appear in the checklist — only chart tiles ship in the email
+ * body). Every chart carries a `query`: the checklist now applies the
+ * backend parser's own filter, and a query-less chart is one the email skips.
  */
 const DASHBOARD_DETAIL = {
   id: 7,
@@ -95,13 +100,13 @@ const DASHBOARD_DETAIL = {
           {
             id: 't1',
             layout: { x: 0, y: 0, w: 6, h: 4 },
-            chart: { id: 'c1', type: 'column', title: 'Sales by month' },
+            chart: { id: 'c1', type: 'column', title: 'Sales by month', query },
           },
           {
             id: 't2',
             layout: { x: 6, y: 0, w: 6, h: 4 },
             kind: 'chart',
-            chart: { id: 'c2', type: 'table', title: 'Raw rows' },
+            chart: { id: 'c2', type: 'table', title: 'Raw rows', query },
           },
           {
             id: 't3',
@@ -111,18 +116,43 @@ const DASHBOARD_DETAIL = {
           },
         ],
       },
+      {
+        id: 'p2',
+        name: 'Ops detail',
+        tiles: [
+          {
+            id: 't4',
+            layout: { x: 0, y: 0, w: 6, h: 4 },
+            kind: 'chart',
+            chart: { id: 'c4', type: 'kpi', title: 'Open work orders', query },
+          },
+        ],
+      },
     ],
   },
 } as unknown as DashboardDetail;
 
 /**
+ * The host user directory behind the recipient picker. `nomail` has no address
+ * — the picker must offer it disabled rather than pushing a null.
+ */
+const DIRECTORY = [
+  { id: 'u1', displayName: 'ann', email: 'one@example.com' },
+  { id: 'u2', displayName: 'bob', email: 'two@example.com' },
+  { id: 'u3', displayName: 'nomail', email: null },
+];
+
+/**
  * Records every request; GET /subscriptions serves `list`, GET /dashboards/7
- * serves the tile-checklist doc, POST echoes a row.
+ * serves the tile-checklist doc, GET /users serves the recipient directory,
+ * POST echoes a row. WITHOUT the /users branch the picker would receive the
+ * subscription array and render nonsense.
  */
 const makeFetcher = (list: DashboardSubscription[]): { calls: RecordedCall[]; fetcher: RcdFetcher } => {
   const calls: RecordedCall[] = [];
   const fetcher = (<T,>(path: string, init?: RcdRequestInit): Promise<T> => {
     calls.push({ path, init });
+    if (path.includes('/users')) return Promise.resolve(DIRECTORY as T);
     if (path.includes('/dashboards/')) return Promise.resolve(DASHBOARD_DETAIL as T);
     if (init?.method === 'POST') return Promise.resolve(flatSubscription() as T);
     return Promise.resolve(list as T);
@@ -172,6 +202,15 @@ const buttonByText = (text: string): HTMLButtonElement => {
   return button as HTMLButtonElement;
 };
 
+const buttonByAriaLabel = (label: string): HTMLButtonElement => {
+  const button = document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  if (!button) throw new Error(`No button with aria-label "${label}"`);
+  return button;
+};
+
+const labelContaining = (text: string): HTMLLabelElement | undefined =>
+  [...document.querySelectorAll('label')].find((label) => label.textContent?.includes(text));
+
 /** Controlled-input edit: React 19 needs the native setter + an input event. */
 const typeInto = (element: HTMLInputElement | HTMLTextAreaElement, value: string) => {
   const proto = element instanceof HTMLTextAreaElement
@@ -197,6 +236,28 @@ const selectValue = (element: HTMLSelectElement, value: string) => {
 const selectByLabel = (label: string): HTMLSelectElement | null =>
   document.querySelector<HTMLSelectElement>(`select[aria-label="${label}"]`);
 
+const buttonByTitle = (title: string): HTMLButtonElement => {
+  const button = document.querySelector<HTMLButtonElement>(`button[title="${title}"]`);
+  if (!button) throw new Error(`No button titled "${title}"`);
+  return button;
+};
+
+/**
+ * Clicks the recipient picker's directory row for one address. Free typing is
+ * gone (D3: system users only), so this is the ONLY way a recipient gets in.
+ */
+const pickRecipient = (email: string) => {
+  const row = [...document.querySelectorAll('button')].find((b) => b.textContent?.includes(email));
+  if (!row) throw new Error(`No directory row for "${email}"`);
+  act(() => (row as HTMLButtonElement).click());
+};
+
+/** The current recipient chips, in order (each owns a "Remove …" button). */
+const recipientChips = (): string[] =>
+  [...document.querySelectorAll('span')]
+    .filter((span) => span.querySelector(':scope > button[aria-label^="Remove "]') !== null)
+    .map((span) => span.textContent?.trim() ?? '');
+
 describe('SubscriptionsDialog save path (wire shape)', () => {
   it('POSTs the exact flat body the backend contract accepts', async () => {
     const { calls, fetcher } = makeFetcher([]);
@@ -209,9 +270,10 @@ describe('SubscriptionsDialog save path (wire shape)', () => {
       document.querySelector<HTMLInputElement>('input[placeholder="e.g. Monday morning report"]')!,
       'Morning snapshot',
     );
-    // Comma+space entry proves recipients are normalized to the ';' join the
-    // backend splits on — commas must never reach the wire.
-    typeInto(document.querySelector('textarea')!, 'one@example.com, two@example.com');
+    // Two directory picks prove recipients are normalized to the ';' join the
+    // backend splits on — the picker's ', ' draft text never reaches the wire.
+    pickRecipient('one@example.com');
+    pickRecipient('two@example.com');
 
     await act(async () => buttonByText('Save subscription').click());
 
@@ -278,10 +340,12 @@ describe('SubscriptionsDialog save path (wire shape)', () => {
       document.querySelector<HTMLInputElement>('input[placeholder="e.g. Monday morning report"]')!,
       'Morning snapshot',
     );
-    typeInto(document.querySelector('textarea')!, 'one@example.com, two@example.com');
+    pickRecipient('one@example.com');
+    pickRecipient('two@example.com');
 
     // Only the doc's CHART tiles are listed — the text tile never emails.
-    act(() => buttonByText('Tiles to include (2/2)').click());
+    // Three across two pages; both sections open by default (<=3 pages).
+    act(() => buttonByText('Tiles to include (3/3)').click());
     const rawRows = [...document.querySelectorAll('label')].find((label) =>
       label.textContent?.includes('Raw rows'),
     );
@@ -291,7 +355,7 @@ describe('SubscriptionsDialog save path (wire shape)', () => {
       'text tiles must not appear in the checklist',
     ).toBe(false);
     act(() => rawRows!.querySelector('input')!.click());
-    expect(buttonByText('Tiles to include (1/2)')).toBeDefined();
+    expect(buttonByText('Tiles to include (2/3)')).toBeDefined();
 
     await act(async () => buttonByText('Save subscription').click());
 
@@ -302,6 +366,186 @@ describe('SubscriptionsDialog save path (wire shape)', () => {
       content: { ...REFERENCE_DAILY_BODY.content, excludedTileIds: ['t2'] },
     });
     expect(errors).toEqual([]);
+  });
+});
+
+/**
+ * D3 (LOCKED): recipients are SYSTEM USERS ONLY — the textarea is gone and the
+ * only way in is a directory row. The one thing that must NOT follow from that
+ * is dropping addresses a saved subscription already carries: contractors and
+ * distribution lists predate the picker and are still legitimate recipients.
+ */
+describe('recipient picker (system users only)', () => {
+  it('replaces free typing with directory picks and removable chips', async () => {
+    const { fetcher } = makeFetcher([]);
+    await mountDialog(fetcher);
+    await act(async () => buttonByText('New subscription').click());
+
+    // No free-text entry survives anywhere in the form.
+    expect(document.querySelector('textarea')).toBeNull();
+    expect(buttonByText('Save subscription').disabled).toBe(true);
+
+    pickRecipient('one@example.com');
+    expect(recipientChips()).toEqual(['one@example.com']);
+    // A picked address stops being offered as a candidate.
+    expect(
+      [...document.querySelectorAll('button')].filter((b) =>
+        b.textContent?.includes('one@example.com'),
+      ),
+    ).toEqual([]);
+
+    // A directory row with no address is offered DISABLED, never pushed as null.
+    const nomail = [...document.querySelectorAll('button')].find((b) =>
+      b.textContent?.includes('nomail'),
+    )!;
+    expect(nomail.disabled).toBe(true);
+    expect(nomail.getAttribute('title')).toBe('No email address');
+
+    act(() => buttonByAriaLabel('Remove one@example.com from the recipients').click());
+    expect(recipientChips()).toEqual([]);
+  });
+
+  it('keeps an existing address no directory user owns — flagged, removable, saved', async () => {
+    const { calls, fetcher } = makeFetcher([
+      flatSubscription({ recipients: 'one@example.com;contractor@vendor.example' }),
+    ]);
+    await mountDialog(fetcher);
+    await act(async () => buttonByAriaLabel('Edit subscription Ops digest').click());
+
+    expect(recipientChips()).toEqual(['one@example.com', 'contractor@vendor.example']);
+    const flagged = [...document.querySelectorAll('span[title]')].find((span) =>
+      span.getAttribute('title')?.startsWith('Not in the user directory'),
+    );
+    expect(flagged, 'the unmatched address must be flagged, not dropped').toBeDefined();
+    expect(flagged!.textContent?.trim()).toBe('contractor@vendor.example');
+    expect(host.textContent).toContain('1 address is not in the user directory');
+
+    // …and it must SURVIVE the save.
+    await act(async () => buttonByText('Save subscription').click());
+    const put = calls.find((call) => call.init?.method === 'PUT');
+    expect(put, 'expected a PUT /subscriptions/41').toBeDefined();
+    expect((put!.init!.body as { recipients: string }).recipients).toBe(
+      'one@example.com;contractor@vendor.example',
+    );
+    expect(errors).toEqual([]);
+  });
+});
+
+describe('tiles to include (grouped by dashboard page)', () => {
+  /** Opens the editor for a saved subscription with a given excluded set. */
+  const openSavedWithExcluded = async (excludedTileIds: string[]) => {
+    const { calls, fetcher } = makeFetcher([
+      flatSubscription({
+        recipients: 'one@example.com',
+        content: { body: 'charts', excludedTileIds, imageWidth: 600, maxTableRows: 50 },
+      }),
+    ]);
+    await mountDialog(fetcher);
+    await act(async () => buttonByAriaLabel('Edit subscription Ops digest').click());
+    return calls;
+  };
+
+  const savedExcluded = (calls: RecordedCall[]): string[] => {
+    const put = calls.find((call) => call.init?.method === 'PUT');
+    if (!put) throw new Error('expected a PUT /subscriptions/41');
+    return (put.init!.body as { content: { excludedTileIds: string[] } }).content.excludedTileIds;
+  };
+
+  it('renders one collapsible section per page with per-page counters and type badges', async () => {
+    const { fetcher } = makeFetcher([]);
+    await mountDialog(fetcher);
+    await act(async () => buttonByText('New subscription').click());
+    act(() => buttonByText('Tiles to include (3/3)').click());
+
+    const page1 = buttonByText('Page 1');
+    const ops = buttonByText('Ops detail');
+    expect(page1.textContent).toContain('(2/2)');
+    expect(ops.textContent).toContain('(1/1)');
+    // Two pages (<=3) => every section starts open.
+    expect(page1.getAttribute('aria-expanded')).toBe('true');
+    expect(ops.getAttribute('aria-expanded')).toBe('true');
+
+    // The chart type rides beside the name, and the row title carries both.
+    const rawRows = labelContaining('Raw rows')!;
+    expect(rawRows.getAttribute('title')).toBe('Raw rows — Table');
+    expect(rawRows.textContent).toContain('Table');
+    expect(labelContaining('Open work orders')!.getAttribute('title')).toBe(
+      'Open work orders — KPI',
+    );
+    // Long names truncate; the TYPE is never the part that gets cut.
+    const [name, type] = [...rawRows.querySelectorAll('span')];
+    expect(name.className).toContain('truncate');
+    expect(name.className).toContain('min-w-0');
+    expect(type.className).toContain('shrink-0');
+
+    // Collapsing one section hides only its rows.
+    act(() => ops.click());
+    expect(buttonByText('Ops detail').getAttribute('aria-expanded')).toBe('false');
+    expect(labelContaining('Open work orders')).toBeUndefined();
+    expect(labelContaining('Raw rows')).toBeDefined();
+  });
+
+  it('legacy flat docs group under the synthetic "Page 1" the backend uses', () => {
+    expect(
+      chartTilesOf({
+        version: 1,
+        slicers: [],
+        tiles: [
+          {
+            id: 't1',
+            layout: { x: 0, y: 0, w: 6, h: 4 },
+            chart: { id: 'c1', type: 'column', title: 'Sales', query },
+          },
+          // No query = a tile the email would skip; it must not be offered.
+          { id: 't9', layout: { x: 0, y: 4, w: 6, h: 4 }, chart: { id: 'c9', type: 'pie', title: 'Broken' } },
+        ],
+      } as unknown as Parameters<typeof chartTilesOf>[0]),
+    ).toEqual([
+      { pageId: '__page1', pageName: 'Page 1', tiles: [{ id: 't1', title: 'Sales', type: 'column' }] },
+    ]);
+  });
+
+  it('Deselect all APPENDS the listed ids and leaves unknown ids untouched', async () => {
+    // 'ghost' is a tile the doc no longer has — it must survive both directions.
+    const calls = await openSavedWithExcluded(['ghost', 't2']);
+    act(() => buttonByText('Tiles to include (2/3)').click());
+
+    const deselectAll = buttonByTitle('Exclude every tile in this dashboard');
+    act(() => deselectAll.click());
+    expect(buttonByText('Tiles to include (0/3)')).toBeDefined();
+    expect(buttonByTitle('Exclude every tile in this dashboard').disabled).toBe(true);
+    expect(buttonByTitle('Include every tile in this dashboard').disabled).toBe(false);
+
+    await act(async () => buttonByText('Save subscription').click());
+    expect(savedExcluded(calls)).toEqual(['ghost', 't2', 't1', 't4']);
+  });
+
+  it('Select all removes ONLY the listed ids — never resets excludedTileIds to []', async () => {
+    const calls = await openSavedWithExcluded(['ghost', 't2']);
+    act(() => buttonByText('Tiles to include (2/3)').click());
+
+    act(() => buttonByTitle('Include every tile in this dashboard').click());
+    expect(buttonByText('Tiles to include (3/3)')).toBeDefined();
+
+    await act(async () => buttonByText('Save subscription').click());
+    // 'ghost' is untouched: the doc never listed it, so no bulk action owns it.
+    expect(savedExcluded(calls)).toEqual(['ghost']);
+  });
+
+  it('the per-page pair moves only that page and updates its counter', async () => {
+    const calls = await openSavedWithExcluded(['ghost', 't2']);
+    act(() => buttonByText('Tiles to include (2/3)').click());
+    expect(buttonByText('Page 1').textContent).toContain('(1/2)');
+    expect(buttonByText('Ops detail').textContent).toContain('(1/1)');
+
+    act(() => buttonByTitle('Exclude every tile on Ops detail').click());
+    expect(buttonByText('Ops detail').textContent).toContain('(0/1)');
+    // The other page is untouched.
+    expect(buttonByText('Page 1').textContent).toContain('(1/2)');
+    expect(buttonByText('Tiles to include (1/3)')).toBeDefined();
+
+    await act(async () => buttonByText('Save subscription').click());
+    expect(savedExcluded(calls)).toEqual(['ghost', 't2', 't4']);
   });
 });
 
@@ -363,7 +607,7 @@ describe('SubscriptionForm email-content defaults', () => {
       document.querySelector<HTMLInputElement>('input[placeholder="e.g. Monday morning report"]')!,
       'Morning snapshot',
     );
-    typeInto(document.querySelector('textarea')!, 'one@example.com');
+    pickRecipient('one@example.com');
     selectValue(selectByLabel('Email body')!, 'both');
     expect(buttonByText('Save subscription').disabled).toBe(false);
 

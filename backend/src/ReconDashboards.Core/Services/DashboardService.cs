@@ -47,6 +47,10 @@ public sealed record DashboardDetail(
     DateTime UpdatedAtUtc,
     bool IsSystem,
     string? OwnerDisplayName,
+    // Opaque host id of the owner (OwnerIsMe answers "mine?" but never yields
+    // an id). The share dialog filters the owner out of its picker with it —
+    // ValidateGrantTargets rejects an owner target and fails the whole save.
+    string OwnerUserId,
     DashboardAccess MyAccess,
     int ShareCount,
     JsonElement Layout);
@@ -980,6 +984,7 @@ public sealed class DashboardService(
             record.OwnerUserId == userId, record.CreatedAtUtc, record.UpdatedAtUtc,
             IsSystem(record),
             owners.TryGetValue(record.OwnerUserId, out var owner) ? owner.DisplayName : record.OwnerUserId,
+            record.OwnerUserId,
             access, shareCount,
             doc.RootElement.Clone());
     }

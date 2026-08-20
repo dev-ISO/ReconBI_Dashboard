@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Globe, Search, UserRound, X } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Globe, UserRound, X } from 'lucide-react';
 import { rcdErrorMessage, type RcdUser } from '@recon/dashboards-core';
 import { useRuntime } from '../provider/DashboardsProvider';
-import { RcdButton, RcdDialog, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
+import { RcdButton, RcdDialog, RcdIconButton, RcdSelect, RcdSpinner } from '../primitives';
+import { UserPicker } from './UserPicker';
 
 export interface ShareDialogProps {
   open: boolean;
@@ -16,6 +17,14 @@ export interface ShareDialogProps {
   canPublish?: boolean;
   /** Current publish state (drives the toggle's initial value). */
   isShared?: boolean;
+  /**
+   * The dashboard OWNER's opaque host id, when the host knows it (the store's
+   * OpenDashboard carries it from 0.14.1 servers). The owner already has full
+   * access and the server REFUSES an owner grant — failing the whole save —
+   * so the picker must not offer them. Absent = no owner filter (pre-0.14.1
+   * server), exactly the pre-existing behavior.
+   */
+  ownerUserId?: string;
   /** Called after shares (and any publish change) saved successfully. */
   onSaved?: () => void;
 }
@@ -61,13 +70,8 @@ interface PermissionTemplate {
 
 const DEFAULT_TEMPLATE: PermissionTemplate = { mode: 'view', flags: allFlags(true) };
 
-/**
- * Candidate rows rendered at once. The list scrolls (max-h-40), so the cap is
- * about render cost, not UX; when more users match, a "Showing N of M" line
- * says so instead of silently truncating (the old cap of 8 made mid-sized
- * directories look incomplete).
- */
-const CANDIDATE_CAP = 50;
+/** Sharing picks BY USER ID (module scope = stable identity for the picker memo). */
+const userIdKey = (user: RcdUser): string => user.id;
 
 const templatePermissions = (template: PermissionTemplate): PermissionFlags =>
   template.mode === 'view' ? allFlags(false) : { ...template.flags };
@@ -150,20 +154,23 @@ export function ShareDialog({
   onClose,
   canPublish = false,
   isShared,
+  ownerUserId,
   onSaved,
 }: ShareDialogProps) {
   const runtime = useRuntime();
 
+  /**
+   * The signed-in user's own id. The store deliberately never learns it (it
+   * cannot compare host-opaque ids to a self it never receives), so it comes
+   * from GET /meta — the same ICurrentUserProvider the server's share
+   * validator compares against, so the two cannot drift. null until it
+   * arrives, and null forever against a pre-0.14.1 server.
+   */
+  const [selfUserId, setSelfUserId] = useState<string | null>(null);
+
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [rows, setRows] = useState<ShareRow[]>([]);
-  /** Directory results for the current query; null until the first load. */
-  const [users, setUsers] = useState<RcdUser[] | null>(null);
-  /** True when the UNFILTERED directory came back empty (not configured). */
-  const [directoryEmpty, setDirectoryEmpty] = useState(false);
-  const [query, setQuery] = useState('');
-  /** Non-null after the freshest search request failed (cleared on success). */
-  const [searchError, setSearchError] = useState<string | null>(null);
   /** Picked-but-not-yet-added users (the chips). */
   const [picked, setPicked] = useState<RcdUser[]>([]);
   const [template, setTemplate] = useState<PermissionTemplate>(DEFAULT_TEMPLATE);
@@ -171,38 +178,26 @@ export function ShareDialog({
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  /**
-   * Directory-search sequencing (finding 16): each issued search takes a
-   * ticket; only the freshest ticket's response may land, so an older slow
-   * response can never overwrite a newer query's results. `searched` marks
-   * that a non-initial search actually ran — the debounced effect's mount run
-   * (query still '') is skipped entirely, because the open effect below
-   * already fetched the unfiltered directory once.
-   */
-  const searchSeqRef = useRef(0);
-  const searchedRef = useRef(false);
-
-  // (Re)load shares + directory on each open.
+  // (Re)load shares on each open. The DIRECTORY is UserPicker's business now
+  // (it reloads on the same `open` flip), so a directory hiccup degrades to an
+  // inline note in the picker instead of replacing the whole dialog — the
+  // grants list stays usable, which is what someone opening this to REVOKE
+  // access came for.
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
-    searchSeqRef.current++;
-    searchedRef.current = false;
     setLoading(true);
     setLoadError(null);
     setSaveError(null);
-    setSearchError(null);
     setRows([]);
     setPicked([]);
-    setQuery('');
     setTemplate(DEFAULT_TEMPLATE);
     setPublish(isShared ?? false);
-    Promise.all([runtime.dashboards.listShares(dashboardId), runtime.dashboards.listUsers()])
-      .then(([shares, directory]) => {
+    runtime.dashboards
+      .listShares(dashboardId)
+      .then((shares) => {
         if (cancelled) return;
         setRows(shares.map(toShareRow));
-        setUsers(directory);
-        setDirectoryEmpty(directory.length === 0);
       })
       .catch((error: unknown) => {
         if (!cancelled) setLoadError(rcdErrorMessage(error));
@@ -215,42 +210,44 @@ export function ShareDialog({
     };
   }, [open, dashboardId, runtime, isShared]);
 
-  // Debounced directory search (skipped entirely when unconfigured). The
-  // initial empty-query run duplicates the open effect's unfiltered fetch, so
-  // it is skipped until a real search happened; clearing the box after that
-  // re-fetches the unfiltered list as before.
+  // Who am I? Best-effort and non-blocking: a failure (or an older server with
+  // no userId on /meta) simply leaves the self filter off, which is exactly
+  // how this dialog behaved before 0.14.1.
   useEffect(() => {
-    if (!open || directoryEmpty) return;
-    const q = query.trim();
-    if (q === '' && !searchedRef.current) return;
-    searchedRef.current = true;
-    const seq = ++searchSeqRef.current;
-    const timer = window.setTimeout(() => {
-      runtime.dashboards
-        .listUsers(q === '' ? undefined : q)
-        .then((result) => {
-          if (seq === searchSeqRef.current) {
-            setUsers(result);
-            setSearchError(null);
-          }
-        })
-        .catch(() => {
-          // The previous results stay on screen (a failed keystroke should
-          // degrade, not blank the list) — but say so: silence here made a
-          // failed search indistinguishable from "no results". The ticket
-          // guard applies to failures too: only the freshest may complain.
-          if (seq === searchSeqRef.current) setSearchError('Search failed — try again.');
-        });
-    }, 250);
-    return () => window.clearTimeout(timer);
-  }, [open, directoryEmpty, query, runtime]);
+    if (!open) return;
+    let cancelled = false;
+    runtime.api
+      .getMeta()
+      .then((meta) => {
+        if (!cancelled) setSelfUserId(meta.userId ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setSelfUserId(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open, runtime]);
 
-  /** Directory hits not already granted or picked (uncapped; render cap below). */
-  const matching = useMemo(() => {
-    const taken = new Set([...rows.map((r) => r.userId), ...picked.map((u) => u.id)]);
-    return (users ?? []).filter((user) => !taken.has(user.id));
-  }, [users, rows, picked]);
-  const candidates = matching.slice(0, CANDIDATE_CAP);
+  /**
+   * The two ids the SERVER refuses as grant targets: the caller and the owner
+   * (DashboardService.ValidateGrantTargets, rcd.dashboard.share_target_invalid).
+   * That check runs before any write, so ONE such pick used to 400 the whole
+   * PUT and lose every other pick with it. Excluding them here is the fix; an
+   * unknown id (older server) just leaves the list as it always was.
+   */
+  const forbiddenIds = useMemo(() => {
+    const ids = new Set<string>();
+    if (selfUserId !== null) ids.add(selfUserId);
+    if (ownerUserId !== undefined) ids.add(ownerUserId);
+    return ids;
+  }, [selfUserId, ownerUserId]);
+
+  /** Ids already granted, picked, or refusable — the picker stops offering them. */
+  const takenIds = useMemo(
+    () => new Set([...rows.map((r) => r.userId), ...picked.map((u) => u.id), ...forbiddenIds]),
+    [rows, picked, forbiddenIds],
+  );
 
   const addPicked = () => {
     if (picked.length === 0) return;
@@ -290,7 +287,11 @@ export function ShareDialog({
       ...picked
         .filter((user) => !rows.some((row) => row.userId === user.id))
         .map((user) => ({ userId: user.id, displayName: user.displayName, ...perms })),
-    ];
+      // Belt to the picker's braces: a chip staged BEFORE /meta answered (or a
+      // grant row from a server that somehow allowed one) is dropped rather
+      // than sent, because the server rejects the whole PUT over a single
+      // owner/self target — losing every other person in the list.
+    ].filter((row) => !forbiddenIds.has(row.userId));
     // Publish flips FIRST (finding 13): it is the admin-gated call likeliest
     // to be refused, so failing it saves NOTHING — no half-committed state to
     // explain. If it succeeds and saveShares then fails, the message states
@@ -362,120 +363,52 @@ export function ShareDialog({
       ) : (
         <div className="flex flex-col gap-4">
           {/* -------------------------------------------------- user picker */}
-          {directoryEmpty ? (
-            <p className="rounded-lg border border-rcd-border bg-rcd-bg px-3 py-2 text-xs text-rcd-muted">
-              User directory not configured — people search is unavailable. Existing access can
-              still be removed below.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-2">
-              <label className="flex flex-col gap-1 text-sm text-rcd-text-2">
-                Add people
-                <div className="relative">
-                  <Search
-                    size={14}
-                    aria-hidden
-                    className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-rcd-muted"
-                  />
-                  <RcdInput
-                    value={query}
-                    onChange={(event) => setQuery(event.target.value)}
-                    // Names what the directory can actually match — typing a
-                    // person's real name finds nothing when the directory
-                    // only indexes usernames and emails.
-                    placeholder="Search by username or email"
-                    aria-label="Search people to share with"
-                    className="w-full pl-8"
-                  />
-                </div>
-              </label>
-
-              {picked.length > 0 && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {picked.map((user) => (
-                    <span
-                      key={user.id}
-                      className="inline-flex items-center gap-1 rounded-md border border-rcd-border bg-rcd-surface py-0.5 pl-2 pr-1 text-xs font-medium text-rcd-text shadow-[var(--rcd-shadow-1)]"
-                    >
-                      {user.displayName}
-                      <button
-                        type="button"
-                        aria-label={`Remove ${user.displayName} from the selection`}
-                        onClick={() => setPicked((prev) => prev.filter((u) => u.id !== user.id))}
-                        className="rounded p-0.5 text-rcd-muted hover:bg-black/5 hover:text-rcd-text dark:hover:bg-white/10"
-                      >
-                        <X size={11} />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-              )}
-
-              {candidates.length > 0 && (
-                <div className="max-h-40 overflow-y-auto rounded-lg border border-rcd-border">
-                  {candidates.map((user) => (
-                    <button
-                      key={user.id}
-                      type="button"
-                      onClick={() => setPicked((prev) => [...prev, user])}
-                      className="flex w-full items-center gap-2 border-b border-rcd-border px-2.5 py-1.5 text-left last:border-b-0 hover:bg-black/5 dark:hover:bg-white/10"
-                    >
-                      <UserRound size={14} aria-hidden className="shrink-0 text-rcd-muted" />
-                      <span className="min-w-0 flex-1 truncate text-sm text-rcd-text">
-                        {user.displayName}
-                      </span>
-                      {user.email && (
-                        <span className="shrink-0 truncate text-xs text-rcd-muted">{user.email}</span>
-                      )}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {matching.length > CANDIDATE_CAP && (
-                <p className="text-xs text-rcd-muted">
-                  Showing {CANDIDATE_CAP} of {matching.length} — keep typing to narrow.
+          <div className="flex flex-col gap-2">
+            <UserPicker
+              open={open}
+              label="Add people"
+              searchAriaLabel="Search people to share with"
+              emptyDirectoryNote={
+                <p className="rounded-lg border border-rcd-border bg-rcd-bg px-3 py-2 text-xs text-rcd-muted">
+                  User directory not configured — people search is unavailable. Existing access
+                  can still be removed below.
                 </p>
-              )}
-              {searchError && (
-                <p className="text-xs text-[var(--rcd-status-critical)]" role="alert">
-                  {searchError}
-                </p>
-              )}
-              {candidates.length === 0 && query.trim() !== '' && !searchError && (
-                <p className="text-xs text-rcd-muted">
-                  No people match — search by username or email address.
-                </p>
-              )}
+              }
+              takenKeys={takenIds}
+              keyOf={userIdKey}
+              onPick={(user) => setPicked((prev) => [...prev, user])}
+              chips={picked.map((user) => ({ key: user.id, label: user.displayName }))}
+              onRemoveChip={(chip) => setPicked((prev) => prev.filter((u) => u.id !== chip.key))}
+            />
 
-              {/* Bulk template applied to every picked chip on Add. */}
-              {picked.length > 0 && (
-                <div className="flex flex-wrap items-center gap-2.5 rounded-lg border border-rcd-border bg-rcd-bg px-2.5 py-2">
-                  <RcdSelect
-                    aria-label="Access for the selected people"
-                    value={template.mode}
-                    onChange={(event) =>
-                      setTemplate((prev) => ({ ...prev, mode: event.target.value as 'view' | 'edit' }))
+            {/* Bulk template applied to every picked chip on Add. */}
+            {picked.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2.5 rounded-lg border border-rcd-border bg-rcd-bg px-2.5 py-2">
+                <RcdSelect
+                  aria-label="Access for the selected people"
+                  value={template.mode}
+                  onChange={(event) =>
+                    setTemplate((prev) => ({ ...prev, mode: event.target.value as 'view' | 'edit' }))
+                  }
+                >
+                  <option value="view">Can view</option>
+                  <option value="edit">Can edit</option>
+                </RcdSelect>
+                {template.mode === 'edit' && (
+                  <PermissionChecks
+                    idPrefix="rcd-share-template"
+                    value={template.flags}
+                    onChange={(patch) =>
+                      setTemplate((prev) => ({ ...prev, flags: { ...prev.flags, ...patch } }))
                     }
-                  >
-                    <option value="view">Can view</option>
-                    <option value="edit">Can edit</option>
-                  </RcdSelect>
-                  {template.mode === 'edit' && (
-                    <PermissionChecks
-                      idPrefix="rcd-share-template"
-                      value={template.flags}
-                      onChange={(patch) =>
-                        setTemplate((prev) => ({ ...prev, flags: { ...prev.flags, ...patch } }))
-                      }
-                    />
-                  )}
-                  <RcdButton size="sm" variant="primary" className="ml-auto" onClick={addPicked}>
-                    Add {picked.length === 1 ? '1 person' : `${picked.length} people`}
-                  </RcdButton>
-                </div>
-              )}
-            </div>
-          )}
+                  />
+                )}
+                <RcdButton size="sm" variant="primary" className="ml-auto" onClick={addPicked}>
+                  Add {picked.length === 1 ? '1 person' : `${picked.length} people`}
+                </RcdButton>
+              </div>
+            )}
+          </div>
 
           {/* ------------------------------------------------ current grants */}
           <div className="flex flex-col gap-1">

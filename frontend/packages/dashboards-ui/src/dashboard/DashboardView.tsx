@@ -82,7 +82,7 @@ import { FitPageViewport } from './FitPageViewport';
 import { LiveMenu } from './LiveMenu';
 import { ButtonTile } from './ButtonTile';
 import { ButtonTileDialog } from './ButtonTileDialog';
-import { ButtonGroupTile } from './ButtonGroupTile';
+import { ButtonGroupTile, buttonGroupFramed } from './ButtonGroupTile';
 import { ButtonGroupTileDialog } from './ButtonGroupTileDialog';
 import { ImageTile } from './ImageTile';
 import { ImageTileDialog } from './ImageTileDialog';
@@ -969,6 +969,13 @@ export function DashboardView({
         .find((t) => t.id === tileId);
       const chart = effective?.chart ?? (tile && isChartTile(tile) ? tile.chart : null);
       if (!chart || !isRunnable(chart)) return;
+      // 'underlying' compiles through PrepareUnderlying, which anchors its
+      // table on the FIRST measure — a measure-less passthrough table has
+      // none, so say so instead of shipping a guaranteed 400.
+      if (mode === 'underlying' && chart.query.measures.length === 0) {
+        setNotice('Underlying rows need at least one measure — this table has none.');
+        return;
+      }
       const clauses = effective?.filters ?? runtime.dashboards.filtersForTile(tileId);
       // Table measure-column filters (HAVING) ride the exported spec too, so
       // the CSV matches exactly what the filtered table shows.
@@ -1170,8 +1177,24 @@ export function DashboardView({
 
   const gridItems = useMemo<DashboardGridItem[]>(
     // `kind` rides along for the grid's per-kind minimum-size floors
-    // (button/buttonGroup tiles must never clip a default button — B4).
-    () => tiles.map((tile) => ({ id: tile.id, kind: tile.kind, ...tile.layout })),
+    // (button/buttonGroup tiles must never clip a default button — B4), and
+    // a button group additionally reports WHAT IT HOLDS so the floor can be
+    // content-aware instead of a fixed 4x2 (0.14.1/A3).
+    () =>
+      tiles.map((tile) => ({
+        id: tile.id,
+        kind: tile.kind,
+        ...tile.layout,
+        ...(isButtonGroupTile(tile)
+          ? {
+              content: {
+                buttonCount: tile.buttonGroup.buttons.length,
+                direction: tile.buttonGroup.direction,
+                framed: buttonGroupFramed(tile.buttonGroup),
+              },
+            }
+          : null),
+      })),
     [tiles],
   );
 
@@ -2464,7 +2487,10 @@ export function DashboardView({
                 runtime.dashboards.startDrillthrough(target.pageId, target.filters, target.label)
               }
               seeRecords={
-                modelId !== null
+                // PrepareUnderlying anchors on the first measure and still
+                // throws without one, so a measure-less passthrough table
+                // hides the item rather than offering a certain error.
+                modelId !== null && pointMenu.chart.query.measures.length > 0
                   ? { label: pointMenu.event.axisLabel, onClick: openSeeRecords }
                   : null
               }
@@ -2556,6 +2582,11 @@ export function DashboardView({
         wide
         draggable
         resizable
+        // ONE geometry for both titles, remembered across sessions: "Add
+        // chart" and "Edit chart" are the same panel, and a builder sized to
+        // the author's screen should stay that way after a reload (the same
+        // reasoning as the builder's single stored pane-size key).
+        geometryKey="chartBuilder"
         // Definite panel height so the builder's flex layout tracks resizes
         // (preview grows with the dialog instead of leaving dead space).
         fillHeight
@@ -2647,6 +2678,11 @@ export function DashboardView({
         // the publish toggle; a non-admin owner's flip is refused server-side.
         canPublish={canManageShares}
         isShared={current.isShared}
+        // The owner already has full access and the server REFUSES an owner
+        // grant (failing the entire save), so the picker must not offer them —
+        // the admin-editing-someone-else's-shares case. Undefined against a
+        // pre-0.14.1 server, which simply keeps the old behavior.
+        {...(current.ownerUserId !== null ? { ownerUserId: current.ownerUserId } : null)}
       />
 
       <ActivityPanel

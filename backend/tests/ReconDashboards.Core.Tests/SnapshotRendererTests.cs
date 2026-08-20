@@ -25,16 +25,16 @@ public class SnapshotRendererTests
         new("dim0", label, ResultColumnRole.Dimension, NormalizedType.Text,
             "public.customers.region", null, null);
 
-    private static ResultColumnPlan Measure(string label = "Total") =>
+    private static ResultColumnPlan Measure(string label = "Total", string? formatString = null) =>
         new("meas0", label, ResultColumnRole.Measure, NormalizedType.Decimal,
-            "public.orders.order_total", null, null);
+            "public.orders.order_total", null, null, formatString);
 
     private static RenderedTile Tile(
         string title, IReadOnlyList<ResultColumnPlan> columns, IReadOnlyList<object?[]> rows,
-        string? error = null, string chartType = "table") =>
+        string? error = null, string chartType = "table", ChartFormatDoc? format = null) =>
         new(
             new SnapshotTile(
-                "t1", title, chartType, new ChartQuerySpec(1, [], [], [], [], null, null)),
+                "t1", title, chartType, new ChartQuerySpec(1, [], [], [], [], null, null), format),
             columns, rows, error);
 
     private static string Render(params RenderedPage[] pages) =>
@@ -117,8 +117,146 @@ public class SnapshotRendererTests
 
         var html = Render(new RenderedPage("Main", [oneRow]));
         Assert.Contains("font-size:26px", html, StringComparison.Ordinal); // the big number
-        Assert.Contains("1234", html, StringComparison.Ordinal);
+        // KPI values read like the tile does: the chart's measure formatting,
+        // not the raw invariant cell text.
+        Assert.Contains("1,234", html, StringComparison.Ordinal);
         Assert.DoesNotContain("<table", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void KpiValuesReadLikeTheTileDoesFormatAndRenamesIncluded()
+    {
+        var format = new ChartFormatDoc(
+            ValueFormat: "#,0",
+            SeriesLabels: new Dictionary<string, string> { ["Systems"] = "Systems tracked" });
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Systems", [Measure("Systems", "0.0000")], [[1234.5m]], format: format)]));
+
+        Assert.Contains("1,235", html, StringComparison.Ordinal); // valueFormat beats the measure pattern
+        Assert.DoesNotContain("1234.5000", html, StringComparison.Ordinal);
+        Assert.Contains("Systems tracked", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASecondKpiMeasureIsDemotedToASmallDeltaRow()
+    {
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Revenue", [Measure("Revenue"), Measure("Change")], [[1000m, 25m]])]));
+
+        // The first measure keeps the big number; the second reads as a note
+        // under it rather than a second headline.
+        Assert.Contains("<div style=\"font-size:26px;font-weight:700;color:#111827;\">1,000</div>", html, StringComparison.Ordinal);
+        Assert.Contains("font-size:13px", html, StringComparison.Ordinal);
+        Assert.Equal(1, html.Split("font-size:26px").Length - 1);
+        Assert.Contains(">25<", html, StringComparison.Ordinal);
+        Assert.Contains(">Change<", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ANonNumericKpiKeepsPlainCellText()
+    {
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Last Updated", [Measure("Last Updated")], [[new DateTime(2026, 8, 18)]],
+            format: new ChartFormatDoc(ValueFormat: "#,0"))]));
+        Assert.Contains("2026-08-18", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void KpiValueStyleOverridesTheHeadlineType()
+    {
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Revenue", [Measure("Revenue")], [[10m]],
+            format: new ChartFormatDoc(KpiValueStyle: new ChartTextStyleDoc(FontSize: 32, Color: "#7b2cbf")))]));
+
+        Assert.Contains("font-size:32px;color:#7b2cbf;", html, StringComparison.Ordinal);
+    }
+
+    // ------------------------------------------------------- tile title + card
+
+    [Fact]
+    public void AFramelessTilesRichInnerTitleReplacesThePlainHeading()
+    {
+        // Every tile on a seeded dashboard hides its header and puts the visible
+        // name (plus an explanatory subtitle) in container.innerTitleHtml; the
+        // email used to print the bare chart.title and drop all of it.
+        var container = new ContainerStyleDoc(
+            HideHeader: true,
+            InnerTitleHtml: "<p><b>Systems by Business Area</b> <span style=\"color:#64748b\">&mdash; top 15</span></p>");
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Systems by Business Area", [Dimension(), Measure()], [["West", 10]],
+            format: new ChartFormatDoc(Container: container))]));
+
+        Assert.Contains("<b>Systems by Business Area</b>", html, StringComparison.Ordinal);
+        Assert.Contains("&mdash; top 15", html, StringComparison.Ordinal);
+        Assert.Contains("style=\"color:#64748b\"", html, StringComparison.Ordinal);
+        // The wrapping paragraph is unwrapped so the heading keeps its spacing.
+        Assert.DoesNotContain("<p>", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AFramedTileKeepsItsTitleAndGainsTheInnerTitleAsASubtitle()
+    {
+        var html = Render(new RenderedPage("Main", [Tile(
+            "Sales", [Dimension(), Measure()], [["West", 10]],
+            format: new ChartFormatDoc(Container: new ContainerStyleDoc(
+                InnerTitleHtml: "<p>rolling 12 months</p>")))]));
+
+        Assert.Contains(">Sales</div>", html, StringComparison.Ordinal);
+        Assert.Contains("rolling 12 months", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AnInnerTitleIsSanitizedBeforeItReachesTheInbox()
+    {
+        var container = new ContainerStyleDoc(
+            HideHeader: true,
+            InnerTitleHtml:
+                "<p onclick=\"steal()\"><b>Safe</b><script>alert(1)</script>"
+                + "<a href=\"http://evil.example\">click</a><img src=x onerror=y>"
+                + "<span style=\"background:url(javascript:1);color:#ff0000\">tinted</span></p>");
+        var html = Render(new RenderedPage("Main", [Tile(
+            "T", [Dimension(), Measure()], [["West", 10]],
+            format: new ChartFormatDoc(Container: container))]));
+
+        Assert.Contains("<b>Safe</b>", html, StringComparison.Ordinal);
+        Assert.Contains("color:#ff0000", html, StringComparison.Ordinal);
+        Assert.Contains("tinted", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("<script", html, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("alert(1)", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("onclick", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("onerror", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("<img", html, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("background:url", html, StringComparison.Ordinal);
+        // Anchors are unwrapped to their text: an author-controlled link in
+        // someone else's inbox is a phishing surface a caption does not need.
+        Assert.DoesNotContain("<a ", html, StringComparison.Ordinal);
+        Assert.DoesNotContain("http://", html, StringComparison.Ordinal);
+        Assert.Contains("click", html, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ContainerStylingReachesTheTileCardAndOnlyAcceptsHexColors()
+    {
+        var styled = Render(new RenderedPage("Main", [Tile(
+            "Systems", [Measure()], [[10m]],
+            format: new ChartFormatDoc(Container: new ContainerStyleDoc(
+                BorderColor: "#2a78d6", BorderWidth: 1, BorderRadius: 12, Shadow: "sm")))]));
+        Assert.Contains("border:1px solid #2a78d6;border-radius:12px;", styled, StringComparison.Ordinal);
+        Assert.Contains("box-shadow:0 1px 2px", styled, StringComparison.Ordinal);
+
+        // A tile with no container keeps the standard card, byte for byte.
+        var plain = Render(new RenderedPage("Main", [Tile("Systems", [Measure()], [[10m]])]));
+        Assert.Contains(
+            "margin:16px 0;padding:12px 16px;border:1px solid #e5e7eb;border-radius:8px;",
+            plain, StringComparison.Ordinal);
+
+        // An injected "color" never becomes CSS.
+        var hostile = Render(new RenderedPage("Main", [Tile(
+            "Systems", [Measure()], [[10m]],
+            format: new ChartFormatDoc(Container: new ContainerStyleDoc(
+                Background: "red;position:fixed", BorderColor: "url(x)")))]));
+        Assert.DoesNotContain("position:fixed", hostile, StringComparison.Ordinal);
+        Assert.DoesNotContain("url(x)", hostile, StringComparison.Ordinal);
     }
 
     [Fact]

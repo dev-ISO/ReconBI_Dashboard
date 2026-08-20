@@ -877,6 +877,9 @@ export function DashboardChartTile({
   // total row, not re-total the visible groups.
   const totalsSpec = useMemo(() => {
     if (!isTable || tableOptions?.totals !== true || modelId === null) return null;
+    // Correct for a measure-less passthrough table: there is nothing to total,
+    // and a no-dimension/no-measure spec has an empty SELECT list (which the
+    // compiler rejects). TableChart's totalsActive guard agrees.
     if (drilledChart.query.measures.length === 0) return null;
     return toWireSpec(
       {
@@ -946,7 +949,10 @@ export function DashboardChartTile({
   // filter state and only while pageSize is active.
   const countSpec = useMemo(() => {
     if (!isTable || pageSize === null || modelId === null) return null;
-    if (drilledChart.query.measures.length === 0) return null;
+    // NOTE: unlike the totals companion above, this one does NOT require a
+    // measure. A measure-less passthrough table is a pure dimension query and
+    // counts its groups perfectly well — guarding it here is what used to
+    // black out "Page X of Y" / "N rows".
     // The authored Top-N caps the companion too (finding 6): the pageable
     // universe is the first authoredLimit groups, so the pager must count
     // exactly those — not the unlimited group count.

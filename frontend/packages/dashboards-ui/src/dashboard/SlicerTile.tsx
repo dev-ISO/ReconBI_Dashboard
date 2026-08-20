@@ -23,6 +23,12 @@ import {
   type SlicerTileStyle,
 } from '@recon/dashboards-core';
 import { useDashboardState, useRuntime } from '../provider/DashboardsProvider';
+import {
+  BUTTON_GAP_CLASSES,
+  BUTTON_VALIGN_CLASSES,
+  slicerButtonLayout,
+  slicerPillClasses,
+} from './buttonLayout';
 import { useColumnType } from './columnType';
 import { RcdButton, RcdIconButton, RcdInput, RcdSelect, RcdSpinner } from '../primitives';
 import { SlicerCalendarFields } from './SlicerCalendar';
@@ -723,89 +729,17 @@ interface ButtonsFetchState {
   error: string | null;
 }
 
-/* ------------------------------------------------------- buttons geometry */
+/* ------------------------------------------------------- buttons geometry
+ * The size/gap/justify class sets and the two layout helpers moved VERBATIM to
+ * dashboard/buttonLayout.ts in 0.14.1 so button TILES render through the same
+ * vocabulary (A6). Nothing here changed shape: the local aliases keep every
+ * call site below byte-identical, and the two helpers are re-exported because
+ * callers (and slicerPills.test.ts) import them from this module.
+ */
 
 type ButtonSize = NonNullable<SlicerTileStyle['buttonSize']>;
 
-/** Literal class sets (host Tailwind builds scan for whole class names). */
-const BUTTON_SIZE_CLASSES: Record<ButtonSize, string> = {
-  sm: 'h-6 px-2 text-xs',
-  md: 'h-8 px-3 text-sm',
-  lg: 'h-10 px-4 text-[15px]',
-};
-
-const BUTTON_GAP_CLASSES: Record<ButtonSize, string> = {
-  sm: 'gap-1',
-  md: 'gap-1.5',
-  lg: 'gap-2',
-};
-
-/** Horizontal placement of the group / of items inside grid cells. */
-const BUTTON_JUSTIFY_CLASSES = {
-  left: 'justify-start',
-  center: 'justify-center',
-  right: 'justify-end',
-} as const;
-
-const BUTTON_JUSTIFY_ITEMS_CLASSES = {
-  left: 'justify-items-start',
-  center: 'justify-items-center',
-  right: 'justify-items-end',
-} as const;
-
-/** Vertical placement of the whole group inside the tile body. */
-const BUTTON_VALIGN_CLASSES = {
-  top: 'justify-start',
-  middle: 'justify-center',
-  bottom: 'justify-end',
-} as const;
-
-/**
- * Shared pill geometry for EVERY slicer button surface (ButtonsSlicer and
- * FieldParamSlicer): one size scale, centered content, truncation-safe.
- * State colors (active/idle/unavailable) stay with each variant.
- */
-export const slicerPillClasses = (size: ButtonSize): string =>
-  `inline-flex items-center justify-center overflow-hidden rounded-md border transition-colors ${BUTTON_SIZE_CLASSES[size]}`;
-
-/**
- * Container classes (+ inline grid template) for a buttons group.
- *
- * Fill mode is a CSS GRID of uniform auto-fill tracks — flex with
- * `flex-1 basis-24` distributed the leftover space PER LINE, so a 2-pill
- * last row grew to half the tile while the 5-pill rows above stayed narrow
- * (the ragged-widths bug); minmax(6rem, 1fr) keeps every pill the same width
- * on every row while wrapping stays intact. Explicit `columns` keeps its
- * fixed-track grid exactly as before; items-center rides every branch.
- */
-export const slicerButtonLayout = (
-  size: ButtonSize,
-  align: keyof typeof BUTTON_JUSTIFY_CLASSES,
-  fill: boolean,
-  columns: number | null,
-): { group: string; item: string; gridTemplateColumns?: string } => {
-  const gap = BUTTON_GAP_CLASSES[size];
-  if (columns !== null) {
-    return {
-      group: `grid ${gap} content-start items-center ${
-        fill ? 'justify-items-stretch' : BUTTON_JUSTIFY_ITEMS_CLASSES[align]
-      }`,
-      item: fill ? 'w-full min-w-0' : 'max-w-full',
-      gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))`,
-    };
-  }
-  if (fill) {
-    return {
-      group: `grid ${gap} content-start items-center justify-items-stretch`,
-      item: 'w-full min-w-0',
-      gridTemplateColumns: 'repeat(auto-fill, minmax(6rem, 1fr))',
-    };
-  }
-  return {
-    group: `flex flex-wrap content-start items-center ${gap} ${BUTTON_JUSTIFY_CLASSES[align]}`,
-    item: 'max-w-full',
-  };
-};
+export { slicerPillClasses, slicerButtonLayout };
 
 /**
  * Value pills honoring the buttons-variant style block: size, fill (stretch to

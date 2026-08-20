@@ -15,6 +15,7 @@ import { useRuntime } from '../provider/DashboardsProvider';
 import { ConfirmDialog, RcdInput } from '../primitives';
 import { RichTextEditingSurface } from '../richtext/RichTextEditingSurface';
 import { RICH_TEXT_CLASSES } from '../richtext/richTextClasses';
+import { contrastingTextColor } from './buttonLayout';
 import { TileBackgroundSwatches } from './TileBackgroundSwatches';
 import { TileFrame } from './TileFrame';
 
@@ -41,10 +42,29 @@ const SCROLL_CLASSES =
   'hover:[&::-webkit-scrollbar-thumb]:bg-black/35 ' +
   'dark:[&::-webkit-scrollbar-thumb]:bg-white/25 dark:hover:[&::-webkit-scrollbar-thumb]:bg-white/40';
 
-const specStyle = (spec: TextTileSpec): CSSProperties => ({
-  ...(spec.background ? { backgroundColor: spec.background } : null),
-  ...(spec.align ? { textAlign: spec.align } : null),
-});
+/**
+ * The ONE place a text tile's background/alignment reach the DOM — view mode,
+ * the editor, the print view and mobile all route through here.
+ *
+ * DARK-MODE WASH-OUT: this used to write backgroundColor and nothing else, so
+ * the body kept `text-rcd-text` (RICH_TEXT_CLASSES) — a token that FLIPS with
+ * the viewer's theme while the persisted background does not. A pale tile in
+ * dark mode rendered near-white text on near-white paper (and #1a1a19 in light
+ * mode rendered near-black on near-black). Deriving the foreground from the
+ * background fixes every existing tile with ZERO schema change.
+ *
+ * Precedence mirrors ButtonVisual: derived color first, so anything more
+ * specific still wins — per-span `color` inside the sanitized html is on a
+ * DESCENDANT and beats this inherited value, exactly as an author expects.
+ */
+const specStyle = (spec: TextTileSpec): CSSProperties => {
+  const derivedTextColor = spec.background ? contrastingTextColor(spec.background) : null;
+  return {
+    ...(spec.background ? { backgroundColor: spec.background } : null),
+    ...(derivedTextColor ? { color: derivedTextColor } : null),
+    ...(spec.align ? { textAlign: spec.align } : null),
+  };
+};
 
 /**
  * Presentational rich-text body (view mode + reusable by the print view).

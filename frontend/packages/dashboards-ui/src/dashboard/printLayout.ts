@@ -2,6 +2,8 @@
 // preview) and PrintConfigDialog (live thumbnail) — one function, no drift.
 import {
   displayDateBound,
+  isButtonGroupTile,
+  isButtonTile,
   isChartTile,
   isImageTile,
   isSlicerTile,
@@ -14,7 +16,7 @@ import {
 } from '@recon/dashboards-core';
 import type { PrintMargin, PrintOptions, PrintOrientation, PrintPaper } from './PrintConfigDialog';
 
-/** A printable tile: chart, text, or image (slicers and buttons never print). */
+/** A printable tile: chart, text, image or button (slicers never print). */
 export type ChartTileEntry = DashboardTile;
 
 /* ---------------------------------------------------------------- paper math
@@ -271,12 +273,20 @@ export function computePrintLayout(
   const userScale = options.scale === 'fit' ? 1 : options.scale / 100;
   const layoutWidth = geometry.contentWidthPx / userScale;
   const headerHeight = headerHeightPx(options, hasFilterSummary);
-  // Printable tiles ONLY: slicers and navigation BUTTONS are interactive
-  // chrome — a slicer's picker and a button's page-switch mean nothing on
-  // paper — so both are excluded outright (not rendered, no space reserved;
-  // the bands below simply never see them).
+  // Printable tiles ONLY: a SLICER is pure interaction — its picker means
+  // nothing on paper and its selection is already summarized in the header —
+  // so it is excluded outright (not rendered, no space reserved; the bands
+  // below simply never see it). Buttons WERE excluded on the same reasoning
+  // until 0.14.1, but a button tile is also a visible design element (a
+  // toolbar bar, a labelled call-out) and leaving a hole where the author put
+  // one is worse than printing it inert (A7).
   const chartTiles = tiles.filter(
-    (tile) => isChartTile(tile) || isTextTile(tile) || isImageTile(tile),
+    (tile) =>
+      isChartTile(tile) ||
+      isTextTile(tile) ||
+      isImageTile(tile) ||
+      isButtonTile(tile) ||
+      isButtonGroupTile(tile),
   );
 
   let raw: RawBlock[];

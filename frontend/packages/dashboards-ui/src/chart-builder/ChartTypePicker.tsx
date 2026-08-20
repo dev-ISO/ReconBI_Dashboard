@@ -1,102 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import {
-  AreaChart,
-  BarChart3,
-  BarChartHorizontal,
-  ChartBarStacked,
-  ChartColumnStacked,
-  ChartGantt,
-  CircleDot,
-  Hash,
-  LineChart,
-  PieChart,
-  ScatterChart,
-  Table2,
-  type LucideIcon,
-} from 'lucide-react';
 import type { ChartType } from '@recon/dashboards-core';
+import { CHART_TYPE_OPTIONS as OPTIONS } from './chartTypeMeta';
 import { wellsFor } from './wellConfig';
 
 export interface ChartTypePickerProps {
   value: ChartType;
   onChange: (type: ChartType) => void;
 }
-
-const OPTIONS: { type: ChartType; label: string; icon: LucideIcon; description: string }[] = [
-  {
-    type: 'column',
-    label: 'Column',
-    icon: BarChart3,
-    description: 'Compare values across categories with vertical bars.',
-  },
-  {
-    type: 'stackedColumn',
-    label: 'Stacked column',
-    icon: ChartColumnStacked,
-    description: 'Show how parts add up to a total within each category.',
-  },
-  {
-    type: 'bar',
-    label: 'Bar',
-    icon: BarChartHorizontal,
-    description: 'Horizontal bars — best when category names are long.',
-  },
-  {
-    type: 'stackedBar',
-    label: 'Stacked bar',
-    icon: ChartBarStacked,
-    description: 'Horizontal stacked bars: parts of a total per category.',
-  },
-  {
-    type: 'line',
-    label: 'Line',
-    icon: LineChart,
-    description: 'Show a trend over time or ordered categories.',
-  },
-  {
-    type: 'area',
-    label: 'Area',
-    icon: AreaChart,
-    description: 'A line with the area filled — emphasizes magnitude.',
-  },
-  {
-    type: 'pie',
-    label: 'Pie',
-    icon: PieChart,
-    description: "Each category's share of the whole, as slices.",
-  },
-  {
-    type: 'donut',
-    label: 'Donut',
-    icon: CircleDot,
-    description: 'A pie with a center hole showing the total.',
-  },
-  {
-    type: 'scatter',
-    label: 'Scatter',
-    icon: ScatterChart,
-    description: 'Plot two measures against each other to spot patterns.',
-  },
-  {
-    type: 'gantt',
-    label: 'Gantt',
-    icon: ChartGantt,
-    description: 'Timeline bars from a start date to an end date — one row per task.',
-  },
-  {
-    type: 'kpi',
-    label: 'KPI',
-    icon: Hash,
-    description: 'One big number, with an optional comparison below it.',
-  },
-  {
-    type: 'table',
-    label: 'Table',
-    icon: Table2,
-    description: 'Rows and columns of values, sortable and pageable.',
-  },
-];
 
 /** "Slots: X axis · Y axis — values · Legend" — derived so it stays in sync. */
 const wellsHintFor = (type: ChartType): string =>
