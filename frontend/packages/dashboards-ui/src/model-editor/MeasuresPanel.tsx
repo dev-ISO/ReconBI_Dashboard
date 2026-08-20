@@ -5,6 +5,7 @@ import { useModelState, useRuntime } from '../provider/DashboardsProvider';
 import { useCanManageShared } from '../provider/useRcdMeta';
 import { scopeRights } from '../chart-builder/measureScopes';
 import { ConfirmDialog, RcdButton, RcdIconButton, RcdInput } from '../primitives';
+import { buildFolderTree, flattenFolderTree, joinFolderPath } from '../util/folderTree';
 import { MeasureDialog, aggregationLabel, type MeasureDraft } from './MeasureDialog';
 
 export type { MeasureDraft } from './MeasureDialog';
@@ -51,27 +52,40 @@ export function MeasuresPanel() {
     return [...set].sort((a, b) => a.localeCompare(b));
   }, [measures]);
 
-  /** Folder groups (alphabetical, ungrouped last) over the search hits. */
+  /**
+   * THE SAME TREE THE CHART BUILDER DRAWS. This panel used to treat the whole
+   * "Stage Tracker\Stage 1\Received" string as one flat header while the
+   * builder's field list split it into a nested tree — the same measures,
+   * grouped two different ways, in one product. Both now call
+   * buildFolderTree: same separator, same alphabetical order, same
+   * ungrouped-last rule.
+   *
+   * The DRAWING still differs, and only in the way this rail forces: it is a
+   * w-72 column, so the hierarchy is expressed by INDENT over a flat sequence
+   * rather than by nested boxes. flattenFolderTree yields exactly the order
+   * the nested renderer draws, so the two surfaces agree on what is grouped
+   * with what and on what comes first — which is what "same mental model"
+   * actually means to someone reading both.
+   */
   const groups = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    const matches = needle === ''
-      ? measures
-      : measures.filter((m) => m.name.toLowerCase().includes(needle));
-    const byFolder = new Map<string, Measure[]>();
-    for (const measure of matches) {
-      const folder = folderOf(measure);
-      const bucket = byFolder.get(folder);
-      if (bucket) bucket.push(measure);
-      else byFolder.set(folder, [measure]);
-    }
-    return [...byFolder.entries()]
-      .sort(([a], [b]) => {
-        if (a === b) return 0;
-        if (a === '') return 1; // ungrouped last
-        if (b === '') return -1;
-        return a.localeCompare(b);
-      })
-      .map(([folder, items]) => ({ folder, items }));
+    const matches =
+      needle === '' ? measures : measures.filter((m) => m.name.toLowerCase().includes(needle));
+    const tree = buildFolderTree(matches, folderOf, joinFolderPath);
+    const folders = flattenFolderTree(tree.folders)
+      .filter((node) => node.items.length > 0)
+      .map((node) => ({
+        key: node.key,
+        label: node.name,
+        /** Full path, for the tooltip — the indent shows depth, not lineage. */
+        path: joinFolderPath(node.path),
+        depth: node.path.length - 1,
+        items: node.items,
+      }));
+    // Ungrouped last, exactly where the field list has always put it.
+    return tree.root.length > 0
+      ? [...folders, { key: '__ungrouped', label: 'Ungrouped', path: '', depth: 0, items: tree.root }]
+      : folders;
   }, [measures, search]);
 
   if (!definition) return null;
@@ -200,11 +214,18 @@ export function MeasuresPanel() {
           ) : (
             <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto px-3 pb-3">
               {groups.map((group) => (
-                <div key={group.folder || '__ungrouped'} className="flex flex-col gap-1">
+                <div
+                  key={group.key}
+                  className="flex flex-col gap-1"
+                  style={group.depth > 0 ? { paddingLeft: `${group.depth * 10}px` } : undefined}
+                >
                   {/* A single implicit group needs no header. */}
-                  {(group.folder !== '' || groups.length > 1) && (
-                    <span className="px-0.5 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted">
-                      {group.folder === '' ? 'Ungrouped' : group.folder}
+                  {(group.key !== '__ungrouped' || groups.length > 1) && (
+                    <span
+                      className="px-0.5 text-[11px] font-semibold uppercase tracking-wide text-rcd-muted"
+                      title={group.path === '' ? undefined : group.path}
+                    >
+                      {group.label}
                     </span>
                   )}
                   <ul className="flex flex-col gap-1">{group.items.map(renderRow)}</ul>

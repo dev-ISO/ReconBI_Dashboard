@@ -565,6 +565,34 @@ describe('personal measure promotion', () => {
     expect(store.store.getState().personalMeasures).toEqual([personal]);
   });
 
+  /**
+   * A personal measure names one MODEL's tables, so the persister has to know
+   * which model it belongs to. Without this the settings document held one
+   * undifferentiated pile that followed the user onto models where those
+   * tables do not exist.
+   */
+  it('persists a personal measure under the OPEN DASHBOARD’S MODEL', async () => {
+    const persist = vi.fn();
+    const stub = apiStub(detailFor(1, { modelId: 7 }));
+    const store = new DashboardStore(stub.api, { onPersistPersonalMeasures: persist });
+    await store.open(1);
+
+    store.setPersonalMeasures([personal]);
+
+    expect(persist).toHaveBeenCalledWith([personal], 7);
+  });
+
+  it('files them under the "no model" bucket when the dashboard has not picked one', async () => {
+    const persist = vi.fn();
+    const stub = apiStub(detailFor(1, { modelId: null }));
+    const store = new DashboardStore(stub.api, { onPersistPersonalMeasures: persist });
+    await store.open(1);
+
+    store.setPersonalMeasures([personal]);
+
+    expect(persist).toHaveBeenCalledWith([personal], null);
+  });
+
   it('promoteMeasureToModel appends the measure — and its dependencies — to the model', async () => {
     const leaf: Measure = {
       id: 'd1',

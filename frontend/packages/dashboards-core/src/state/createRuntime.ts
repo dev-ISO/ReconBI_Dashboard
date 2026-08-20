@@ -1,8 +1,14 @@
 import { DashboardsApi } from '../api/DashboardsApi';
 import type { RcdFetcher } from '../api/fetcher';
-import type { Measure } from '../types/model';
 import { DashboardStore, type DashboardCollabSenders } from './dashboardStore';
 import { ModelStore } from './modelStore';
+import {
+  PERSONAL_MEASURES_SECTION,
+  migrateFlatPersonalMeasures,
+  personalMeasuresModelKey,
+  readPersonalMeasures,
+  writePersonalMeasures,
+} from './personalMeasures';
 import { QueryCache, type QueryCacheOptions } from './queryCache';
 import { UserSettingsStore, type UserSettingsStoreOptions } from './userSettingsStore';
 
@@ -74,20 +80,58 @@ export const createDashboardsRuntime = (
   const dashboards = new DashboardStore(api, {
     onSendCursor: options?.onSendCursor,
     onSendSlicerValue: options?.onSendSlicerValue,
-    // PERSONAL-scope measures live in the per-user settings document; the
-    // dashboard store holds the working copy the builder reads. Writes go
-    // through the settings store's debounce, so a burst of edits is one PUT.
-    onPersistPersonalMeasures: (measures) => userSettings.setSection('measures', measures),
+    // PERSONAL-scope measures live in the per-user settings document, keyed by
+    // MODEL (a measure names one model's tables). The dashboard store holds the
+    // working copy for the open dashboard's model; writes go through the
+    // settings store's debounce, so a burst of edits is one PUT, and only the
+    // active model's bucket is replaced.
+    onPersistPersonalMeasures: (measures, modelId) =>
+      userSettings.update((doc) => ({
+        ...doc,
+        [PERSONAL_MEASURES_SECTION]: writePersonalMeasures(
+          doc[PERSONAL_MEASURES_SECTION],
+          modelId,
+          measures,
+        ),
+      })),
   });
 
-  // Seed the working copy once, in the background. Deliberately fire-and-forget
-  // and deliberately NOT awaited by the runtime: a settings outage must not
-  // stop dashboards from opening — personal measures simply stay empty, and the
+  /**
+   * Keeps the working copy pointed at the OPEN DASHBOARD'S MODEL. Re-seeds
+   * whenever that model changes, and does nothing while no dashboard is open —
+   * closing one leaves the last set in place, matching the store's own rule
+   * that personal measures belong to the user, not to the dashboard.
+   */
+  let seededKey: string | null = null;
+  const syncPersonalMeasures = (): void => {
+    const current = dashboards.store.getState().current;
+    if (!current) return;
+    const key = personalMeasuresModelKey(current.modelId);
+    if (key === seededKey) return;
+    seededKey = key;
+
+    const raw = userSettings.section<unknown>(PERSONAL_MEASURES_SECTION, null);
+    // One-time migration of the pre-keying flat array (see personalMeasures.ts:
+    // it is attributed to the first model it is seen against).
+    const migrated = migrateFlatPersonalMeasures(raw, current.modelId);
+    if (migrated !== null) userSettings.setSection(PERSONAL_MEASURES_SECTION, migrated);
+    dashboards.hydratePersonalMeasures(readPersonalMeasures(migrated ?? raw, current.modelId));
+  };
+  dashboards.store.subscribe(syncPersonalMeasures);
+
+  // Load the document in the background. Deliberately fire-and-forget and
+  // deliberately NOT awaited by the runtime: a settings outage must not stop
+  // dashboards from opening — personal measures simply stay empty, and the
   // store's own error state carries the reason. hydrate() is idempotent, so a
   // later read by the field list joins this same request rather than racing it.
   void userSettings
     .hydrate()
-    .then(() => dashboards.hydratePersonalMeasures(userSettings.section<Measure[]>('measures', [])))
+    .then(() => {
+      // A dashboard opened while this was in flight has already run the sync
+      // against an empty document; re-run it against the real one.
+      seededKey = null;
+      syncPersonalMeasures();
+    })
     .catch(() => {
       /* surfaced by userSettings.state.error; nothing to do here. */
     });

@@ -162,11 +162,54 @@ describe('FieldList measure management', () => {
 
   it('badges the narrower scopes and leaves System (the norm) unmarked', () => {
     render(ALL_WRITABLE, handlers());
-    const text = host.textContent ?? '';
-    expect(text).toContain('Dashboard');
-    expect(text).toContain('Personal');
-    // "System" would badge nearly every row in a real model, so it is implicit.
-    expect(text).not.toContain('System');
+    const badges = [...host.querySelectorAll('span[title]')]
+      .map((span) => span.getAttribute('title') ?? '')
+      .filter((title) => title.startsWith('Belongs to this dashboard') || title.startsWith('Your own measure'));
+    expect(badges).toHaveLength(2);
+    // "System" would badge nearly every row in a real model, so the ROW stays
+    // unmarked — the scope SECTION says it once instead (wave 4).
+    expect(
+      [...host.querySelectorAll('span')].some((span) => span.textContent === 'System'),
+    ).toBe(false);
+  });
+
+  it('splits measures into the three scope sections, all three always present', () => {
+    render(ALL_WRITABLE, handlers());
+    const headings = [...host.querySelectorAll('button[aria-expanded]')].map((b) =>
+      (b.textContent ?? '').trim(),
+    );
+    // Widest audience first — the same order the manager uses.
+    expect(headings).toContain('System measures1');
+    expect(headings).toContain('This dashboard1');
+    expect(headings).toContain('My measures1');
+  });
+
+  it('an empty scope says so rather than disappearing', () => {
+    act(() => {
+      root.render(
+        <DndContext>
+          <FieldList
+            model={{ ...MODEL, measures: [SYSTEM] }}
+            catalog={null}
+            onAdd={() => {}}
+            measures={{
+              scoped: buildScopedMeasures([SYSTEM], [], []),
+              rights: ALL_WRITABLE,
+              handlers: handlers(),
+              onCreate: () => {},
+              onManage: () => {},
+            }}
+          />
+        </DndContext>,
+      );
+    });
+    expect(host.textContent).toContain('No measures belong to this dashboard yet.');
+    expect(host.textContent).toContain('None of your own yet');
+  });
+
+  it('a read-only scope explains itself on the section, not just per row', () => {
+    render({ ...ALL_WRITABLE, system: locked }, handlers());
+    expect(host.textContent).toContain('only an administrator can change its measures');
   });
 
   it('the row menu offers edit, duplicate, delete and one entry per other scope', () => {

@@ -54,6 +54,28 @@
   --rcd-status-serious: #ea580c;
   --rcd-status-critical: #dc2626;
 
+  /* FIELD-TYPE palette: what KIND of field a row is (text / number / date /
+     yes-no / measure), used on the field-list glyph and on the well chip so a
+     field keeps its identity when it is dragged.
+
+     Deliberately NOT --rcd-cat-N. Those are the categorical CHART colours: a
+     future palette change there is about series legibility and must not
+     silently restyle the field picker. A field colour also means ONE thing
+     forever (its type), while cat-3 means "the third series in this chart".
+
+     Colour is an ACCENT, never the signal: every row keeps its type icon and
+     its text, so the list reads identically without colour vision.
+
+     Contrast: each value is chosen to clear 3:1 against its theme's
+     --rcd-surface (WCAG 1.4.11, the bar for a graphical object like a glyph);
+     fieldColors.test.ts pins that with the existing relativeLuminance helper
+     so a future tweak cannot quietly drop below it. */
+  --rcd-field-text: #7e22ce; /* purple-700 — 6.5:1 on white */
+  --rcd-field-number: #1d4ed8; /* blue-700  — 6.9:1 */
+  --rcd-field-date: #0e7490; /* cyan-700  — 4.9:1 */
+  --rcd-field-boolean: #a16207; /* yellow-700 — 4.7:1 */
+  --rcd-field-measure: #15803d; /* green-700 — 4.7:1 */
+
   color: var(--rcd-text);
   background-color: var(--rcd-bg);
   font-family:
@@ -95,6 +117,14 @@ html[data-theme='dark'] .rcd-root {
   --rcd-status-warn: #f59e0b;
   --rcd-status-serious: #fb923c;
   --rcd-status-critical: #ef4444;
+
+  /* Re-stepped for the dark card surface (#18181b), not auto-flipped: the
+     700-weight light values fall to ~2:1 there. Same hues, same meanings. */
+  --rcd-field-text: #c084fc; /* purple-400 */
+  --rcd-field-number: #60a5fa; /* blue-400 */
+  --rcd-field-date: #22d3ee; /* cyan-400 */
+  --rcd-field-boolean: #fbbf24; /* amber-400 */
+  --rcd-field-measure: #4ade80; /* green-400 */
 }
 
 /* Slim, token-colored scrollbars on every scroll container inside the library

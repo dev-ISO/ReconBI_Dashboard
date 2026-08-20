@@ -82,14 +82,37 @@ afterEach(() => {
   host.remove();
 });
 
-const fetcherFor = (result: QueryResult): RcdFetcher =>
-  (<T,>(path: string): Promise<T> => {
-    if (path.endsWith('/query')) return Promise.resolve(result as T);
+/** Resolves once the query response has actually been handed to the runtime. */
+let queryDelivered: Promise<void>;
+
+const fetcherFor = (result: QueryResult): RcdFetcher => {
+  let markDelivered: () => void = () => {};
+  queryDelivered = new Promise<void>((resolve) => {
+    markDelivered = resolve;
+  });
+  return (<T,>(path: string): Promise<T> => {
+    if (path.endsWith('/query')) {
+      markDelivered();
+      return Promise.resolve(result as T);
+    }
     if (path.endsWith('/meta')) return Promise.resolve({ canManageShared: false } as T);
     if (path.endsWith('/user-settings')) return Promise.resolve({ settings: {} } as T);
     return Promise.resolve({} as T);
   }) as RcdFetcher;
+};
 
+/**
+ * Renders, then waits for the query to land and the DOM to STOP CHANGING.
+ *
+ * The previous version awaited a fixed three microtasks and hoped, which failed
+ * 2-5 of these 7 tests at random: how many ticks the query cache needs before
+ * the tile re-renders is not a constant, and the chart renderer is a lazy chunk
+ * whose Suspense fallback is the SAME skeleton as the pre-query one — so
+ * "the skeleton is gone" is not a usable signal either. Quiescence is: once two
+ * consecutive flushes leave the markup identical, everything that was going to
+ * render has rendered, including the no-failure cases where the assertion is
+ * that nothing appeared.
+ */
 const mount = async (fetcher: RcdFetcher, children: ReactNode) => {
   await act(async () => {
     root.render(
@@ -98,12 +121,20 @@ const mount = async (fetcher: RcdFetcher, children: ReactNode) => {
       </DashboardsProvider>,
     );
   });
-  // Let the query cache resolve and the tile re-render with the result.
   await act(async () => {
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
+    await queryDelivered;
   });
+
+  let previous = '';
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const current = host.innerHTML;
+    if (attempt > 0 && current === previous) return;
+    previous = current;
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  }
+  throw new Error('Tile never settled: the markup kept changing for 50 flushes.');
 };
 
 const notice = (): HTMLElement | null =>

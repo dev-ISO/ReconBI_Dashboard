@@ -71,10 +71,17 @@ export interface RcdMeta {
 export interface RcdUserSettingsDoc {
   /** Document schema version. 1 today; bump only for a breaking reshape. */
   version: number;
-  /** RESERVED — personal measures (Fields wave 2). */
-  measures?: unknown[];
-  /** RESERVED — field-list grouping/expansion/colour preferences (Fields wave 4). */
-  fieldList?: Record<string, unknown>;
+  /**
+   * RESERVED — personal measures, keyed by model id (readPersonalMeasures).
+   * `unknown`, not a shape: this module owns the transport, and the reserved
+   * sections have already changed shape once (the flat array this key held
+   * before measures became model-scoped). Declaring the shape here would
+   * invite a reader to trust it without sanitizing, which is exactly the bug
+   * the sanitizers exist to prevent.
+   */
+  measures?: unknown;
+  /** RESERVED — field-list grouping/expansion/hidden groups (readFieldListPrefs). */
+  fieldList?: unknown;
   /** Forward compatibility: sections written by a newer client are kept as-is. */
   [section: string]: unknown;
 }

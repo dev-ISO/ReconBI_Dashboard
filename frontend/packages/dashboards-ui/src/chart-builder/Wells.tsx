@@ -46,7 +46,9 @@ import {
   type ModelDefinition,
   type SortSpec,
 } from '@recon/dashboards-core';
+import { ColumnTypeIcon } from '../data-pane/SchemaExplorer';
 import { RcdInput, RcdSelect } from '../primitives';
+import { fieldKindLabel, fieldKindOfColumnType, fieldKindStyle, type FieldKind } from './fieldColors';
 import {
   aggregationOptionsFor,
   canAccept,
@@ -1401,6 +1403,7 @@ function SortableOrderRow({ id, label }: { id: string; label: string }) {
 
 function Chip({
   icon,
+  iconKind,
   leading,
   label,
   labelContent,
@@ -1409,6 +1412,14 @@ function Chip({
   onRemove,
 }: {
   icon?: React.ReactNode;
+  /**
+   * Colours the chip glyph by field TYPE — the same token the field list's row
+   * used, so a field that was purple in the picker is still purple once it
+   * lands in a well. That continuity is the whole reason the colour is worth
+   * having: it survives the drag. An accent only; the icon shape and the label
+   * still say everything the colour says.
+   */
+  iconKind?: FieldKind;
   /** Rendered before the icon/label (e.g. a sortable drag handle). */
   leading?: React.ReactNode;
   label: string;
@@ -1437,7 +1448,15 @@ function Chip({
       }`}
     >
       {leading}
-      {icon && <span className="shrink-0 text-rcd-muted">{icon}</span>}
+      {icon && (
+        <span
+          className={iconKind ? 'shrink-0' : 'shrink-0 text-rcd-muted'}
+          style={iconKind ? fieldKindStyle(iconKind) : undefined}
+          title={iconKind ? fieldKindLabel(iconKind) : undefined}
+        >
+          {icon}
+        </span>
+      )}
       {labelContent ??
         (drag ? (
           <span
@@ -1617,6 +1636,8 @@ function DimensionChip({
   return (
     <Chip
       label={label}
+      icon={type !== null ? <ColumnTypeIcon type={type} /> : undefined}
+      iconKind={type !== null ? fieldKindOfColumnType(type) : undefined}
       leading={leading}
       drag={drag}
       onRemove={onRemove}
@@ -1872,6 +1893,7 @@ function ValueChip({
     return (
       <Chip
         icon={<Sigma size={12} />}
+        iconKind="measure"
         label={displayLabel}
         labelContent={aliasInput}
         leading={leading}
@@ -1896,6 +1918,11 @@ function ValueChip({
   return (
     <Chip
       label={label}
+      // An INLINE aggregation is still the column you dragged here: it keeps
+      // the column's own type colour rather than becoming generic "measure"
+      // green, so the field is recognizable in the well it landed in.
+      icon={type !== null ? <ColumnTypeIcon type={type} /> : undefined}
+      iconKind={type !== null ? fieldKindOfColumnType(type) : undefined}
       labelContent={aliasInput}
       leading={leading}
       drag={drag}

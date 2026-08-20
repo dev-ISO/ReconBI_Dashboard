@@ -38,6 +38,8 @@ import { ConfirmDialog, RcdButton, RcdInput } from '../primitives';
 import { PaneDivider, useBuilderPanes } from './builderLayout';
 import { ChartTypePicker } from './ChartTypePicker';
 import { FieldList } from './FieldList';
+import { chartFieldUsage } from './fieldGroups';
+import { useFieldListPrefs } from './fieldListPrefs';
 import { FilterEditor } from './FilterEditor';
 import { MeasureManager } from './MeasureManager';
 import { useMeasureActions } from './measureActions';
@@ -244,6 +246,17 @@ export function ChartBuilder({
     () => ({ ...model, measures: measureActions.effective }),
     [model, measureActions.effective],
   );
+
+  /**
+   * FIELD-LIST ORGANIZATION, per user and server-side (wave 1's store), so the
+   * grouping choice and every collapsed group follow the user to another
+   * machine — and, more to the point, survive closing this modal. It used to
+   * be component state, which meant reopening the builder collapsed everything
+   * back every single time.
+   */
+  const fieldListPrefs = useFieldListPrefs(runtime.userSettings);
+  /** What the DRAFT references — the exception a hidden group cannot override. */
+  const fieldsInUse = useMemo(() => chartFieldUsage(draft), [draft]);
 
   const measureManagement = useMemo(
     () => ({
@@ -641,6 +654,8 @@ export function ChartBuilder({
                 setFilterTarget({ index: null, table: data.table, column: data.column })
               }
               measures={measureManagement}
+              prefs={fieldListPrefs}
+              inUse={fieldsInUse}
             />
           </div>
 

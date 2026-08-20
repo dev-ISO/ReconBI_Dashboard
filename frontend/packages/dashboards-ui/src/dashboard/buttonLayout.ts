@@ -199,6 +199,24 @@ export const relativeLuminance = (hex: string): number | null => {
 export const CONTRAST_SWITCH_LUMINANCE = 0.179;
 
 /**
+ * WCAG contrast ratio between two colors, 1 (identical) to 21 (black/white);
+ * null when either color cannot be parsed.
+ *
+ * Lives HERE, on top of relativeLuminance, so nothing has to re-derive the
+ * (L+0.05) ratio anywhere else. The library already carries two luminance
+ * implementations (this one and the Gantt bar-ink one); a third would be one
+ * too many, and a private copy inside a test would be the same mistake with
+ * less visibility.
+ */
+export const contrastRatio = (a: string, b: string): number | null => {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  if (la === null || lb === null) return null;
+  const [lighter, darker] = la >= lb ? [la, lb] : [lb, la];
+  return (lighter + 0.05) / (darker + 0.05);
+};
+
+/**
  * A readable label color for a custom fill: '#ffffff' on dark fills, null on
  * light ones (null keeps the theme's own text token, which is correct there
  * AND stays theme-aware). null for unparseable values — an author-supplied

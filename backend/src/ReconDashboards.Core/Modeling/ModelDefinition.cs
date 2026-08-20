@@ -42,13 +42,38 @@ public sealed record CanvasPosition(double X, double Y);
 /// <summary>
 /// Column OVERRIDE. Existence and types are always re-resolved against the
 /// introspected catalog; entries exist only where the user customized something.
+///
+/// <para><see cref="DisplayFolders"/> is pure UI metadata (like Measure's
+/// DisplayFolder): the field list's "Category" grouping. It is a LIST because
+/// the relation it models is many-to-many — a host column commonly appears on
+/// several of the host's own pages, and a single string could only express one
+/// of them. Paths are backslash-separated for nesting ('Safety\Dispersion'),
+/// matching Measure.DisplayFolder exactly. The engine never reads it: no
+/// query, join, filter or validation rule consults it.</para>
+///
+/// <para>WIRE COMPATIBILITY: <see cref="ModelJson"/> sets
+/// UnmappedMemberHandling.Disallow, so a document written WITH this field is a
+/// hard load failure on an engine that predates it. Serialization omits it
+/// when null (DefaultIgnoreCondition.WhenWritingNull), so a model that never
+/// sets it is byte-identical to one written before the field existed — which
+/// is what lets this ship ahead of any host that populates it.</para>
+///
+/// <para>NO ColumnDisplayFolders CONVENIENCE PROPERTY, unlike
+/// <see cref="ModelTable.ColumnOverrides"/> and Measure.MeasureFilters. Those
+/// predate this and their computed values are SERIALIZED (System.Text.Json
+/// emits get-only properties), so each already costs bytes in every stored
+/// document. A folder list mirrored the same way would be written twice per
+/// column — inline and again inside columnOverrides — against a 256KB model
+/// cap, to serve a field no C# code reads. Callers use
+/// <c>DisplayFolders ?? []</c>.</para>
 /// </summary>
 public sealed record ModelColumn(
     string Name,
     string? FriendlyName = null,
     Aggregation? DefaultAggregation = null,
     string? FormatHint = null,
-    bool Hidden = false);
+    bool Hidden = false,
+    IReadOnlyList<string>? DisplayFolders = null);
 
 public sealed record ModelTable(
     string Schema,

@@ -86,6 +86,118 @@ public class ModelJsonNewFieldsTests
         Assert.Empty(definition.DateTableDefs);
     }
 
+    /// <summary>
+    /// ModelColumn.DisplayFolders — the field list's "Category" grouping. It is
+    /// additive and optional, so an older document still parses; the pair of
+    /// assertions below is what makes the library upgrade safe to ship BEFORE
+    /// any host starts emitting it.
+    /// </summary>
+    [Fact]
+    public void ColumnDisplayFoldersRoundTripAndAreOmittedWhenNull()
+    {
+        var demo = TestFixtures.BuildValidDemoModel();
+        var table = demo.Tables[0];
+        var original = demo with
+        {
+            Tables =
+            [
+                table with
+                {
+                    Columns =
+                    [
+                        // Many-to-many is the whole point: one column, several folders.
+                        new ModelColumn("region", "Region",
+                            DisplayFolders: ["Finance\\Core", "Mitigation"]),
+                        // No folders at all — must serialize exactly as before.
+                        new ModelColumn("name", "Customer"),
+                    ],
+                },
+                .. demo.Tables.Skip(1),
+            ],
+        };
+
+        var json = ModelJson.Serialize(original);
+        var reloaded = ModelJson.TryDeserialize(json, out var error);
+
+        Assert.Null(error);
+        Assert.NotNull(reloaded);
+        var columns = reloaded.Tables[0].ColumnOverrides;
+        var foldered = columns.Single(c => c.Name == "region");
+        Assert.Equal(new[] { "Finance\\Core", "Mitigation" }, foldered.DisplayFolders);
+        var unfoldered = columns.Single(c => c.Name == "name");
+        Assert.Null(unfoldered.DisplayFolders);
+
+        Assert.Contains(
+            "\"displayFolders\":[\"Finance\\\\Core\",\"Mitigation\"]",
+            json,
+            StringComparison.Ordinal);
+        // WhenWritingNull: a column that sets no folders emits no key at all,
+        // so it is byte-identical to one written before the field existed.
+        Assert.Contains(
+            "{\"name\":\"name\",\"friendlyName\":\"Customer\",\"hidden\":false}",
+            json,
+            StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The other half of the compatibility story: a document written by an
+    /// OLDER engine (no displayFolders anywhere) still loads here, and a column
+    /// folder list read from raw JSON lands where the field list expects it.
+    /// </summary>
+    [Fact]
+    public void LegacyColumnsWithoutDisplayFoldersStillParse()
+    {
+        const string json = """
+            {
+              "version": 1,
+              "tables": [
+                {"schema":"public","name":"orders","columns":[
+                  {"name":"order_total","friendlyName":"Total"},
+                  {"name":"status","displayFolders":["Ops","Ops\\Detail"]}
+                ]}
+              ],
+              "relationships": [],
+              "measures": []
+            }
+            """;
+
+        var definition = ModelJson.TryDeserialize(json, out var error);
+
+        Assert.Null(error);
+        Assert.NotNull(definition);
+        var columns = definition.Tables[0].ColumnOverrides;
+        Assert.Null(columns.Single(c => c.Name == "order_total").DisplayFolders);
+        Assert.Equal(
+            new[] { "Ops", "Ops\\Detail" },
+            columns.Single(c => c.Name == "status").DisplayFolders);
+    }
+
+    /// <summary>
+    /// THE DISALLOW CONTRACT, stated as a test: adding displayFolders did not
+    /// loosen strictness. An unknown member is still a hard failure, which is
+    /// exactly why a host must not emit a new field speculatively.
+    /// </summary>
+    [Fact]
+    public void UnknownColumnMemberIsStillRejected()
+    {
+        const string json = """
+            {
+              "version": 1,
+              "tables": [
+                {"schema":"public","name":"orders","columns":[{"name":"status","displayFolder":"Ops"}]}
+              ],
+              "relationships": [],
+              "measures": []
+            }
+            """;
+
+        var definition = ModelJson.TryDeserialize(json, out var error);
+
+        Assert.Null(definition);
+        Assert.NotNull(error);
+        Assert.Contains("displayFolder", error, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void ExpressionMeasureJsonWithCamelCaseFieldsParses()
     {

@@ -388,7 +388,7 @@ export interface DashboardCollabSenders {
    * Not a collab channel, but this is the store's one host-seam bag and a
    * second one would be a distinction without a difference.
    */
-  onPersistPersonalMeasures?: (measures: Measure[]) => void;
+  onPersistPersonalMeasures?: (measures: Measure[], modelId: number | null) => void;
 }
 
 /**
@@ -3702,7 +3702,10 @@ export class DashboardStore {
   setPersonalMeasures(measures: Measure[]): void {
     const next = [...measures];
     this.set({ personalMeasures: next });
-    this.collab.onPersistPersonalMeasures?.(next);
+    // The MODEL is part of the address: a personal measure is written against
+    // one model's tables, so the persister files it under that model rather
+    // than into one pile that follows the user onto unrelated models.
+    this.collab.onPersistPersonalMeasures?.(next, this.state.current?.modelId ?? null);
   }
 
   /**

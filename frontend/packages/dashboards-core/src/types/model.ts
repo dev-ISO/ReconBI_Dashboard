@@ -34,6 +34,23 @@ export interface ModelColumn {
   defaultAggregation?: Aggregation | null;
   formatHint?: string | null;
   hidden?: boolean;
+  /**
+   * Grouping folders for the field list's "Category" mode — pure UI metadata,
+   * never read by the engine. Backslash-separated for nesting
+   * ('Safety\\Dispersion'), exactly like Measure.displayFolder.
+   *
+   * A LIST because the relation it models is genuinely many-to-many: one
+   * column commonly appears on several of the host's pages, and a single
+   * string could only ever name one of them. How a multi-membership column is
+   * RENDERED (under each folder, or pooled into "Common fields") is a
+   * presentation rule, not part of this shape — see fieldGroups.ts.
+   *
+   * *** The server rejects unknown members outright (ModelJson's
+   * UnmappedMemberHandling.Disallow), so a model document carrying this field
+   * fails to LOAD on an engine older than the one that introduced it. Nothing
+   * may emit it until the engine is upgraded. ***
+   */
+  displayFolders?: string[] | null;
 }
 
 export interface ModelTable {

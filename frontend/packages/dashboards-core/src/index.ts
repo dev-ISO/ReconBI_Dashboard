@@ -72,6 +72,14 @@ export {
   nextMeasureCopyName,
 } from './state/measureScope';
 export type { MeasureMergeResult } from './state/measureScope';
+export {
+  PERSONAL_MEASURES_SECTION,
+  migrateFlatPersonalMeasures,
+  personalMeasuresModelKey,
+  readPersonalMeasures,
+  writePersonalMeasures,
+} from './state/personalMeasures';
+export type { PersonalMeasuresByModel } from './state/personalMeasures';
 export { createDashboardsRuntime } from './state/createRuntime';
 export type { DashboardsRuntime, DashboardsRuntimeOptions } from './state/createRuntime';
 
