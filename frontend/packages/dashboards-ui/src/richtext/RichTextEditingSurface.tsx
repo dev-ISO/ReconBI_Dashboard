@@ -322,7 +322,21 @@ export function RichTextEditingSurface({
   const readPreviewHtml = (): string | null => {
     const el = editorRef.current;
     if (!el) return null;
-    const range = selectionRangeIn(el);
+    // The LIVE selection is gone whenever focus left the editor — which is
+    // routine here: menu buttons preventDefault their mousedown, but the native
+    // colour input and the hex field legitimately take focus, and some browsers
+    // drop the contentEditable selection outright when they do. selectionRangeIn
+    // then returns null, previewHtml became null, and the strip silently swapped
+    // the real slice for an unstyled "Sample text" — the preview looking broken
+    // at exactly the moment the user was choosing a colour.
+    //
+    // savedRangeRef holds the same slice, re-saved after every apply, so it is
+    // the accurate fallback. It is only trusted while its nodes are still in the
+    // editor: execCommand rebuilds nodes, and a detached range would throw.
+    const saved = savedRangeRef.current;
+    const range =
+      selectionRangeIn(el) ??
+      (saved && el.contains(saved.commonAncestorContainer) ? saved : null);
     if (!range || range.collapsed) return null;
     try {
       const holder = el.ownerDocument.createElement('div');
@@ -361,7 +375,11 @@ export function RichTextEditingSurface({
 
   const refreshMenuState = () => {
     setMenuActive(readMenuActive());
-    setPreviewHtml(readPreviewHtml());
+    // Keep the last good slice if this read cannot find one at all: a preview
+    // that goes blank mid-edit is worse than one that is a moment stale, and
+    // the menu's mode was fixed when it opened — a SELECTION menu never wants
+    // the caret-mode sample.
+    setPreviewHtml((previous) => readPreviewHtml() ?? previous);
     setCaretFormatting(readCaretFormatting());
   };
 

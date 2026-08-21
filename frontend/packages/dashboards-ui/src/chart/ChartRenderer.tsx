@@ -48,6 +48,7 @@ import {
   type AxisValueFormat,
   type CellValue,
   type ChartFormat,
+  type SliceLabelOptions,
   type ChartPointEvent,
   type ChartSpec,
   type QueryColumn,
@@ -57,6 +58,7 @@ import {
   type TextStyle,
   type TooltipStyle,
 } from '@recon/dashboards-core';
+import { onBarTextColor } from './ganttUtils';
 import {
   COLOR_INDEX_KEY,
   legacyMeasureColumnLabels,
@@ -1710,6 +1712,100 @@ function CenteredPieFrame({ legendRight, children }: { legendRight: boolean; chi
  * smaller plot dimension). Hidden when the hole is too small to read; the
  * value font shrinks to fit the hole before giving up.
  */
+/**
+ * SLICE SHARE LABELS — drawn on the pie itself, and deliberately NOT drawn
+ * whenever they would turn into a smear.
+ *
+ * A pie's long tail is where labels collide, and it is also where a label is
+ * least worth reading. Two independent rules suppress one:
+ *
+ *  1. SHARE FLOOR (`minPercent`, default 5%) — the author's own statement of
+ *     "below this I do not care".
+ *  2. DOES IT PHYSICALLY FIT — geometry, not guesswork. A slice's label sits on
+ *     an arc whose length is `share * 2πr`; if the text is wider than that arc,
+ *     or the ring is thinner than the text is tall, the label cannot be drawn
+ *     without spilling into its neighbours, so it is dropped. This is what
+ *     makes a 40-slice chart stay readable while a 4-slice chart labels
+ *     everything — no tuning required.
+ *
+ * INK. Labels inside a slice are painted with `onBarTextColor` (white, or dark
+ * ink on a pale fill) PLUS a halo in the opposite ink. The halo is not
+ * decoration: palette colours are CSS variables whose value is unknowable at
+ * render time, so luminance comes back null and the ink falls back to white —
+ * which would vanish on a pale slice. The halo makes the label legible on any
+ * fill, known or not.
+ */
+const PIE_LABEL_FONT_PX = 11;
+/** Rough advance width per character at PIE_LABEL_FONT_PX, in px. */
+const PIE_LABEL_CHAR_PX = PIE_LABEL_FONT_PX * 0.62;
+const PIE_LABEL_HALO_PX = 2.5;
+const DEFAULT_SLICE_LABEL_MIN_PERCENT = 5;
+
+/** Recharts types every geometry prop as optional, so this mirrors it and
+ *  validates at runtime rather than casting the contract away. */
+interface SliceLabelRenderProps {
+  cx?: number;
+  cy?: number;
+  midAngle?: number;
+  innerRadius?: number;
+  outerRadius?: number;
+  percent?: number;
+  fill?: string;
+}
+
+export const sliceLabelRenderer = (
+  options: SliceLabelOptions,
+): ((props: SliceLabelRenderProps) => ReactNode) => {
+  const minPercent = options.minPercent ?? DEFAULT_SLICE_LABEL_MIN_PERCENT;
+  const decimals = Math.min(Math.max(options.decimals ?? 0, 0), 2);
+  const outside = options.position === 'outside';
+
+  return ({ cx, cy, midAngle, innerRadius, outerRadius, percent, fill }) => {
+    const geometry = [cx, cy, midAngle, innerRadius, outerRadius, percent];
+    if (geometry.some((value) => typeof value !== 'number' || !Number.isFinite(value))) return null;
+    const [cxN, cyN, midAngleN, innerR, outerR, share01] = geometry as number[];
+    const share = share01! * 100;
+    if (share <= minPercent) return null;
+
+    const text = `${share.toFixed(decimals)}%`;
+    const textWidth = text.length * PIE_LABEL_CHAR_PX;
+    const radius = outside
+      ? outerR! + 14
+      : innerR! + (outerR! - innerR!) * (innerR! > 0 ? 0.5 : 0.62);
+
+    if (!outside) {
+      // Geometry gate: the arc the label sits on, and the ring's thickness.
+      const arc = share01! * 2 * Math.PI * radius;
+      if (arc < textWidth || outerR! - innerR! < PIE_LABEL_FONT_PX * 1.25) return null;
+    }
+
+    const radians = -midAngleN! * (Math.PI / 180);
+    const x = cxN! + radius * Math.cos(radians);
+    const y = cyN! + radius * Math.sin(radians);
+    const ink = outside ? 'var(--rcd-text)' : onBarTextColor(fill ?? '');
+    const halo = outside ? 'var(--rcd-surface)' : ink === '#ffffff' ? '#111827' : '#ffffff';
+
+    return (
+      <text
+        x={x}
+        y={y}
+        textAnchor={outside ? (Math.cos(radians) >= 0 ? 'start' : 'end') : 'middle'}
+        dominantBaseline="central"
+        fontSize={PIE_LABEL_FONT_PX}
+        fontWeight={600}
+        fill={ink}
+        stroke={halo}
+        strokeWidth={PIE_LABEL_HALO_PX}
+        paintOrder="stroke"
+        strokeLinejoin="round"
+        style={{ pointerEvents: 'none' }}
+      >
+        {text}
+      </text>
+    );
+  };
+};
+
 function DonutCenterTotal({ text }: { text: string }) {
   const plotArea = usePlotArea();
   if (!plotArea || plotArea.width <= 0 || plotArea.height <= 0) return null;
@@ -3398,6 +3494,7 @@ export default function ChartRenderer({
       // Toggle mode: hidden slices are removed from the pie entirely (the
       // visible total is the percent denominator); the interactive legend
       // still lists them.
+      const sliceLabels = format.sliceLabels?.show === true ? format.sliceLabels : null;
       const visibleSlices = dimHiddenSlices ? slices : slices.filter((s) => !hidden.has(s.label));
       const visibleTotal = visibleSlices.reduce((sum, s) => sum + s.value, 0);
       // The slice label IS the (first) dimension, so it rides as axisValue;
@@ -3475,6 +3572,11 @@ export default function ChartRenderer({
                 stroke="var(--rcd-surface)"
                 strokeWidth={1}
                 isAnimationActive={false}
+                // Share labels on the slices. labelLine only for the outside
+                // placement — an inside label needs no leader, and drawing one
+                // is what makes a dense pie look like a spider.
+                label={sliceLabels ? sliceLabelRenderer(sliceLabels) : undefined}
+                labelLine={sliceLabels?.position === 'outside' ? { stroke: 'var(--rcd-border)' } : false}
                 cursor={handleSliceClick ? 'pointer' : undefined}
                 onClick={handleSliceClick}
                 onContextMenu={handleSliceContextMenu}

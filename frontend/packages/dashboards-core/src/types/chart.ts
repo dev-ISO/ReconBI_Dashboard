@@ -582,6 +582,31 @@ export interface ChartFormat {
    * one color per series. colorOverrides keyed by category label win.
    */
   colorByCategory?: boolean;
+  /** Pie/donut: share-of-total labels drawn on the slices themselves. */
+  sliceLabels?: SliceLabelOptions | null;
+}
+
+/**
+ * Pie/donut slice labels — the share of the visible total, drawn ON the chart
+ * (distinct from tooltip.showPercent, which only affects the hover card).
+ */
+export interface SliceLabelOptions {
+  /** Absent or false = no labels. */
+  show: boolean;
+  /**
+   * Slices at or below this share (percent, 0..100) get NO label. This is the
+   * anti-clutter rule: a pie's long tail is where labels pile onto each other
+   * and turn into a smear, and the tail is exactly where a label is least worth
+   * reading. Default 5. Set 0 to label everything and accept the mess.
+   */
+  minPercent?: number;
+  /**
+   * 'inside' (default) draws on the slice; 'outside' draws beyond the rim with
+   * a leader line, which suits a chart of many thin slices.
+   */
+  position?: 'inside' | 'outside';
+  /** Decimal places on the percentage (default 0). */
+  decimals?: number;
 }
 
 export interface ChartQuery {

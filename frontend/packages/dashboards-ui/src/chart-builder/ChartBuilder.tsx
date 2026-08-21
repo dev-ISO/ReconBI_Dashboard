@@ -688,6 +688,23 @@ export function ChartBuilder({
     return draft.query.measures.map((measure) => measureLabel(effectiveModel, measure));
   }, [draft, previewShaped, effectiveModel]);
 
+  /**
+   * CATEGORY labels for the Format panel's per-slice / per-bar colour swatches.
+   * Same source the renderer colours from — pie slice labels via shapePieData,
+   * otherwise the shaped axis categories — so a swatch always keys on exactly
+   * what the chart reads. On a grouped dimension these are the GROUP labels.
+   * Deduplicated and blank-tolerant: "(Blank)" is a real, colourable bucket.
+   */
+  const categoryKeys = useMemo<string[]>(() => {
+    const isPie = draft.type === 'pie' || draft.type === 'donut';
+    const labels = isPie
+      ? previewResult
+        ? shapePieData(previewResult, draft).slices.map((slice) => slice.label)
+        : []
+      : (previewShaped?.data.map((row) => String(row[previewShaped.axisKey] ?? '')) ?? []);
+    return [...new Set(labels)];
+  }, [draft, previewResult, previewShaped]);
+
   // Manual-order inputs for the Wells sort section (orderable families only).
   // Categories/series come from the CURRENT shaped preview — exactly the
   // labels/styleKeys the persisted arrays key on; pie mirrors slice labels.
@@ -849,6 +866,7 @@ export function ChartBuilder({
                 <FormatPanel
                   spec={draft}
                   seriesKeys={seriesKeys}
+                  categoryKeys={categoryKeys}
                   onChange={(format: ChartFormat) =>
                     setDraft((current) => ({ ...current, format }))
                   }

@@ -40,6 +40,17 @@ export interface FormatPanelProps {
   spec: ChartSpec;
   /** Series (or slice) names currently rendered — drives the color rows. */
   seriesKeys: string[];
+  /**
+   * CATEGORY labels currently rendered — pie/donut slice labels, or the axis
+   * categories of a single-series bar/column. These are the keys the RENDERER
+   * looks colorOverrides up by for those charts (chartData.shapePieData and
+   * ChartRenderer's colorByCategory path both key on the label), so without
+   * them the panel offered swatches for the measure while the chart read the
+   * category — "Color by category" could be switched on with no way to set a
+   * colour. On a GROUPED dimension these labels ARE the group labels, so the
+   * per-group colours fall out for free.
+   */
+  categoryKeys?: string[];
   onChange(format: ChartFormat): void;
 }
 
@@ -1427,7 +1438,7 @@ function AxisTitleField({
  * no format state — only which sections are expanded and which rich-text
  * dialog (inner title / axis title) is open.
  */
-export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
+export function FormatPanel({ spec, seriesKeys, categoryKeys = [], onChange }: FormatPanelProps) {
   const format = spec.format;
   const patch = (partial: Partial<ChartFormat>) => onChange({ ...format, ...partial });
 
@@ -1498,6 +1509,11 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
   const showValuesSection = !isTable && !isGantt;
   /** Series color swatches; KPI/table consume seriesLabels (names) only. */
   const showSeriesColors = isCartesian || isScatter || isPieType || ganttHasGroup;
+  // Pie/donut always colour per slice; bars only once "Color by category" is on
+  // (otherwise the renderer uses the SERIES colour and these keys are ignored).
+  const categoryColorsApply =
+    isPieType ||
+    ((spec.type === 'column' || spec.type === 'bar') && format.colorByCategory === true);
   const showSmallMultiplesSection = supportsSmallMultiples(spec.type);
   /** Clicked-point emphasis: cartesian marks, slices, scatter groups, gantt bars. */
   const showSelectionHighlight = isCartesian || isScatter || isPieType || isGantt;
@@ -2493,9 +2509,114 @@ export function FormatPanel({ spec, seriesKeys, onChange }: FormatPanelProps) {
               onChange={(checked) => patch({ colorByCategory: checked || undefined })}
             />
             <p className="text-xs text-rcd-muted">
-              Single-series charts give each bar its own palette color; color overrides then apply
-              per category.
+              Single-series charts give each bar its own palette color; set individual bars below.
             </p>
+          </>
+        )}
+
+        {isPieType && (
+          <>
+            <h4 className={SUBHEAD_CLASS}>Slice labels</h4>
+            <CheckboxRow
+              label="Show percentage on slices"
+              checked={format.sliceLabels?.show ?? false}
+              onChange={(checked) =>
+                patch({
+                  sliceLabels: checked
+                    ? { ...(format.sliceLabels ?? {}), show: true }
+                    : undefined,
+                })
+              }
+            />
+            {format.sliceLabels?.show && (
+              <>
+                <label className="flex items-center justify-between gap-2 text-sm text-rcd-text-2">
+                  Position
+                  <RcdSelect
+                    className="w-36"
+                    value={format.sliceLabels.position ?? 'inside'}
+                    onChange={(event) =>
+                      patch({
+                        sliceLabels: {
+                          ...format.sliceLabels!,
+                          position: event.target.value === 'outside' ? 'outside' : 'inside',
+                        },
+                      })
+                    }
+                  >
+                    <option value="inside">On the slice</option>
+                    <option value="outside">Outside the rim</option>
+                  </RcdSelect>
+                </label>
+                <NumberRow
+                  label="Hide below (%)"
+                  value={format.sliceLabels.minPercent ?? 5}
+                  min={0}
+                  max={50}
+                  onChange={(next) =>
+                    patch({ sliceLabels: { ...format.sliceLabels!, minPercent: next ?? 0 } })
+                  }
+                />
+                <NumberRow
+                  label="Decimal places"
+                  value={format.sliceLabels.decimals ?? 0}
+                  min={0}
+                  max={2}
+                  onChange={(next) =>
+                    patch({ sliceLabels: { ...format.sliceLabels!, decimals: next ?? 0 } })
+                  }
+                />
+                <p className="text-xs text-rcd-muted">
+                  Small slices are skipped automatically when their label will not fit the slice,
+                  so a chart with a long tail stays readable. Raise “Hide below” to drop more.
+                </p>
+              </>
+            )}
+          </>
+        )}
+
+        {/* PER-CATEGORY colours. These key on the CATEGORY label, which is what
+            the renderer reads for pie slices and for colour-by-category bars —
+            and on a grouped axis the category label IS the group label, so
+            colouring a group is the same act. Hidden when the chart is not in
+            one of those modes, because the keys would then be dead. */}
+        {categoryColorsApply && (
+          <>
+            <h4 className={SUBHEAD_CLASS}>{isPieType ? 'Slice colors' : 'Bar colors'}</h4>
+            {categoryKeys.length === 0 ? (
+              <p className="text-xs text-rcd-muted">
+                Run the chart to list its {isPieType ? 'slices' : 'categories'}.
+              </p>
+            ) : (
+              categoryKeys.map((key) => {
+                const override = format.colorOverrides?.[key];
+                const label = key === '' ? '(Blank)' : key;
+                return (
+                  <div key={`cat-${key}`} className="flex items-center gap-2">
+                    <input
+                      type="color"
+                      aria-label={`Color for ${label}`}
+                      className={COLOR_INPUT_CLASS}
+                      value={override ?? DEFAULT_SWATCH}
+                      onChange={(event) => setOverride(key, event.target.value)}
+                    />
+                    <span className="min-w-0 flex-1 truncate text-sm text-rcd-text" title={label}>
+                      {label}
+                    </span>
+                    {override && (
+                      <button
+                        type="button"
+                        aria-label={`Reset color for ${label}`}
+                        className={RESET_BUTTON_CLASS}
+                        onClick={() => clearOverride(key)}
+                      >
+                        Reset
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            )}
           </>
         )}
         {isLineType && seriesKeys.length > 0 && (
