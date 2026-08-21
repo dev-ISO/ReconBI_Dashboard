@@ -436,3 +436,77 @@ describe('copy and paste ACROSS PAGES', () => {
     ]);
   });
 });
+
+describe('copying OUT of a read-only or built-in dashboard', () => {
+  it('copies without edit mode — copying is a read', async () => {
+    // Built-in dashboards are isSystem: canEnterEdit is false for EVERYONE, so
+    // if copy needed edit mode there would be no way to get an element out of
+    // one at all. copyTile deliberately has no mode gate.
+    const store = await openStore(detailFor(1, [groupTile()]));
+    expect(store.store.getState().mode).not.toBe('edit');
+
+    store.copyTile('tile-group');
+    const clip = store.store.getState().tileClipboard;
+    expect(clip).not.toBeNull();
+    expect(clip!.tile.buttonGroup!.buttons).toHaveLength(2);
+  });
+
+  it('carries the element into a DIFFERENT dashboard, styling intact', async () => {
+    const styled: DashboardTile = {
+      id: 'tile-group',
+      layout: { x: 0, y: 0, w: 6, h: 3 },
+      kind: 'buttonGroup',
+      buttonGroup: {
+        buttons: [
+          {
+            id: 'btn-a',
+            html: '<p>Stage 1</p>',
+            targetPageId: 'page-only-in-source',
+            background: '#123456',
+            textColor: '#ffffff',
+            radius: 12,
+          },
+        ],
+        direction: 'row',
+        wrap: true,
+        gap: 8,
+        align: 'stretch',
+      },
+    };
+    const source = await openStore(detailFor(1, [styled]));
+    source.copyTile('tile-group'); // view mode, as on a built-in
+    const clip = source.store.getState().tileClipboard!;
+
+    const target = await openStore(detailFor(2));
+    target.enterEdit();
+    target.store.setState({ tileClipboard: clip });
+    const pastedId = target.pasteTile()!;
+
+    const pasted = tilesOf(target).find((t) => t.id === pastedId)!;
+    // THE POINT OF THE FEATURE: the styling survives the trip.
+    const button = pasted.buttonGroup!.buttons[0]!;
+    expect(button.background).toBe('#123456');
+    expect(button.textColor).toBe('#ffffff');
+    expect(button.radius).toBe(12);
+    expect(button.html).toBe('<p>Stage 1</p>');
+    expect(pasted.buttonGroup!.gap).toBe(8);
+    expect(pasted.layout.w).toBe(6);
+    // Identity is still fresh.
+    expect(pasted.id).not.toBe('tile-group');
+    expect(button.id).not.toBe('btn-a');
+    // And the dangling page link rides along to be fixed by hand, rather than
+    // being silently re-pointed at some page the author never chose.
+    expect(button.targetPageId).toBe('page-only-in-source');
+  });
+
+  it('still refuses to PASTE without edit mode — the write half keeps its gate', async () => {
+    const source = await openStore(detailFor(1, [textTile()]));
+    source.copyTile('tile-text');
+    const clip = source.store.getState().tileClipboard!;
+
+    const target = await openStore(detailFor(2));
+    target.store.setState({ tileClipboard: clip });
+    expect(target.pasteTile()).toBeNull();
+    expect(tilesOf(target)).toHaveLength(0);
+  });
+});

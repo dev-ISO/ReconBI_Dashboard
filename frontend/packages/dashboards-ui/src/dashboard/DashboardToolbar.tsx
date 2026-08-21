@@ -1274,7 +1274,7 @@ function AddTileMenu({
                 title={
                   pasteChartEnabled
                     ? 'Paste the copied element as a new one (Ctrl+V)'
-                    : 'Copy an element first: select it and press Ctrl+C, or use its menu > Copy'
+                    : 'Copy an element first — click it on ANY dashboard (including a built-in one) and press Ctrl+C'
                 }
               >
                 <ClipboardPaste size={14} />

@@ -599,11 +599,15 @@ export function DashboardView({
     if (id) runtime.dashboards.selectTile(id);
   }, [runtime]);
 
-  // Ctrl/Cmd+C / Ctrl/Cmd+V on the SELECTED tile while editing. Same doctrine
-  // as the undo hotkeys above — document-level, gated on this view's edit
-  // mode, suspended by any open modal, and ignored inside text controls.
+  // Ctrl/Cmd+C / Ctrl/Cmd+V on the selected tile. Same doctrine as the undo
+  // hotkeys above — document-level, suspended by any open modal, and ignored
+  // inside text controls.
+  //
+  // COPY IS NOT GATED ON EDIT MODE. It is how an element gets out of a
+  // read-only or built-in dashboard, which is the whole point of copying
+  // between dashboards; PASTE still requires edit mode and the right for the
+  // kind being pasted.
   useEffect(() => {
-    if (!editable) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
       const key = event.key.toLowerCase();
@@ -622,7 +626,7 @@ export function DashboardView({
         runtime.dashboards.copyTile(selectedTileId);
         return;
       }
-      if (!canPasteClipboardTile) return;
+      if (!editable || !canPasteClipboardTile) return;
       event.preventDefault();
       pasteFromClipboard();
     };
@@ -1990,19 +1994,29 @@ export function DashboardView({
    */
   const renderTile = (id: string) => {
     const lock = tileLocks[id];
-    // SELECTION IS UNIVERSAL, not chart-only. Chart tiles have always selected
-    // themselves (and draw their own ring); every other kind never could, so
-    // the copy shortcut had nothing to act on for exactly the kinds it is most
-    // useful for — text, buttons, button groups. Selecting here covers them all
-    // without disturbing the chart tile's own handling, which still runs.
+    // SELECTION IS UNIVERSAL — every kind, in EVERY mode.
+    //
+    // Chart tiles have always selected themselves (and ring themselves in edit
+    // mode); no other kind could, so the copy shortcut had nothing to act on
+    // for exactly the kinds it helps most. And selection was edit-mode only,
+    // which made copying impossible on a BUILT-IN dashboard: those are
+    // isSystem, canEnterEdit is false for everyone, so there was no mode in
+    // which any copy affordance appeared. Copying is a READ — it needs no
+    // right — so it is available wherever the element is visible, while paste
+    // stays gated on edit rights at the DESTINATION.
     const tile = tiles.find((t) => t.id === id);
-    const ringed = editable && selectedTileId === id && !tile?.chart;
+    // Do not double-ring: an editable chart tile already draws its own.
+    const ringed = selectedTileId === id && !(tile?.chart && editable);
     return (
       <div
         className={`relative h-full rounded-xl ${
-          ringed ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''
+          ringed
+            ? editable
+              ? 'ring-2 ring-[var(--rcd-accent-interactive)]'
+              : 'ring-1 ring-[var(--rcd-accent-interactive)]'
+            : ''
         }`}
-        onPointerDown={editable ? () => runtime.dashboards.selectTile(id) : undefined}
+        onPointerDown={() => runtime.dashboards.selectTile(id)}
       >
         {renderTileContent(id)}
         {lock !== undefined && (
