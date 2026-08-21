@@ -9,6 +9,7 @@ import {
 } from 'react';
 import { createPortal } from 'react-dom';
 import {
+  ClipboardCopy,
   Copy,
   GripHorizontal,
   GripVertical,
@@ -43,6 +44,13 @@ export interface TileFrameProps {
   titleStyle?: TextStyle | null;
   onEdit?: () => void;
   onDuplicate?: () => void;
+  /**
+   * Copies this tile to the session clipboard for pasting elsewhere (Add >
+   * Paste, or Ctrl/Cmd+V). Hidden without a handler, like onDelete — the
+   * caller withholds it when the viewer lacks the right to add this kind of
+   * tile, so Copy is never offered where Paste could not follow.
+   */
+  onCopy?: () => void;
   onDelete?: () => void;
   /**
    * Replaces the built-in kebab menu: the kebab reports its screen position and
@@ -107,6 +115,7 @@ export function TileFrame({
   titleStyle = null,
   onEdit,
   onDuplicate,
+  onCopy,
   onDelete,
   onMenu,
   onContextMenu,
@@ -196,6 +205,16 @@ export function TileFrame({
               onDuplicate?.();
             }}
           />
+          {onCopy && (
+            <MenuItem
+              icon={ClipboardCopy}
+              label="Copy"
+              onClick={() => {
+                setMenuOpen(false);
+                onCopy();
+              }}
+            />
+          )}
           {/* Hidden (not disabled) without a handler: tile deletion is gated
               on the CanDeleteContent right (0.11.1) and callers withhold the
               callback when the caller lacks it. */}

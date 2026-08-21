@@ -422,7 +422,7 @@ export function DashboardView({
    */
   const viewFitOverride = useDashboardState((state) => state.viewFitOverride);
   /** Session chart clipboard (edit-mode Copy / Paste chart). */
-  const chartClipboard = useDashboardState((state) => state.chartClipboard);
+  const tileClipboard = useDashboardState((state) => state.tileClipboard);
 
   // Ctrl/Cmd-click detection for additive cross-filtering (see module header).
   useClickModifierTracker();
@@ -582,6 +582,53 @@ export function DashboardView({
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [editable, runtime]);
+
+  /**
+   * True when the viewer may add the KIND of tile sitting on the clipboard.
+   * Paste is an add, so it rides the same split rights as the Add menu:
+   * charts on CanEditCharts, every layout kind on CanEditLayout. Without this
+   * split, paste would be a way around a right the Add menu enforces.
+   */
+  const canPasteClipboardTile =
+    tileClipboard !== null && (tileClipboard.tile.chart ? canEditCharts : canEditLayout);
+
+  const pasteFromClipboard = useCallback(() => {
+    const id = runtime.dashboards.pasteTile();
+    // Select what was just created: the copy lands below the fold, and
+    // selecting it is what makes the grid scroll it into view.
+    if (id) runtime.dashboards.selectTile(id);
+  }, [runtime]);
+
+  // Ctrl/Cmd+C / Ctrl/Cmd+V on the SELECTED tile while editing. Same doctrine
+  // as the undo hotkeys above — document-level, gated on this view's edit
+  // mode, suspended by any open modal, and ignored inside text controls.
+  useEffect(() => {
+    if (!editable) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return;
+      const key = event.key.toLowerCase();
+      if (key !== 'c' && key !== 'v') return;
+      if (anyDialogOpen()) return;
+      const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target && (target.isContentEditable || target.closest('input, textarea, select'))) return;
+      // A live text SELECTION means the user is copying words, not a tile —
+      // hijacking Ctrl+C there would break ordinary copying out of a tile's
+      // rendered text, which is a worse regression than the feature is a win.
+      if (key === 'c' && (window.getSelection()?.toString().trim().length ?? 0) > 0) return;
+
+      if (key === 'c') {
+        if (!selectedTileId) return;
+        event.preventDefault();
+        runtime.dashboards.copyTile(selectedTileId);
+        return;
+      }
+      if (!canPasteClipboardTile) return;
+      event.preventDefault();
+      pasteFromClipboard();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [editable, runtime, selectedTileId, canPasteClipboardTile, pasteFromClipboard]);
 
   /** ⋯ > Make a copy: caller-owned duplicate of the visible dashboard. */
   const makeCopy = useCallback(async () => {
@@ -1897,6 +1944,7 @@ export function DashboardView({
         onSelect={() => runtime.dashboards.selectTile(tile.id)}
         onEdit={() => openBuilderForTile(tile.id, chart)}
         onDuplicate={() => runtime.dashboards.duplicateTile(tile.id)}
+        onCopy={() => runtime.dashboards.copyTile(tile.id)}
         // Tile deletion additionally rides the CanDeleteContent right (0.11.1)
         // — withholding the handler hides the affordance for grantees without it.
         onDelete={canDeleteContent ? () => runtime.dashboards.removeTile(tile.id) : undefined}
@@ -1942,8 +1990,20 @@ export function DashboardView({
    */
   const renderTile = (id: string) => {
     const lock = tileLocks[id];
+    // SELECTION IS UNIVERSAL, not chart-only. Chart tiles have always selected
+    // themselves (and draw their own ring); every other kind never could, so
+    // the copy shortcut had nothing to act on for exactly the kinds it is most
+    // useful for — text, buttons, button groups. Selecting here covers them all
+    // without disturbing the chart tile's own handling, which still runs.
+    const tile = tiles.find((t) => t.id === id);
+    const ringed = editable && selectedTileId === id && !tile?.chart;
     return (
-      <div className="relative h-full">
+      <div
+        className={`relative h-full rounded-xl ${
+          ringed ? 'ring-2 ring-[var(--rcd-accent-interactive)]' : ''
+        }`}
+        onPointerDown={editable ? () => runtime.dashboards.selectTile(id) : undefined}
+      >
         {renderTileContent(id)}
         {lock !== undefined && (
           <TileLockOverlay holderUserId={lock.holderUserId} holderName={lock.holderName} />
@@ -2084,8 +2144,8 @@ export function DashboardView({
         addSlicerDisabled={modelId === null}
         // Session clipboard paste (Add ▾ > Paste chart); gated with the
         // chart-side Add items via canAddChartTiles.
-        onPasteChart={() => runtime.dashboards.pasteChartTile()}
-        pasteChartEnabled={chartClipboard !== null}
+        onPasteChart={pasteFromClipboard}
+        pasteChartEnabled={canPasteClipboardTile}
         // Split per server class (0.11.1): chart adds ride CanEditCharts;
         // text/image/slicer/button adds are layout-class and ride
         // CanEditLayout — the old single gate over-restricted layout grantees.
@@ -2461,7 +2521,11 @@ export function DashboardView({
               onDuplicate={() => runtime.dashboards.duplicateTile(chartMenuTile.id)}
               // Both copy flavors take the AUTHORED tile spec, never the
               // drilled/filtered effective one.
-              onCopy={() => runtime.dashboards.copyChart(chartMenuTile.chart, modelId)}
+              // copyTile, not copyChart: the clipboard now carries the whole
+              // TILE (layout, container format, kind) so a paste reproduces the
+              // element, not just its query. copyTile keeps chartClipboard in
+              // step for anything still reading the older field.
+              onCopy={() => runtime.dashboards.copyTile(chartMenuTile.id)}
               onCopyTo={() => setCopyChartSpec(chartMenuTile.chart)}
               onExport={(exportMode) => void exportChartCsv(chartMenuTile.id, exportMode)}
               onSetAlert={

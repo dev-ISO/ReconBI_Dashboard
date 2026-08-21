@@ -350,6 +350,8 @@ export interface DashboardChartTileProps {
   onSelect: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
+  /** Copies the whole tile to the session clipboard (kebab > Copy). */
+  onCopy?: () => void;
   /** Absent = the caller lacks the delete right (0.11.1) — the affordance hides. */
   onDelete?: () => void;
   /** Edit-mode right-click on the tile (opens the chart context card). */
@@ -460,6 +462,7 @@ export function DashboardChartTile({
   onSelect,
   onEdit,
   onDuplicate,
+  onCopy,
   onDelete,
   onTileContextMenu,
   onCrossFilter,
@@ -1358,6 +1361,7 @@ export function DashboardChartTile({
         headerExtra={drillControls}
         onEdit={onEdit}
         onDuplicate={onDuplicate}
+        onCopy={onCopy}
         onDelete={onDelete}
         onContextMenu={contextMenuActive ? handleTileContextMenu : undefined}
       >

@@ -176,7 +176,14 @@ describe('the value picker', () => {
     await type(byLabel('Name for group 1') as HTMLInputElement, 'Keyword');
     await click(buttonWith('Apply'));
 
-    expect(applied[0]).toEqual({ groups: [{ label: 'Keyword', values: ['yes'] }] });
+    // otherLabel is ALWAYS written, even when the author left it blank: the
+    // engine reads a missing one as "keep each unmatched value's own text",
+    // while the UI calls that bucket "Other" — writing it is what stops the
+    // chart and the label list from disagreeing.
+    expect(applied[0]).toEqual({
+      groups: [{ label: 'Keyword', values: ['yes'] }],
+      otherLabel: 'Other',
+    });
   });
 });
 

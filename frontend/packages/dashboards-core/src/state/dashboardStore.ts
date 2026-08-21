@@ -346,6 +346,25 @@ export interface DashboardStoreState {
     derivedFields: DerivedField[];
   } | null;
   /**
+   * Transient clipboard for ANY tile kind (copyTile / pasteTile) — chart,
+   * slicer, text, image, button, button group. NEVER persisted; survives
+   * closing and opening dashboards within the session, so an element copied on
+   * one dashboard can be pasted on another.
+   *
+   * `chartClipboard` above is the older chart-only field, kept in sync for
+   * hosts that read it; this is the one to use.
+   */
+  tileClipboard: {
+    tile: DashboardTile;
+    /** Dashboard the tile was copied FROM — null when it was never saved. */
+    sourceDashboardId: number | null;
+    sourceModelId: number | null;
+    /** Chart tiles only: same snapshot-and-carry contract as chartClipboard. */
+    definitions: Measure[];
+    /** Chart tiles only: see chartClipboard.derivedFields. */
+    derivedFields: DerivedField[];
+  } | null;
+  /**
    * PERSONAL-scope derived fields (the per-user settings document's
    * `derivedFields`), the sibling of personalMeasures below and held here for
    * exactly the same two reasons: the query wire has to send them, and a chart
@@ -720,6 +739,55 @@ export const cloneChartForCopy = (
   return copy;
 };
 
+/**
+ * A button group's children carry their OWN ids, and those ids are the address
+ * the group editor patches, expands, reorders and removes by — and the React
+ * key it renders them under. structuredClone would hand the copy the SOURCE's
+ * child ids, so two groups on one page would answer to the same names. Nothing
+ * today reads a child id across tile boundaries, so it is latent rather than
+ * live, but it is exactly the shape of bug that later turns into "editing this
+ * button edits the other one" or "this field will not take an edit". Fresh ids
+ * cost nothing and close it for good.
+ */
+const cloneButtonGroupForCopy = (group: ButtonGroupTileSpec): ButtonGroupTileSpec => {
+  const copy = structuredClone(group);
+  copy.buttons = copy.buttons.map((button) => ({ ...button, id: newId() }));
+  return copy;
+};
+
+/**
+ * Clone of ANY tile kind — the single clone behind duplicate, clipboard paste
+ * and copy-to-dashboard, so no copy path can drift into handling one kind
+ * differently from another.
+ *
+ * THE RULE: the copy is a NEW ELEMENT that merely starts out looking like its
+ * source. Every id it owns is re-minted (tile, chart, button-group children);
+ * everything else is a deep copy, so no field is shared with the original and
+ * editing one can never move the other. `layout` is carried verbatim — callers
+ * decide placement, because duplicate and paste both want "below everything"
+ * while a future paste-in-place would not.
+ */
+export const cloneTileForCopy = (
+  tile: DashboardTile,
+  options?: { suffix?: boolean },
+): DashboardTile => ({
+  id: newId(),
+  layout: { ...tile.layout },
+  ...(tile.kind ? { kind: tile.kind } : {}),
+  ...(tile.chart ? { chart: cloneChartForCopy(tile.chart, options) } : {}),
+  ...(tile.slicer
+    ? {
+        slicer: structuredClone(
+          options?.suffix ? { ...tile.slicer, label: `${tile.slicer.label} (copy)` } : tile.slicer,
+        ),
+      }
+    : {}),
+  ...(tile.text ? { text: structuredClone(tile.text) } : {}),
+  ...(tile.image ? { image: structuredClone(tile.image) } : {}),
+  ...(tile.button ? { button: structuredClone(tile.button) } : {}),
+  ...(tile.buttonGroup ? { buttonGroup: cloneButtonGroupForCopy(tile.buttonGroup) } : {}),
+});
+
 const initialState: DashboardStoreState = {
   list: [],
   listStatus: 'idle',
@@ -753,6 +821,7 @@ const initialState: DashboardStoreState = {
   saveStatus: 'idle',
   error: null,
   chartClipboard: null,
+  tileClipboard: null,
   personalMeasures: [],
   personalDerivedFields: [],
 };
@@ -2389,6 +2458,7 @@ export class DashboardStore {
       // The clipboard outlives the open dashboard on purpose — copy on one
       // dashboard, paste on the next (still never persisted).
       chartClipboard: this.state.chartClipboard,
+      tileClipboard: this.state.tileClipboard,
       // Personal measures belong to the USER, not to the open dashboard.
       personalMeasures: this.state.personalMeasures,
       // Per-user preference and any still-mounted overlay quiesce survive too.
@@ -2611,18 +2681,10 @@ export class DashboardStore {
       // Free placement (no auto-compaction): drop the copy below ALL content
       // so it can never overlap an existing tile.
       const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+      const clone = cloneTileForCopy(source, { suffix: true });
       const copy: DashboardTile = {
-        id: newId(),
-        layout: { ...source.layout, x: source.layout.x, y: maxY },
-        ...(source.kind ? { kind: source.kind } : {}),
-        ...(source.chart ? { chart: cloneChartForCopy(source.chart, { suffix: true }) } : {}),
-        ...(source.slicer
-          ? { slicer: structuredClone({ ...source.slicer, label: `${source.slicer.label} (copy)` }) }
-          : {}),
-        ...(source.text ? { text: structuredClone(source.text) } : {}),
-        ...(source.image ? { image: structuredClone(source.image) } : {}),
-        ...(source.button ? { button: structuredClone(source.button) } : {}),
-        ...(source.buttonGroup ? { buttonGroup: structuredClone(source.buttonGroup) } : {}),
+        ...clone,
+        layout: { ...clone.layout, x: source.layout.x, y: maxY },
       };
       return [...tiles, copy];
     });
@@ -4034,6 +4096,103 @@ export class DashboardStore {
     return this.state.personalMeasures.length === 0
       ? []
       : collectMeasureDefinitions(this.state.personalMeasures, chartMeasureIds(chart));
+  }
+
+  /* ------------------------------------ tile clipboard / copy (0.17.0) */
+
+  /**
+   * Puts ANY tile on the session clipboard. For a chart it also snapshots the
+   * scoped measure and derived-field definitions it cites, exactly as
+   * copyChart does — the clipboard spans dashboards, so those must travel with
+   * it or the paste lands broken.
+   *
+   * `chartClipboard` is kept in step for a chart so hosts still reading the
+   * older field keep working.
+   */
+  copyTile(tileId: string): void {
+    const tile = this.activeTiles().find((t) => t.id === tileId);
+    if (!tile) return;
+    const modelId = this.state.current?.modelId ?? null;
+    const chart = tile.chart;
+    this.set({
+      tileClipboard: {
+        tile: structuredClone(tile),
+        sourceDashboardId: this.state.current?.id ?? null,
+        sourceModelId: modelId,
+        definitions: chart ? structuredClone(this.definitionsForChart(chart)) : [],
+        derivedFields: chart ? structuredClone(this.derivedFieldsForChart(chart)) : [],
+      },
+      ...(chart
+        ? {
+            chartClipboard: {
+              chart: structuredClone(chart),
+              sourceModelId: modelId,
+              definitions: structuredClone(this.definitionsForChart(chart)),
+              derivedFields: structuredClone(this.derivedFieldsForChart(chart)),
+            },
+          }
+        : {}),
+    });
+  }
+
+  /**
+   * Pastes the clipboard tile onto the active page as a NEW element with the
+   * same settings — fresh ids at every level (see cloneTileForCopy), placed
+   * below all content so it can never land on top of something.
+   *
+   * A chart carries its scoped definitions through the same merge the chart
+   * clipboard uses, so a chart citing dashboard-scoped measures or derived
+   * fields does not paste as QRY_UNKNOWN_MEASURE / QRY_UNKNOWN_COLUMN.
+   *
+   * CROSS-DASHBOARD REFERENCE REPAIR. Some tiles point at things that exist
+   * only in the dashboard they came from. Pasting them elsewhere would leave
+   * references that resolve to nothing:
+   *   - a slicer's `targets` name CHART TILE IDS. Ids from another dashboard
+   *     match nothing, and "targets that match nothing" reads as a slicer that
+   *     silently filters NOTHING — the worst kind of broken, because it looks
+   *     fine. Unresolvable targets are dropped; if none survive, the slicer
+   *     falls back to `null`, its own documented "all charts" default.
+   *   - a button's `targetPageId` names a PAGE. These are deliberately LEFT
+   *     alone: the tile chrome already badges a dead target as broken in edit
+   *     mode, so it is visible and fixable, whereas silently re-pointing it at
+   *     some other page would invent an intent the author never expressed.
+   * Pasting into the SAME dashboard repairs nothing, because nothing is stale.
+   *
+   * Returns the new tile id (null when nothing was pasted) so a caller can
+   * select what it just created.
+   */
+  pasteTile(): string | null {
+    const clip = this.state.tileClipboard;
+    if (!clip || this.state.mode !== 'edit' || !this.state.current) return null;
+
+    const sameDashboard = clip.sourceDashboardId === this.state.current.id;
+    const copy = cloneTileForCopy(clip.tile, { suffix: true });
+    if (!sameDashboard && copy.slicer?.targets) {
+      const live = new Set(this.activeTiles().filter((t) => t.chart).map((t) => t.id));
+      const kept = copy.slicer.targets.filter((id) => live.has(id));
+      copy.slicer = { ...copy.slicer, targets: kept.length > 0 ? kept : null };
+    }
+
+    this.groupHistory(() => {
+      let tile = copy;
+      if (copy.chart) {
+        // Derived fields first: a name collision renames the field and
+        // re-points the chart, and the measure merge must see that chart.
+        const fields = mergeDerivedFields(this.dashboardDerivedFields, clip.derivedFields, copy.chart);
+        if (fields.added.length > 0) this.mutateDerivedFields(() => fields.fields);
+        const carried = fields.chart ?? copy.chart;
+        const merged = mergeMeasureDefinitions(this.dashboardMeasures, clip.definitions, carried);
+        if (merged.added.length > 0) this.mutateMeasures(() => merged.measures);
+        // A personal measure the chart cites is promoted to dashboard scope
+        // here, exactly as it is when a chart enters via addTile.
+        tile = { ...copy, chart: this.promotePersonalMeasuresFor(merged.chart ?? carried) };
+      }
+      this.mutateActiveTiles((tiles) => {
+        const maxY = tiles.reduce((max, t) => Math.max(max, t.layout.y + t.layout.h), 0);
+        return [...tiles, { ...tile, layout: { ...tile.layout, y: maxY } }];
+      });
+    });
+    return copy.id;
   }
 
   /* -------------------------------------- chart clipboard / copy (0.9.0) */

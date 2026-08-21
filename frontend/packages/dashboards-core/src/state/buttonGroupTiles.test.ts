@@ -236,8 +236,22 @@ describe('button-group tiles: insert + round-trip', () => {
     const copy = tiles[1]!;
     expect(copy.id).not.toBe(original.id);
     expect(copy.kind).toBe('buttonGroup');
-    expect(copy.buttonGroup).toEqual(original.buttonGroup);
     expect(copy.buttonGroup).not.toBe(original.buttonGroup); // deep clone
+
+    // The CHILD ids are re-minted too. They are what the group editor patches,
+    // expands, reorders and removes by, so a copy that kept them would give two
+    // groups the same child names — the shape of bug that later reads as
+    // "editing this button edited the other one". Everything that is not
+    // identity is still carried verbatim.
+    const idsOf = (spec: typeof original.buttonGroup) => spec!.buttons.map((b) => b.id);
+    expect(idsOf(copy.buttonGroup).some((id) => idsOf(original.buttonGroup).includes(id))).toBe(
+      false,
+    );
+    const withoutIds = (spec: typeof original.buttonGroup) => ({
+      ...spec,
+      buttons: spec!.buttons.map(({ id: _id, ...rest }) => rest),
+    });
+    expect(withoutIds(copy.buttonGroup)).toEqual(withoutIds(original.buttonGroup));
   });
 });
 

@@ -63,9 +63,17 @@ export interface DashboardToolbarProps {
   onAddSlicer: () => void;
   /** Disables the Add > Slicer item (no model attached). */
   addSlicerDisabled?: boolean;
-  /** Add ▾ > Paste chart (hidden when absent; disabled while the clipboard is empty). */
+  /**
+   * Add ▾ > Paste (hidden when absent; disabled while nothing is pastable).
+   * Pastes whatever kind is on the clipboard — chart, text, image, button,
+   * button group or slicer — so it is NOT gated with the chart-only items.
+   */
   onPasteChart?: () => void;
-  /** True while the session chart clipboard holds a copied chart. */
+  /**
+   * True while the session clipboard holds a tile the viewer is allowed to
+   * paste. The caller resolves the rights split (charts on CanEditCharts,
+   * layout kinds on CanEditLayout), because only it knows the clipboard kind.
+   */
   pasteChartEnabled?: boolean;
   onSave: () => void;
   onDiscard: () => void;
@@ -1257,7 +1265,7 @@ function AddTileMenu({
               </AddMenuItem>
             </>
           )}
-          {showChartItems && onPasteChart && (
+          {onPasteChart && (
             <>
               <div className="my-1 border-t border-rcd-border" />
               <AddMenuItem
@@ -1265,12 +1273,12 @@ function AddTileMenu({
                 disabled={!pasteChartEnabled}
                 title={
                   pasteChartEnabled
-                    ? undefined
-                    : 'Copy a chart first (right-click a chart > Copy)'
+                    ? 'Paste the copied element as a new one (Ctrl+V)'
+                    : 'Copy an element first: select it and press Ctrl+C, or use its menu > Copy'
                 }
               >
                 <ClipboardPaste size={14} />
-                Paste chart
+                Paste
               </AddMenuItem>
             </>
           )}
