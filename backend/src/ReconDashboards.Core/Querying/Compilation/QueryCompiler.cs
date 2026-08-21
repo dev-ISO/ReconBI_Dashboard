@@ -145,6 +145,9 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
     public const int MaxGroupingBuckets = 64;
 
     /// <summary>Maximum characters in one grouping label.</summary>
+    /// <summary>Match rules one bucket may carry (each is a per-row predicate).</summary>
+    public const int MaxGroupingRulesPerBucket = 20;
+
     public const int MaxGroupingLabelLength = 200;
 
     // ---------- Phase 1: resolution ----------
@@ -1542,11 +1545,44 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                     "QRY_BAD_GROUPING", $"A grouping label may be at most {MaxGroupingLabelLength} characters.");
             }
 
-            if (!group.MatchBlank && group.MatchValues.Count == 0)
+            if (!group.MatchBlank && group.MatchValues.Count == 0 && group.MatchRules.Count == 0)
             {
                 throw new QueryCompilationException(
                     "QRY_BAD_GROUPING",
-                    $"Group '{group.Label}' matches nothing; give it values or mark it as the blank group.");
+                    $"Group '{group.Label}' matches nothing; give it values, a rule, or mark it as the blank group.");
+            }
+
+            // A rule is a predicate evaluated per row, so a bucket carrying
+            // dozens of them is real work inside GROUP BY. Generous for
+            // authoring, far below anything that would hurt.
+            if (group.MatchRules.Count > MaxGroupingRulesPerBucket)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING",
+                    $"Group '{group.Label}' has {group.MatchRules.Count} rules; at most {MaxGroupingRulesPerBucket} are allowed.");
+            }
+
+            foreach (var rule in group.MatchRules)
+            {
+                var needsValue =
+                    rule.Operator is not (GroupingMatchOperator.IsBlank or GroupingMatchOperator.NotBlank);
+                var hasValue = rule.Value is { } ruleValue
+                    && ruleValue.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined);
+                if (needsValue && !hasValue)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_GROUPING",
+                        $"Group '{group.Label}': the {rule.Operator} rule needs a value.");
+                }
+
+                if (hasValue
+                    && rule.Value!.Value.ValueKind == JsonValueKind.String
+                    && (rule.Value.Value.GetString()?.Length ?? 0) > MaxGroupingLabelLength)
+                {
+                    throw new QueryCompilationException(
+                        "QRY_BAD_GROUPING",
+                        $"Group '{group.Label}': a rule value may be at most {MaxGroupingLabelLength} characters.");
+                }
             }
 
             if (group.MatchValues.Count > limits.MaxInValues)
@@ -2354,6 +2390,25 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
                 conditions.Add(dialect.InPredicate(columnExpr, negated: false, values, columnType, bag));
             }
 
+            if (group.MatchRules.Count > 0)
+            {
+                var rules = group.MatchRules
+                    .Select(rule => EmitGroupingRule(rule, columnExpr, columnType, context, bag))
+                    .ToArray();
+                var joined = string.Join(group.RuleMode == GroupingRuleMode.All ? " AND " : " OR ", rules);
+                // Parenthesised because the bucket's own conditions OR together:
+                // without it an ALL-mode rule set would bind loosely and quietly
+                // widen the bucket.
+                conditions.Add(rules.Length > 1 ? $"({joined})" : joined);
+            }
+
+            if (conditions.Count == 0)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING",
+                    $"Group '{group.Label}' matches nothing; give it values, a rule, or mark it as the blank group.");
+            }
+
             var label = dialect.ParameterPlaceholder(bag.Add(group.Label, NormalizedType.Text));
             sql.Append(" WHEN ").Append(string.Join(" OR ", conditions)).Append(" THEN ").Append(label);
         }
@@ -2363,6 +2418,84 @@ public sealed class QueryCompiler(ISqlDialect dialect, TimeProvider? timeProvide
             : dialect.CastToText(columnExpr));
 
         return sql.Append(" END").ToString();
+    }
+
+    /// <summary>
+    /// One Excel-style grouping rule as SQL.
+    ///
+    /// TEXT operators run against <c>CAST(col AS text)</c> and are
+    /// CASE-INSENSITIVE, because that is what "contains" means in a
+    /// spreadsheet and an author grouping "Westlake" does not expect
+    /// "westlake" to fall out. ORDERED operators convert their operand against
+    /// the COLUMN's own type instead, so a date column compares as a date.
+    ///
+    /// Every operand is BOUND. The pattern operators additionally escape the
+    /// LIKE metacharacters in the author's text, so a value containing % or _
+    /// matches literally rather than turning into a wildcard the author never
+    /// wrote.
+    /// </summary>
+    private string EmitGroupingRule(
+        GroupingMatchRule rule,
+        string columnExpr,
+        NormalizedType columnType,
+        string context,
+        ParameterBag bag)
+    {
+        var text = dialect.CastToText(columnExpr);
+
+        string Like(string pattern, bool negated)
+        {
+            var placeholder = dialect.ParameterPlaceholder(bag.Add(pattern, NormalizedType.Text));
+            var like = dialect.CaseInsensitiveLike(text, placeholder);
+            return negated ? $"NOT ({like})" : like;
+        }
+
+        string Operand()
+        {
+            if (rule.Value is not { } value || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING", $"{context}: the {rule.Operator} rule needs a value.");
+            }
+
+            return value.ValueKind == JsonValueKind.String
+                ? value.GetString() ?? string.Empty
+                : value.ToString();
+        }
+
+        string Compare(string op)
+        {
+            if (rule.Value is not { } value || value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+            {
+                throw new QueryCompilationException(
+                    "QRY_BAD_GROUPING", $"{context}: the {rule.Operator} rule needs a value.");
+            }
+
+            var converted = SpecValueConverter.Convert(value, columnType, context);
+            return $"{columnExpr} {op} {dialect.ParameterPlaceholder(bag.Add(converted, columnType))}";
+        }
+
+        return rule.Operator switch
+        {
+            GroupingMatchOperator.Contains => Like($"%{EscapeLikePattern(Operand())}%", negated: false),
+            GroupingMatchOperator.NotContains => Like($"%{EscapeLikePattern(Operand())}%", negated: true),
+            GroupingMatchOperator.StartsWith => Like($"{EscapeLikePattern(Operand())}%", negated: false),
+            GroupingMatchOperator.EndsWith => Like($"%{EscapeLikePattern(Operand())}", negated: false),
+            GroupingMatchOperator.Equals => Like(EscapeLikePattern(Operand()), negated: false),
+            GroupingMatchOperator.NotEquals => Like(EscapeLikePattern(Operand()), negated: true),
+            // Blank means NULL *or* empty, the same reading as MatchBlank and
+            // the isBlank filter operator — one definition of blank everywhere.
+            GroupingMatchOperator.IsBlank =>
+                $"({columnExpr} IS NULL OR {text} = {dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text))})",
+            GroupingMatchOperator.NotBlank =>
+                $"({columnExpr} IS NOT NULL AND {text} <> {dialect.ParameterPlaceholder(bag.Add(string.Empty, NormalizedType.Text))})",
+            GroupingMatchOperator.GreaterThan => Compare(">"),
+            GroupingMatchOperator.GreaterOrEqual => Compare(">="),
+            GroupingMatchOperator.LessThan => Compare("<"),
+            GroupingMatchOperator.LessOrEqual => Compare("<="),
+            _ => throw new QueryCompilationException(
+                "QRY_BAD_GROUPING", $"{context}: unsupported rule operator {rule.Operator}."),
+        };
     }
 
     /// <summary>

@@ -231,3 +231,65 @@ describe('promotion to a reusable field', () => {
     ).toBe(false);
   });
 });
+
+/**
+ * EXCEL-STYLE RULES in the editor. A listed bucket freezes the values that
+ * existed when it was written; a rule keeps catching new ones, which is the
+ * point — so the editor has to be able to express one without picking values.
+ */
+describe('match rules', () => {
+  const selectOption = async (select: HTMLSelectElement, value: string) => {
+    const setter = Object.getOwnPropertyDescriptor(
+      window.HTMLSelectElement.prototype,
+      'value',
+    )!.set!;
+    await act(async () => {
+      setter.call(select, value);
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+  };
+
+  it('a rule reaches the applied grouping, with no values picked at all', async () => {
+    await mount();
+    await click(buttonWith('Start from a group of values'));
+    await type(byLabel('Name for group 1') as HTMLInputElement, 'Westlake');
+    await click(buttonWith('+ Add rule'));
+    await type(byLabel('Value for rule 1 of group 1') as HTMLInputElement, 'westlake');
+    await click(buttonWith('Apply'));
+
+    expect(applied[0]!.groups[0]).toEqual({
+      label: 'Westlake',
+      rules: [{ operator: 'contains', value: 'westlake' }],
+    });
+  });
+
+  it('hides the value box for the operators that take none', async () => {
+    await mount();
+    await click(buttonWith('Start from a group of values'));
+    await click(buttonWith('+ Add rule'));
+    expect(byLabel('Value for rule 1 of group 1')).toBeTruthy();
+
+    await selectOption(byLabel('Rule 1 for group 1') as HTMLSelectElement, 'isBlank');
+    expect(() => byLabel('Value for rule 1 of group 1')).toThrow();
+  });
+
+  it('offers any/all only once there is more than one rule', async () => {
+    await mount();
+    await click(buttonWith('Start from a group of values'));
+    await click(buttonWith('+ Add rule'));
+    expect(() => byLabel('How rules combine for group 1')).toThrow();
+
+    await click(buttonWith('+ Add rule'));
+    expect(byLabel('How rules combine for group 1')).toBeTruthy();
+  });
+
+  it('will not apply a rule with no value, and says so', async () => {
+    await mount();
+    await click(buttonWith('Start from a group of values'));
+    await type(byLabel('Name for group 1') as HTMLInputElement, 'Westlake');
+    await click(buttonWith('+ Add rule'));
+
+    expect(host.textContent).toContain('give every rule a value');
+    expect(buttonWith('Apply').disabled).toBe(true);
+  });
+});

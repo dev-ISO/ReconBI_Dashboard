@@ -35,6 +35,47 @@ export interface ValueGroup {
   label: string;
   values?: FilterValue[];
   matchBlank?: boolean;
+  /**
+   * EXCEL-STYLE MATCH RULES — the dynamic half of a bucket.
+   *
+   * `values` is a snapshot: it holds exactly the values that existed when the
+   * author picked them, so every value that appears afterwards has to be added
+   * by hand. A rule is evaluated in SQL against the live data, so a value that
+   * arrives tomorrow joins its group on its own.
+   *
+   * Rules and values coexist: a bucket can list the awkward exceptions AND
+   * carry a rule for the general case. Within a bucket, values, the blank flag
+   * and the rule set OR together.
+   */
+  rules?: ValueGroupRule[];
+  /** How this bucket's rules combine. 'any' (default) is Excel's "or". */
+  ruleMode?: 'any' | 'all';
+}
+
+/** The Excel-autofilter vocabulary a bucket rule can match by. */
+export type ValueGroupRuleOperator =
+  | 'contains'
+  | 'notContains'
+  | 'startsWith'
+  | 'endsWith'
+  | 'equals'
+  | 'notEquals'
+  | 'isBlank'
+  | 'notBlank'
+  | 'greaterThan'
+  | 'greaterOrEqual'
+  | 'lessThan'
+  | 'lessOrEqual';
+
+/**
+ * One rule. `value` is required by every operator except isBlank/notBlank.
+ * Text operators are CASE-INSENSITIVE — "contains Westlake" catches "westlake",
+ * which is what the same words mean in a spreadsheet — and LIKE metacharacters
+ * in the author's text match literally rather than acting as wildcards.
+ */
+export interface ValueGroupRule {
+  operator: ValueGroupRuleOperator;
+  value?: FilterValue | null;
 }
 
 /**

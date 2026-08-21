@@ -8,9 +8,30 @@ import {
   type FilterValue,
   type ValueGroup,
   type ValueGrouping,
+  type ValueGroupRule,
+  type ValueGroupRuleOperator,
 } from '@recon/dashboards-core';
-import { RcdButton, RcdDialog, RcdInput } from '../primitives';
+import { RcdButton, RcdDialog, RcdInput, RcdSelect } from '../primitives';
 import { DistinctValueList } from './DistinctValueList';
+
+/** The rule vocabulary, in the order a spreadsheet offers it. */
+const RULE_OPERATORS: ReadonlyArray<{ value: ValueGroupRuleOperator; label: string }> = [
+  { value: 'contains', label: 'contains' },
+  { value: 'notContains', label: 'does not contain' },
+  { value: 'startsWith', label: 'begins with' },
+  { value: 'endsWith', label: 'ends with' },
+  { value: 'equals', label: 'is exactly' },
+  { value: 'notEquals', label: 'is not' },
+  { value: 'isBlank', label: 'is blank' },
+  { value: 'notBlank', label: 'is not blank' },
+  { value: 'greaterThan', label: 'is greater than' },
+  { value: 'greaterOrEqual', label: 'is at least' },
+  { value: 'lessThan', label: 'is less than' },
+  { value: 'lessOrEqual', label: 'is at most' },
+];
+
+/** Operators with nothing to type — the value box hides for these. */
+const VALUELESS_OPERATORS: ReadonlySet<ValueGroupRuleOperator> = new Set(['isBlank', 'notBlank']);
 
 export interface ValueGroupingEditorProps {
   modelId: number;
@@ -111,6 +132,36 @@ export function ValueGroupingEditor({
     setGroups((current) => current.filter((group) => group.key !== key));
     setPickerKey((open) => (open === key ? null : open));
   };
+
+  const patchRule = (key: string, index: number, next: Partial<ValueGroupRule>): void =>
+    setGroups((current) =>
+      current.map((group) =>
+        group.key === key
+          ? {
+              ...group,
+              rules: (group.rules ?? []).map((rule, i) => (i === index ? { ...rule, ...next } : rule)),
+            }
+          : group,
+      ),
+    );
+
+  const addRule = (key: string): void =>
+    setGroups((current) =>
+      current.map((group) =>
+        group.key === key
+          ? { ...group, rules: [...(group.rules ?? []), { operator: 'contains' as const, value: '' }] }
+          : group,
+      ),
+    );
+
+  const removeRule = (key: string, index: number): void =>
+    setGroups((current) =>
+      current.map((group) =>
+        group.key === key
+          ? { ...group, rules: (group.rules ?? []).filter((_rule, i) => i !== index) }
+          : group,
+      ),
+    );
 
   const toggleValue = (key: string, value: FilterValue): void =>
     setGroups((current) =>
@@ -268,6 +319,79 @@ export function ValueGroupingEditor({
                     >
                       {picking ? 'Done choosing' : values.length === 0 ? 'Choose values…' : '+ more'}
                     </button>
+                  </div>
+
+                  {/* MATCH RULES — the dynamic half. Listed values freeze what
+                      existed when they were picked; a rule keeps catching new
+                      values as they arrive, which is the whole point. */}
+                  <div className="flex flex-col gap-1 pl-6">
+                    {(group.rules ?? []).map((rule, ruleIndex) => (
+                      <div key={ruleIndex} className="flex items-center gap-1">
+                        <RcdSelect
+                          className="w-40 shrink-0"
+                          aria-label={`Rule ${ruleIndex + 1} for group ${index + 1}`}
+                          value={rule.operator}
+                          onChange={(event) =>
+                            patchRule(group.key, ruleIndex, {
+                              operator: event.target.value as ValueGroupRuleOperator,
+                            })
+                          }
+                        >
+                          {RULE_OPERATORS.map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </RcdSelect>
+                        {!VALUELESS_OPERATORS.has(rule.operator) && (
+                          <RcdInput
+                            className="min-w-0 flex-1"
+                            value={rule.value === undefined || rule.value === null ? '' : String(rule.value)}
+                            placeholder="Value, e.g. Westlake"
+                            aria-label={`Value for rule ${ruleIndex + 1} of group ${index + 1}`}
+                            onChange={(event) =>
+                              patchRule(group.key, ruleIndex, { value: event.target.value })
+                            }
+                          />
+                        )}
+                        <button
+                          type="button"
+                          aria-label={`Remove rule ${ruleIndex + 1} from group ${index + 1}`}
+                          onClick={() => removeRule(group.key, ruleIndex)}
+                          className="shrink-0 rounded p-1 text-rcd-muted hover:bg-black/10 hover:text-rcd-text dark:hover:bg-white/10"
+                        >
+                          <X size={11} />
+                        </button>
+                      </div>
+                    ))}
+
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => addRule(group.key)}
+                        className="rounded border border-dashed border-rcd-border px-1.5 py-0.5 text-[11px] text-rcd-muted hover:text-rcd-text"
+                      >
+                        + Add rule
+                      </button>
+                      {(group.rules ?? []).length > 1 && (
+                        <label className="flex items-center gap-1 text-[11px] text-rcd-text-2">
+                          Match
+                          <RcdSelect
+                            className="w-24"
+                            aria-label={`How rules combine for group ${index + 1}`}
+                            value={group.ruleMode ?? 'any'}
+                            onChange={(event) =>
+                              patch(group.key, {
+                                ruleMode: event.target.value === 'all' ? 'all' : 'any',
+                              })
+                            }
+                          >
+                            <option value="any">any rule</option>
+                            <option value="all">all rules</option>
+                          </RcdSelect>
+                        </label>
+                      )}
+                    </div>
                   </div>
 
                   {picking && (

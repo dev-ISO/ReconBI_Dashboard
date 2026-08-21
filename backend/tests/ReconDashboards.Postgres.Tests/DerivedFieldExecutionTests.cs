@@ -58,11 +58,29 @@ public sealed class DerivedFieldExecutionTests(PostgresContainerFixture fixture)
         DateTables: null,
         DerivedFields: fields);
 
+    /// <summary>
+    /// ONE executor for the whole class. Each call used to build a fresh
+    /// NpgsqlDataSource, and a data source owns a POOL that is never disposed —
+    /// so every test in this class left idle connections open for the rest of
+    /// the run. Adding four tests pushed the total past the container's
+    /// max_connections and broke the CONCURRENCY test in another class with
+    /// "sorry, too many clients already": a failure with nothing to do with the
+    /// test that reported it. Caching keeps this class to a single pool.
+    /// </summary>
+    private static IQueryExecutor? cachedExecutor;
+
     private IQueryExecutor Executor()
     {
+        if (cachedExecutor is not null) return cachedExecutor;
+        // Each call builds its OWN NpgsqlDataSource, so each brings its own
+        // pool. Left at the default that is dozens of idle connections across
+        // this class, and the container's max_connections is shared with the
+        // concurrency tests — which then fail with "sorry, too many clients
+        // already" for reasons that have nothing to do with them.
         var connectionString = new NpgsqlConnectionStringBuilder(fixture.DataSource.ConnectionString)
         {
             Password = "postgres",
+            MaxPoolSize = 2,
         }.ConnectionString;
 
         var options = new ReconDashboardsOptions();
@@ -73,7 +91,8 @@ public sealed class DerivedFieldExecutionTests(PostgresContainerFixture fixture)
         });
         var registry = new DataSourceRegistry(options, new NullServices());
         Assert.True(registry.TryGet("derived-demo", out var source));
-        return source.Executor!;
+        cachedExecutor = source.Executor!;
+        return cachedExecutor;
     }
 
     private sealed class NullServices : IServiceProvider
@@ -402,6 +421,82 @@ public sealed class DerivedFieldExecutionTests(PostgresContainerFixture fixture)
 
         // Every label the field produces is non-blank, so nothing is filtered out.
         Assert.Equal(7L, rows.Sum(r => r.Count));
+    }
+
+    // ---------- Excel-style grouping RULES, over real data ----------
+
+    private static GroupingRule ContainsGrouping(string needle, string label) =>
+        new([new GroupingBucket(label, Rules: [new GroupingMatchRule(GroupingMatchOperator.Contains, Json(needle))])],
+            OtherLabel: "Other");
+
+    [Fact]
+    public async Task AContainsRuleMatchesEveryRowThePatternFits()
+    {
+        // 'st' ends both West and East — one pattern, two values, no list.
+        var rows = await RunAsync(Compile(Spec(
+            new DimensionSpec("public.reviews", "region", null, ContainsGrouping("st", "Has st")))));
+
+        Assert.Equal([("Has st", 7L)], rows);
+    }
+
+    [Fact]
+    public async Task TextRulesAreCaseInsensitiveLikeASpreadsheet()
+    {
+        var rows = await RunAsync(Compile(Spec(
+            new DimensionSpec("public.reviews", "region", null, ContainsGrouping("WEST", "West-ish")))));
+
+        Assert.Contains(rows, r => r.Label == "West-ish" && r.Count == 3);
+    }
+
+    /// <summary>
+    /// THE WHOLE REASON RULES EXIST: a value that did not exist when the author
+    /// wrote the rule still lands in the right group, with no edit to the chart.
+    /// A bucket built from listed values cannot do this — it would need the new
+    /// value adding by hand.
+    /// </summary>
+    [Fact]
+    public async Task AValueThatArrivesLATERJoinsTheGroupOnItsOwn()
+    {
+        var listed = new GroupingRule(
+            [new GroupingBucket("Westish", Values: [Json("West")])], OtherLabel: "Other");
+        var ruled = ContainsGrouping("West", "Westish");
+
+        var before = await RunAsync(Compile(Spec(
+            new DimensionSpec("public.reviews", "region", null, ruled))));
+        Assert.Contains(before, r => r.Label == "Westish" && r.Count == 3);
+
+        await using var insert = fixture.DataSource.CreateCommand(
+            "INSERT INTO reviews (region, edms_uploaded) VALUES ('Westlake', 'Yes')");
+        await insert.ExecuteNonQueryAsync();
+        try
+        {
+            var byRule = await RunAsync(Compile(Spec(
+                new DimensionSpec("public.reviews", "region", null, ruled))));
+            // The rule picked the new row up without being touched.
+            Assert.Contains(byRule, r => r.Label == "Westish" && r.Count == 4);
+
+            var byList = await RunAsync(Compile(Spec(
+                new DimensionSpec("public.reviews", "region", null, listed))));
+            // The listed bucket did not — it still knows only the old value.
+            Assert.Contains(byList, r => r.Label == "Westish" && r.Count == 3);
+        }
+        finally
+        {
+            await using var cleanup = fixture.DataSource.CreateCommand(
+                "DELETE FROM reviews WHERE region = 'Westlake'");
+            await cleanup.ExecuteNonQueryAsync();
+        }
+    }
+
+    [Fact]
+    public async Task ALikeMetacharacterInTheAuthorsTextMatchesLITERALLY()
+    {
+        // '%' is a wildcard in LIKE. Escaped, it matches a literal per-cent
+        // sign — so this rule finds nothing rather than everything.
+        var rows = await RunAsync(Compile(Spec(
+            new DimensionSpec("public.reviews", "region", null, ContainsGrouping("%", "Percent")))));
+
+        Assert.DoesNotContain(rows, r => r.Label == "Percent");
     }
 
 }

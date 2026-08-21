@@ -65,10 +65,62 @@ public enum SortTargetKind
 public sealed record GroupingBucket(
     string Label,
     IReadOnlyList<JsonElement>? Values = null,
-    bool MatchBlank = false)
+    bool MatchBlank = false,
+    IReadOnlyList<GroupingMatchRule>? Rules = null,
+    GroupingRuleMode RuleMode = GroupingRuleMode.Any)
 {
     public IReadOnlyList<JsonElement> MatchValues => Values ?? [];
+
+    public IReadOnlyList<GroupingMatchRule> MatchRules => Rules ?? [];
 }
+
+/// <summary>
+/// How a bucket's <see cref="GroupingBucket.Rules"/> combine with each other.
+/// Any (default) is Excel's "or" — a row joins the bucket if ANY rule matches.
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<GroupingRuleMode>))]
+public enum GroupingRuleMode
+{
+    Any,
+    All,
+}
+
+/// <summary>
+/// The Excel-autofilter vocabulary a grouping bucket can match by. Text
+/// operators are CASE-INSENSITIVE, matching what the same words mean in a
+/// spreadsheet; the ordered ones convert their operand against the column's own
+/// type, so a date column compares as a date rather than as text.
+/// </summary>
+[JsonConverter(typeof(CamelCaseJsonStringEnumConverter<GroupingMatchOperator>))]
+public enum GroupingMatchOperator
+{
+    Contains,
+    NotContains,
+    StartsWith,
+    EndsWith,
+    Equals,
+    NotEquals,
+    IsBlank,
+    NotBlank,
+    GreaterThan,
+    GreaterOrEqual,
+    LessThan,
+    LessOrEqual,
+}
+
+/// <summary>
+/// One Excel-style match rule. THE POINT OF RULES: a bucket built from listed
+/// values only ever contains the values that existed when the author picked
+/// them, so every new value that arrives has to be added by hand. A rule is
+/// evaluated in SQL against the live data, so a value that appears tomorrow
+/// joins its group with no edit.
+///
+/// <para><see cref="Value"/> is required by every operator except IsBlank and
+/// NotBlank, and is BOUND as a parameter like every other grouping operand.</para>
+/// </summary>
+public sealed record GroupingMatchRule(
+    GroupingMatchOperator Operator,
+    JsonElement? Value = null);
 
 /// <summary>
 /// A chart-local mapping from raw column values to category labels — the

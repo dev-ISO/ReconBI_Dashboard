@@ -25,6 +25,7 @@ import {
   groupingProblems,
   groupingPromotionProblems,
   MAX_PROMOTABLE_BRANCHES,
+  ruleIsUsable,
   groupingToExpression,
   groupingSurvives,
   hasGrouping,
@@ -346,5 +347,136 @@ describe('promotion has a smaller budget than grouping', () => {
       otherLabel: 'Other',
     };
     expect(groupingPromotionProblems(grouping).join(' ')).toContain('chart grouping instead');
+  });
+});
+
+/**
+ * EXCEL-STYLE RULES — the dynamic half of a bucket.
+ *
+ * A listed bucket freezes the values that existed when it was written; a rule is
+ * evaluated in SQL, so tomorrow's value joins on its own. These tests hold the
+ * CLIENT half of that: what normalizes onto the wire, what a click can honestly
+ * translate to, and what the editor must refuse.
+ */
+describe('grouping rules', () => {
+  const ruleGroup = (rules: { operator: string; value?: unknown }[], extra = {}) => ({
+    groups: [{ label: 'Westlake', rules, ...extra } as never],
+    otherLabel: 'Other',
+  });
+
+  it('a bucket with only a rule is not empty', () => {
+    expect(normalizeGrouping(ruleGroup([{ operator: 'contains', value: 'west' }]))).not.toBeNull();
+  });
+
+  it('drops half-typed rules rather than sending them', () => {
+    // An operator with no operand is a compile error the author would meet as
+    // a broken chart, so it never reaches the wire.
+    const normalized = normalizeGrouping({
+      groups: [
+        {
+          label: 'Westlake',
+          rules: [
+            { operator: 'contains', value: 'west' },
+            { operator: 'contains', value: '   ' },
+          ],
+        } as never,
+      ],
+      otherLabel: 'Other',
+    });
+    expect(normalized!.groups[0]!.rules).toEqual([{ operator: 'contains', value: 'west' }]);
+  });
+
+  it('keeps valueless operators, which are complete without one', () => {
+    expect(ruleIsUsable({ operator: 'isBlank' })).toBe(true);
+    expect(ruleIsUsable({ operator: 'notBlank' })).toBe(true);
+    expect(ruleIsUsable({ operator: 'contains' })).toBe(false);
+  });
+
+  it('only writes ruleMode when it changes the meaning', () => {
+    const one = normalizeGrouping(ruleGroup([{ operator: 'contains', value: 'w' }], { ruleMode: 'all' }));
+    expect(one!.groups[0]!.ruleMode).toBeUndefined(); // one rule: any === all
+
+    const two = normalizeGrouping(
+      ruleGroup(
+        [
+          { operator: 'startsWith', value: 'W' },
+          { operator: 'endsWith', value: 't' },
+        ],
+        { ruleMode: 'all' },
+      ),
+    );
+    expect(two!.groups[0]!.ruleMode).toBe('all');
+  });
+
+  it('flags a rule with no value', () => {
+    expect(groupingProblems(ruleGroup([{ operator: 'contains' }])).join(' ')).toContain(
+      'give every rule a value',
+    );
+  });
+
+  it('RULES ARE PART OF THE IDENTITY — two rule sets are two groupings', () => {
+    // groupingKeyOf drives cross-tile hover matching. Without rules in the key,
+    // two charts grouping one column differently would highlight each other.
+    const a = groupingKeyOf({ grouping: ruleGroup([{ operator: 'contains', value: 'west' }]) });
+    const b = groupingKeyOf({ grouping: ruleGroup([{ operator: 'contains', value: 'east' }]) });
+    const c = groupingKeyOf({ grouping: ruleGroup([{ operator: 'startsWith', value: 'west' }]) });
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(c);
+  });
+
+  it('cannot be promoted to a reusable field, and says why', () => {
+    const problems = groupingPromotionProblems(ruleGroup([{ operator: 'contains', value: 'w' }]));
+    expect(problems.join(' ')).toContain('keep it as a chart grouping');
+    expect(
+      groupingToExpression('public.report_systems', 'uploaded_to_edms', ruleGroup([
+        { operator: 'contains', value: 'w' },
+      ])),
+    ).toBeNull();
+  });
+});
+
+describe('clicking a rule-based bar', () => {
+  const dimOf = (rules: { operator: string; value?: unknown }[], mode?: 'any' | 'all') =>
+    dim({ groups: [{ label: 'Westlake', rules, ...(mode ? { ruleMode: mode } : {}) } as never], otherLabel: 'Other' });
+
+  it('translates the operators the filter language can say', () => {
+    expect(groupingClauseFor(dimOf([{ operator: 'contains', value: 'west' }]), 'Westlake')).toEqual({
+      table: 'public.report_systems',
+      column: 'uploaded_to_edms',
+      operator: 'contains',
+      values: ['west'],
+    });
+    expect(groupingClauseFor(dimOf([{ operator: 'isBlank' }]), 'Westlake')).toMatchObject({
+      operator: 'isBlank',
+      values: [],
+    });
+    expect(groupingClauseFor(dimOf([{ operator: 'greaterThan', value: 5 }]), 'Westlake')).toMatchObject({
+      operator: 'gt',
+      values: [5],
+    });
+  });
+
+  it('DECLINES the operators it cannot say, rather than approximating', () => {
+    // There is no "not contains" / "ends with" filter operator. Filtering with
+    // something close would show rows the user did not click.
+    expect(groupingClauseFor(dimOf([{ operator: 'notContains', value: 'x' }]), 'Westlake')).toBeNull();
+    expect(groupingClauseFor(dimOf([{ operator: 'endsWith', value: 'x' }]), 'Westlake')).toBeNull();
+  });
+
+  it('declines several rules — an OR, or an AND, is not one clause', () => {
+    const two = [
+      { operator: 'contains', value: 'a' },
+      { operator: 'contains', value: 'b' },
+    ];
+    expect(groupingClauseFor(dimOf(two), 'Westlake')).toBeNull();
+    expect(groupingClauseFor(dimOf(two, 'all'), 'Westlake')).toBeNull();
+  });
+
+  it('declines "everything else" whenever any bucket matches by rule', () => {
+    expect(groupingClauseFor(dimOf([{ operator: 'contains', value: 'w' }]), 'Other')).toBeNull();
+  });
+
+  it('declines a header-filter checklist over rule buckets', () => {
+    expect(groupingClausesForLabels(dimOf([{ operator: 'contains', value: 'w' }]), ['Westlake'])).toBeNull();
   });
 });

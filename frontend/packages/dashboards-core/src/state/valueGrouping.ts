@@ -23,6 +23,8 @@ import type {
   FilterValue,
   ValueGroup,
   ValueGrouping,
+  ValueGroupRule,
+  ValueGroupRuleOperator,
 } from '../types/query';
 
 /** The engine's label for rows that match no group (grouping.otherLabel ?? this). */
@@ -50,14 +52,23 @@ export const groupingKeyOf = (dimension: Pick<DimensionRef, 'grouping'>): string
   const grouping = dimension.grouping;
   if (!grouping || grouping.groups.length === 0) return null;
   const groups = grouping.groups
-    .map(
-      (group) =>
-        `${group.label}\u0001${(group.values ?? []).map(String).join('\u0002')}\u0001${
-          group.matchBlank === true ? 'b' : ''
-        }`,
+    .map((group) =>
+      [
+        group.label,
+        (group.values ?? []).map(String).join(''),
+        group.matchBlank === true ? 'b' : '',
+        // RULES ARE PART OF THE IDENTITY. Two charts grouping one column by
+        // DIFFERENT rules are different groupings, and this key is what
+        // cross-tile hover matching compares - leaving rules out would make
+        // them highlight each other's bars.
+        rulesOf(group)
+          .map((rule) => `${rule.operator}=${String(rule.value ?? '')}`)
+          .join(''),
+        group.ruleMode ?? 'any',
+      ].join(''),
     )
-    .join('\u0003');
-  return `${groups}\u0004${otherLabelOf(grouping)}`;
+    .join('');
+  return `${groups}${otherLabelOf(grouping)}`;
 };
 
 /** True when the dimension carries a usable grouping. */
@@ -78,9 +89,24 @@ export const groupingLabels = (grouping: ValueGrouping): string[] => [
 
 const valuesOf = (group: ValueGroup): FilterValue[] => group.values ?? [];
 
+const rulesOf = (group: ValueGroup): ValueGroupRule[] => group.rules ?? [];
+
+/** Operators that carry no operand — the only ones valid with an empty value. */
+const VALUELESS_RULE_OPERATORS: ReadonlySet<ValueGroupRuleOperator> = new Set([
+  'isBlank',
+  'notBlank',
+]);
+
+/** True when a rule is complete enough to send. */
+export const ruleIsUsable = (rule: ValueGroupRule): boolean =>
+  VALUELESS_RULE_OPERATORS.has(rule.operator) ||
+  (rule.value !== undefined && rule.value !== null && String(rule.value).trim() !== '');
+
 /** A bucket that collects nothing is a no-op the engine would still emit. */
 export const groupIsEmpty = (group: ValueGroup): boolean =>
-  valuesOf(group).length === 0 && group.matchBlank !== true;
+  valuesOf(group).length === 0 &&
+  group.matchBlank !== true &&
+  rulesOf(group).filter(ruleIsUsable).length === 0;
 
 /**
  * Drops empty buckets and trims labels, or returns null when nothing is left —
@@ -94,10 +120,15 @@ export const normalizeGrouping = (grouping: ValueGrouping | null): ValueGrouping
   const groups = grouping.groups
     .map((group): ValueGroup => {
       const values = valuesOf(group);
+      // Half-typed rules are dropped rather than sent: an operator with no
+      // operand is a compile error the author would meet as a broken chart.
+      const rules = rulesOf(group).filter(ruleIsUsable);
       return {
         label: group.label.trim(),
         ...(values.length > 0 ? { values } : {}),
         ...(group.matchBlank === true ? { matchBlank: true } : {}),
+        ...(rules.length > 0 ? { rules } : {}),
+        ...(rules.length > 1 && group.ruleMode === 'all' ? { ruleMode: 'all' as const } : {}),
       };
     })
     .filter((group) => !groupIsEmpty(group));
@@ -134,6 +165,9 @@ export const groupingProblems = (grouping: ValueGrouping): string[] => {
   }
   const labels = groupingLabels(grouping).map((label) => label.trim().toLowerCase());
   if (new Set(labels).size !== labels.length) problems.push('give each group a different name');
+  if (grouping.groups.some((group) => rulesOf(group).some((rule) => !ruleIsUsable(rule)))) {
+    problems.push('give every rule a value (or use "is blank" / "is not blank")');
+  }
   if (grouping.groups.filter((group) => group.matchBlank === true).length > 1) {
     problems.push('let only one group collect blanks');
   }
@@ -186,6 +220,37 @@ export const groupForLabel = (
  * error into the CHART: an empty-string row would render under "Yes", reporting
  * an EDMS upload that never happened.
  */
+/**
+ * The FilterClause a single rule becomes, or null when the filter language
+ * cannot say it. `notContains`, `notEquals` and `endsWith` have no operator, so
+ * clicking such a bar declines to filter rather than filtering approximately —
+ * the same never-over-match rule the rest of this module keeps.
+ */
+const RULE_CLAUSE_OPERATORS: Partial<Record<ValueGroupRuleOperator, FilterClause['operator']>> = {
+  contains: 'contains',
+  startsWith: 'startsWith',
+  equals: 'eq',
+  isBlank: 'isBlank',
+  notBlank: 'notBlank',
+  greaterThan: 'gt',
+  greaterOrEqual: 'gte',
+  lessThan: 'lt',
+  lessOrEqual: 'lte',
+};
+
+const ruleClauseFor = (
+  table: string,
+  column: string,
+  rule: ValueGroupRule,
+): FilterClause | null => {
+  const operator = RULE_CLAUSE_OPERATORS[rule.operator];
+  if (!operator) return null;
+  const valueless = operator === 'isBlank' || operator === 'notBlank';
+  if (valueless) return { table, column, operator, values: [] };
+  if (rule.value === undefined || rule.value === null) return null;
+  return { table, column, operator, values: [rule.value] };
+};
+
 export const groupingClauseFor = (
   dimension: DimensionRef,
   label: string,
@@ -199,7 +264,17 @@ export const groupingClauseFor = (
   if (target.kind === 'group') {
     const values = valuesOf(target.group);
     const blank = target.group.matchBlank === true;
-    if (values.length > 0 && blank) return null; // a disjunction; see above
+    const rules = rulesOf(target.group).filter(ruleIsUsable);
+    // A bucket's values, blank flag and rules OR together, and a clause list is
+    // conjunctive — so more than one of them present is a disjunction no single
+    // clause can say.
+    const parts = (values.length > 0 ? 1 : 0) + (blank ? 1 : 0) + (rules.length > 0 ? 1 : 0);
+    if (parts > 1) return null;
+    if (rules.length > 0) {
+      // Several rules are an OR ('any') or an AND ('all'); neither is one
+      // clause, so only a lone rule translates here.
+      return rules.length === 1 ? ruleClauseFor(table, column, rules[0]!) : null;
+    }
     if (blank) return { table, column, operator: 'isBlank', values: [] };
     if (values.length === 0) return null;
     return values.length === 1
@@ -207,7 +282,10 @@ export const groupingClauseFor = (
       : { table, column, operator: 'in', values: [...values] };
   }
 
-  // "Everything else": the complement of every bucket at once.
+  // "Everything else": the complement of every bucket at once. A rule anywhere
+  // makes that complement a negated pattern the filter language cannot express,
+  // so the click declines rather than filtering wrongly.
+  if (grouping.groups.some((group) => rulesOf(group).filter(ruleIsUsable).length > 0)) return null;
   const claimed = grouping.groups.flatMap(valuesOf);
   const blankClaimed = grouping.groups.some((group) => group.matchBlank === true);
   if (claimed.length > 0 && blankClaimed) return null; // needs notIn AND notNull
@@ -232,6 +310,10 @@ export const groupingClausesForLabels = (
 ): FilterClause[] | null => {
   const grouping = dimension.grouping;
   if (!grouping || grouping.groups.length === 0) return null;
+  // Excluding a rule bucket means NEGATING its pattern, and the filter language
+  // has no "not contains". Refusing the whole checklist keeps the promise that
+  // a translation never returns rows the user did not ask for.
+  if (grouping.groups.some((group) => rulesOf(group).filter(ruleIsUsable).length > 0)) return null;
   const wanted = new Set(labels);
   const all = groupingLabels(grouping);
   const excluded = all.filter((label) => !wanted.has(label));
@@ -334,6 +416,14 @@ export const groupingPromotionProblems = (grouping: ValueGrouping): string[] => 
   ];
   if (texts.some((text) => !literalIsSafe(text))) {
     problems.push('remove quotes and backslashes from the names and values first');
+  }
+  // The row-level formula grammar has comparisons, ISBLANK and IF - it has no
+  // CONTAINS/STARTSWITH, so a rule-based bucket cannot be written as one.
+  // Saying so beats promoting a field that quietly drops the rule.
+  if (grouping.groups.some((group) => rulesOf(group).length > 0)) {
+    problems.push(
+      'a group that matches by rule cannot become a reusable field yet - keep it as a chart grouping',
+    );
   }
   return problems;
 };

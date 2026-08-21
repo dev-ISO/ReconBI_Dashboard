@@ -665,4 +665,116 @@ public class QueryCompilerDerivedFieldTests
         Assert.DoesNotContain(compiled.Columns, c => c.Name == "EDMS Uploaded?");
         Assert.Equal(4, compiled.Columns.Count);
     }
+    // ---------- Excel-style grouping RULES ----------
+
+    private static GroupingRule RuleGrouping(
+        GroupingMatchOperator op,
+        object? value,
+        GroupingRuleMode mode = GroupingRuleMode.Any,
+        params (GroupingMatchOperator Op, object? Value)[] extra)
+    {
+        var rules = new List<GroupingMatchRule>
+        {
+            new(op, value is null ? null : Json(value)),
+        };
+        rules.AddRange(extra.Select(e => new GroupingMatchRule(e.Op, e.Value is null ? null : Json(e.Value))));
+        return new GroupingRule(
+            [new GroupingBucket("Westlake", Rules: rules, RuleMode: mode)],
+            OtherLabel: "Other");
+    }
+
+    /// <summary>
+    /// THE POINT OF RULES: a bucket that names values only ever holds the values
+    /// that existed when the author picked them. A rule is evaluated in SQL, so
+    /// a value that shows up tomorrow joins its group with no edit.
+    /// </summary>
+    [Fact]
+    public void AContainsRuleCompilesToACaseInsensitiveLike()
+    {
+        var compiled = Compile(Spec([
+            new DimensionSpec("public.reviews", "region", null,
+                RuleGrouping(GroupingMatchOperator.Contains, "west")),
+        ]));
+
+        Assert.Contains("ILIKE", compiled.Sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(compiled.Parameters, p => Equals(p.Value, "%west%"));
+    }
+
+    [Fact]
+    public void RuleOperandsAreBoundAndNeverEmitted()
+    {
+        const string hostile = "%' OR 1=1 --";
+        var compiled = Compile(Spec([
+            new DimensionSpec("public.reviews", "region", null,
+                RuleGrouping(GroupingMatchOperator.Contains, hostile)),
+        ]));
+
+        Assert.DoesNotContain("OR 1=1", compiled.Sql, StringComparison.Ordinal);
+        // A LIKE predicate carries the dialect's own ESCAPE clause, which is a
+        // fixed constant and the ONE quoted literal the renderer emits. Strip
+        // it, then hold the same line as everywhere else: no author text.
+        // Every quote character in the statement must belong to one of those
+        // ESCAPE clauses — two apiece. Anything else would be emitted text.
+        var escapeClauses = compiled.Sql.Split("ESCAPE ").Length - 1;
+        Assert.True(escapeClauses > 0, "a LIKE predicate should carry an ESCAPE clause");
+        Assert.Equal(escapeClauses * 2, compiled.Sql.Count(c => c == '\''));
+        // And the LIKE metacharacter the author typed is ESCAPED, so it matches
+        // literally instead of silently becoming a wildcard.
+        Assert.Contains(compiled.Parameters, p => p.Value is string s && s.Contains(@"\%", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void EveryOperatorCompiles()
+    {
+        foreach (var op in Enum.GetValues<GroupingMatchOperator>())
+        {
+            var needsValue = op is not (GroupingMatchOperator.IsBlank or GroupingMatchOperator.NotBlank);
+            var compiled = Compile(Spec([
+                new DimensionSpec("public.reviews", "region", null,
+                    RuleGrouping(op, needsValue ? "West" : null)),
+            ]));
+            Assert.Contains("CASE", compiled.Sql, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public void AllModeAndsTheRulesAndParenthesisesThem()
+    {
+        var compiled = Compile(Spec([
+            new DimensionSpec("public.reviews", "region", null,
+                RuleGrouping(
+                    GroupingMatchOperator.StartsWith, "W",
+                    GroupingRuleMode.All,
+                    (GroupingMatchOperator.EndsWith, "t"))),
+        ]));
+
+        Assert.Contains(" AND ", compiled.Sql, StringComparison.Ordinal);
+        Assert.Contains(compiled.Parameters, p => Equals(p.Value, "W%"));
+        Assert.Contains(compiled.Parameters, p => Equals(p.Value, "%t"));
+    }
+
+    [Fact]
+    public void ARuleWithoutItsValueIsRefusedWithTheOperatorNamed()
+    {
+        var error = Assert.Throws<QueryCompilationException>(() => Compile(Spec([
+            new DimensionSpec("public.reviews", "region", null,
+                RuleGrouping(GroupingMatchOperator.Contains, null)),
+        ])));
+
+        Assert.Equal("QRY_BAD_GROUPING", error.Code);
+        Assert.Contains("Contains", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ABucketWithOnlyRulesIsValid()
+    {
+        // The old validation demanded values or the blank flag, which would
+        // have rejected every rule-only bucket before it reached the emitter.
+        var compiled = Compile(Spec([
+            new DimensionSpec("public.reviews", "region", null,
+                RuleGrouping(GroupingMatchOperator.NotBlank, null)),
+        ]));
+        Assert.Contains("CASE", compiled.Sql, StringComparison.Ordinal);
+    }
+
 }
