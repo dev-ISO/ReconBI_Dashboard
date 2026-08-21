@@ -1,6 +1,6 @@
 {
   "name": "@recon/dashboards-ui",
-  "version": "0.17.0",
+  "version": "0.17.1",
   "description": "Embeddable React components for ReconDashboards: model canvas, chart builder, dashboard grid.",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,7 +26,7 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@recon/dashboards-core": "^0.17.0",
+    "@recon/dashboards-core": "^0.17.1",
     "lucide-react": ">=0.400.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
