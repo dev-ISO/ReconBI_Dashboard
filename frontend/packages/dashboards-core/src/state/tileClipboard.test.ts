@@ -242,12 +242,27 @@ describe('cross-dashboard paste repairs what cannot resolve', () => {
     slicer: { table: 't', column: 'c', label: 'Region', variant: 'checklist', targets },
   });
 
-  it('keeps the rule exactly as authored when pasting into the SAME dashboard', async () => {
-    const store = await openStore(detailFor(1, [slicerTile(['chart-tile-x'])]));
+  it('keeps a target that really is on the destination page', async () => {
+    const store = await openStore(
+      detailFor(1, [
+        { id: 'chart-tile-x', layout: { x: 0, y: 0, w: 6, h: 4 }, chart: chartFor() },
+        slicerTile(['chart-tile-x']),
+      ]),
+    );
     store.enterEdit();
     store.copyTile('tile-slicer');
     const pastedId = store.pasteTile()!;
     expect(tilesOf(store).find((t) => t.id === pastedId)!.slicer!.targets).toEqual(['chart-tile-x']);
+  });
+
+  it('drops a target that names no tile at all, even in the same dashboard', async () => {
+    // The test is "does this resolve where the slicer will live", not "did the
+    // dashboard change" — a target naming nothing can never filter anything.
+    const store = await openStore(detailFor(1, [slicerTile(['chart-that-is-gone'])]));
+    store.enterEdit();
+    store.copyTile('tile-slicer');
+    const pastedId = store.pasteTile()!;
+    expect(tilesOf(store).find((t) => t.id === pastedId)!.slicer!.targets).toBeNull();
   });
 
   it('drops targets that resolve to nothing in ANOTHER dashboard', async () => {
@@ -290,5 +305,134 @@ describe('cross-dashboard paste repairs what cannot resolve', () => {
     expect(tilesOf(other).find((t) => t.id === pastedId)!.button!.targetPageId).toBe(
       'page-of-dash-1',
     );
+  });
+});
+
+describe('copy and paste ACROSS PAGES', () => {
+  const twoPages = (page1: DashboardTile[], page2: DashboardTile[] = []): DashboardDetail => ({
+    ...detailFor(1),
+    layout: {
+      version: 1,
+      tiles: [],
+      slicers: [],
+      pages: [
+        { id: 'p1', name: 'Page 1', tiles: page1 },
+        { id: 'p2', name: 'Page 2', tiles: page2 },
+      ],
+    },
+  });
+
+  const pageTiles = (store: DashboardStore, index: number): DashboardTile[] =>
+    store.store.getState().current!.layout.pages![index]!.tiles;
+
+  it('pastes onto whichever page is active, leaving the source page alone', async () => {
+    const store = await openStore(twoPages([textTile()]));
+    store.enterEdit();
+    store.copyTile('tile-text');
+    store.setActivePage('p2');
+    const pastedId = store.pasteTile()!;
+
+    expect(pageTiles(store, 0)).toHaveLength(1);
+    expect(pageTiles(store, 1)).toHaveLength(1);
+    expect(pageTiles(store, 1)[0]!.id).toBe(pastedId);
+    expect(pageTiles(store, 1)[0]!.text).toEqual(textTile().text);
+  });
+
+  it('the clipboard survives the page switch that clears the selection', async () => {
+    const store = await openStore(twoPages([groupTile()]));
+    store.enterEdit();
+    store.copyTile('tile-group');
+    store.setActivePage('p2');
+    // setActivePage deliberately drops selectedTileId; the clipboard is not
+    // selection and must outlive it, or copy-here-paste-there is impossible.
+    expect(store.store.getState().selectedTileId).toBeNull();
+    expect(store.store.getState().tileClipboard).not.toBeNull();
+    expect(store.pasteTile()).not.toBeNull();
+  });
+
+  it('a pasted button keeps its target page — pages are dashboard-wide', async () => {
+    const store = await openStore(
+      twoPages([
+        {
+          id: 'tile-button',
+          layout: { x: 0, y: 0, w: 2, h: 1 },
+          kind: 'button',
+          button: { html: '<p>To page 2</p>', targetPageId: 'p2' },
+        },
+      ]),
+    );
+    store.enterEdit();
+    store.copyTile('tile-button');
+    store.setActivePage('p2');
+    const pastedId = store.pasteTile()!;
+    expect(pageTiles(store, 1)[0]!.id).toBe(pastedId);
+    expect(pageTiles(store, 1)[0]!.button!.targetPageId).toBe('p2');
+  });
+
+  it('a slicer pasted onto ANOTHER page drops targets it can never reach', async () => {
+    // Slicers are PAGE-SCOPED: filtersForTile only consults slicers on the
+    // tile's own page. Carrying page-1 chart ids onto page 2 would leave a
+    // slicer that filters NOTHING while looking perfectly healthy.
+    const store = await openStore(
+      twoPages([
+        { id: 'chart-a', layout: { x: 0, y: 0, w: 6, h: 4 }, chart: chartFor() },
+        {
+          id: 'tile-slicer',
+          layout: { x: 0, y: 4, w: 3, h: 2 },
+          kind: 'slicer',
+          slicer: {
+            table: 't',
+            column: 'c',
+            label: 'Region',
+            variant: 'checklist',
+            targets: ['chart-a'],
+          },
+        },
+      ]),
+    );
+    store.enterEdit();
+    store.copyTile('tile-slicer');
+
+    // Same page: the target is right there, so the rule is untouched.
+    const samePage = store.pasteTile()!;
+    expect(pageTiles(store, 0).find((t) => t.id === samePage)!.slicer!.targets).toEqual([
+      'chart-a',
+    ]);
+
+    // Other page: nothing it names exists here, so it falls back to "all charts".
+    store.setActivePage('p2');
+    const otherPage = store.pasteTile()!;
+    expect(pageTiles(store, 1).find((t) => t.id === otherPage)!.slicer!.targets).toBeNull();
+  });
+
+  it('keeps the targets that DO exist on the destination page', async () => {
+    const store = await openStore(
+      twoPages(
+        [
+          {
+            id: 'tile-slicer',
+            layout: { x: 0, y: 0, w: 3, h: 2 },
+            kind: 'slicer',
+            slicer: {
+              table: 't',
+              column: 'c',
+              label: 'Region',
+              variant: 'checklist',
+              targets: ['chart-a', 'chart-b'],
+            },
+          },
+        ],
+        [{ id: 'chart-b', layout: { x: 0, y: 0, w: 6, h: 4 }, chart: chartFor() }],
+      ),
+    );
+    store.enterEdit();
+    store.copyTile('tile-slicer');
+    store.setActivePage('p2');
+    const pastedId = store.pasteTile()!;
+    // chart-b is on page 2; chart-a is not on any page here. Keep the real one
+    // rather than collapsing to "all charts" and widening what it filters.
+    expect(pageTiles(store, 1).find((t) => t.id === pastedId)!.slicer!.targets).toEqual([
+      'chart-b',
+    ]);
   });
 });

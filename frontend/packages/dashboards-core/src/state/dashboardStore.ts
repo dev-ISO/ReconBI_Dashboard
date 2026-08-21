@@ -4144,19 +4144,23 @@ export class DashboardStore {
    * clipboard uses, so a chart citing dashboard-scoped measures or derived
    * fields does not paste as QRY_UNKNOWN_MEASURE / QRY_UNKNOWN_COLUMN.
    *
-   * CROSS-DASHBOARD REFERENCE REPAIR. Some tiles point at things that exist
-   * only in the dashboard they came from. Pasting them elsewhere would leave
-   * references that resolve to nothing:
-   *   - a slicer's `targets` name CHART TILE IDS. Ids from another dashboard
-   *     match nothing, and "targets that match nothing" reads as a slicer that
-   *     silently filters NOTHING — the worst kind of broken, because it looks
-   *     fine. Unresolvable targets are dropped; if none survive, the slicer
-   *     falls back to `null`, its own documented "all charts" default.
-   *   - a button's `targetPageId` names a PAGE. These are deliberately LEFT
-   *     alone: the tile chrome already badges a dead target as broken in edit
-   *     mode, so it is visible and fixable, whereas silently re-pointing it at
-   *     some other page would invent an intent the author never expressed.
-   * Pasting into the SAME dashboard repairs nothing, because nothing is stale.
+   * REFERENCE REPAIR. Some tiles point at things that exist only where they
+   * came from, and pasting them elsewhere leaves references resolving to
+   * nothing:
+   *   - a slicer's `targets` name CHART TILE IDS, and SLICERS ARE PAGE-SCOPED
+   *     (filtersForTile only consults slicers on the tile's own page). So a
+   *     slicer pasted onto a DIFFERENT PAGE — not merely a different dashboard
+   *     — names charts that cannot be there, and "targets that match nothing"
+   *     is a slicer that silently filters NOTHING while looking perfectly
+   *     healthy. The test is therefore whether each target resolves ON THE
+   *     DESTINATION PAGE, which covers same-page (all survive, rule untouched),
+   *     cross-page and cross-dashboard with one rule. If none survive it falls
+   *     back to `null`, its own documented "all charts" default.
+   *   - a button's `targetPageId` names a PAGE, and pages are dashboard-wide,
+   *     so a cross-PAGE paste keeps working. Across dashboards it is
+   *     deliberately LEFT alone: edit mode already badges a dead target, so it
+   *     is visible and fixable, whereas silently re-pointing it at some other
+   *     page would invent an intent the author never expressed.
    *
    * Returns the new tile id (null when nothing was pasted) so a caller can
    * select what it just created.
@@ -4165,9 +4169,11 @@ export class DashboardStore {
     const clip = this.state.tileClipboard;
     if (!clip || this.state.mode !== 'edit' || !this.state.current) return null;
 
-    const sameDashboard = clip.sourceDashboardId === this.state.current.id;
     const copy = cloneTileForCopy(clip.tile, { suffix: true });
-    if (!sameDashboard && copy.slicer?.targets) {
+    if (copy.slicer?.targets) {
+      // activeTiles() IS the destination page — the only place this slicer can
+      // ever filter. Same-page pastes keep every target; anything else keeps
+      // only what is really there.
       const live = new Set(this.activeTiles().filter((t) => t.chart).map((t) => t.id));
       const kept = copy.slicer.targets.filter((id) => live.has(id));
       copy.slicer = { ...copy.slicer, targets: kept.length > 0 ? kept : null };
